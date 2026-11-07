@@ -30,11 +30,21 @@ The patch:
   its own devices and is not affected. The new device's first frame uploads
   the font atlas again. Other textures are the app's to load again
   (`host/src/gui/renderer.rs` counts devices for that).
+- A replacement never blocks the window's thread. The window makes the new
+  surface (it belongs to the window, and Metal wants it on the main thread).
+  Listing adapters and making the device, where a driver can stall, run on
+  their own thread (`winit::Answer`), which the window polls each frame. One
+  that hasn't answered in 10 s counts as a failed try, and no other starts
+  while it is out; a late device is still taken. Configuring the new surface,
+  which makes the swapchain, stays on the window's thread, because DXGI sends
+  the window messages while it does that.
 - `configure_surface` replaces the device, instead of panicking, when the
   adapter supports no surface any more.
-- `Renderer::upload_failed` and `winit::SKIPPED_FRAMES` let the app see
-  skipped frames: the host counts them, so a backend that only skips frames
-  is never recorded as one that drew.
+- `Renderer::upload_failed`, `winit::SKIPPED_FRAMES` and `winit::DEVICES_LOST`
+  let the app see skipped frames and dropped devices. The host counts them, so
+  a backend that only skips frames is never recorded as one that drew, and a
+  device lost before the window worked is recorded as its backend's failure
+  even if no replacement is ever made.
 - A D3D12 device is only replaced once nothing holds the lost one, so the host
   drops the copy eframe keeps in `Frame` (`release_render_state`).
 

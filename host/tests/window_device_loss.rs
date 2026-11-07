@@ -7,7 +7,7 @@
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use eframe::egui_wgpu::winit::Replacement;
+use eframe::egui_wgpu::winit::{Answer, Asked, Replacement, REPLACEMENT_TIMEOUT};
 use eframe::egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
 use eframe::wgpu;
 
@@ -149,4 +149,87 @@ fn a_device_that_drew_for_a_while_starts_the_count_again() {
     assert_eq!(replacement.wait(now), Some(Duration::ZERO));
     replacement.failed(now);
     assert_eq!(replacement.wait(now), Some(Duration::from_millis(500)));
+}
+
+#[test]
+fn a_stuck_replacement_times_out_without_blocking_and_its_late_device_is_taken() {
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let start = Instant::now();
+    // As a driver call that stalls while the replacement device is made.
+    let mut answer = Answer::ask("test replacement", start, REPLACEMENT_TIMEOUT, move || {
+        let _ = released.recv();
+        "device"
+    })
+    .unwrap();
+    let polling = Instant::now();
+    assert!(matches!(answer.poll(start), Asked::Waiting));
+    assert!(matches!(
+        answer.poll(start + REPLACEMENT_TIMEOUT),
+        Asked::TimedOut
+    ));
+    // One timeout per period, each a failed try for the backoff.
+    assert!(matches!(
+        answer.poll(start + REPLACEMENT_TIMEOUT),
+        Asked::Waiting
+    ));
+    assert!(matches!(
+        answer.poll(start + REPLACEMENT_TIMEOUT * 2),
+        Asked::TimedOut
+    ));
+    assert!(
+        polling.elapsed() < SECOND,
+        "polling never waits for the worker"
+    );
+
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        match answer.poll(start) {
+            Asked::Answered(device) => break assert_eq!(device, "device"),
+            Asked::Waiting => std::thread::sleep(Duration::from_millis(10)),
+            other => panic!("{other:?}"),
+        }
+        assert!(Instant::now() < deadline);
+    }
+}
+
+#[test]
+fn a_replacement_thread_that_dies_ends_the_wait() {
+    let start = Instant::now();
+    let mut answer = Answer::<()>::ask("test replacement", start, REPLACEMENT_TIMEOUT, || {
+        panic!("simulated driver panic")
+    })
+    .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !matches!(answer.poll(start), Asked::Ended) {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn a_replacement_that_never_answers_ends_in_giving_up() {
+    // The painter counts each timeout of a stuck replacement as a failed
+    // try, and starts no other while it is out.
+    let (_never, never) = std::sync::mpsc::channel::<()>();
+    let mut now = Instant::now();
+    let mut replacement = Replacement::default();
+    replacement.lost(now);
+    let mut answer = Answer::ask("test replacement", now, REPLACEMENT_TIMEOUT, move || {
+        let _ = never.recv();
+    })
+    .unwrap();
+    let mut timeouts = 0;
+    for _ in 0..100 {
+        if replacement.wait(now).is_none() {
+            break;
+        }
+        now += REPLACEMENT_TIMEOUT;
+        if let Asked::TimedOut = answer.poll(now) {
+            timeouts += 1;
+            replacement.failed(now);
+        }
+        assert!(timeouts <= Replacement::MAX_FAILURES);
+    }
+    assert_eq!(timeouts, Replacement::MAX_FAILURES);
 }

@@ -35,7 +35,9 @@ static SHOWN_AT: OnceLock<Instant> = OnceLock::new();
 /// fail while the window renderer starts; `early-error` to fail right after the failure reporter
 /// starts; `panic-later` or, on Windows, `fail-fast-later` to fail 15 s after
 /// the window works; `device-lost-later` to lose the window's graphics
-/// device 15 s after the window works; or `surface-error` to report a surface
+/// device 15 s after the window works, with `-fail` or `-hang` to fail or
+/// hang every replacement device; `device-lost-early-fail` to lose it at the
+/// first frame and fail every replacement; or `surface-error` to report a surface
 /// error on every frame of the first two seconds. A `-quiet` suffix skips the
 /// message box.
 /// Only debug builds and builds with the `fault-injection` feature read it;
@@ -585,21 +587,41 @@ pub(crate) fn simulate_window_failure() {
     }
 }
 
-/// [`SIMULATE_ENV`] asks for `device-lost-later`.
+/// [`SIMULATE_ENV`] asks for `device-lost-later`, `device-lost-later-fail` or
+/// `device-lost-later-hang` (every replacement device fails or never comes),
+/// or `device-lost-early-fail` (at the first frame, before the window works).
 #[cfg(any(debug_assertions, feature = "fault-injection"))]
 pub(crate) fn device_loss_requested() -> bool {
-    simulated() == "device-lost-later"
+    simulated().starts_with("device-lost-")
 }
 
-/// True once, 15 s after the window works, when [`device_loss_requested`]:
-/// the window's graphics device is to be lost then.
+/// Fail or hang the choice of a replacement device, when [`SIMULATE_ENV`]
+/// asks. It runs on egui-wgpu's replacement thread.
+#[cfg(any(debug_assertions, feature = "fault-injection"))]
+pub(crate) fn simulate_replacement_failure() -> Result<(), String> {
+    match simulated().as_str() {
+        "device-lost-later-fail" | "device-lost-early-fail" => {
+            Err(format!("Simulated replacement failure from {SIMULATE_ENV}"))
+        }
+        "device-lost-later-hang" => loop {
+            std::thread::park();
+        },
+        _ => Ok(()),
+    }
+}
+
+/// True once when [`device_loss_requested`]: at the first frame for
+/// `device-lost-early-*`, else 15 s after the window works. The window's
+/// graphics device is to be lost then.
 #[cfg(any(debug_assertions, feature = "fault-injection"))]
 pub(crate) fn simulate_device_loss_now() -> bool {
     static DONE: AtomicBool = AtomicBool::new(false);
+    let early = simulated().starts_with("device-lost-early");
     device_loss_requested()
-        && SHOWN_AT
-            .get()
-            .is_some_and(|shown| shown.elapsed() > Duration::from_secs(15))
+        && (early
+            || SHOWN_AT
+                .get()
+                .is_some_and(|shown| shown.elapsed() > Duration::from_secs(15)))
         && !DONE.swap(true, Ordering::SeqCst)
 }
 

@@ -20,6 +20,98 @@ use web_time::Instant;
 /// failures.
 pub static SKIPPED_FRAMES: AtomicU64 = AtomicU64::new(0);
 
+/// EternalMonitor patch: devices the painter dropped because they were lost, whether or
+/// not a replacement was ever made.
+pub static DEVICES_LOST: AtomicU64 = AtomicU64::new(0);
+
+/// EternalMonitor patch: how long a replacement device may take before the try counts as
+/// failed. A driver call can stall for much longer, so the window never waits on it.
+pub const REPLACEMENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// EternalMonitor patch: how often the window looks for a replacement device being made.
+const REPLACEMENT_POLL: Duration = Duration::from_millis(100);
+
+/// EternalMonitor patch: what [`Answer::poll`] found.
+#[derive(Debug)]
+pub enum Asked<T> {
+    Answered(T),
+    Waiting,
+    /// No answer by the deadline. The next deadline is a timeout later; a late answer
+    /// still arrives.
+    TimedOut,
+    /// The thread ended without an answer, as by a panic.
+    Ended,
+}
+
+/// EternalMonitor patch: work done on its own thread, which the window polls without ever
+/// waiting for it.
+pub struct Answer<T> {
+    receiver: std::sync::mpsc::Receiver<T>,
+    deadline: Instant,
+    timeout: Duration,
+}
+
+impl<T: Send + 'static> Answer<T> {
+    pub fn ask(
+        name: &str,
+        now: Instant,
+        timeout: Duration,
+        work: impl FnOnce() -> T + Send + 'static,
+    ) -> std::io::Result<Self> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name(name.to_owned())
+            .spawn(move || {
+                let _ = sender.send(work());
+            })?;
+        Ok(Self {
+            receiver,
+            deadline: now + timeout,
+            timeout,
+        })
+    }
+
+    /// Never blocks.
+    pub fn poll(&mut self, now: Instant) -> Asked<T> {
+        match self.receiver.try_recv() {
+            Ok(answer) => Asked::Answered(answer),
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => Asked::Ended,
+            Err(std::sync::mpsc::TryRecvError::Empty) if now >= self.deadline => {
+                self.deadline = now + self.timeout;
+                Asked::TimedOut
+            }
+            Err(std::sync::mpsc::TryRecvError::Empty) => Asked::Waiting,
+        }
+    }
+}
+
+/// EternalMonitor patch: run `future` on this thread. wgpu's native futures are ready at
+/// once; this parks until woken otherwise.
+fn block_on<F: core::future::Future>(future: F) -> F::Output {
+    struct Unpark(std::thread::Thread);
+    impl std::task::Wake for Unpark {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = std::task::Waker::from(Arc::new(Unpark(std::thread::current())));
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut future = core::pin::pin!(future);
+    loop {
+        if let core::task::Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+            return output;
+        }
+        std::thread::park();
+    }
+}
+
+/// EternalMonitor patch: a replacement device being made on another thread, with the
+/// surface it was made for.
+type Replacing = Answer<(
+    wgpu::Surface<'static>,
+    Result<RenderState, crate::WgpuError>,
+)>;
+
 /// EternalMonitor patch: when the painter tries to replace a lost device, and when it
 /// stops trying.
 ///
@@ -132,6 +224,9 @@ pub struct Painter {
     restore_fonts: bool,
     /// When to try replacing a lost device, and when to stop.
     replacement: Replacement,
+    /// The replacement being made, if any. Never more than one: a stuck one is waited
+    /// for, not joined by another.
+    replacing: Option<Replacing>,
 }
 
 impl Painter {
@@ -177,6 +272,7 @@ impl Painter {
             rebuilding: false,
             restore_fonts: false,
             replacement: Replacement::default(),
+            replacing: None,
         }
     }
 
@@ -299,37 +395,13 @@ impl Painter {
         if let Some(window) = window {
             let size = window.inner_size();
             if !self.surfaces.contains_key(&viewport_id) {
-                // EternalMonitor patch: a lost device is replaced when `replacement` says,
-                // not on every repaint, and not at all once it gave up.
+                // EternalMonitor patch: a lost device is replaced off this thread.
                 if self.rebuilding {
-                    match self.replacement.wait(Instant::now()) {
-                        None => return Ok(()),
-                        Some(wait) if !wait.is_zero() => {
-                            self.context.request_repaint_after(wait);
-                            return Ok(());
-                        }
-                        Some(_) => {}
-                    }
+                    self.replace_device(viewport_id, window);
+                    return Ok(());
                 }
-                let added = match self.instance.create_surface(window) {
-                    Ok(surface) => self.add_surface(surface, viewport_id, size).await,
-                    Err(err) => Err(err.into()),
-                };
-                match added {
-                    // EternalMonitor patch: while a lost device is replaced, the window
-                    // skips frames until a new one can be made.
-                    Err(err) if self.rebuilding => {
-                        if self.replacement.failed(Instant::now()) {
-                            Self::log_gave_up(&err);
-                        } else {
-                            log::warn!("Could not replace the lost wgpu device yet: {err}");
-                            if let Some(wait) = self.replacement.wait(Instant::now()) {
-                                self.context.request_repaint_after(wait);
-                            }
-                        }
-                    }
-                    added => added?,
-                }
+                let surface = self.instance.create_surface(window)?;
+                self.add_surface(surface, viewport_id, size).await?;
             }
         } else {
             log::warn!("No window - clearing all surfaces");
@@ -378,11 +450,6 @@ impl Painter {
                 RenderState::create(&self.config, &self.instance, Some(&surface), self.options)
                     .await?;
             self.watch_device(&render_state.device);
-            if self.rebuilding {
-                log::info!("Replaced the lost wgpu device");
-                self.rebuilding = false;
-                self.restore_fonts = true;
-            }
             self.render_state = Some(render_state);
         }
         self.install_surface(surface, viewport_id, size.width, size.height, false);
@@ -420,6 +487,7 @@ impl Painter {
         self.screen_capture_state = None;
         self.rebuilding = true;
         self.restore_fonts = false;
+        DEVICES_LOST.fetch_add(1, Ordering::SeqCst);
         let now = Instant::now();
         if self.replacement.lost(now) {
             Self::log_gave_up(&"the new device was lost too");
@@ -428,6 +496,107 @@ impl Painter {
             if let Some(wait) = self.replacement.wait(now) {
                 self.context.request_repaint_after(wait);
             }
+        }
+    }
+
+    /// EternalMonitor patch: work towards a new device for a lost one, without blocking.
+    ///
+    /// The surface is made here, on the window's thread: it is the window's (Metal wants
+    /// it on the main thread) and calls no driver for a device. Listing adapters and
+    /// making the device, where a driver can stall, run on another thread, which this
+    /// polls. One that hasn't answered in [`REPLACEMENT_TIMEOUT`] counts as a failed try,
+    /// and no other starts while it is out; its late device is still taken. Configuring
+    /// the new surface, which makes the swapchain, stays here too: DXGI sends the window
+    /// messages while it does.
+    fn replace_device(&mut self, viewport_id: ViewportId, window: Arc<winit::window::Window>) {
+        let now = Instant::now();
+        if let Some(replacing) = &mut self.replacing {
+            match replacing.poll(now) {
+                Asked::Waiting => {}
+                Asked::TimedOut => self.replacement_failed(now, &"no new device within 10 s"),
+                Asked::Ended => {
+                    self.replacing = None;
+                    self.replacement_failed(now, &"the thread making it ended");
+                }
+                Asked::Answered((surface, Ok(render_state))) => {
+                    self.replacing = None;
+                    self.watch_device(&render_state.device);
+                    self.render_state = Some(render_state);
+                    let size = window.inner_size();
+                    self.install_surface(surface, viewport_id, size.width, size.height, false);
+                    self.rebuilding = false;
+                    self.restore_fonts = true;
+                    log::info!("Replaced the lost wgpu device");
+                    return;
+                }
+                Asked::Answered((_, Err(err))) => {
+                    self.replacing = None;
+                    self.replacement_failed(now, &err);
+                }
+            }
+            if let Some(wait) = self.next_check(now) {
+                self.context.request_repaint_after(wait);
+            }
+            return;
+        }
+        match self.replacement.wait(now) {
+            None => return,
+            Some(wait) if !wait.is_zero() => {
+                self.context.request_repaint_after(wait);
+                return;
+            }
+            Some(_) => {}
+        }
+        let surface = match self.instance.create_surface(window) {
+            Ok(surface) => surface,
+            Err(err) => {
+                self.replacement_failed(now, &err);
+                return;
+            }
+        };
+        let (config, instance, options) =
+            (self.config.clone(), self.instance.clone(), self.options);
+        let asked = Answer::ask(
+            "wgpu device replacement",
+            now,
+            REPLACEMENT_TIMEOUT,
+            move || {
+                let made = block_on(RenderState::create(
+                    &config,
+                    &instance,
+                    Some(&surface),
+                    options,
+                ));
+                (surface, made)
+            },
+        );
+        match asked {
+            Ok(replacing) => {
+                self.replacing = Some(replacing);
+                self.context.request_repaint_after(REPLACEMENT_POLL);
+            }
+            Err(err) => self.replacement_failed(now, &err),
+        }
+    }
+
+    /// EternalMonitor patch: a try at a new device failed at `now`.
+    fn replacement_failed(&mut self, now: Instant, why: &dyn core::fmt::Display) {
+        if self.replacement.failed(now) {
+            Self::log_gave_up(why);
+            // A stuck thread may still answer; nothing waits for it.
+            self.replacing = None;
+        } else {
+            log::warn!("Could not replace the lost wgpu device yet: {why}");
+        }
+    }
+
+    /// EternalMonitor patch: when the window should look again at a device being replaced,
+    /// or `None` once the painter gave up.
+    fn next_check(&self, now: Instant) -> Option<Duration> {
+        if self.replacing.is_some() {
+            Some(REPLACEMENT_POLL)
+        } else {
+            self.replacement.wait(now)
         }
     }
 
@@ -713,7 +882,7 @@ impl Painter {
         // the last frame draws nothing again, so it goes.
         if self.rebuilding {
             SKIPPED_FRAMES.fetch_add(1, Ordering::SeqCst);
-            if let Some(wait) = self.replacement.wait(Instant::now()) {
+            if let Some(wait) = self.next_check(Instant::now()) {
                 self.context.request_repaint_after(wait);
             }
             return vsync_sec;

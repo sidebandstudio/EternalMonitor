@@ -652,6 +652,10 @@ fn select(
     if replacing {
         lost_before_drawing();
     }
+    #[cfg(any(debug_assertions, feature = "fault-injection"))]
+    if replacing {
+        crate::startup::simulate_replacement_failure()?;
+    }
     let usable: Vec<&wgpu::Adapter> = adapters
         .iter()
         .filter(|adapter| surface.is_none_or(|surface| adapter.is_surface_supported(surface)))
