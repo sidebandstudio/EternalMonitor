@@ -64,13 +64,9 @@ fn crash_dir() -> Option<PathBuf> {
 /// threads belong to the pipeline, which the supervisor restarts, so they keep
 /// the plain log line. Native crashes on any thread end the process.
 pub fn install_failure_hooks() {
-    let default_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        on_panic(info, || {
-            crate::vdd::disable();
-        });
-        default_hook(info);
-    }));
+    install_panic_hook(|| {
+        crate::vdd::disable();
+    });
     #[cfg(windows)]
     prepare_crash_reporting();
     if simulated() == "early-error" {
@@ -105,6 +101,16 @@ fn prepare_crash_reporting() {
     }
     let launch_id = crate::telemetry::launch_id().unwrap_or_else(|| "-".to_string());
     reporter::start(&directory, owner, &launch_id);
+}
+
+/// The panic hook of [`install_failure_hooks`], ahead of the one before it,
+/// with `disable_virtual_display` turning the virtual display off.
+fn install_panic_hook(disable_virtual_display: impl Fn() + Send + Sync + 'static) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        on_panic(info, &disable_virtual_display);
+        default_hook(info);
+    }));
 }
 
 /// What [`install_failure_hooks`] does for a panic, by its thread, with
@@ -908,26 +914,39 @@ mod tests {
         assert!(detail.contains("mod.rs:"), "{detail}");
     }
 
+    /// Set for [`panic_hook_child`]: where it notes what happened.
+    const PANIC_HOOK_CHILD: &str = "EM_TEST_PANIC_HOOK_CHILD";
+    const PIPELINE_THREAD: &str = "test pipeline thread";
+
+    /// Run alone, in its own process, by
+    /// [`a_panic_making_a_window_device_leaves_the_virtual_display_on`]: the
+    /// panic hook is process-wide. Installs the host's panic hook with a
+    /// virtual display "turn off" that notes the thread it ran for, then
+    /// panics on egui-wgpu's replacement thread and on another background
+    /// thread.
     #[test]
-    fn a_panic_making_a_window_device_leaves_the_virtual_display_on() {
-        use eframe::egui_wgpu::winit::{
-            Answer, Asked, Replacement, REPLACEMENT_THREAD, REPLACEMENT_TIMEOUT,
+    fn panic_hook_child() {
+        use eframe::egui_wgpu::winit::{Answer, Asked, REPLACEMENT_THREAD, REPLACEMENT_TIMEOUT};
+        let Some(notes) = std::env::var_os(PANIC_HOOK_CHILD).map(PathBuf::from) else {
+            return;
         };
-        use std::sync::atomic::AtomicUsize;
-        use std::sync::Arc;
-        const PIPELINE: &str = "test pipeline thread";
-        static TURNED_OFF: AtomicUsize = AtomicUsize::new(0);
-        // The host's hook, for this test's threads; the hook is process-wide,
-        // so other tests' panics go to the old one.
-        let previous: Arc<dyn Fn(&std::panic::PanicHookInfo<'_>) + Send + Sync> =
-            std::panic::take_hook().into();
-        let fallback = previous.clone();
-        std::panic::set_hook(Box::new(move |info| match std::thread::current().name() {
-            Some(REPLACEMENT_THREAD | PIPELINE) => on_panic(info, || {
-                TURNED_OFF.fetch_add(1, Ordering::SeqCst);
-            }),
-            _ => fallback(info),
-        }));
+        let note = move |line: String| {
+            use std::io::Write;
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&notes)
+                .unwrap();
+            writeln!(file, "{line}").unwrap();
+        };
+        let off = note.clone();
+        install_panic_hook(move || {
+            let thread = std::thread::current()
+                .name()
+                .unwrap_or("unnamed")
+                .to_string();
+            off(format!("virtual display off: {thread}"));
+        });
 
         // The painter's replacement thread panics, as in a driver.
         let start = Instant::now();
@@ -937,24 +956,69 @@ mod tests {
             })
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
-        while !matches!(replacing.poll(start), Asked::Ended) && Instant::now() < deadline {
+        while !matches!(replacing.poll(start), Asked::Ended) {
+            assert!(
+                Instant::now() < deadline,
+                "the painter never saw the try end"
+            );
             std::thread::sleep(Duration::from_millis(10));
         }
-        let ended = matches!(replacing.poll(start), Asked::Ended);
-        let after_replacement = TURNED_OFF.load(Ordering::SeqCst);
-        // Any other background thread's panic still turns it off.
+        note("replacement ended".into());
+
+        // Any other background thread.
         let _ = std::thread::Builder::new()
-            .name(PIPELINE.into())
+            .name(PIPELINE_THREAD.into())
             .spawn(|| panic!("simulated pipeline panic"))
             .unwrap()
             .join();
-        let after_pipeline = TURNED_OFF.load(Ordering::SeqCst);
-        std::panic::set_hook(Box::new(move |info| previous(info)));
-        assert!(ended);
-        assert_eq!(after_replacement, 0);
-        assert_eq!(after_pipeline, 1);
+        note("pipeline ended".into());
+    }
+
+    #[test]
+    fn a_panic_making_a_window_device_leaves_the_virtual_display_on() {
+        use eframe::egui_wgpu::winit::{Replacement, REPLACEMENT_THREAD};
+        let directory = std::env::temp_dir().join(format!(
+            "eternal-panic-hook-{}-{:?}",
+            std::process::id(),
+            Instant::now()
+        ));
+        fs::create_dir_all(&directory).unwrap();
+        let notes = directory.join("notes.txt");
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "startup::tests::panic_hook_child",
+                "--exact",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(PANIC_HOOK_CHILD, &notes)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&child.stderr);
+        assert!(child.status.success(), "{stderr}");
+        let notes = fs::read_to_string(&notes).unwrap();
+        // The worker's panic left the virtual display alone, the other
+        // thread's turned it off, in order.
+        assert_eq!(
+            notes.lines().collect::<Vec<_>>(),
+            [
+                "replacement ended",
+                &format!("virtual display off: {PIPELINE_THREAD}"),
+                "pipeline ended",
+            ],
+            "{stderr}"
+        );
+        assert!(!notes.contains(REPLACEMENT_THREAD));
+        // The hook before the host's still ran for both.
+        assert!(
+            stderr.contains("simulated panic making a device"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("simulated pipeline panic"), "{stderr}");
+        fs::remove_dir_all(directory).unwrap();
 
         // The painter counts the ended try as failed and tries again later.
+        let start = Instant::now();
         let mut replacement = Replacement::default();
         replacement.lost(start);
         replacement.failed(start);
