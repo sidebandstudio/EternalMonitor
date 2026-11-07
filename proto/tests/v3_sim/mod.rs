@@ -990,9 +990,10 @@ impl Sim {
     }
 
     /// Commits made at or before `at` that device 0 never went live on and
-    /// that no later commit replaced: sessions the host kept as live after
-    /// the iPad had dropped their keys. A commit replaced by a newer one
-    /// before the iPad could use it is harmless and not counted.
+    /// that the host kept as live until its liveness timeout or maximum age
+    /// ended them, or still holds: sessions left live after the iPad had
+    /// dropped their keys. Commits the host itself ended sooner (replaced by
+    /// a newer commit, revoked, shut down) aren't counted.
     pub fn stranded_commits_before(&self, at: Duration) -> usize {
         let live: Vec<u32> = self
             .events
@@ -1002,15 +1003,15 @@ impl Sim {
                 _ => None,
             })
             .collect();
-        let superseded: Vec<u32> = self
+        let ended_by_host: Vec<u32> = self
             .events
             .iter()
             .filter_map(|e| match e {
                 Event::HostClosed {
-                    session_id,
-                    reason: CloseReason::Superseded,
-                    ..
-                } => Some(*session_id),
+                    session_id, reason, ..
+                } if !matches!(reason, CloseReason::Liveness | CloseReason::Expired) => {
+                    Some(*session_id)
+                }
                 _ => None,
             })
             .collect();
@@ -1018,7 +1019,7 @@ impl Sim {
             .iter()
             .filter(|e| {
                 matches!(e, Event::HostCommitted { at: t, session_id, .. }
-                    if *t <= at && !live.contains(session_id) && !superseded.contains(session_id))
+                    if *t <= at && !live.contains(session_id) && !ended_by_host.contains(session_id))
             })
             .count()
     }
