@@ -1,5 +1,5 @@
 use ffmpeg_next::format::Pixel;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::capture::FRAME_PADDING;
 
@@ -104,7 +104,26 @@ pub(super) fn conversion_context(
     if !matches!(format, Pixel::YUV420P | Pixel::NV12) {
         return Ok(None);
     }
-    Scaler::new(format, width, height, scaler_threads()).map(Some)
+    with_one_thread_fallback(scaler_threads(), |threads| {
+        Scaler::new(format, width, height, threads)
+    })
+    .map(Some)
+}
+
+/// Opens a scaler with `open` on `threads` threads, or on one when that
+/// fails: swscale can fail to start its threads, and the single-threaded
+/// conversion, which needs none, must still open wherever it did before.
+fn with_one_thread_fallback(
+    threads: usize,
+    mut open: impl FnMut(usize) -> Result<Scaler, ffmpeg_next::Error>,
+) -> Result<Scaler, ffmpeg_next::Error> {
+    match open(threads) {
+        Err(error) if threads > 1 => {
+            warn!(%error, threads, "swscale could not start its threads; converting on one");
+            open(1)
+        }
+        opened => opened,
+    }
 }
 
 /// Threads one conversion is split across: half the logical processors, at
@@ -676,6 +695,45 @@ mod tests {
                 unsafe { ffmpeg_next::ffi::av_buffer_get_ref_count((*source.as_ptr()).buf[0]) };
             assert_eq!(held, 1, "threads={threads}");
         }
+    }
+
+    /// A scaler whose threads fail to start opens on one thread instead; a
+    /// failure on one thread is the encoder's, as before threading.
+    #[test]
+    fn a_scaler_whose_threads_fail_converts_on_one() {
+        ffmpeg_next::init().unwrap();
+        let refused = || ffmpeg_next::Error::Other {
+            errno: libc::ENOMEM,
+        };
+        let mut tried = Vec::new();
+        let scaler = with_one_thread_fallback(4, |threads| {
+            tried.push(threads);
+            if threads > 1 {
+                return Err(refused());
+            }
+            Scaler::new(Pixel::YUV420P, 96, 64, threads)
+        })
+        .unwrap();
+        assert_eq!(tried, [4, 1]);
+        assert_eq!(scaler.threads(), 1);
+
+        for threads in [4, 1] {
+            let mut tried = Vec::new();
+            let opened = with_one_thread_fallback(threads, |threads| {
+                tried.push(threads);
+                Err(refused())
+            });
+            assert!(opened.is_err());
+            assert_eq!(tried, if threads > 1 { vec![4, 1] } else { vec![1] });
+        }
+
+        let mut tried = Vec::new();
+        let scaler = with_one_thread_fallback(4, |threads| {
+            tried.push(threads);
+            Scaler::new(Pixel::YUV420P, 96, 64, threads)
+        })
+        .unwrap();
+        assert_eq!((tried, scaler.threads()), (vec![4], 4));
     }
 
     #[test]
