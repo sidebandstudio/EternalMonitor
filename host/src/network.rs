@@ -395,7 +395,8 @@ const HOME_TTL: Duration = Duration::from_secs(2);
 
 /// The home network addresses from the last listing, listed on a thread of
 /// its own at most every 2 s. Asking never waits: an identity check asks
-/// under the session lock, and no listing runs while it is held.
+/// under the session lock, and no listing runs while it is held. Addresses
+/// older than that are never given out: the PC may have lost them.
 pub struct HomeCache {
     list: fn() -> Option<Vec<Adapter>>,
     ttl: Duration,
@@ -409,7 +410,7 @@ struct HomeState {
 }
 
 impl HomeCache {
-    fn with(list: fn() -> Option<Vec<Adapter>>, ttl: Duration) -> Self {
+    pub(crate) fn with(list: fn() -> Option<Vec<Adapter>>, ttl: Duration) -> Self {
         Self {
             list,
             ttl,
@@ -417,33 +418,35 @@ impl HomeCache {
         }
     }
 
-    /// The last listing's addresses. A missing or stale one starts a listing
-    /// and reads as before (or none) until it is done.
+    /// The last listing's addresses while it is fresh: it started less than
+    /// `ttl` ago. A missing or expired one reads as none, so nothing is
+    /// signed, and starts a listing on its own thread. A listing that is
+    /// already expired when it ends is dropped.
     pub fn get(&self) -> Vec<Ipv4Addr> {
         let (addresses, start) = {
             let mut state = self.state.lock();
-            let stale = state
+            let fresh = state
                 .listed
                 .as_ref()
-                .is_none_or(|(at, _)| at.elapsed() >= self.ttl);
-            let start = stale && !state.listing;
+                .filter(|(started, _)| started.elapsed() < self.ttl);
+            let addresses = fresh.map(|(_, addresses)| addresses.clone());
+            let start = addresses.is_none() && !state.listing;
             state.listing |= start;
-            let addresses = state
-                .listed
-                .as_ref()
-                .map(|(_, addresses)| addresses.clone());
             (addresses.unwrap_or_default(), start)
         };
         if start {
-            let (list, listing) = (self.list, HomeListing(self.state.clone()));
+            let (list, ttl, listing) = (self.list, self.ttl, HomeListing(self.state.clone()));
             // A thread that can't start drops the closure, and with it the guard.
             let _ = std::thread::Builder::new()
                 .name("home-addresses".into())
                 .spawn(move || {
+                    let started = Instant::now();
                     let addresses = list()
                         .map(|adapters| home_addresses_of(&adapters))
                         .unwrap_or_default();
-                    listing.0.lock().listed = Some((Instant::now(), addresses));
+                    if started.elapsed() < ttl {
+                        listing.0.lock().listed = Some((started, addresses));
+                    }
                 });
         }
         addresses
@@ -1158,6 +1161,27 @@ mod tests {
             (1..=4).map(|last| ip([10, 0, 9, last])).collect::<Vec<_>>()[..]
         );
         assert_eq!(addresses.last(), Some(&ip([169, 254, 3, 4])));
+    }
+
+    static SLOW_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn slow_home() -> Option<Vec<Adapter>> {
+        SLOW_CALLS.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(Duration::from_millis(150));
+        tailscale_and_wifi()
+    }
+
+    /// A listing that took longer than its lifetime is already stale when
+    /// it arrives: it is dropped, and the addresses stay unknown.
+    #[test]
+    fn a_listing_older_than_its_lifetime_is_dropped() {
+        let cache = HomeCache::with(slow_home, Duration::from_millis(50));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while SLOW_CALLS.load(Ordering::SeqCst) < 3 {
+            assert!(cache.get().is_empty(), "a stale listing was signed");
+            assert!(Instant::now() < deadline, "no listing finished");
+            std::thread::sleep(Duration::from_millis(5));
+        }
     }
 
     static HOME_GATE: Mutex<()> = Mutex::new(());

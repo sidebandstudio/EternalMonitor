@@ -2501,6 +2501,80 @@ mod tests {
         }
     }
 
+    /// A paired host on every address whose home network addresses come
+    /// from `HomeCache`, listed by `held_home`.
+    struct ListedConfig(PairConfig, crate::network::HomeCache);
+    impl ConfigSource for ListedConfig {
+        fn stream_config(&self) -> StreamConfig {
+            TestConfig.stream_config()
+        }
+        fn host_name(&self) -> String {
+            TestConfig.host_name()
+        }
+        fn pairing(&self) -> Option<&parking_lot::Mutex<crate::pairing::Pairing>> {
+            self.0.pairing()
+        }
+        fn identity_endpoints(&self) -> Option<(u16, Vec<[u8; 4]>)> {
+            super::super::identity_endpoints(SocketAddr::from(([0, 0, 0, 0], 9876)), || {
+                self.1.get()
+            })
+        }
+    }
+
+    /// Held while the test keeps the PC's adapters from being listed.
+    static HOME_HELD: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    fn held_home() -> Option<Vec<crate::network::Adapter>> {
+        let _open = HOME_HELD.lock();
+        Some(vec![crate::network::Adapter {
+            name: String::new(),
+            kind: crate::network::Kind::Wifi,
+            up: true,
+            gateway: true,
+            ipv4: vec![std::net::Ipv4Addr::new(192, 168, 1, 20)],
+        }])
+    }
+
+    /// Once the last listing of the PC's addresses has expired, IDENTIFY gets
+    /// no answer until a new listing comes, however long that takes: the PC
+    /// never signs an address it may no longer have.
+    #[test]
+    fn identify_signs_no_expired_listing() {
+        let lifetime = Duration::from_secs(1);
+        let config = ListedConfig(
+            pair_config(true),
+            crate::network::HomeCache::with(held_home, lifetime),
+        );
+        let mut session = Session::new(100);
+        let start = Instant::now();
+        // A new asker and a new limiter window each time, so only the
+        // listing decides.
+        let mut asked = 0u32;
+        let mut ask = |session: &mut Session| {
+            asked += 1;
+            let asker = addr([192, 0, 2, (asked % 250) as u8 + 1], 50100);
+            answered(session, asker, &config, start + IDENTIFY_WINDOW * asked)
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ask(&mut session) {
+            assert!(Instant::now() < deadline, "the addresses were never listed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let held = HOME_HELD.lock();
+        std::thread::sleep(lifetime + Duration::from_millis(100));
+        for _ in 0..30 {
+            assert!(!ask(&mut session), "signed an expired listing");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        drop(held);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ask(&mut session) {
+            assert!(Instant::now() < deadline, "a fresh listing never came");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn identify_config(required: bool) -> IdentifyConfig {
         IdentifyConfig(
             pair_config(required),
