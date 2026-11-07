@@ -96,15 +96,18 @@ pub(super) fn retries_as_yuv(mode: EncoderInput, format: Pixel) -> bool {
     mode == EncoderInput::Automatic && matches!(format, Pixel::BGRA | Pixel::BGRZ)
 }
 
+/// swscale converting BGRA to `format` on `threads` threads, or nothing
+/// when the encoder takes BGRA itself.
 pub(super) fn conversion_context(
     format: Pixel,
     width: u32,
     height: u32,
+    threads: usize,
 ) -> Result<Option<Scaler>, ffmpeg_next::Error> {
     if !matches!(format, Pixel::YUV420P | Pixel::NV12) {
         return Ok(None);
     }
-    with_one_thread_fallback(scaler_threads(), |threads| {
+    with_one_thread_fallback(threads, |threads| {
         Scaler::new(format, width, height, threads)
     })
     .map(Some)
@@ -129,7 +132,7 @@ fn with_one_thread_fallback(
 /// Threads one conversion is split across: half the logical processors, at
 /// most four. A 2732x2048 frame takes about 14 ms on one thread of a desktop
 /// CPU, most of a 60 fps frame's 16.7 ms.
-fn scaler_threads() -> usize {
+pub(super) fn scaler_threads() -> usize {
     threads_for(std::thread::available_parallelism().map_or(1, |count| count.get()))
 }
 
@@ -626,7 +629,9 @@ mod tests {
                     let label = format!("{width}x{height} {format:?} threads={threads}");
                     assert_same_picture(&before, &after, &label);
                 }
-                let mut scaler = conversion_context(format, width, height).unwrap().unwrap();
+                let mut scaler = conversion_context(format, width, height, scaler_threads())
+                    .unwrap()
+                    .unwrap();
                 let mut after = ffmpeg_next::frame::Video::new(format, width, height);
                 // A short buffer or another size is refused, never read past.
                 assert_eq!(
@@ -657,7 +662,7 @@ mod tests {
         for (processors, threads) in [(1, 1), (2, 1), (4, 2), (6, 3), (8, 4), (16, 4), (64, 4)] {
             assert_eq!(threads_for(processors), threads, "{processors} processors");
         }
-        let scaler = conversion_context(Pixel::YUV420P, 2732, 2048)
+        let scaler = conversion_context(Pixel::YUV420P, 2732, 2048, scaler_threads())
             .unwrap()
             .unwrap();
         assert_eq!(scaler.threads(), scaler_threads());
@@ -880,7 +885,7 @@ mod tests {
         let mut planar = ffmpeg_next::frame::Video::new(Pixel::YUV420P, width, height);
         let mut nv12 = ffmpeg_next::frame::Video::new(Pixel::NV12, width, height);
         for output in [&mut planar, &mut nv12] {
-            conversion_context(output.format(), width, height)
+            conversion_context(output.format(), width, height, 1)
                 .unwrap()
                 .unwrap()
                 .run(&bgra, output)
@@ -910,10 +915,10 @@ mod tests {
                 );
             }
         }
-        assert!(conversion_context(Pixel::BGRA, width, height)
+        assert!(conversion_context(Pixel::BGRA, width, height, 1)
             .unwrap()
             .is_none());
-        assert!(conversion_context(Pixel::BGRZ, width, height)
+        assert!(conversion_context(Pixel::BGRZ, width, height, 1)
             .unwrap()
             .is_none());
     }
