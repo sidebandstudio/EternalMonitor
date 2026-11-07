@@ -75,6 +75,8 @@ final class NetworkScanner: NSObject, ObservableObject {
 
     private let browser = NetServiceBrowser()
     private var resolvingServices: [String: NetService] = [:]
+    /// Every service name this search heard of, until it leaves.
+    private var serviceNames = Set<String>()
     /// Services whose IPv4 address is being looked up by host name, each
     /// with the lookup whose answer still counts. A removed service, a new
     /// scan or a newer address drops its entry, so a late answer can't list
@@ -106,6 +108,7 @@ final class NetworkScanner: NSObject, ObservableObject {
         searchProblem = nil
         hosts = []
         resolvingServices.removeAll()
+        serviceNames.removeAll()
         ipv4Lookups.removeAll()
         status = .looking
 
@@ -125,6 +128,14 @@ final class NetworkScanner: NSObject, ObservableObject {
                 stopScan()
             }
         }
+    }
+
+    /// Every PC this search heard of: those listed, and those whose address
+    /// never came or is still coming, without one. A lookup that must not
+    /// mistake one PC for another counts them all.
+    var claims: [DiscoveredHost] {
+        hosts + serviceNames.filter { name in !hosts.contains { $0.name == name } }.sorted()
+            .map { DiscoveredHost(name: $0, address: nil, port: 0, finding: true) }
     }
 
     func stopScan() {
@@ -170,6 +181,7 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
     ) {
         Task { @MainActor in
             let key = Self.serviceKey(service)
+            serviceNames.insert(service.name)
             guard resolvingServices[key] == nil else { return }
 
             service.delegate = self
@@ -195,6 +207,7 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
                 resolving.stop()
             }
             ipv4Lookups.removeValue(forKey: service.name)
+            serviceNames.remove(service.name)
             hosts.removeAll { $0.name == service.name }
 
             if !moreComing {

@@ -404,8 +404,39 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
         "hello2_v030",
         encode_control(0, 4, &ControlMessage::Hello2(hello)),
     ));
+    let nonce = std::array::from_fn(|index| 0xA0 + index as u8);
+    vectors.push((
+        "identify",
+        encode_control(
+            0,
+            1,
+            &ControlMessage::Identify(Identify {
+                version: IDENTIFY_VERSION,
+                nonce,
+            }),
+        ),
+    ));
+    // The proof for pairing token 01..10: the same known answer the host's
+    // pairing tests and the iPad's identity tests check.
+    vectors.push((
+        "identity",
+        encode_control(
+            0,
+            1,
+            &ControlMessage::Identity(Identity {
+                version: IDENTIFY_VERSION,
+                nonce,
+                proof: IDENTITY_PROOF,
+            }),
+        ),
+    ));
     vectors
 }
+
+const IDENTITY_PROOF: [u8; 32] = [
+    0x12, 0x6d, 0xc9, 0x34, 0x67, 0xaf, 0x3b, 0x06, 0x21, 0xc4, 0xf9, 0xb4, 0x20, 0xe0, 0xd3, 0x23,
+    0x14, 0x32, 0x59, 0xd7, 0x43, 0xf8, 0x57, 0x03, 0xb9, 0xfe, 0xc8, 0x39, 0x89, 0xeb, 0xa3, 0x53,
+];
 
 fn render(vectors: &[(&'static str, Vec<u8>)]) -> String {
     let mut out = String::new();
@@ -538,6 +569,21 @@ fn packet_type_registry_is_stable() {
     assert_eq!(PacketType::StreamConfig as u8, 0x18);
     assert_eq!(PacketType::Nack as u8, 0x19);
     assert_eq!(PacketType::InputEvent as u8, 0x20);
+    assert_eq!(PacketType::Identify as u8, 0x1A);
+    assert_eq!(PacketType::Identity as u8, 0x1B);
+}
+
+/// The request is as long as the answer, so answering never sends more
+/// bytes than arrived; a request cut short of its reserved bytes is refused.
+#[test]
+fn identify_request_is_as_long_as_its_answer() {
+    let vectors: BTreeMap<_, _> = canonical_vectors().into_iter().collect();
+    assert_eq!(vectors["identify"].len(), vectors["identity"].len());
+    assert_eq!(vectors["identify"].len(), 16 + IDENTIFY_BODY_SIZE);
+    match parse_control(&vectors["identity"]).unwrap().1 {
+        ControlMessage::Identity(identity) => assert_eq!(identity.proof, IDENTITY_PROOF),
+        other => panic!("{other:?}"),
+    }
 }
 
 /// A host that numbers frames contiguously says so in HELLO_ACK; one that

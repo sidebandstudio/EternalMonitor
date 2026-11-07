@@ -532,7 +532,7 @@ impl Session {
         // INPUT_EVENT moved the mouse and clicked, a stray RECEIVER_REPORT
         // steered the bitrate, and a late BYE from a superseded session tore
         // down the one that replaced it.
-        if !matches!(message, ControlMessage::Hello2(_)) {
+        if !matches!(message, ControlMessage::Hello2(_) | ControlMessage::Identify(_)) {
             match self.active.as_ref() {
                 Some(session)
                     if session.session_id == header_session_id && !session.awaiting_takeover => {}
@@ -542,6 +542,7 @@ impl Session {
         }
         match message {
             ControlMessage::Hello2(hello) => self.handle_hello(source, hello, config, now),
+            ControlMessage::Identify(request) => Self::answer_identify(source, request, config),
             ControlMessage::Bye(reason) => self.handle_bye(source, reason, now),
             ControlMessage::KeyframeRequest(request) => self.handle_keyframe(source, request, now),
             ControlMessage::ReceiverReport(report) => self.handle_report(source, report, now),
@@ -848,6 +849,33 @@ impl Session {
                 actions.report = Some(report);
             }
         }
+        actions
+    }
+
+    /// An iPad checking that this is the PC it paired with, before it
+    /// reconnects at a new address. Stateless: it starts no session and
+    /// works while another device streams.
+    fn answer_identify(
+        source: PeerId,
+        request: eternal_wire::v2::control::Identify,
+        config: &impl ConfigSource,
+    ) -> Actions {
+        let mut actions = Actions::default();
+        let Some(pairing) = config.pairing() else {
+            return actions;
+        };
+        if request.version != eternal_wire::v2::control::IDENTIFY_VERSION {
+            return actions;
+        }
+        let identity = ControlMessage::Identity(eternal_wire::v2::control::Identity {
+            version: eternal_wire::v2::control::IDENTIFY_VERSION,
+            nonce: request.nonce,
+            proof: pairing.lock().identity_proof(&request.nonce),
+        });
+        actions.replies.push((
+            source,
+            eternal_wire::v2::control::encode_control(0, 1, &identity),
+        ));
         actions
     }
 
@@ -2253,6 +2281,61 @@ mod tests {
             Some(&self.0)
         }
     }
+    fn identity_reply(actions: &Actions) -> eternal_wire::v2::control::Identity {
+        assert_eq!(actions.replies.len(), 1);
+        let (header, ControlMessage::Identity(identity)) =
+            eternal_wire::v2::control::parse_control(&actions.replies[0].1).unwrap()
+        else {
+            panic!("expected IDENTITY")
+        };
+        assert_eq!(header.session_id, 0);
+        identity
+    }
+
+    fn identify(version: u8, nonce: [u8; 16]) -> ControlMessage {
+        ControlMessage::Identify(eternal_wire::v2::control::Identify { version, nonce })
+    }
+
+    /// The PC proves it holds its pairing token, with pairing on or off,
+    /// without starting a session, and while another iPad streams.
+    #[test]
+    fn identify_is_answered_with_the_token_proof_and_starts_nothing() {
+        let config = pair_config(true);
+        let mut session = Session::new(100);
+        let now = Instant::now();
+        let asker = addr([192, 0, 2, 9], 50100);
+        let actions = session.handle_control(asker, 0, identify(1, [3; 16]), &config, now);
+        let identity = identity_reply(&actions);
+        assert_eq!(actions.replies[0].0, asker);
+        assert_eq!(identity.nonce, [3; 16]);
+        assert_eq!(identity.proof, config.0.lock().identity_proof(&[3; 16]));
+        assert_ne!(identity.proof, crate::pairing::Pairing::new(true, [8; 16]).unwrap().identity_proof(&[3; 16]));
+        assert!(session.session_id().is_none());
+        assert!(actions.new_target.is_none());
+
+        let streaming = addr([192, 0, 2, 5], 50000);
+        session.handle_control(streaming, 0, ControlMessage::Hello2(pair_hello(1)), &pair_config(false), now);
+        let live = session.session_id();
+        assert!(live.is_some());
+        let actions = session.handle_control(asker, 0, identify(1, [4; 16]), &pair_config(false), now);
+        assert_eq!(identity_reply(&actions).proof, config.0.lock().identity_proof(&[4; 16]));
+        assert_eq!(session.session_id(), live, "the stream goes on");
+        assert!(actions.new_target.is_none() && !actions.client_lost);
+    }
+
+    /// A layout this PC doesn't know gets no answer, as from a PC before
+    /// 0.3.5; so does a host without pairing state.
+    #[test]
+    fn identify_of_another_version_is_not_answered() {
+        let mut session = Session::new(100);
+        let now = Instant::now();
+        let asker = addr([192, 0, 2, 9], 50100);
+        let actions = session.handle_control(asker, 0, identify(2, [3; 16]), &pair_config(true), now);
+        assert!(actions.replies.is_empty());
+        let actions = session.handle_control(asker, 0, identify(1, [3; 16]), &TestConfig, now);
+        assert!(actions.replies.is_empty());
+    }
+
     fn pair_config(required: bool) -> PairConfig {
         PairConfig(parking_lot::Mutex::new(
             crate::pairing::Pairing::new(required, [7; 16]).unwrap(),

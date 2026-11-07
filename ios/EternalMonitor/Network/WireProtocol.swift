@@ -30,6 +30,8 @@ enum Wire {
         case streamConfig = 0x18
         case nack = 0x19
         case inputEvent = 0x20
+        case identify = 0x1A
+        case identity = 0x1B
         case error = 0x7F
     }
 
@@ -374,6 +376,25 @@ struct WirePong: Equatable {
     var t3Us: UInt64
 }
 
+/// iPad → PC, session 0: before reconnecting to a PC it found at a new
+/// address, the iPad checks that it is the same PC. The PC answers with a
+/// `WireIdentity`. 32 reserved bytes keep the request as long as the answer.
+struct WireIdentify: Equatable {
+    static let version: UInt8 = 1
+    /// What the proof signs after the nonce.
+    static let context = Data("EternalMonitor identify v1".utf8)
+    var version = WireIdentify.version
+    var nonce: Data
+}
+
+/// PC → iPad, session 0: HMAC-SHA256 keyed with the pairing token over
+/// `nonce ‖ WireIdentify.context`.
+struct WireIdentity: Equatable {
+    var version = WireIdentify.version
+    var nonce: Data
+    var proof: Data
+}
+
 struct WireInputEvent: Equatable {
     var inputVer: UInt8 = 1
     var kind: UInt8
@@ -404,6 +425,8 @@ enum ControlMessage: Equatable {
     case pong(WirePong)
     case streamConfig(StreamConfig)
     case inputEvent(WireInputEvent)
+    case identify(WireIdentify)
+    case identity(WireIdentity)
 
     var packetType: Wire.PacketType {
         switch self {
@@ -418,6 +441,8 @@ enum ControlMessage: Equatable {
         case .pong: return .pong
         case .streamConfig: return .streamConfig
         case .inputEvent: return .inputEvent
+        case .identify: return .identify
+        case .identity: return .identity
         }
     }
 }
@@ -510,6 +535,16 @@ extension Wire {
             body.appendLE(p.t3Us)
         case .streamConfig(let cfg):
             cfg.encode(into: &body)
+        case .identify(let i):
+            precondition(i.nonce.count == 16)
+            body.append(i.version)
+            body.append(i.nonce)
+            body.append(Data(repeating: 0, count: 32))
+        case .identity(let i):
+            precondition(i.nonce.count == 16 && i.proof.count == 32)
+            body.append(i.version)
+            body.append(i.nonce)
+            body.append(i.proof)
         case .inputEvent(let e):
             body.append(e.inputVer)
             body.append(e.kind)
@@ -609,6 +644,12 @@ extension Wire {
             message = .streamConfig(cfg)
         case .inputEvent:
             message = parseInputEvent(&r)
+        case .identify:
+            guard let version = r.readU8(), let nonce = r.take(16), r.take(32) != nil else { return nil }
+            message = .identify(WireIdentify(version: version, nonce: Data(nonce)))
+        case .identity:
+            guard let version = r.readU8(), let nonce = r.take(16), let proof = r.take(32) else { return nil }
+            message = .identity(WireIdentity(version: version, nonce: Data(nonce), proof: Data(proof)))
         case .media, .mediaFec, .audio, .error:
             return nil
         }

@@ -35,9 +35,28 @@ final class WireProtocolGoldenTests: XCTestCase {
 
     func testGoldenFileIsBundledAndComplete() throws {
         XCTAssertEqual(
-            Self.vectors.count, 29,
+            Self.vectors.count, 31,
             "golden vector count drifted — update both test suites together"
         )
+    }
+
+    /// The identify request and its answer: nonce A0..AF, and the proof of
+    /// pairing token 01..10, which the iPad checks as the PC's own.
+    func testIdentifyAndIdentityVectors() throws {
+        let nonce = Data(0xA0...0xAF)
+        let request = try vector("identify")
+        let (requestHeader, asked) = try XCTUnwrap(Wire.parseControl(request))
+        XCTAssertEqual(asked, .identify(WireIdentify(version: 1, nonce: nonce)))
+        XCTAssertEqual(requestHeader.sessionId, 0)
+        XCTAssertEqual(Wire.encodeControl(sessionId: 0, msgSeq: 1, message: asked), request)
+
+        let answer = try vector("identity")
+        XCTAssertEqual(answer.count, request.count, "never longer than the request")
+        let (_, message) = try XCTUnwrap(Wire.parseControl(answer))
+        guard case .identity(let identity) = message else { return XCTFail("wrong type") }
+        XCTAssertEqual(identity.nonce, nonce)
+        XCTAssertEqual(identity.proof, MovedPC.proof(token: Data(1...16), nonce: nonce))
+        XCTAssertEqual(Wire.encodeControl(sessionId: 0, msgSeq: 1, message: message), answer)
     }
 
     func testPairingRejectionVectors() throws {

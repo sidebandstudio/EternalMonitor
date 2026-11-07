@@ -315,6 +315,33 @@ pub struct InputEvent {
     pub tilt_y: i16,
 }
 
+/// [`Identify`] and [`Identity`] layout version.
+pub const IDENTIFY_VERSION: u8 = 1;
+/// What an [`Identity`] proof signs after the nonce.
+pub const IDENTIFY_CONTEXT: &[u8] = b"EternalMonitor identify v1";
+
+/// Client → host, session_id 0: before reconnecting to a PC it found at a new
+/// address, the iPad checks that it is the same PC. The host answers with an
+/// [`Identity`] whose proof only the PC holding the pairing token can make.
+/// 32 reserved bytes keep the request as long as the answer. Hosts before
+/// 0.3.5 don't know the type and drop it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Identify {
+    pub version: u8,
+    pub nonce: [u8; 16],
+}
+
+/// Host → client, session_id 0: `proof` is HMAC-SHA256 keyed with the
+/// pairing token over `nonce ‖ IDENTIFY_CONTEXT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Identity {
+    pub version: u8,
+    pub nonce: [u8; 16],
+    pub proof: [u8; 32],
+}
+
+pub const IDENTIFY_BODY_SIZE: usize = 49;
+
 pub const INPUT_EVENT_SIZE: usize = 30;
 pub const PEN_INPUT_EVENT_SIZE: usize = INPUT_EVENT_SIZE + 4;
 
@@ -332,6 +359,8 @@ pub enum ControlMessage {
     Pong(Pong),
     StreamConfig(StreamConfig),
     InputEvent(InputEvent),
+    Identify(Identify),
+    Identity(Identity),
 }
 
 impl ControlMessage {
@@ -348,6 +377,8 @@ impl ControlMessage {
             Self::Pong(_) => PacketType::Pong,
             Self::StreamConfig(_) => PacketType::StreamConfig,
             Self::InputEvent(_) => PacketType::InputEvent,
+            Self::Identify(_) => PacketType::Identify,
+            Self::Identity(_) => PacketType::Identity,
         }
     }
 }
@@ -456,6 +487,16 @@ pub fn encode_control(session_id: u32, msg_seq: u32, message: &ControlMessage) -
             let mut block = [0u8; STREAM_CONFIG_SIZE];
             cfg.encode_into(&mut block);
             body.extend_from_slice(&block);
+        }
+        ControlMessage::Identify(i) => {
+            body.push(i.version);
+            body.extend_from_slice(&i.nonce);
+            body.extend_from_slice(&[0; 32]);
+        }
+        ControlMessage::Identity(i) => {
+            body.push(i.version);
+            body.extend_from_slice(&i.nonce);
+            body.extend_from_slice(&i.proof);
         }
         ControlMessage::InputEvent(e) => {
             body.push(e.input_ver);
@@ -677,6 +718,17 @@ pub fn parse_control(datagram: &[u8]) -> Result<(ControlHeader, ControlMessage),
                 tilt_y: if input_ver == 2 { r.i16()? } else { 0 },
             })
         }
+        PacketType::Identify => {
+            let version = r.u8()?;
+            let nonce = r.take(16)?.try_into().unwrap();
+            r.take(32)?;
+            ControlMessage::Identify(Identify { version, nonce })
+        }
+        PacketType::Identity => ControlMessage::Identity(Identity {
+            version: r.u8()?,
+            nonce: r.take(16)?.try_into().unwrap(),
+            proof: r.take(32)?.try_into().unwrap(),
+        }),
         PacketType::Media | PacketType::MediaFec | PacketType::Audio | PacketType::Error => {
             return Err(WireError::InvalidField("packet_type"));
         }
@@ -937,6 +989,15 @@ mod tests {
                 t3_us: 44,
             }),
             ControlMessage::StreamConfig(sample_config()),
+            ControlMessage::Identify(Identify {
+                version: IDENTIFY_VERSION,
+                nonce: [7; 16],
+            }),
+            ControlMessage::Identity(Identity {
+                version: IDENTIFY_VERSION,
+                nonce: [7; 16],
+                proof: [9; 32],
+            }),
             ControlMessage::InputEvent(InputEvent {
                 input_ver: 1,
                 kind: 0,

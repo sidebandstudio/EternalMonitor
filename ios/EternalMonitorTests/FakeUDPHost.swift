@@ -16,6 +16,8 @@ final class FakeUDPHost: @unchecked Sendable {
     private(set) var lastNonce: UInt32 = 0
     /// The pairing token the HELLO2 answered last carried.
     private(set) var lastAuthToken = Data()
+    /// A HELLO2 came before the identify request was answered.
+    private(set) var helloBeforeIdentify = false
 
     init() {
         var address = sockaddr_in()
@@ -87,6 +89,33 @@ final class FakeUDPHost: @unchecked Sendable {
                 }
             }
         }
+    }
+
+    /// Answers the next identify request as the PC holding `token` would,
+    /// or with `proof` instead. False after thirty quiet seconds.
+    func answerIdentify(token: Data, proof: Data? = nil) -> Bool {
+        for _ in 0..<100 {
+            guard let (data, from, length) = receive() else { continue }
+            let message = Wire.parseControl(data)?.message
+            if case .hello2? = message { helloBeforeIdentify = true }
+            guard case .identify(let request)? = message else { continue }
+            client = (from, length)
+            send(Wire.encodeControl(sessionId: 0, msgSeq: 1, message: .identity(WireIdentity(
+                nonce: request.nonce, proof: proof ?? MovedPC.proof(token: token, nonce: request.nonce)))))
+            return true
+        }
+        return false
+    }
+
+    /// The control messages received within `seconds`, by type.
+    func received(within seconds: Double) -> [Wire.PacketType] {
+        var types: [Wire.PacketType] = []
+        let deadline = Date().addingTimeInterval(seconds)
+        while Date() < deadline {
+            guard let (data, _, _) = receive(), let (header, _) = Wire.parseControl(data) else { continue }
+            types.append(header.packetType)
+        }
+        return types
     }
 
     /// Ends session 41 from the PC's side.
