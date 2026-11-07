@@ -613,11 +613,15 @@ impl Session {
 
     /// Feed one control datagram off a link, with its header. Input whose
     /// msg_seq this session took already, or that is too old, is dropped.
+    ///
+    /// `datagram_len` is the datagram's size: an answer saying the PC isn't
+    /// streaming is never larger than the HELLO2 it answers.
     pub fn handle_datagram(
         &mut self,
         source: PeerId,
         header: &ControlHeader,
         message: ControlMessage,
+        datagram_len: usize,
         config: &impl ConfigSource,
         now: Instant,
     ) -> Actions {
@@ -625,6 +629,7 @@ impl Session {
             source,
             header.session_id,
             Some(header.msg_seq),
+            Some(datagram_len),
             message,
             config,
             now,
@@ -645,7 +650,7 @@ impl Session {
         config: &impl ConfigSource,
         now: Instant,
     ) -> Actions {
-        self.handle(source, header_session_id, None, message, config, now)
+        self.handle(source, header_session_id, None, None, message, config, now)
     }
 
     fn handle(
@@ -653,6 +658,7 @@ impl Session {
         source: PeerId,
         header_session_id: u32,
         msg_seq: Option<u32>,
+        datagram_len: Option<usize>,
         message: ControlMessage,
         config: &impl ConfigSource,
         now: Instant,
@@ -674,7 +680,9 @@ impl Session {
             }
         }
         match message {
-            ControlMessage::Hello2(hello) => self.handle_hello(source, hello, config, now),
+            ControlMessage::Hello2(hello) => {
+                self.handle_hello(source, hello, datagram_len, config, now)
+            }
             ControlMessage::Bye(reason) => self.handle_bye(source, reason, now),
             ControlMessage::KeyframeRequest(request) => self.handle_keyframe(source, request, now),
             ControlMessage::ReceiverReport(report) => self.handle_report(source, report, now),
@@ -753,6 +761,7 @@ impl Session {
         &mut self,
         source: PeerId,
         hello: eternal_wire::v2::control::Hello2,
+        datagram_len: Option<usize>,
         config: &impl ConfigSource,
         now: Instant,
     ) -> Actions {
@@ -784,7 +793,14 @@ impl Session {
                 // first code-based ACK must not require the now-rotated code.
                 if let Some(Closed::NotStreaming(state)) = closed {
                     drop(pairing);
-                    return self.answer_not_streaming(source, state, &hello, config, now);
+                    return self.answer_not_streaming(
+                        source,
+                        state,
+                        &hello,
+                        datagram_len,
+                        config,
+                        now,
+                    );
                 }
                 actions.replies.push((source, session.ack.clone()));
                 return actions;
@@ -808,7 +824,7 @@ impl Session {
         // A right pairing code isn't spent: it still works after Start.
         if let Some(Closed::NotStreaming(state)) = closed {
             drop(pairing);
-            return self.answer_not_streaming(source, state, &hello, config, now);
+            return self.answer_not_streaming(source, state, &hello, datagram_len, config, now);
         }
 
         // The media target: the client's advertised listen port at its source IP
@@ -1223,6 +1239,7 @@ impl Session {
         source: PeerId,
         state: NotStreaming,
         hello: &eternal_wire::v2::control::Hello2,
+        datagram_len: Option<usize>,
         config: &impl ConfigSource,
         now: Instant,
     ) -> Actions {
@@ -1238,8 +1255,15 @@ impl Session {
                 NotStreaming::Failed(reason) => (HelloStatus::Failed, reason.token()),
             }
         };
-        let actions = self.refuse_with_reason(source, status, reason, hello, config, now);
-        if actions.ended.is_some() {
+        let mut actions = self.refuse_with_reason(source, status, reason, hello, config, now);
+        // Never larger than the HELLO2: iPads that understand these answers
+        // pad theirs so every answer fits. A stopping stream answers here
+        // too, until its transport ends, so the bound is here as well as in
+        // the standby responder.
+        actions
+            .replies
+            .retain(|(_, reply)| datagram_len.is_none_or(|len| reply.len() <= len));
+        if actions.ended.is_some() && !actions.replies.is_empty() {
             info!(peer = %source, ?status, reason, "Told an iPad the PC isn't streaming");
         }
         actions
@@ -2338,7 +2362,7 @@ mod tests {
                 msg_seq,
             };
             let message = ControlMessage::InputEvent(event);
-            let actions = session.handle_datagram(peer, &header, message, &TestConfig, now);
+            let actions = session.handle_datagram(peer, &header, message, 64, &TestConfig, now);
             actions
                 .input
                 .map(|(_, event)| event)
@@ -3859,5 +3883,61 @@ mod tests {
         ));
         assert_eq!(ack.status, HelloStatus::Restarting);
         assert!(session.is_active());
+    }
+
+    /// The stream that is stopping still takes HELLO2s until its transport
+    /// ends. Its not-streaming answers are never larger than the HELLO2
+    /// either, as the standby's aren't.
+    #[test]
+    fn a_not_streaming_answer_is_never_larger_than_the_hello() {
+        let config = pair_config(false);
+        let mut session = Session::new(10);
+        let peer = addr([192, 0, 2, 1], 50000);
+        let mut small = pair_hello(1);
+        small.device_name = String::new();
+        small.device_id = 0;
+        let unpadded =
+            eternal_wire::v2::control::encode_control(0, 1, &ControlMessage::Hello2(small.clone()));
+        // The same small HELLO2 claiming the bit, without its padding.
+        let mut claimed = unpadded.clone();
+        claimed[26..28].copy_from_slice(&FEATURE_STANDBY_STATUS.to_le_bytes());
+        let mut padded_hello = small;
+        padded_hello.client_nonce = 2;
+        padded_hello.feature_caps = FEATURE_STANDBY_STATUS;
+        let padded =
+            eternal_wire::v2::control::encode_control(0, 2, &ControlMessage::Hello2(padded_hello));
+        session.set_not_streaming(Some(NotStreaming::Failed(FailedReason::Encoder)));
+        let mut answer = |datagram: &[u8]| {
+            let (header, message) = eternal_wire::v2::control::parse_control(datagram).unwrap();
+            session.handle_datagram(
+                peer,
+                &header,
+                message,
+                datagram.len(),
+                &config,
+                Instant::now(),
+            )
+        };
+        for small in [&unpadded, &claimed] {
+            assert_eq!(small.len(), 38);
+            let actions = answer(small);
+            assert!(
+                actions.replies.is_empty(),
+                "{} bytes answered",
+                actions.replies[0].1.len()
+            );
+        }
+        let actions = answer(&padded);
+        let (_, reply) = &actions.replies[0];
+        assert!(reply.len() <= padded.len());
+        let (_, ControlMessage::HelloAck(ack)) =
+            eternal_wire::v2::control::parse_control(reply).unwrap()
+        else {
+            panic!("expected an ACK");
+        };
+        assert_eq!(
+            (ack.status, ack.reason.as_str()),
+            (HelloStatus::Failed, "encoder")
+        );
     }
 }

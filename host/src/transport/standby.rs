@@ -204,7 +204,14 @@ async fn answer(links: &TransportLinks, shared: &SharedControl, peer: PeerId, da
         if session.not_streaming().is_none() {
             return;
         }
-        session.handle_datagram(peer, &header, message, &config, super::now())
+        session.handle_datagram(
+            peer,
+            &header,
+            message,
+            datagram.len(),
+            &config,
+            super::now(),
+        )
     };
     if let Some(end) = &actions.ended {
         crate::diagnostics::log_session_end(end, shared);

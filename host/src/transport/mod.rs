@@ -364,6 +364,7 @@ pub async fn start_sender(
                                             src,
                                             &header,
                                             message,
+                                            datagram.len(),
                                             &config,
                                             now(),
                                         );
@@ -757,7 +758,7 @@ async fn repair_while_pacing(
                     #[cfg(feature = "test-hooks")]
                     probe::taken(peer);
                     let actions = shared.session.lock().handle_datagram(PeerId::udp(peer), &header,
-                        message, config, now());
+                        message, len, config, now());
                     act(actions, state, links, shared, config, supervisor_tx).await;
                     continue;
                 }
