@@ -137,6 +137,9 @@ class SigningTest(unittest.TestCase):
         self.assertEqual(len(github.assets[signer.SIGNATURE]), 64)
         self.assertEqual(signer.verify_published(github, public), VERSION)
         self.assertEqual(signer.verify_published(github, public, sha256=HASH, version=VERSION), VERSION)
+        self.assertEqual(signer.verify_published(github, public, version=VERSION), VERSION)
+        with self.assertRaises(signer.SigningError):
+            signer.verify_published(github, public, version="0.3.5-beta.20990101.999")
         # The key went to openssl's stdin only: never an argument, never uploaded.
         with_key = [args for args, given in run.calls if given == private]
         self.assertEqual(len(with_key), 1)

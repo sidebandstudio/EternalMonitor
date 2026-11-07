@@ -131,11 +131,10 @@ def verified(manifest, signature, public_key, run=subprocess.run):
 
 def verify_published(github, public_key=PUBLIC_KEY, run=subprocess.run, sha256=None, version=None):
     """Checks the published manifest and signature as a Beta install does, and
-    returns the version they vouch for. With sha256, the release must name that
-    installer (and version)."""
+    returns the version they vouch for. With sha256 or version, the release must
+    name that installer or version; each is checked on its own."""
     found = read_release(github.release())
-    if sha256 is not None:
-        expect(found, sha256, version)
+    expect(found, sha256, version)
     version, sha256, size = found
     with tempfile.TemporaryDirectory() as tmp:
         try:
@@ -156,7 +155,7 @@ def verify_published(github, public_key=PUBLIC_KEY, run=subprocess.run, sha256=N
 def expect(found, sha256, version=None):
     """Refuses a release that does not name the installer the nightly run built."""
     found_version, found_sha256, _ = found
-    if found_sha256 != sha256.lower():
+    if sha256 is not None and found_sha256 != sha256.lower():
         raise SigningError(f"the release names installer {found_sha256}, not {sha256.lower()} from the nightly run")
     if version is not None and found_version != version:
         raise SigningError(f"the release names {found_version}, not {version}")
@@ -166,6 +165,8 @@ def sign_and_publish(github, private_key, sha256, version=None, run=subprocess.r
     """Writes, signs and uploads the manifest for the release as it is now, once it
     names the installer sha256 (and version), then verifies what was published
     against the pinned key. Returns the version."""
+    if not sha256:
+        raise SigningError("signing needs the installer SHA-256 from the nightly run")
     found = read_release(github.release())
     expect(found, sha256, version)
     version, sha256, size = found
