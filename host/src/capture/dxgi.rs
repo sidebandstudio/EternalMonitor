@@ -319,6 +319,15 @@ pub fn run_capture_loop(
     // Whether `last_frame` has the pointer drawn in: it has unless the
     // client draws the pointer itself (`SharedControl::client_draws_pointer`).
     let mut last_frame_has_pointer = true;
+    if second_screen {
+        // A position from a mirror before this one would stay drawn.
+        shared.pointer.set_position(super::pointer::Position {
+            visible: false,
+            x: 0,
+            y: 0,
+            host_time_us: crate::clock::host_now_us(),
+        });
+    }
 
     loop {
         if !shared.running.load(Ordering::SeqCst)
@@ -353,7 +362,7 @@ pub fn run_capture_loop(
         // other client, or none, one with it. The staging texture still
         // holds the last desktop image, so the cached frame is redrawn from
         // it when the connected client's answer differs from the cache's.
-        let draws_pointer = shared.client_draws_pointer();
+        let draws_pointer = pointer_apart(shared.client_draws_pointer(), second_screen);
         if seen_image && last_frame_has_pointer == draws_pointer {
             let mut pixel_buf = frame_buffer(frame_bytes);
             copy_staging(
@@ -441,7 +450,8 @@ pub fn run_capture_loop(
                     cursor_x = frame_info.PointerPosition.Position.x;
                     cursor_y = frame_info.PointerPosition.Position.y;
                     shared.pointer.set_position(super::pointer::Position {
-                        visible: cursor_visible,
+                        // The second screen's picture has the pointer in it.
+                        visible: cursor_visible && !second_screen,
                         x: cursor_x,
                         y: cursor_y,
                         host_time_us: crate::clock::host_now_us(),
@@ -449,6 +459,7 @@ pub fn run_capture_loop(
                 }
                 if frame_info.PointerShapeBufferSize > 0
                     && cursor.update_shape(dupl, frame_info.PointerShapeBufferSize)
+                    && !second_screen
                 {
                     if let Some(image) = super::pointer::convert_shape(
                         cursor.shape_type,

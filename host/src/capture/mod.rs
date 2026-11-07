@@ -108,6 +108,19 @@ pub(crate) fn frame_has_image(last_present_time: i64, seen_image: bool) -> bool 
     last_present_time != 0 || seen_image
 }
 
+/// Whether the pointer goes apart from the video for this capture. On the
+/// second screen it never does: the virtual display has no hardware
+/// pointer, so Windows draws the pointer into its image, and Desktop
+/// Duplication kept reporting a stale position there (measured on the
+/// reference PC: every pointer move was a new image, and the reported
+/// position never moved). An iPad that draws the pointer would show that
+/// stale one too. There the pointer stays in the video, as before, and the
+/// iPad is told it is hidden.
+#[cfg(any(windows, test))]
+pub(crate) fn pointer_apart(client_draws_pointer: bool, second_screen: bool) -> bool {
+    client_draws_pointer && !second_screen
+}
+
 /// What the capture loop does with an acquired frame.
 #[cfg(any(windows, test))]
 #[derive(Debug, PartialEq, Eq)]
@@ -1046,6 +1059,17 @@ mod tests {
                 && *at <= Duration::from_millis(2_000) + KEYFRAME_RESEND + step),
             "the keyframe request waited: {resends:?}"
         );
+    }
+
+    #[test]
+    fn the_second_screen_keeps_the_pointer_in_the_video() {
+        assert!(pointer_apart(true, false), "Mirror, an iPad that draws it");
+        assert!(
+            !pointer_apart(true, true),
+            "second screen: Windows draws it"
+        );
+        assert!(!pointer_apart(false, false), "an older iPad");
+        assert!(!pointer_apart(false, true));
     }
 
     pub(super) fn connect_viewer(shared: &SharedControl) {
