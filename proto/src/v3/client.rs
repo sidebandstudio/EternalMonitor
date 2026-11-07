@@ -276,6 +276,10 @@ pub struct Client {
     intent: Option<Id16>,
     /// From a `TooNew` answer: the clock is used only up to this value.
     clock_limit: Option<u64>,
+    /// Keys the host answered `PairAgain` for: no new attempt starts under
+    /// them. Their live session, and an abandoned attempt the host may have
+    /// committed (the commit that reached the ceiling), stay usable.
+    no_new_attempts: Vec<Id16>,
 }
 
 /// A confirming attempt the iPad stopped retrying. Nothing is sealed under
@@ -305,6 +309,7 @@ impl Client {
             abandoned: Vec::new(),
             intent: None,
             clock_limit: None,
+            no_new_attempts: Vec::new(),
         }
     }
 
@@ -408,6 +413,11 @@ impl Client {
     ) {
         self.abandon_current();
         self.intent = Some(key.dev_id);
+        if self.no_new_attempts.contains(&key.dev_id) {
+            // The host said this key can never connect again.
+            out.push(ClientOutput::PairAgain { dev_id: key.dev_id });
+            return;
+        }
         self.start_attempt(now, key, clock_us, stale_retried, out);
     }
 
@@ -423,8 +433,7 @@ impl Client {
         out.push(ClientOutput::AttemptFailed { dev_id });
     }
 
-    /// The host refused this key, or said it must be paired again: stop
-    /// using it. Ends an attempt under it, drops every abandoned attempt
+    /// The host refused this key: stop using it. Ends an attempt under it, drops every abandoned attempt
     /// under it, and forgets it as the reconnect key.
     fn retire_key(&mut self, dev_id: &Id16) {
         let attempt_key = match &self.attempt {
@@ -537,7 +546,13 @@ impl Client {
                 }
             }
             (Msg2Payload::PairAgain, _) => {
-                self.retire_key(&key.dev_id);
+                // Unlike a refusal, the record isn't retired: a session
+                // already committed under this key (the one that reached the
+                // ceiling) stays valid. Only new attempts stop.
+                self.attempt = Attempt::Idle;
+                if !self.no_new_attempts.contains(&key.dev_id) {
+                    self.no_new_attempts.push(key.dev_id);
+                }
                 out.push(ClientOutput::PairAgain { dev_id: key.dev_id });
             }
             (Msg2Payload::Accept(accept), Some(keys)) => {

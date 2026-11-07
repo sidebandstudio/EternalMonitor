@@ -1495,3 +1495,35 @@ fn a_failed_attempt_without_a_live_session_keeps_the_intent() {
     assert_eq!(sim.unused_commits(), 0);
     assert!(sim.both_live_on_same_session());
 }
+
+/// The commit that takes a key's timestamp to the ceiling is a valid
+/// session. If the PairAgain answer to the next attempt outruns that
+/// commit's media and ack, the iPad must still use the committed session.
+#[test]
+fn pair_again_never_strands_the_session_that_reached_the_ceiling() {
+    use eternal_wire::v3::MAX_TIMESTAMP_US;
+    let mut sim = Sim::new(134);
+    sim.latency = ms(100);
+    let now = sim.now;
+    sim.host.set_wall_clock(now, MAX_TIMESTAMP_US - 10);
+    sim.store
+        .timestamps
+        .borrow_mut()
+        .insert(sim.key.dev_id, MAX_TIMESTAMP_US - 3);
+    sim.client.set_last_timestamp(MAX_TIMESTAMP_US - 2);
+    sim.policy.decision_delay = ms(1950);
+    // The host's records reach the iPad 400 ms late; handshake answers don't.
+    sim.fault = Box::new(|sent| match sent.kind {
+        Kind::Media | Kind::AckOrRefused | Kind::Heartbeat => Fate::Delay { extra: ms(400) },
+        _ => Fate::Deliver,
+    });
+    sim.connect();
+    sim.run_for(Duration::from_secs(14));
+    assert!(sim
+        .events
+        .iter()
+        .any(|e| matches!(e, Event::IpadPairAgain { .. })));
+    assert_eq!(sim.stranded_commits_before(sim.now), 0);
+    assert_eq!(sim.commits().len(), 1);
+    assert!(sim.both_live_on_same_session());
+}
