@@ -286,8 +286,8 @@ fn take_fallback(session_id: u32) -> Option<&'static str> {
 
 /// A `second_screen_fallback` reason as the summary names it. `remembered`
 /// is a failure saved by an earlier app run. The backend's check of the
-/// summary lists each token, so the newer reasons, `vdd_only` and
-/// `panel_lost`, go as `other` until it lists them too.
+/// summary lists each token (`copy_session_summaries`), so a new reason goes
+/// as `other` until it lists that one too.
 fn fallback_token(reason: &str) -> &'static str {
     match reason {
         "attach_timeout" => "attach_timeout",
@@ -296,6 +296,8 @@ fn fallback_token(reason: &str) -> &'static str {
         "no_frames" => "no_frames",
         "duplication_failed" => "duplication_failed",
         "remembered" => "remembered",
+        "vdd_only" => "vdd_only",
+        "panel_lost" => "panel_lost",
         _ => "other",
     }
 }
@@ -592,7 +594,7 @@ pub(crate) mod tests {
                 r" stage=(started|hello_sent|accepted|video_sent|first_frame|steady)",
                 r" outcome=(streamed|no_reply|no_picture|pairing|user_ended|app_ended|error)",
                 r" failure=(none|no_reply|no_video|no_frame|vdd_enable_failed|vdd_attach_timeout|vdd_not_attached|capture_failed|encoder_failed|usb_lost|signal_lost|other)",
-                r" fallback=(none|attach_timeout|enable_failed|no_driver|no_frames|duplication_failed|remembered|other)",
+                r" fallback=(none|attach_timeout|enable_failed|no_driver|no_frames|duplication_failed|remembered|vdd_only|panel_lost|other)",
                 r" end=(goodbye|liveness|superseded|shutdown|timeout|user|background|error)",
                 r" ttff_ms=(0|[1-9][0-9]{0,5}|-) duration_ms=(0|[1-9][0-9]{0,9})",
                 r" os=(win:[0-9]{1,6}\.[0-9]{1,6}|ipados:[0-9]{1,3}\.[0-9]{1,3}(\.[0-9]{1,3})?) hw=(pc|iPad[0-9]{1,2},[0-9]{1,2})",
@@ -885,8 +887,8 @@ pub(crate) mod tests {
             ("no_frames", "no_frames"),
             ("duplication_failed", "duplication_failed"),
             ("remembered", "remembered"),
-            ("vdd_only", "other"),
-            ("panel_lost", "other"),
+            ("vdd_only", "vdd_only"),
+            ("panel_lost", "panel_lost"),
             ("C:\\Users\\someone", "other"),
         ] {
             assert_eq!(fallback_token(reason), token);
@@ -992,6 +994,48 @@ pub(crate) mod tests {
                 "second_screen none",
             ]
         );
+    }
+
+    /// The hybrid laptop's two fallbacks along the whole path: the session's
+    /// summary names each (the backend's check lists both), passes that
+    /// check, and uploads as written, in its own category.
+    #[test]
+    fn a_lone_display_or_lost_panel_reaches_the_uploaded_summary() {
+        use tracing_subscriber::prelude::*;
+        let _slot = FALLBACK_SLOT.lock();
+        let summaries = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(FallbackWatch)
+            .with(SummaryCapture(summaries.clone()));
+        let shared = SharedControl::new(9876, 15_000_000);
+        *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
+        tracing::subscriber::with_default(subscriber, || {
+            for (id, reason) in [(1, "vdd_only"), (2, "panel_lost")] {
+                note_session_start(id, &shared);
+                tracing::warn!(second_screen_fallback = reason, "fell back");
+                let ended = SessionEnd {
+                    session_id: Some(id),
+                    ..end(
+                        EndReason::Goodbye(ByeReason::UserDisconnect),
+                        Some(400),
+                        60_000,
+                    )
+                };
+                log_session_end(&ended, &shared);
+            }
+        });
+        let lines = summaries.lock().clone();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        for (line, token) in lines.iter().zip(["vdd_only", "panel_lost"]) {
+            assert_contract(line);
+            assert!(line.contains(&format!(" fallback={token} ")), "{line}");
+            let logged = format!("2026-11-07T01:02:03.123456Z  INFO {line}");
+            assert_eq!(
+                crate::telemetry::session_summary(&logged),
+                Some(line.as_str())
+            );
+            assert_eq!(crate::telemetry::uploaded(&logged), *line);
+        }
     }
 
     #[test]
