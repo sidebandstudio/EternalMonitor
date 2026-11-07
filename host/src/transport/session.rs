@@ -438,7 +438,12 @@ impl Session {
     fn end(&mut self, reason: EndReason, now: Instant) -> Option<SessionEnd> {
         let session = self.active.take()?;
         self.last_end = Some((session.session_id, reason));
+        // One entry per address, its time refreshed. Once the memory is
+        // full the oldest goes; the host-wide budget still counts it.
         if let Some(addr) = session.peer.addr.filter(|_| !session.answered) {
+            self.unanswered.retain(|(ip, at)| {
+                *ip != addr.ip() && now.saturating_duration_since(*at) < UNANSWERED_FOR
+            });
             if self.unanswered.len() == UNANSWERED_KEPT {
                 self.unanswered.pop_front();
             }
@@ -3974,6 +3979,36 @@ mod tests {
             session.may_send_media(refilled, UNANSWERED_MEDIA_BUDGET, at(80_000)),
             "a minute after the last spend"
         );
+    }
+
+    /// An address that keeps ending sessions before it is heard holds one
+    /// entry in the memory, refreshed in place, and can't push another
+    /// address out of it.
+    #[test]
+    fn a_churning_address_keeps_one_entry_in_the_memory() {
+        let mut session = Session::new(1234);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let first = addr([10, 0, 0, 5], 50000);
+        datagram(&mut session, first, 0, identified_hello(1, 77), at(0));
+        session.tick(&TestConfig, false, at(3200));
+
+        let churn = addr([10, 0, 0, 6], 50000);
+        for nonce in 0..2 * UNANSWERED_KEPT as u32 {
+            datagram(
+                &mut session,
+                churn,
+                0,
+                identified_hello(10 + nonce, 88),
+                at(4000 + u64::from(nonce)),
+            );
+        }
+        session.tick(&TestConfig, false, at(7200));
+        assert_eq!(session.unanswered.len(), 2);
+
+        datagram(&mut session, first, 0, identified_hello(2, 77), at(8000));
+        let back = session.session_id().unwrap();
+        assert!(!session.may_send_media(back, 1000, at(8000)));
     }
 
     /// An iPad's HELLO2 as shipped since 0.3.0: the generic "iPad" name and
