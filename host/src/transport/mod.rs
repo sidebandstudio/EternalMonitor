@@ -265,6 +265,11 @@ pub async fn start_sender(
     // Capture numbers skip the frames the encoder never took, and the iPad
     // held the frame after each skip waiting for one that never existed.
     let mut frame_seq: u32 = 0;
+    // The encoder closes its channel when it exits, before it reports why.
+    // The loop goes on until `running` goes false, so a goodbye the
+    // supervisor leaves on hearing that report (the storm brake) still goes
+    // out.
+    let mut video_open = true;
 
     let mut state = LoopState {
         retransmit_ring: RetransmitRing::default(),
@@ -276,10 +281,16 @@ pub async fn start_sender(
     let pacing_clock = PacingClock::new()?;
 
     let mut links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
-    shared.session.lock().transport_resumed(now());
-    // A goodbye left while no transport ran (a Stop while the port was held)
-    // is for a session that is over; its iPad may be in a new one by now.
-    if shared.session.lock().take_goodbye().is_some() {
+    // One lock, with `running` read under it: a stop
+    // (`diagnostics::stop_session`) queues its goodbye and clears `running`
+    // under the same lock, so this either sees that stop and keeps its
+    // goodbye, or comes first and the stop's goodbye is kept anyway.
+    let retired = {
+        let mut session = shared.session.lock();
+        let stopping = !shared.running.load(Ordering::SeqCst);
+        session.transport_resumed(now(), stopping)
+    };
+    if retired {
         debug!("Dropped a goodbye left while the stream was stopped");
     }
     let beat = std::sync::Arc::clone(&shared.transport_beat);
@@ -382,9 +393,13 @@ pub async fn start_sender(
                 beat.mark(Phase::Audio);
                 audio_sender.send(packet, &links, &shared, stream_epoch).await;
             }
-            nal_opt = nal_rx.recv() => {
+            nal_opt = nal_rx.recv(), if video_open => {
                 beat.mark(Phase::Video);
-                let Some(nal) = nal_opt else { break; };
+                let Some(nal) = nal_opt else {
+                    info!("The encoder closed its channel; the transport runs until the stream stops");
+                    video_open = false;
+                    continue;
+                };
                 let Some(session_id) = shared.session.lock().session_id() else { continue; };
                 let target_addr = *shared.target_addr.lock();
                 if target_addr.link == LinkId::Udp && target_addr.addr.is_none_or(|a| a.ip().is_unspecified() || a.port() == 0) {

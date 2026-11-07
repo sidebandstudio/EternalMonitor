@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use eternal_host::control::SharedControl;
 use eternal_host::transport::link::{read_datagram, read_preamble, write_datagram, PeerId};
-use eternal_host::transport::session::ConfigSource;
+use eternal_host::transport::session::{ConfigSource, StageFailure, StreamStop};
 use eternal_host::transport::{self};
 use eternal_wire::v2::control::{
     encode_control, parse_control, ByeReason, ControlMessage, Hello2, StreamConfig, CAP_DECODE_H264,
@@ -62,8 +62,9 @@ fn is_bye(bytes: &[u8], reason: ByeReason) -> bool {
     matches!(parse_control(bytes), Ok((_, ControlMessage::Bye(said))) if said == reason)
 }
 
+/// The transport binds every address, so the port must be free on all.
 fn free_udp_port() -> u16 {
-    std::net::UdpSocket::bind("127.0.0.1:0")
+    std::net::UdpSocket::bind("0.0.0.0:0")
         .and_then(|s| s.local_addr())
         .map(|a| a.port())
         .unwrap()
@@ -78,13 +79,17 @@ enum End {
     Quit,
     /// The app quits for "Restart EternalMonitor".
     Restart,
+    /// The encoder kept failing: it closed its channel as it exited, and the
+    /// supervisor, on hearing why, gave up (the storm brake).
+    GaveUp,
 }
 
 /// How the transport stops after the stream ended.
 enum Stop {
     /// The host is closing: `running` goes false.
     Shutdown,
-    /// The encoder stopped first and closed its channel.
+    /// The encoder stopped first and closed its channel, then the host
+    /// closes.
     EncoderEof,
 }
 
@@ -114,6 +119,7 @@ fn udp_goodbyes(end: End, stop: Stop, reason: ByeReason) -> usize {
                 .handle_control(peer, 0, hello(), &Config, Instant::now());
         assert_eq!(admitted.new_target, Some(peer));
         let (nal_tx, nal_rx) = mpsc::channel(4);
+        let mut nal_tx = Some(nal_tx);
         let (_audio_tx, audio_rx) = mpsc::channel(4);
         let (supervisor_tx, _supervisor_rx) = std::sync::mpsc::channel();
         let control = shared.clone();
@@ -125,6 +131,17 @@ fn udp_goodbyes(end: End, stop: Stop, reason: ByeReason) -> usize {
         // Let the loop take its first ticks.
         tokio::time::sleep(Duration::from_millis(40)).await;
         match end {
+            End::GaveUp => {
+                // The encoder thread drops its sender before its exit report
+                // reaches the supervisor. Longer than a liveness tick: the
+                // transport used to end here, before the goodbye existed.
+                drop(nal_tx.take());
+                tokio::time::sleep(Duration::from_millis(400)).await;
+                eternal_host::diagnostics::stop_session(
+                    &shared,
+                    StreamStop::GaveUp(StageFailure::Encoder),
+                );
+            }
             End::Update => assert!(shared.session.lock().begin_update(true)),
             End::Quit => eternal_host::diagnostics::log_session_end_at_quit(&shared),
             End::Restart => {
@@ -137,7 +154,10 @@ fn udp_goodbyes(end: End, stop: Stop, reason: ByeReason) -> usize {
         }
         match stop {
             Stop::Shutdown => shared.stop(),
-            Stop::EncoderEof => drop(nal_tx),
+            Stop::EncoderEof => {
+                drop(nal_tx.take());
+                shared.stop();
+            }
         }
         // Only a backstop for a transport that never stops. It stops at its
         // next liveness tick, 250 ms away, but a loaded machine can leave
@@ -187,6 +207,75 @@ fn quitting_tells_the_ipad_the_pc_ended_the_session() {
         udp_goodbyes(End::Quit, Stop::Shutdown, ByeReason::UserDisconnect),
         3
     );
+}
+
+/// The storm brake gives up after the encoder kept failing. The encoder
+/// closes its channel before the supervisor hears why, so the transport must
+/// still be there to send the goodbye the supervisor leaves.
+#[test]
+fn giving_up_on_a_failing_encoder_tells_the_ipad_to_connect_again() {
+    assert_eq!(
+        udp_goodbyes(End::GaveUp, Stop::Shutdown, ByeReason::Error),
+        3
+    );
+}
+
+/// Stop lands while a pipeline generation is starting: after the supervisor
+/// re-armed `running`, before the new transport reopened to clients. The
+/// stopped session's goodbye is current, and the transport going up must
+/// send it on its way out. Startup used to take it for one left while no
+/// transport ran and drop it, and the iPad timed out instead of showing the
+/// card.
+#[test]
+fn a_stop_during_startup_still_says_goodbye() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    eternal_host::clock::init();
+    std::env::set_var("ETERNAL_USB_DIRECT", "127.0.0.1:0");
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let goodbyes = runtime.block_on(async {
+        let ipad = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = free_udp_port();
+        let shared = SharedControl::new(port, 10_000_000);
+        shared.pairing.lock().required = false;
+        // The new generation's `running`, re-armed before its threads start.
+        shared.running.store(true, Ordering::SeqCst);
+        let peer = PeerId::udp(ipad.local_addr().unwrap());
+        // The session carried over from the previous generation.
+        shared
+            .session
+            .lock()
+            .handle_control(peer, 0, hello(), &Config, Instant::now());
+        // Stop, as the supervisor's stop_pipeline does it.
+        eternal_host::diagnostics::stop_session(&shared, StreamStop::User);
+        shared.stop();
+        let (_nal_tx, nal_rx) = mpsc::channel(4);
+        let (_audio_tx, audio_rx) = mpsc::channel(4);
+        let (supervisor_tx, _supervisor_rx) = std::sync::mpsc::channel();
+        let control = shared.clone();
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            transport::start_sender(nal_rx, audio_rx, port, control, supervisor_tx),
+        )
+        .await
+        .expect("the transport stops")
+        .unwrap();
+        assert!(
+            shared.session.lock().take_goodbye().is_none(),
+            "the goodbye was not left behind"
+        );
+        let mut bytes = [0; 2048];
+        let mut goodbyes = 0;
+        while let Ok(Ok((len, _))) =
+            tokio::time::timeout(Duration::from_millis(100), ipad.recv_from(&mut bytes)).await
+        {
+            goodbyes += usize::from(is_bye(&bytes[..len], ByeReason::UserDisconnect));
+        }
+        goodbyes
+    });
+    assert_eq!(goodbyes, 3);
 }
 
 /// A restart hands over to a new copy that is back in seconds: the iPad is
@@ -261,7 +350,9 @@ fn usb_goodbye(end: End, reason: ByeReason) {
         tokio::time::sleep(Duration::from_millis(40)).await;
         match end {
             End::Update => assert!(shared.session.lock().begin_update(true)),
-            End::Quit | End::Restart => eternal_host::diagnostics::log_session_end_at_quit(&shared),
+            End::Quit | End::Restart | End::GaveUp => {
+                eternal_host::diagnostics::log_session_end_at_quit(&shared)
+            }
         }
         shared.stop();
         let stopping = Instant::now();
