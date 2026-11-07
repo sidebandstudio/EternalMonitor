@@ -3,5 +3,27 @@ name = "eternal-wire"
 version = "0.3.4"
 edition = "2021"
 
+[features]
+# Deterministic ephemeral keys and randomness for golden transcripts and fuzz
+# targets. Never enabled by the host or any shipped build.
+test-hooks = []
+
 [dependencies]
 tracing = "0.1"
+# v3 handshake (Noise_NNpsk0_25519_ChaChaPoly_SHA256), with only that suite's
+# primitives. The raw split hands the two transport keys to the record layer,
+# which seals with ring.
+snow = { version = "0.10", default-features = false, features = [
+    "std",
+    "default-resolver",
+    "use-chacha20poly1305",
+    "use-sha2",
+    "use-curve25519",
+    "use-getrandom",
+    "risky-raw-split",
+] }
+ring = "0.17"
+zeroize = "1"
+
+[[example]]
+name = "v3_record_bench"

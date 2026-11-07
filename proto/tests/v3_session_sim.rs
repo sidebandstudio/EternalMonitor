@@ -1,0 +1,620 @@
+//! v3 reconnect state machines, host and iPad together, on a simulated clock
+//! and network (`v3_sim`). Each test pins a row of the session tables or the
+//! timing rule; nothing depends on real time or machine load.
+
+mod v3_sim;
+
+use std::time::Duration;
+
+use eternal_wire::v2::PacketType;
+use eternal_wire::v3::client::{ClientClose, ClientConfig, ClientKey};
+use eternal_wire::v3::host::{CloseReason, HostConfig};
+use v3_sim::*;
+
+fn live_ids(sim: &Sim) -> Vec<u32> {
+    sim.events
+        .iter()
+        .filter_map(|e| match e {
+            Event::IpadLive { session_id, .. } => Some(*session_id),
+            _ => None,
+        })
+        .collect()
+}
+
+fn first_at(sim: &Sim, pred: impl Fn(&Event) -> bool) -> Option<Duration> {
+    sim.events.iter().find(|e| pred(e)).map(|e| match e {
+        Event::HostCommitted { at, .. }
+        | Event::HostClosed { at, .. }
+        | Event::HostDelivered { at, .. }
+        | Event::HostConfirmRequested { at, .. }
+        | Event::IpadLive { at, .. }
+        | Event::IpadReleased { at }
+        | Event::IpadStatus { at, .. }
+        | Event::IpadRefused { at, .. }
+        | Event::IpadAttemptFailed { at }
+        | Event::IpadDelivered { at, .. }
+        | Event::IpadClosed { at, .. } => *at,
+    })
+}
+
+fn connect_live(sim: &mut Sim) -> u32 {
+    sim.connect();
+    assert!(sim.run_until(ms(1000), |s| s.both_live_on_same_session()));
+    sim.run_for(ms(100));
+    sim.host_live().unwrap()
+}
+
+#[test]
+fn timing_rule_every_retry_goes_out_while_its_pending_exists() {
+    let host = HostConfig::new(HOST_ID);
+    let client = ClientConfig::new(HOST_ID);
+    assert!(client.msg1_window + client.confirm_window < host.pending_lifetime);
+    assert_eq!(host.pending_lifetime, ms(5000));
+    assert_eq!(client.msg1_window, ms(2000));
+    assert_eq!(client.confirm_window, ms(2000));
+    assert_eq!(client.msg1_retry_interval, ms(250));
+    assert_eq!(client.confirm_retry_interval, ms(100));
+    assert_eq!(client.drain_limit, ms(1000));
+}
+
+#[test]
+fn clean_connect_commits_once_and_acks_with_the_status() {
+    let mut sim = Sim::new(1);
+    let start = sim.now;
+    sim.connect();
+    assert!(sim.run_until(ms(500), |s| s.both_live_on_same_session()));
+    sim.run_for(ms(500));
+    assert_eq!(sim.commits().len(), 1);
+    let live_at = first_at(&sim, |e| matches!(e, Event::IpadLive { .. })).unwrap();
+    assert!(live_at - start <= ms(60), "{:?}", live_at - start);
+    assert!(first_at(&sim, |e| matches!(e, Event::IpadStatus { .. })).is_some());
+    let released = first_at(&sim, |e| matches!(e, Event::IpadReleased { .. })).unwrap();
+    assert!(
+        released <= live_at,
+        "cutover releases input before going live"
+    );
+    assert!(!sim.client.is_confirming());
+    // Reports reach the host under the live session.
+    assert!(sim.events.iter().any(|e| matches!(e,
+        Event::HostDelivered { inner_type, .. } if *inner_type == PacketType::ReceiverReport as u8)));
+}
+
+/// The worst case the timing rule allows: only the last message 1 copy that
+/// can still be answered inside the 2 s window gets through, and only the
+/// last `SessionConfirm` of its 2 s window. The pending must still exist, so
+/// that confirm commits. When the ack then can't make it back inside the
+/// iPad's window, its next attempt replaces the session, as the table says.
+#[test]
+fn the_last_message_1_and_the_last_confirm_still_commit() {
+    for latency_ms in [5u64, 20, 60, 120, 400, 900] {
+        let latency = ms(latency_ms);
+        let rtt_ticks = 2 * latency + 2 * TICK;
+        // Last copy j (sent at j × 250 ms) whose message 2 is back before 2 s.
+        let last_msg1 = (0..8u32)
+            .rev()
+            .find(|j| ms(250) * *j + rtt_ticks < ms(2000))
+            .unwrap() as usize;
+        let mut sim = Sim::new(10 + latency_ms);
+        sim.latency = latency;
+        sim.policy.media_every = None;
+        // Faults hit the first attempt only.
+        sim.fault = Box::new(move |sent| match sent.kind {
+            Kind::Msg1 if sent.nth < 8 && sent.nth != last_msg1 => Fate::Drop,
+            Kind::Confirm if sent.nth < 20 && sent.nth != 19 => Fate::Drop,
+            _ => Fate::Deliver,
+        });
+        sim.connect();
+        assert!(
+            sim.run_until(ms(6000), |s| !s.commits().is_empty()),
+            "latency {latency_ms} ms: the last confirm found no pending"
+        );
+        let confirms = sim.sent_of(Dir::ToHost, Kind::Confirm);
+        assert_eq!(confirms.len(), 20, "latency {latency_ms} ms");
+        let commit = first_at(&sim, |e| matches!(e, Event::HostCommitted { .. })).unwrap();
+        assert_eq!(commit, confirms[19].at + latency, "latency {latency_ms} ms");
+        assert!(
+            sim.run_until(ms(10_000), |s| s.both_live_on_same_session()),
+            "latency {latency_ms} ms"
+        );
+    }
+}
+
+#[test]
+fn a_lost_message_2_is_resent_byte_for_byte_from_the_cache() {
+    let mut sim = Sim::new(2);
+    sim.fault = Box::new(|sent| match sent.kind {
+        Kind::Msg2 if sent.nth < 2 => Fate::Drop,
+        _ => Fate::Deliver,
+    });
+    sim.connect();
+    assert!(sim.run_until(ms(2000), |s| s.both_live_on_same_session()));
+    let msg2s = sim.sent_of(Dir::ToIpad, Kind::Msg2);
+    assert_eq!(msg2s.len(), 3);
+    assert_eq!(msg2s[0].datagram, msg2s[1].datagram);
+    assert_eq!(msg2s[1].datagram, msg2s[2].datagram);
+    let msg1s = sim.sent_of(Dir::ToHost, Kind::Msg1);
+    assert_eq!(msg1s.len(), 3);
+    assert!(msg1s.windows(2).all(|w| w[0].datagram == w[1].datagram));
+    assert_eq!(sim.commits().len(), 1);
+}
+
+#[test]
+fn all_confirms_lost_starts_a_new_attempt_and_the_first_pending_never_commits() {
+    let mut sim = Sim::new(3);
+    sim.policy.media_every = None;
+    sim.fault = Box::new(|sent| match sent.kind {
+        Kind::Confirm if sent.nth < 20 => Fate::Drop,
+        _ => Fate::Deliver,
+    });
+    sim.connect();
+    sim.run_for(ms(100));
+    let first = sim.host.pending_session(&sim.key.dev_id).unwrap();
+    assert!(sim.run_until(ms(6000), |s| s.both_live_on_same_session()));
+    assert_eq!(sim.commits().len(), 1);
+    assert_ne!(sim.host_live(), Some(first));
+    assert_eq!(
+        sim.sent_of(Dir::ToHost, Kind::Msg1).len(),
+        2,
+        "one new attempt"
+    );
+    let msg1s = sim.sent_of(Dir::ToHost, Kind::Msg1);
+    assert_ne!(
+        msg1s[0].datagram, msg1s[1].datagram,
+        "new ephemeral and timestamp"
+    );
+}
+
+#[test]
+fn reconnect_keeps_the_old_session_until_commit_and_zeroes_it_after() {
+    let mut sim = Sim::new(4);
+    sim.policy.media_every = None;
+    let old = connect_live(&mut sim);
+    // Hold back a report sealed under the old session.
+    let held = sim
+        .client
+        .seal(sim.now, PacketType::ReceiverReport as u8, &[0; REPORT_BODY])
+        .unwrap();
+    // Drop every confirm for a while so the cutover is observable.
+    sim.fault = Box::new(|sent| match sent.kind {
+        Kind::Confirm if sent.nth < 5 => Fate::Drop,
+        _ => Fate::Deliver,
+    });
+    sim.connect();
+    sim.run_until(ms(200), |s| s.client.is_confirming());
+    assert!(sim.client.is_confirming());
+    assert_eq!(
+        sim.host_live(),
+        Some(old),
+        "old session untouched before commit"
+    );
+    assert_eq!(sim.client.live_session(), Some(old));
+    assert!(
+        sim.client
+            .seal(sim.now, PacketType::InputEvent as u8, &[0; 30])
+            .is_none(),
+        "no input across the cutover"
+    );
+    assert!(sim.run_until(ms(2000), |s| s.host_live() != Some(old)
+        && s.both_live_on_same_session()));
+    let new = sim.host_live().unwrap();
+    assert!(sim.events.iter().any(|e| *e
+        == Event::HostClosed {
+            at: first_at(
+                &sim,
+                |e| matches!(e, Event::HostCommitted { session_id, .. } if *session_id == new)
+            )
+            .unwrap(),
+            session_id: old,
+            reason: CloseReason::Superseded,
+        }));
+    // The old session's keys are gone on the host: its record is dropped.
+    let delivered_before = sim
+        .events
+        .iter()
+        .filter(|e| matches!(e, Event::HostDelivered { session_id, .. } if *session_id == old))
+        .count();
+    sim.inject(Dir::ToHost, &held);
+    let delivered_after = sim
+        .events
+        .iter()
+        .filter(|e| matches!(e, Event::HostDelivered { session_id, .. } if *session_id == old))
+        .count();
+    assert_eq!(delivered_before, delivered_after);
+    assert_eq!(sim.commits().len(), 2);
+}
+
+#[test]
+fn the_old_session_drains_until_the_new_idr_decodes() {
+    let mut sim = Sim::new(5);
+    sim.policy.media_every = None;
+    connect_live(&mut sim);
+    let dev_id = sim.key.dev_id;
+    let held: Vec<Vec<u8>> = (0..3)
+        .map(|_| {
+            sim.host
+                .seal(sim.now, &dev_id, PacketType::Media as u8, &[1; MEDIA_BODY])
+                .unwrap()
+                .1
+        })
+        .collect();
+    sim.connect();
+    assert!(sim.run_until(ms(1000), |s| s.client.draining_session().is_some()));
+    let old = sim.client.draining_session().expect("old session drains");
+    let new = sim.client.live_session().unwrap();
+
+    sim.inject(Dir::ToIpad, &held[0]);
+    assert!(sim.events.contains(&Event::IpadDelivered {
+        at: sim.now,
+        session_id: old,
+        draining: true
+    }));
+    let idr = sim
+        .host
+        .seal(sim.now, &dev_id, PacketType::Media as u8, &[2; MEDIA_BODY])
+        .unwrap()
+        .1;
+    sim.inject(Dir::ToIpad, &idr);
+    assert!(sim.events.contains(&Event::IpadClosed {
+        at: sim.now,
+        session_id: old,
+        reason: ClientClose::DrainEnded
+    }));
+    let count = sim.events.len();
+    sim.inject(Dir::ToIpad, &held[1]);
+    assert_eq!(sim.events.len(), count, "old media dropped after the IDR");
+    assert_eq!(sim.client.live_session(), Some(new));
+}
+
+#[test]
+fn the_drain_ends_after_1_s_without_an_idr() {
+    let mut sim = Sim::new(6);
+    sim.policy.media_every = None;
+    connect_live(&mut sim);
+    let dev_id = sim.key.dev_id;
+    let held = sim
+        .host
+        .seal(sim.now, &dev_id, PacketType::Media as u8, &[1; MEDIA_BODY])
+        .unwrap()
+        .1;
+    sim.connect();
+    assert!(sim.run_until(ms(1000), |s| s.client.draining_session().is_some()));
+    let old = sim.client.draining_session().unwrap();
+    let drain_start = first_at(&sim, |e| matches!(e, Event::IpadLive { session_id, .. } if Some(*session_id) == sim.client.live_session())).unwrap();
+    sim.run_until(ms(2000), |s| s.client.draining_session().is_none());
+    let ended = first_at(&sim, |e| {
+        matches!(e, Event::IpadClosed { session_id, reason: ClientClose::DrainEnded, .. } if *session_id == old)
+    })
+    .unwrap();
+    assert_eq!(ended - drain_start, ms(1000));
+    let count = sim.events.len();
+    sim.inject(Dir::ToIpad, &held);
+    assert_eq!(sim.events.len(), count);
+}
+
+#[test]
+fn replayed_handshakes_and_records_never_commit_or_deliver() {
+    let mut sim = Sim::new(7);
+    let live = connect_live(&mut sim);
+    let captured: Vec<Vec<u8>> = sim
+        .sent
+        .iter()
+        .filter(|s| s.dir == Dir::ToHost)
+        .map(|s| s.datagram.clone())
+        .collect();
+    let host_events = |sim: &Sim| {
+        sim.events
+            .iter()
+            .filter(|e| {
+                matches!(
+                    e,
+                    Event::HostCommitted { .. }
+                        | Event::HostDelivered { .. }
+                        | Event::HostConfirmRequested { .. }
+                )
+            })
+            .count()
+    };
+    let before = host_events(&sim);
+    let sends_before = sim.sent.len();
+    for datagram in &captured {
+        sim.inject(Dir::ToHost, datagram);
+    }
+    assert_eq!(host_events(&sim), before, "replayed records are dropped");
+    assert_eq!(sim.sent.len(), sends_before, "and get no reply");
+    assert_eq!(sim.host_live(), Some(live));
+
+    // After a reconnect, the first session's message 1 is stale: it gets an
+    // encrypted Stale answer at most, never a pending session.
+    let first_msg1 = sim.sent_of(Dir::ToHost, Kind::Msg1)[0].datagram.clone();
+    sim.connect();
+    assert!(sim.run_until(ms(1000), |s| s.host_live() != Some(live)
+        && s.both_live_on_same_session()));
+    sim.run_for(ms(300));
+    sim.inject(Dir::ToHost, &first_msg1);
+    assert!(sim.host.pending_session(&sim.key.dev_id).is_none());
+    sim.run_for(ms(6000));
+    assert_eq!(sim.commits().len(), 2);
+}
+
+#[test]
+fn a_finalize_conflict_is_refused_with_identical_resends_and_the_live_session_survives() {
+    let mut sim = Sim::new(8);
+    let live = connect_live(&mut sim);
+    // A second key whose record will conflict at Finalize.
+    let other = ClientKey {
+        dev_id: [0x77; 16],
+        k_dev: [0x88; 32],
+    };
+    sim.store.keys.insert(other.dev_id, other.k_dev);
+    sim.policy.refuse = true;
+    // Lose the first refusal, so a confirm retry draws a resend.
+    sim.fault = Box::new(|sent| match sent.kind {
+        Kind::AckOrRefused if sent.nth == 1 => Fate::Drop,
+        _ => Fate::Deliver,
+    });
+    let out = sim.client.connect(sim.now, other.clone(), sim.clock_us());
+    for o in out {
+        if let eternal_wire::v3::client::ClientOutput::Send(d) = o {
+            sim.inject(Dir::ToHost, &d);
+        }
+    }
+    assert!(sim.run_until(ms(1000), |s| s
+        .events
+        .iter()
+        .any(|e| matches!(e, Event::IpadRefused { .. }))));
+    let refused = sim
+        .events
+        .iter()
+        .find_map(|e| match e {
+            Event::IpadRefused { status, .. } => Some(status.clone()),
+            _ => None,
+        })
+        .unwrap();
+    assert!(refused.tombstones.contains(&other.dev_id));
+    let refusals = sim.sent_of(Dir::ToIpad, Kind::AckOrRefused);
+    assert_eq!(refusals.len(), 3, "first ack, refusal, one resend");
+    assert_eq!(
+        refusals[1].datagram, refusals[2].datagram,
+        "identical bytes"
+    );
+    assert!(refusals[2].at - refusals[1].at >= ms(100));
+    assert_eq!(sim.host_live(), Some(live));
+    assert_eq!(sim.client.live_session(), Some(live));
+    sim.run_for(ms(3000));
+    assert!(sim.both_live_on_same_session());
+    assert_eq!(sim.host_live(), Some(live));
+}
+
+#[test]
+fn the_ack_waits_for_the_durable_writes_and_retries_are_rate_limited() {
+    let mut config = ClientConfig::new(HOST_ID);
+    config.confirm_retry_interval = ms(20);
+    let mut sim = Sim::with_configs(9, HostConfig::new(HOST_ID), config);
+    sim.policy.media_every = None;
+    sim.policy.durable_delay = ms(300);
+    // Lose every ack after the first durable one, so retries continue.
+    sim.fault = Box::new(|sent| match sent.kind {
+        Kind::AckOrRefused => Fate::Drop,
+        _ => Fate::Deliver,
+    });
+    sim.connect();
+    // Stay inside the 2 s confirm window: after it the iPad starts over.
+    sim.run_for(ms(1900));
+    let commit_at = first_at(&sim, |e| matches!(e, Event::HostCommitted { .. })).unwrap();
+    let acks = sim.sent_of(Dir::ToIpad, Kind::AckOrRefused);
+    assert!(
+        acks.iter().all(|a| a.at >= commit_at + ms(300)),
+        "no ack before durable"
+    );
+    assert_eq!(acks[0].at, commit_at + ms(300));
+    assert!(
+        acks.windows(2).all(|w| w[1].at - w[0].at >= ms(50)),
+        "at most one per 50 ms"
+    );
+    let confirms_after = sim
+        .sent_of(Dir::ToHost, Kind::Confirm)
+        .iter()
+        .filter(|c| c.at >= commit_at + ms(300))
+        .count();
+    assert!(
+        acks.len() < confirms_after,
+        "{} acks for {confirms_after} confirms",
+        acks.len()
+    );
+    assert_eq!(sim.commits().len(), 1, "no second commit from retries");
+}
+
+#[test]
+fn media_before_the_ack_makes_the_session_live_and_confirms_continue_to_the_window_end() {
+    let mut sim = Sim::new(10);
+    sim.fault = Box::new(|sent| match sent.kind {
+        Kind::AckOrRefused => Fate::Drop,
+        _ => Fate::Deliver,
+    });
+    sim.connect();
+    assert!(sim.run_until(ms(500), |s| s.both_live_on_same_session()));
+    sim.run_for(ms(3000));
+    assert!(sim.both_live_on_same_session());
+    let confirms = sim.sent_of(Dir::ToHost, Kind::Confirm);
+    assert_eq!(
+        confirms.len(),
+        20,
+        "100 ms retries for the whole 2 s window"
+    );
+    assert!(confirms.last().unwrap().at - confirms[0].at < ms(2000));
+    assert_eq!(sim.commits().len(), 1);
+}
+
+#[test]
+fn silence_from_the_ipad_ends_the_session_after_the_liveness_timeout() {
+    let mut sim = Sim::new(11);
+    sim.policy.report_every = None;
+    let live = connect_live(&mut sim);
+    sim.run_for(ms(4000));
+    let last_rx = sim
+        .sent_of(Dir::ToHost, Kind::Confirm)
+        .last()
+        .map(|c| c.at + sim.latency)
+        .unwrap();
+    let closed = first_at(&sim, |e| {
+        matches!(e, Event::HostClosed { session_id, reason: CloseReason::Liveness, .. } if *session_id == live)
+    })
+    .unwrap();
+    assert!(
+        closed - last_rx >= ms(3000) && closed - last_rx <= ms(3000) + 2 * TICK,
+        "{:?}",
+        closed - last_rx
+    );
+    assert!(sim.events.iter().any(|e| matches!(e,
+        Event::IpadClosed { session_id, reason: ClientClose::HostBye(_), .. } if *session_id == live)));
+}
+
+#[test]
+fn the_ipad_reconnects_before_the_maximum_age() {
+    let mut host = HostConfig::new(HOST_ID);
+    host.max_age = Duration::from_secs(60);
+    let mut client = ClientConfig::new(HOST_ID);
+    client.max_age = Duration::from_secs(60);
+    client.reconnect_margin = Duration::from_secs(5);
+    let mut sim = Sim::with_configs(12, host, client);
+    let first = connect_live(&mut sim);
+    let first_commit = first_at(&sim, |e| matches!(e, Event::HostCommitted { .. })).unwrap();
+    sim.run_for(Duration::from_secs(70));
+    let commits = sim.commits();
+    assert!(commits.len() >= 2);
+    assert_ne!(commits[1], first);
+    let second_commit = sim
+        .events
+        .iter()
+        .filter_map(|e| match e {
+            Event::HostCommitted { at, .. } => Some(*at),
+            _ => None,
+        })
+        .nth(1)
+        .unwrap();
+    assert!(second_commit - first_commit < Duration::from_secs(60));
+    assert!(second_commit - first_commit >= Duration::from_secs(55));
+    assert!(!sim.events.iter().any(|e| matches!(
+        e,
+        Event::HostClosed {
+            reason: CloseReason::Expired,
+            ..
+        }
+    )));
+    assert!(sim.both_live_on_same_session());
+}
+
+#[test]
+fn past_the_maximum_age_the_host_ends_the_session() {
+    let mut host = HostConfig::new(HOST_ID);
+    host.max_age = Duration::from_secs(60);
+    let mut client = ClientConfig::new(HOST_ID);
+    client.max_age = Duration::from_secs(600);
+    client.reconnect_margin = Duration::ZERO;
+    let mut sim = Sim::with_configs(13, host, client);
+    let live = connect_live(&mut sim);
+    let commit = first_at(&sim, |e| matches!(e, Event::HostCommitted { .. })).unwrap();
+    sim.run_for(Duration::from_secs(61));
+    let closed = first_at(&sim, |e| {
+        matches!(e, Event::HostClosed { session_id, reason: CloseReason::Expired, .. } if *session_id == live)
+    })
+    .unwrap();
+    assert!(
+        closed - commit >= Duration::from_secs(60)
+            && closed - commit <= Duration::from_secs(60) + TICK
+    );
+    assert!(sim
+        .host
+        .seal(sim.now, &sim.key.dev_id, PacketType::Media as u8, &[0; 10])
+        .is_none());
+}
+
+#[test]
+fn a_rolled_back_clock_gets_stale_then_one_retry_commits() {
+    let mut sim = Sim::new(14);
+    let ahead = sim.clock_us() + 3_600_000_000;
+    sim.store
+        .timestamps
+        .borrow_mut()
+        .insert(sim.key.dev_id, ahead);
+    sim.connect();
+    assert!(sim.run_until(ms(1000), |s| s.both_live_on_same_session()));
+    assert_eq!(sim.sent_of(Dir::ToHost, Kind::Msg1).len(), 2);
+    assert_eq!(sim.sent_of(Dir::ToIpad, Kind::Msg2).len(), 2);
+    assert!(sim.client.last_timestamp() > ahead);
+    assert_eq!(sim.commits().len(), 1);
+}
+
+#[test]
+fn soak_with_loss_duplication_and_reordering() {
+    for seed in 0..40u64 {
+        let mut sim = Sim::new(100 + seed);
+        let mut rng = XorShift(seed * 7919 + 1);
+        sim.latency = ms(5 + rng.next() % 60);
+        let mut fault_rng = XorShift(seed * 104_729 + 3);
+        sim.fault = Box::new(move |_| match fault_rng.next() % 100 {
+            0..=4 => Fate::Drop,
+            5..=6 => Fate::Duplicate {
+                extra: ms(fault_rng.next() % 40),
+            },
+            7..=9 => Fate::Delay {
+                extra: ms(fault_rng.next() % 80),
+            },
+            _ => Fate::Deliver,
+        });
+        sim.connect();
+        for round in 0..4 {
+            assert!(
+                sim.run_until(Duration::from_secs(8), |s| s.both_live_on_same_session()),
+                "seed {seed} round {round}"
+            );
+            sim.run_for(ms(1000 + rng.next() % 4000));
+            sim.connect();
+        }
+        assert!(
+            sim.run_until(Duration::from_secs(10), |s| s.both_live_on_same_session()
+                && !s.client.is_connecting()
+                && !s.client.is_confirming()),
+            "seed {seed}"
+        );
+        let commits = sim.commits();
+        for id in live_ids(&sim) {
+            assert!(
+                commits.contains(&id),
+                "seed {seed}: iPad live on {id} the host never committed"
+            );
+        }
+    }
+}
+
+#[test]
+fn after_a_refusal_the_automatic_reconnect_uses_the_live_sessions_key() {
+    let mut host = HostConfig::new(HOST_ID);
+    host.max_age = Duration::from_secs(30);
+    let mut client = ClientConfig::new(HOST_ID);
+    client.max_age = Duration::from_secs(30);
+    client.reconnect_margin = Duration::from_secs(5);
+    let mut sim = Sim::with_configs(15, host, client);
+    let first = connect_live(&mut sim);
+    let other = ClientKey {
+        dev_id: [0x66; 16],
+        k_dev: [0x99; 32],
+    };
+    sim.store.keys.insert(other.dev_id, other.k_dev);
+    sim.policy.refuse = true;
+    let out = sim.client.connect(sim.now, other, sim.clock_us());
+    for o in out {
+        if let eternal_wire::v3::client::ClientOutput::Send(d) = o {
+            sim.inject(Dir::ToHost, &d);
+        }
+    }
+    assert!(sim.run_until(ms(1000), |s| s
+        .events
+        .iter()
+        .any(|e| matches!(e, Event::IpadRefused { .. }))));
+    sim.policy.refuse = false;
+    sim.run_for(Duration::from_secs(30));
+    let live = sim.host_live().expect("reconnected under the first key");
+    assert_ne!(live, first);
+    assert!(sim.both_live_on_same_session());
+}
