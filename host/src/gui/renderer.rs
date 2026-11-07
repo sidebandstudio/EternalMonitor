@@ -66,6 +66,9 @@ const RETRY_AFTER: u32 = 5;
 /// What ended a launch that crashed in no module the reporter could name, or
 /// that no reporter described.
 pub(crate) const UNKNOWN: &str = "unknown";
+/// What ended a launch whose graphics device was lost before the window
+/// worked.
+pub(crate) const DEVICE_LOST: &str = "device_lost";
 /// What ended a launch that was ended without a crash, as by Task Manager.
 #[cfg(any(windows, test))]
 pub(crate) const TERMINATED: &str = "terminated";
@@ -441,7 +444,7 @@ pub(super) fn frame_started(ctx: &egui::Context) {
     };
     let now_drawing = tracker.observe(
         ctx.cumulative_frame_nr(),
-        FAILED_ACQUIRES.load(Ordering::SeqCst),
+        failures(),
         visible,
         Instant::now(),
     );
@@ -453,6 +456,41 @@ pub(super) fn frame_started(ctx: &egui::Context) {
     }
     if drawing {
         clear_marker(true);
+    }
+}
+
+/// Surface errors, devices and frames the painter skipped while its device
+/// was lost or being replaced: any of them starts the wait for a working
+/// window again. egui-wgpu reports no surface error for a frame it skips.
+fn failures() -> u64 {
+    FAILED_ACQUIRES.load(Ordering::SeqCst)
+        + devices()
+        + eframe::egui_wgpu::winit::SKIPPED_FRAMES.load(Ordering::SeqCst)
+}
+
+/// The window's device was lost before the window was confirmed working: the
+/// backend it started on failed to draw. Record that, and end this launch's
+/// marker, so the replacement drawing later is not counted for it.
+fn lost_before_drawing() {
+    if PRESENT.lock().is_ok_and(|tracker| tracker.confirmed) {
+        return;
+    }
+    let marker = STARTED.lock().ok().and_then(|mut started| started.take());
+    if let (Some(directory), Some(marker)) = (STATE_DIR.get(), marker) {
+        warn!(gpu = %marker.gpu, backend = %marker.backend, "Window device lost before the window worked");
+        lose_launch(directory, &marker, ProcessId::current());
+    }
+}
+
+/// Record `marker`'s backend as failed and remove the marker. While another
+/// instance holds the history the marker stays, and the next launch counts it.
+fn lose_launch(directory: &Path, marker: &Marker, owner: ProcessId) {
+    if update_history(directory, |history| {
+        record_failure(history, marker, DEVICE_LOST)
+    })
+    .is_some()
+    {
+        let _ = fs::remove_file(marker_path(directory, owner));
     }
 }
 
@@ -601,10 +639,13 @@ fn select(
     rules: &[RendererRule],
     overruled: Option<&'static str>,
 ) -> Result<wgpu::Adapter, String> {
-    // A replacement for a lost device chooses as the start did, but this
-    // launch's marker stays as it is: the window started, so a later end is
-    // not a failed start.
+    // A replacement for a lost device chooses as the start did, and starts no
+    // marker. The window may have worked, so a later end is not a failed
+    // start; if it hadn't yet, the backend it started on failed.
     let replacing = SELECTIONS.fetch_add(1, Ordering::SeqCst) > 0;
+    if replacing {
+        lost_before_drawing();
+    }
     let usable: Vec<&wgpu::Adapter> = adapters
         .iter()
         .filter(|adapter| surface.is_none_or(|surface| adapter.is_surface_supported(surface)))
@@ -2062,6 +2103,43 @@ mod tests {
         assert!(!run(&mut tracker, start, 4..15, 1));
         let mut tracker = PresentTracker::new();
         assert!(run(&mut tracker, start, 0..20, 0));
+    }
+
+    #[test]
+    fn frames_skipped_for_a_lost_device_or_a_new_device_are_not_a_working_window() {
+        use eframe::egui_wgpu::winit::SKIPPED_FRAMES;
+        let start = Instant::now();
+        let mut tracker = PresentTracker::new();
+        assert!(!run(&mut tracker, start, 0..10, failures()));
+        // The device is lost: egui-wgpu skips frames without a surface error.
+        SKIPPED_FRAMES.fetch_add(3, Ordering::SeqCst);
+        assert!(!run(&mut tracker, start, 10..24, failures()));
+        // A new device is made, and it must draw for a while too.
+        SELECTIONS.fetch_add(1, Ordering::SeqCst);
+        assert!(!run(&mut tracker, start, 24..38, failures()));
+        assert!(run(&mut tracker, start, 38..60, failures()));
+    }
+
+    #[test]
+    fn a_device_lost_before_the_window_works_fails_its_backend() {
+        let directory = temp_dir("lost-start");
+        let owner = ProcessId::current();
+        let gpu = "10de:2c02 32.0.15.9186";
+        let started = marker(gpu, "dx12");
+        assert!(save_marker(&directory, owner, &started));
+        lose_launch(&directory, &started, owner);
+        let history = read_history(&directory);
+        assert_eq!(history.len(), 1);
+        assert_eq!(
+            (history[0].gpu.as_str(), history[0].backend.as_str()),
+            (gpu, "dx12")
+        );
+        assert_eq!(history[0].failures, 1);
+        assert_eq!(history[0].fault.as_deref(), Some(DEVICE_LOST));
+        assert!(!marker_path(&directory, owner).exists());
+        // Not a driver crash: retried after clean launches, like any other end.
+        assert!(!history[0].in_driver());
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
