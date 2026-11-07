@@ -38,6 +38,20 @@ pub enum CaptureBlock {
 }
 
 impl CaptureBlock {
+    /// How an iPad that asks after the storm brake is told this block.
+    pub fn failed_reason(self) -> eternal_wire::v2::control::FailedReason {
+        use eternal_wire::v2::control::FailedReason;
+        match self {
+            Self::SecureDesktop => FailedReason::SecureDesktop,
+            Self::DisplayChanging => FailedReason::DisplayChanging,
+            Self::NoDisplay => FailedReason::NoDisplay,
+            Self::UnsupportedOnThisGpu => FailedReason::UnsupportedOnThisGpu,
+            Self::TooManyCaptureApps => FailedReason::TooManyCaptureApps,
+            Self::SessionDisconnected => FailedReason::SessionDisconnected,
+            Self::DriverNotResponding => FailedReason::DriverNotResponding,
+        }
+    }
+
     /// Maps a DXGI/Win32 HRESULT from DuplicateOutput or AcquireNextFrame.
     /// `None` means a real failure that the supervisor should handle.
     pub fn from_hresult(code: i32) -> Option<Self> {

@@ -95,12 +95,15 @@ final class ConnectionManager: ObservableObject {
     @Published var pairingPrompt: PairingSheetModel?
 
     /// HELLO2 feature bits. Every build says it checks for its own updates,
-    /// so the PC tells only older iPad apps to update.
+    /// so the PC tells only older iPad apps to update, and that it
+    /// understands why a PC isn't streaming.
     nonisolated static func featureCaps(wantsInput: Bool, wantsAudio: Bool, isUSB: Bool) -> UInt16 {
         (wantsInput ? Hello2.featureWantsInput : 0) | (wantsAudio ? Hello2.featureWantsAudio : 0)
-            | (isUSB ? 0 : Hello2.featureSupportsNack) | Hello2.featureChecksUpdates
+            | (isUSB ? 0 : Hello2.featureSupportsNack) | Hello2.featureChecksUpdates | Hello2.featureStandbyStatus
     }
     private var awaitingPairing = false
+    /// The PC answered that it isn't streaming; the attempt waits for it.
+    private var waitingForStream = false
     private var explicitPairingToken: Data?
     private let pairingStore = PairingStore.shared
     @Published private(set) var diagnostics: [DiagnosticEntry] = []
@@ -389,6 +392,7 @@ final class ConnectionManager: ObservableObject {
         prevCounters = FrameAssembler.Counters()
         diagnostics.removeAll()
         didExtendTimeout = false
+        waitingForStream = false
         attemptStartedAt = ProcessInfo.processInfo.systemUptime
         sessionAcceptedAt = nil
         firstFrameAt = nil
@@ -595,6 +599,11 @@ final class ConnectionManager: ObservableObject {
                                               at: isUSB ? nil : "\(normalizedHost):\(port)")
                 self.livenessTimeoutUs = UInt64(info.livenessTimeoutMs) * 1000
                 self.hostInfo = info
+                if self.waitingForStream {
+                    self.waitingForStream = false
+                    if case .pcNotStreaming = self.problem { self.problem = nil }
+                    self.armConnectTimeout(seconds: self.timing.connectTimeoutSeconds)
+                }
                 if self.awaitingPairing {
                     self.awaitingPairing = false
                     self.pairingPrompt = nil
@@ -647,6 +656,20 @@ final class ConnectionManager: ObservableObject {
                 }
                 self.record(.error, "ctrl", self.connectionError ?? self.problem?.title ?? "rejected")
                 self.disconnect(.pcRefused)
+            }
+        }
+        channel.onPCNotStreaming = { [weak self] status, reason in
+            Task { @MainActor in
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }),
+                      let wait = ConnectionProblem.StreamWait(status, reason: reason) else { return }
+                if self.problem != .pcNotStreaming(wait) {
+                    self.record(.info, "ctrl", "PC isn't streaming (\(status)\(reason.isEmpty ? "" : " \(reason)")); waiting for it")
+                }
+                // No reconnect attempt is spent while the PC says why it
+                // isn't streaming. If it stops answering, the timeout says so.
+                self.waitingForStream = true
+                self.problem = .pcNotStreaming(wait)
+                self.armConnectTimeout(seconds: self.timing.connectTimeoutSeconds)
             }
         }
         channel.onHandshakeTimeout = { [weak self, weak receiver] in
@@ -1036,7 +1059,9 @@ final class ConnectionManager: ObservableObject {
                 self.record(level, "timeout", debug.timeoutSummary(handshakeDone: handshakeDone) + self.attemptTimings)
                 // Only an attempt the PC answered counts.
                 if handshakeDone { self.noPictureStreak.endedWithoutPicture() }
-                self.problem = self.noPictureStreak.shown(.timeout(
+                // A PC that said it isn't streaming and then went quiet (it
+                // closed, or slept) didn't answer: its answers were no picture.
+                self.problem = self.waitingForStream ? .noReply(usb: isUSB) : self.noPictureStreak.shown(.timeout(
                     listenerReady: debug.listenerReadyPort != nil, helloAttempts: debug.helloAttempts,
                     handshakeDone: handshakeDone, datagramsReceived: debug.datagramsReceived,
                     isUSB: isUSB, host: debug.host), at: isUSB ? nil : "\(debug.host):\(debug.port)")
@@ -1088,6 +1113,8 @@ final class ConnectionManager: ObservableObject {
         timeoutTask?.cancel()
         endReconnectCycle()
         disconnect()
+        // The user stopped waiting for the PC to stream.
+        if case .pcNotStreaming = problem { problem = nil }
     }
 
     /// Try the last connection again: the cable when that is what failed,
@@ -1220,6 +1247,7 @@ final class ConnectionManager: ObservableObject {
             recordSummary(end)
         }
         awaitingPairing = false
+        waitingForStream = false
         pairingPrompt = nil
         currentAttempt.withLock { $0 = nil }
         timeoutTask?.cancel()

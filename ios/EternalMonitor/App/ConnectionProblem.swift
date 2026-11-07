@@ -35,6 +35,46 @@ enum ConnectionProblem: Equatable {
     case pcBusy
     /// The PC stopped the stream to install an update and restarts on it.
     case pcUpdating(UpdateWait)
+    /// The PC answered but isn't streaming. This iPad keeps asking and
+    /// connects as soon as it is.
+    case pcNotStreaming(StreamWait)
+
+    enum StreamWait: Equatable {
+        /// Someone clicked Stop on the PC.
+        case stopped
+        case restarting
+        /// The PC stopped after repeated errors, for the reason it gave (a
+        /// token; one this iPad doesn't know is no reason).
+        case failed(String)
+
+        /// What the PC's answer means, if it is one of these.
+        init?(_ status: HelloStatus, reason: String) {
+            switch status {
+            case .stopped: self = .stopped
+            case .restarting: self = .restarting
+            case .failed: self = .failed(reason)
+            default: return nil
+            }
+        }
+
+        /// The PC's reason for `.failed`, in words, if this iPad knows it.
+        /// The PC's Stream page says the same.
+        static func failedReason(_ token: String) -> String? {
+            switch token {
+            case "capture": return "Capturing your screen kept failing"
+            case "encoder": return "Encoding the video kept failing"
+            case "transport": return "Sending the video kept failing"
+            case "secure_desktop": return "Your PC is showing the lock screen or a permission prompt"
+            case "display_changing": return "Windows is changing the display"
+            case "no_display": return "No display is on"
+            case "unsupported_gpu": return "Windows won't share this screen from the graphics card EternalMonitor uses"
+            case "too_many_capture_apps": return "Another app is recording or sharing your screen"
+            case "session_disconnected": return "This Windows session is disconnected"
+            case "driver_not_responding": return "The graphics driver isn't responding"
+            default: return nil
+            }
+        }
+    }
 
     /// What this iPad does while the PC updates.
     enum UpdateWait: Equatable {
@@ -79,6 +119,9 @@ enum ConnectionProblem: Equatable {
         case .pcBusy: return "Your PC is already streaming to another device"
         case .pcUpdating(.reconnecting), .pcUpdating(.manual): return "Your PC is updating EternalMonitor"
         case .pcUpdating(.notBack): return "Your PC hasn't come back from its update yet"
+        case .pcNotStreaming(.stopped): return "Your PC isn't streaming"
+        case .pcNotStreaming(.restarting): return "Your PC is restarting the stream…"
+        case .pcNotStreaming(.failed): return "Your PC stopped streaming after repeated errors"
         }
     }
 
@@ -134,6 +177,13 @@ enum ConnectionProblem: Equatable {
             return "Check that EternalMonitor opened again on the PC, then try again. Windows may still be waiting for you to approve the update there."
         case .pcBusy:
             return "Disconnect the other iPad first, then try again."
+        case .pcNotStreaming(.stopped):
+            return "Click Start streaming in EternalMonitor on the PC. This iPad connects as soon as it starts."
+        case .pcNotStreaming(.restarting):
+            return "This iPad connects as soon as it's back."
+        case .pcNotStreaming(.failed(let token)):
+            let start = "Click Start streaming in EternalMonitor on the PC to try again. This iPad connects as soon as it starts."
+            return StreamWait.failedReason(token).map { "\($0). \(start)" } ?? start
         }
     }
 
@@ -152,7 +202,8 @@ enum ConnectionProblem: Equatable {
     var canReport: Bool {
         switch self {
         case .reconnecting, .pcUpdating(.reconnecting), .pcUpdating(.manual),
-             .lost(.cableUnplugged), .lost(.usbTurnedOff), .pcBusy, .pairingCodeAsAddress:
+             .lost(.cableUnplugged), .lost(.usbTurnedOff), .pcBusy, .pairingCodeAsAddress,
+             .pcNotStreaming(.stopped), .pcNotStreaming(.restarting):
             return false
         default:
             return true
@@ -162,7 +213,8 @@ enum ConnectionProblem: Equatable {
     var actions: [Action] {
         switch self {
         case .localNetworkBlocked: return [.openSettings, .retry]
-        case .reconnecting, .lost(.cableUnplugged), .lost(.usbTurnedOff), .receiverNotReady, .pairingCodeAsAddress: return []
+        case .reconnecting, .lost(.cableUnplugged), .lost(.usbTurnedOff), .receiverNotReady, .pairingCodeAsAddress,
+             .pcNotStreaming: return []
         default: return [.retry]
         }
     }

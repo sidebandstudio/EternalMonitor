@@ -37,6 +37,10 @@ pub const CAP_DECODE_HEVC_10BIT: u16 = 1 << 2;
 pub const FEATURE_WANTS_INPUT: u16 = 1 << 0;
 pub const FEATURE_WANTS_AUDIO: u16 = 1 << 1;
 pub const FEATURE_SUPPORTS_NACK: u16 = 1 << 2;
+/// The iPad understands [`HelloStatus::Stopped`], [`HelloStatus::Restarting`]
+/// and [`HelloStatus::Failed`] (0.3.5 and later). Older iPads drop an ACK
+/// whose status they don't know, so the host sends them only statuses 0-5.
+pub const FEATURE_STANDBY_STATUS: u16 = 1 << 3;
 /// The iPad app checks for its own updates (0.3.2 and later), so a HELLO2
 /// without it comes from 0.3.1 or older. Older hosts ignore it.
 pub const FEATURE_CHECKS_UPDATES: u16 = 1 << 4;
@@ -136,6 +140,13 @@ pub enum HelloStatus {
     Error = 3,
     Unauthorized = 4,
     RateLimited = 5,
+    /// The PC answered but isn't streaming: someone clicked Stop on it.
+    Stopped = 6,
+    /// The PC is restarting its stream; ask again shortly.
+    Restarting = 7,
+    /// The PC stopped streaming after repeated errors, until someone clicks
+    /// Start. [`HelloAck::reason`] carries a [`FailedReason`] token.
+    Failed = 8,
 }
 
 impl HelloStatus {
@@ -147,6 +158,9 @@ impl HelloStatus {
             3 => Self::Error,
             4 => Self::Unauthorized,
             5 => Self::RateLimited,
+            6 => Self::Stopped,
+            7 => Self::Restarting,
+            8 => Self::Failed,
             _ => return None,
         })
     }
@@ -167,6 +181,64 @@ pub struct HelloAck {
     pub host_name: String,
     pub auth_token: [u8; 16],
     pub host_caps: u16,
+    /// Why the PC isn't streaming, for [`HelloStatus::Failed`]: a
+    /// [`FailedReason`] token, empty otherwise. Appended after `host_caps`
+    /// (0.3.5), at most [`MAX_REASON_LEN`] bytes; older parsers ignore it.
+    pub reason: String,
+}
+
+/// Longest [`HelloAck::reason`] on the wire, in bytes.
+pub const MAX_REASON_LEN: usize = 32;
+
+/// Why a PC stopped streaming after repeated errors, as [`HelloAck::reason`]
+/// carries it. A token, not text: the iPad says it in its own words, and an
+/// iPad that doesn't know a token shows the general advice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailedReason {
+    Capture,
+    Encoder,
+    Transport,
+    SecureDesktop,
+    DisplayChanging,
+    NoDisplay,
+    UnsupportedOnThisGpu,
+    TooManyCaptureApps,
+    SessionDisconnected,
+    DriverNotResponding,
+}
+
+impl FailedReason {
+    pub const ALL: [FailedReason; 10] = [
+        Self::Capture,
+        Self::Encoder,
+        Self::Transport,
+        Self::SecureDesktop,
+        Self::DisplayChanging,
+        Self::NoDisplay,
+        Self::UnsupportedOnThisGpu,
+        Self::TooManyCaptureApps,
+        Self::SessionDisconnected,
+        Self::DriverNotResponding,
+    ];
+
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Capture => "capture",
+            Self::Encoder => "encoder",
+            Self::Transport => "transport",
+            Self::SecureDesktop => "secure_desktop",
+            Self::DisplayChanging => "display_changing",
+            Self::NoDisplay => "no_display",
+            Self::UnsupportedOnThisGpu => "unsupported_gpu",
+            Self::TooManyCaptureApps => "too_many_capture_apps",
+            Self::SessionDisconnected => "session_disconnected",
+            Self::DriverNotResponding => "driver_not_responding",
+        }
+    }
+
+    pub fn from_token(token: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|reason| reason.token() == token)
+    }
 }
 
 /// Host → client, every heartbeat interval while a session is active.
@@ -395,9 +467,14 @@ pub fn encode_control(session_id: u32, msg_seq: u32, message: &ControlMessage) -
             body.extend_from_slice(&cfg);
             body.push(name.len() as u8);
             body.extend_from_slice(name.as_bytes());
-            if a.host_caps != 0 || a.auth_token != [0; 16] {
+            let reason = truncated(&a.reason, MAX_REASON_LEN);
+            if a.host_caps != 0 || a.auth_token != [0; 16] || !reason.is_empty() {
                 body.extend_from_slice(&a.auth_token);
                 body.extend_from_slice(&a.host_caps.to_le_bytes());
+            }
+            if !reason.is_empty() {
+                body.push(reason.len() as u8);
+                body.extend_from_slice(reason.as_bytes());
             }
         }
         ControlMessage::Heartbeat(hb) => {
@@ -569,6 +646,16 @@ pub fn parse_control(datagram: &[u8]) -> Result<(ControlHeader, ControlMessage),
             } else {
                 ([0; 16], 0)
             };
+            let reason = if r.remaining() > 0 {
+                let len = usize::from(r.u8()?);
+                if len > MAX_REASON_LEN {
+                    return Err(WireError::InvalidField("reason_len"));
+                }
+                String::from_utf8(r.take(len)?.to_vec())
+                    .map_err(|_| WireError::InvalidField("reason_utf8"))?
+            } else {
+                String::new()
+            };
             if status == HelloStatus::Ok && session_id == 0 {
                 return Err(WireError::InvalidField("session_id"));
             }
@@ -584,6 +671,7 @@ pub fn parse_control(datagram: &[u8]) -> Result<(ControlHeader, ControlMessage),
                 host_name,
                 auth_token,
                 host_caps,
+                reason,
             })
         }
         PacketType::Heartbeat => ControlMessage::Heartbeat(Heartbeat {
@@ -686,11 +774,15 @@ pub fn parse_control(datagram: &[u8]) -> Result<(ControlHeader, ControlMessage),
 }
 
 fn truncated_name(name: &str) -> &str {
-    if name.len() <= MAX_NAME_LEN {
+    truncated(name, MAX_NAME_LEN)
+}
+
+fn truncated(name: &str, max: usize) -> &str {
+    if name.len() <= max {
         return name;
     }
     // Truncate on a char boundary at or below the cap.
-    let mut end = MAX_NAME_LEN;
+    let mut end = max;
     while end > 0 && !name.is_char_boundary(end) {
         end -= 1;
     }
@@ -904,6 +996,7 @@ mod tests {
                 host_name: "ALI-PC".to_string(),
                 auth_token: [0; 16],
                 host_caps: 0,
+                reason: String::new(),
             }),
             ControlMessage::Heartbeat(Heartbeat {
                 host_time_us: 987_654_321,
@@ -1022,6 +1115,7 @@ mod tests {
             host_name: String::new(),
             auth_token: [0; 16],
             host_caps: 0,
+            reason: String::new(),
         });
         // encode_control would happily serialize it; the parser must reject.
         let datagram = encode_control(0, 1, &ack);
@@ -1112,5 +1206,79 @@ mod tests {
             let _ = super::super::media::MediaHeader::decode(&bytes);
             let _ = super::super::classify(&bytes);
         }
+    }
+
+    fn standby_ack(status: HelloStatus, reason: &str) -> HelloAck {
+        HelloAck {
+            status,
+            accepted_version: 2,
+            client_nonce: 9,
+            session_id: 0,
+            heartbeat_interval_ms: 1000,
+            report_interval_ms: 500,
+            liveness_timeout_ms: 3000,
+            stream_config: StreamConfig::default(),
+            host_name: "PC".to_string(),
+            auth_token: [0; 16],
+            host_caps: 0,
+            reason: reason.to_string(),
+        }
+    }
+
+    #[test]
+    fn not_streaming_statuses_and_their_reason_round_trip() {
+        for status in [
+            HelloStatus::Stopped,
+            HelloStatus::Restarting,
+            HelloStatus::Failed,
+        ] {
+            for reason in ["", "display_changing"] {
+                let ack = standby_ack(status, reason);
+                let bytes = encode_control(0, 1, &ControlMessage::HelloAck(ack.clone()));
+                assert_eq!(
+                    parse_control(&bytes).unwrap().1,
+                    ControlMessage::HelloAck(ack)
+                );
+            }
+        }
+        // A reason past the cap is cut, so it always parses.
+        let long = "x".repeat(100);
+        let bytes = encode_control(
+            0,
+            1,
+            &ControlMessage::HelloAck(standby_ack(HelloStatus::Failed, &long)),
+        );
+        let Ok((_, ControlMessage::HelloAck(ack))) = parse_control(&bytes) else {
+            panic!("a long reason must still parse");
+        };
+        assert_eq!(ack.reason.len(), MAX_REASON_LEN);
+    }
+
+    /// 0.3.4 and older know statuses 0-5 only and drop the whole ACK for
+    /// any other, like a lost datagram: the host must not send them 6-8.
+    #[test]
+    fn a_status_past_the_known_ones_is_rejected() {
+        let mut bytes = encode_control(
+            0,
+            1,
+            &ControlMessage::HelloAck(standby_ack(HelloStatus::Error, "")),
+        );
+        bytes[CONTROL_HEADER_SIZE] = 9;
+        assert_eq!(
+            parse_control(&bytes),
+            Err(WireError::InvalidField("status"))
+        );
+    }
+
+    #[test]
+    fn failed_reason_tokens_are_short_distinct_and_round_trip() {
+        let mut seen = std::collections::HashSet::new();
+        for reason in FailedReason::ALL {
+            let token = reason.token();
+            assert!(token.len() <= MAX_REASON_LEN && token.is_ascii(), "{token}");
+            assert!(seen.insert(token), "{token} twice");
+            assert_eq!(FailedReason::from_token(token), Some(reason));
+        }
+        assert_eq!(FailedReason::from_token("something new"), None);
     }
 }

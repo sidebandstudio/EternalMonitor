@@ -14,6 +14,34 @@ final class ConnectionProblemTests: XCTestCase {
         XCTAssertEqual(ConnectionProblem.timeout(listenerReady: true, helloAttempts: 1, handshakeDone: true, datagramsReceived: 0, isUSB: true), .noPicture)
     }
 
+    /// The PC's not-streaming answers, in plain words. None offers Try
+    /// again: the iPad is already asking again by itself.
+    func testNotStreamingAnswersSayWhatToDo() {
+        typealias Wait = ConnectionProblem.StreamWait
+        XCTAssertEqual(Wait(.stopped, reason: ""), .stopped)
+        XCTAssertEqual(Wait(.restarting, reason: "ignored"), .restarting)
+        XCTAssertEqual(Wait(.failed, reason: "encoder"), .failed("encoder"))
+        for status: HelloStatus in [.ok, .busy, .versionUnsupported, .error, .unauthorized, .rateLimited] {
+            XCTAssertNil(Wait(status, reason: ""), "\(status)")
+        }
+        XCTAssertEqual(ConnectionProblem.pcNotStreaming(.restarting).detail, "This iPad connects as soon as it's back.")
+        XCTAssertEqual(ConnectionProblem.pcNotStreaming(.failed("encoder")).detail,
+            "Encoding the video kept failing. Click Start streaming in EternalMonitor on the PC to try again. "
+                + "This iPad connects as soon as it starts.")
+        // Every token the PC sends has words here.
+        for token in ["capture", "encoder", "transport", "secure_desktop", "display_changing", "no_display",
+                      "unsupported_gpu", "too_many_capture_apps", "session_disconnected", "driver_not_responding"] {
+            XCTAssertNotNil(Wait.failedReason(token), token)
+        }
+        for wait: Wait in [.stopped, .restarting, .failed("encoder")] {
+            XCTAssertEqual(ConnectionProblem.pcNotStreaming(wait).actions, [])
+        }
+        // Only a PC that ran into errors offers Report this problem.
+        XCTAssertFalse(ConnectionProblem.pcNotStreaming(.stopped).canReport)
+        XCTAssertFalse(ConnectionProblem.pcNotStreaming(.restarting).canReport)
+        XCTAssertTrue(ConnectionProblem.pcNotStreaming(.failed("")).canReport)
+    }
+
     /// PCs on 0.3.1 and 0.3.2 answer but send no picture in Second screen
     /// mode. The card says to mirror, naming the choice as both versions do.
     func testNoPictureSaysToMirrorTheScreen() {
