@@ -1078,7 +1078,7 @@ impl eframe::App for AnalyzerApp {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         renderer::frame_started(ui.ctx());
-        renderer::simulate_device_loss(frame);
+        renderer::release_render_state(frame);
         crate::startup::simulate_window_failure();
         let ctx = ui.ctx().clone();
         if let Some(language) = self.pending_language.take() {

@@ -456,16 +456,23 @@ pub(super) fn frame_started(ctx: &egui::Context) {
     }
 }
 
-/// Lose the window's graphics device on purpose when
-/// [`crate::startup::SIMULATE_ENV`] asks: DX12 removes the device, as a
-/// driver reset does; other backends destroy it.
-pub(super) fn simulate_device_loss(frame: &eframe::Frame) {
-    if !crate::startup::simulate_device_loss_now() {
+/// Drop eframe's copy of the window's first device, which is kept for paint
+/// callbacks the window has none of. A lost device is only replaced once
+/// nothing holds it: D3D12 keeps one device per GPU in a process, and the
+/// window's old swapchain stays with it. When [`crate::startup::SIMULATE_ENV`]
+/// asks for a device loss, the copy is kept until then, and the device is lost
+/// on purpose: DX12 removes it, as a driver reset does; other backends destroy
+/// it.
+pub(super) fn release_render_state(frame: &mut eframe::Frame) {
+    if crate::startup::device_loss_requested() && !crate::startup::simulate_device_loss_now() {
         return;
     }
-    let Some(render_state) = frame.wgpu_render_state() else {
+    let Some(render_state) = frame.wgpu_render_state.take() else {
         return;
     };
+    if !crate::startup::device_loss_requested() {
+        return;
+    }
     warn!("Simulated loss of the window's graphics device");
     #[cfg(windows)]
     if remove_dx12_device(&render_state.device) {

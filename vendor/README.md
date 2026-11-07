@@ -18,14 +18,17 @@ panic ends the app and the stream with it. 0.37.0 still does.
 The patch:
 - `Renderer::update_buffers` skips a frame whose staging buffer can't be made,
   and `Renderer::render` then draws nothing.
-- The winit `Painter` watches each device's lost callback, and keeps wgpu's
-  default error handler from panicking on what a lost device reports.
+- The winit `Painter` watches each device's lost callback. A wgpu error
+  outside an error scope counts as a loss too, where wgpu's default handler
+  panics: a window whose device or surface fails is drawn on a new one.
 - When the device is lost, or a frame's upload fails, the `Painter` drops the
   device, its surfaces and egui's renderer. eframe calls `set_window` before
   each paint, which makes new ones; until that works the window skips frames
   and tries again every 500 ms. The new device's first frame uploads the font
   atlas again. Other textures are the app's to load again
   (`host/src/gui/renderer.rs` counts devices for that).
+- A D3D12 device is only replaced once nothing holds the lost one, so the host
+  drops the copy eframe keeps in `Frame` (`release_render_state`).
 
 Drop this copy when an egui-wgpu release survives device loss, or carry the
 patch to the version eframe moves to.

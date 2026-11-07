@@ -15,7 +15,7 @@ use egui::{Context, Event, UserData, ViewportId, ViewportIdMap, ViewportIdSet};
 use std::sync::Arc;
 
 /// EternalMonitor patch: how often a lost device's replacement is tried again
-/// while it can't be created, as during a driver reset.
+/// while it can't be created or doesn't work, as during a driver reset.
 const REBUILD_RETRY: Duration = Duration::from_millis(500);
 
 struct SurfaceState {
@@ -59,6 +59,8 @@ pub struct Painter {
     rebuilding: bool,
     /// The new device's first paint uploads the font atlas again.
     restore_fonts: bool,
+    /// When the last device was dropped, so a replacement that fails at once waits.
+    dropped_at: Option<web_time::Instant>,
 }
 
 impl Painter {
@@ -103,6 +105,7 @@ impl Painter {
             device_lost: Arc::new(AtomicBool::new(false)),
             rebuilding: false,
             restore_fonts: false,
+            dropped_at: None,
         }
     }
 
@@ -288,8 +291,9 @@ impl Painter {
         Ok(())
     }
 
-    /// EternalMonitor patch: flag the loss of `device`, and keep wgpu's default handler
-    /// from panicking on the errors a lost device then reports.
+    /// EternalMonitor patch: flag the loss of `device`. An error wgpu reports outside an
+    /// error scope flags it too, instead of panicking as wgpu's default handler does: a
+    /// window whose device or surface fails is drawn again on a new one.
     fn watch_device(&mut self, device: &wgpu::Device) {
         let lost = Arc::new(AtomicBool::new(false));
         let flag = Arc::clone(&lost);
@@ -299,11 +303,10 @@ impl Painter {
         });
         let flag = Arc::clone(&lost);
         device.on_uncaptured_error(Arc::new(move |error| {
-            if flag.load(Ordering::SeqCst) {
+            if flag.swap(true, Ordering::SeqCst) {
                 log::debug!("wgpu error on the lost device: {error}");
             } else {
-                // As wgpu's default handler.
-                panic!("wgpu error: {error}\n");
+                log::error!("wgpu error; replacing the window's device: {error}");
             }
         }));
         self.device_lost = lost;
@@ -320,6 +323,7 @@ impl Painter {
         self.screen_capture_state = None;
         self.rebuilding = true;
         self.restore_fonts = false;
+        self.dropped_at = Some(web_time::Instant::now());
         self.context.request_repaint();
     }
 
@@ -582,9 +586,17 @@ impl Painter {
         let capture = !capture_data.is_empty();
         let mut vsync_sec = 0.0;
 
-        // EternalMonitor patch: a lost device draws nothing again; replace it.
+        // EternalMonitor patch: a lost device draws nothing again; replace it, at most
+        // every REBUILD_RETRY.
         if self.device_lost.load(Ordering::SeqCst) {
-            self.drop_lost_device();
+            if self
+                .dropped_at
+                .is_some_and(|dropped| dropped.elapsed() < REBUILD_RETRY)
+            {
+                self.context.request_repaint_after(REBUILD_RETRY);
+            } else {
+                self.drop_lost_device();
+            }
             return vsync_sec;
         }
 

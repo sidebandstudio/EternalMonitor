@@ -585,11 +585,16 @@ pub(crate) fn simulate_window_failure() {
     }
 }
 
-/// True once, 15 s after the window works, when [`SIMULATE_ENV`] asks for
-/// `device-lost-later`: the window's graphics device is to be lost then.
+/// [`SIMULATE_ENV`] asks for `device-lost-later`.
+pub(crate) fn device_loss_requested() -> bool {
+    simulated() == "device-lost-later"
+}
+
+/// True once, 15 s after the window works, when [`device_loss_requested`]:
+/// the window's graphics device is to be lost then.
 pub(crate) fn simulate_device_loss_now() -> bool {
     static DONE: AtomicBool = AtomicBool::new(false);
-    simulated() == "device-lost-later"
+    device_loss_requested()
         && SHOWN_AT
             .get()
             .is_some_and(|shown| shown.elapsed() > Duration::from_secs(15))
