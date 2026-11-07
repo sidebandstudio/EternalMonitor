@@ -475,7 +475,7 @@ fn the_storm_brake_says_why_and_waits_for_start() {
 #[test]
 fn a_stopped_pc_follows_the_chosen_network() {
     use eternal_host::network::{default_route, set_test_adapters, Adapter, Kind, ListenOn};
-    use std::net::{IpAddr, Ipv4Addr};
+    use std::net::IpAddr;
     // Binding the network's address needs a real one.
     let Some(IpAddr::V4(ip)) = default_route().filter(|ip| !ip.is_loopback()) else {
         eprintln!("SKIP: no IPv4 default route to stand in for the chosen network");
