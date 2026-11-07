@@ -1,0 +1,48 @@
+name: Proto fuzz
+
+# Builds the cargo-fuzz targets in proto/fuzz and runs each one briefly.
+# Longer runs happen locally; this keeps the targets compiling and catches
+# shallow crashes on every change to proto.
+
+on:
+  pull_request:
+    paths:
+      - "proto/**"
+      - ".github/workflows/proto-fuzz.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: proto-fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  fuzz:
+    name: Proto fuzz targets (build, then 30 s each)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install nightly
+        run: rustup toolchain install nightly --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: proto/fuzz
+      - name: Install cargo-fuzz
+        run: cargo +nightly install cargo-fuzz --version 0.13.2 --locked
+      - name: Build fuzz targets
+        working-directory: proto/fuzz
+        run: cargo +nightly fuzz build
+      - name: Run each target for 30 s
+        working-directory: proto/fuzz
+        run: |
+          for target in $(cargo +nightly fuzz list); do
+            sanitizer=address
+            # Safe Rust only; it runs far faster without the sanitizer.
+            if [ "$target" = v3_session_sim ]; then sanitizer=none; fi
+            echo "::group::$target"
+            cargo +nightly fuzz run -s "$sanitizer" "$target" -- -max_total_time=30
+            echo "::endgroup::"
+          done

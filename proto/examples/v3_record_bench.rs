@@ -1,7 +1,7 @@
 //! Seal and open throughput of v3 records at video datagram sizes, compared
 //! with the per-frame budget at 120 fps.
 //!
-//! `cargo run --release -p eternal-wire --example v3_record_bench [seconds]`
+//! `cargo run --release -p eternal-wire --features test-hooks --example v3_record_bench [seconds]`
 
 use std::hint::black_box;
 use std::time::{Duration, Instant};

@@ -27,3 +27,4 @@ zeroize = "1"
 
 [[example]]
 name = "v3_record_bench"
+required-features = ["test-hooks"]

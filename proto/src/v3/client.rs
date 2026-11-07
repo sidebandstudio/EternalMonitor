@@ -16,6 +16,10 @@
 //!   of the window). The old session drains: its media is still delivered
 //!   until the new session's first IDR decodes, for at most 1 s.
 //!
+//! Only input stops across the cutover. Reports, heartbeats and anything
+//! else keep flowing on the old session, so it stays alive while a
+//! confirmation is retried.
+//!
 //! 2 s + 2 s is under the host's 5 s pending lifetime, so every retry goes out
 //! while the pending session it targets still exists.
 
@@ -24,7 +28,9 @@ use std::time::Duration;
 use super::handshake::Initiator;
 use super::record::{Opener, RecordHeader, Sealer};
 use super::wire::{self, Accept, HelloPayload, Msg2Payload, SessionMessage, SlotStatus, V3Kind};
-use super::{Id16, Key32, Random, MAX_RECORDS_PER_DIRECTION, SESSION_MAX_AGE};
+use super::{Id16, Key32, Random, MAX_RECORDS_PER_DIRECTION, MAX_TIMESTAMP_US, SESSION_MAX_AGE};
+use crate::v2::PacketType;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -57,12 +63,27 @@ impl ClientConfig {
     }
 }
 
-/// One of the iPad's keys for this host.
+/// One of the iPad's keys for this host. Every copy, clones included,
+/// wipes its key on drop.
 #[derive(Clone, PartialEq, Eq)]
 pub struct ClientKey {
     pub dev_id: Id16,
     pub k_dev: Key32,
 }
+
+impl Zeroize for ClientKey {
+    fn zeroize(&mut self) {
+        self.k_dev.zeroize();
+    }
+}
+
+impl Drop for ClientKey {
+    fn drop(&mut self) {
+        self.zeroize();
+    }
+}
+
+impl ZeroizeOnDrop for ClientKey {}
 
 impl std::fmt::Debug for ClientKey {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -85,7 +106,8 @@ pub enum ClientClose {
     Local,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Debug` shows a delivered body's length, not its bytes.
+#[derive(Clone, PartialEq, Eq)]
 pub enum ClientOutput {
     Send(Vec<u8>),
     /// The input cutover. End every held touch, key and button locally, and
@@ -125,6 +147,52 @@ pub enum ClientOutput {
     },
 }
 
+impl std::fmt::Debug for ClientOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Send(datagram) => f.debug_tuple("Send").field(&datagram.len()).finish(),
+            Self::ReleaseAllInput => f.write_str("ReleaseAllInput"),
+            Self::Live { session_id, .. } => f
+                .debug_struct("Live")
+                .field("session_id", session_id)
+                .finish_non_exhaustive(),
+            Self::Status { dev_id, status } => f
+                .debug_struct("Status")
+                .field("dev_id", dev_id)
+                .field("status", status)
+                .finish(),
+            Self::Refused { dev_id, status } => f
+                .debug_struct("Refused")
+                .field("dev_id", dev_id)
+                .field("status", status)
+                .finish(),
+            Self::AttemptFailed { dev_id } => f
+                .debug_struct("AttemptFailed")
+                .field("dev_id", dev_id)
+                .finish(),
+            Self::Deliver {
+                session_id,
+                counter,
+                inner_type,
+                body,
+                draining,
+            } => f
+                .debug_struct("Deliver")
+                .field("session_id", session_id)
+                .field("counter", counter)
+                .field("inner_type", inner_type)
+                .field("body_len", &body.len())
+                .field("draining", draining)
+                .finish(),
+            Self::Closed { session_id, reason } => f
+                .debug_struct("Closed")
+                .field("session_id", session_id)
+                .field("reason", reason)
+                .finish(),
+        }
+    }
+}
+
 struct Session {
     session_id: u32,
     sealer: Sealer,
@@ -157,7 +225,7 @@ enum Attempt {
     },
 }
 
-/// Records left before the client reconnects on its own.
+/// Records left in either direction before the client reconnects on its own.
 const RECONNECT_RECORD_MARGIN: u64 = 1 << 20;
 
 pub struct Client {
@@ -194,7 +262,7 @@ impl Client {
     }
 
     pub fn set_last_timestamp(&mut self, timestamp_us: u64) {
-        self.last_timestamp = self.last_timestamp.max(timestamp_us);
+        self.last_timestamp = self.last_timestamp.max(timestamp_us.min(MAX_TIMESTAMP_US));
     }
 
     pub fn live_session(&self) -> Option<u32> {
@@ -229,7 +297,9 @@ impl Client {
         stale_retried: bool,
         out: &mut Vec<ClientOutput>,
     ) {
-        let timestamp = clock_us.max(self.last_timestamp + 1);
+        let timestamp = clock_us
+            .max(self.last_timestamp.saturating_add(1))
+            .min(MAX_TIMESTAMP_US);
         self.last_timestamp = timestamp;
         let mut nonce = [0u8; 4];
         self.rng.fill(&mut nonce);
@@ -296,7 +366,7 @@ impl Client {
                 },
                 _,
             ) => {
-                self.last_timestamp = self.last_timestamp.max(stored_timestamp_us);
+                self.set_last_timestamp(stored_timestamp_us);
                 if stale_retried {
                     self.attempt = Attempt::Idle;
                     out.push(ClientOutput::AttemptFailed { dev_id: key.dev_id });
@@ -478,10 +548,10 @@ impl Client {
         out
     }
 
-    /// Seals an application message under the live session. `None` while
-    /// confirming (nothing is sent across the cutover) or without one.
+    /// Seals an application message under the live session. `None` without
+    /// one, and for input while confirming: no input crosses the cutover.
     pub fn seal(&mut self, now: Duration, inner_type: u8, body: &[u8]) -> Option<Vec<u8>> {
-        if self.is_confirming() {
+        if self.is_confirming() && inner_type == PacketType::InputEvent as u8 {
             return None;
         }
         let live = self.live.as_mut()?;
@@ -578,7 +648,12 @@ impl Client {
 
         if let Some(live) = &self.live {
             let age = now.saturating_sub(live.established);
-            if age >= self.config.max_age || live.sealer.sealed() >= MAX_RECORDS_PER_DIRECTION {
+            // Authenticated progress in each direction: sealed here, opened
+            // from the host.
+            let sent = live.sealer.sealed();
+            let received = live.opener.highest().map_or(0, |top| top + 1);
+            let used = sent.max(received);
+            if age >= self.config.max_age || used >= MAX_RECORDS_PER_DIRECTION {
                 out.push(ClientOutput::Closed {
                     session_id: live.session_id,
                     reason: ClientClose::Expired,
@@ -586,7 +661,7 @@ impl Client {
                 self.live = None;
             } else if matches!(self.attempt, Attempt::Idle)
                 && (age + self.config.reconnect_margin >= self.config.max_age
-                    || live.sealer.sealed() + RECONNECT_RECORD_MARGIN >= MAX_RECORDS_PER_DIRECTION)
+                    || used + RECONNECT_RECORD_MARGIN >= MAX_RECORDS_PER_DIRECTION)
             {
                 if let Some(key) = self.key.clone() {
                     self.start_attempt(now, key, clock_us, false, &mut out);
@@ -602,4 +677,156 @@ fn seal_confirm(sealer: &mut Sealer) -> Option<Vec<u8>> {
     sealer
         .seal(confirm.inner_type(), &confirm.encode_body())
         .ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::v3::handshake::Responder;
+    use crate::v3::SeededRandom;
+
+    const HOST: Id16 = [0xB2; 16];
+    const T0: Duration = Duration::from_secs(50);
+
+    fn key() -> ClientKey {
+        ClientKey {
+            dev_id: [0xD2; 16],
+            k_dev: [0x24; 32],
+        }
+    }
+
+    fn client() -> Client {
+        Client::new(
+            ClientConfig::new(HOST),
+            HelloPayload::default(),
+            Box::new(SeededRandom::new(3)),
+        )
+    }
+
+    fn sent(out: &[ClientOutput]) -> Vec<Vec<u8>> {
+        out.iter()
+            .filter_map(|o| match o {
+                ClientOutput::Send(d) => Some(d.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Connects through a hand-driven host side and returns the host's
+    /// sealer for the live session.
+    fn live_client() -> (Client, Sealer) {
+        let mut ipad = client();
+        let msg1 = sent(&ipad.connect(T0, key(), 1_000)).remove(0);
+        let parsed = wire::parse_msg1(&msg1).unwrap();
+        let host = Responder::read_msg1(&parsed, &key().k_dev, &HOST).unwrap();
+        let accept = Msg2Payload::Accept(Accept {
+            session_id: 77,
+            ..Default::default()
+        });
+        let (msg2, keys) = host.write_msg2(&accept).unwrap();
+        let (mut host_sealer, _) = keys.unwrap().responder(77);
+        ipad.handle_datagram(T0, &msg2, 1_000);
+        let ack = SessionMessage::ConfirmAck(SlotStatus::default());
+        let record = host_sealer
+            .seal(ack.inner_type(), &ack.encode_body())
+            .unwrap();
+        ipad.handle_datagram(T0, &record, 1_000);
+        assert_eq!(ipad.live_session(), Some(77));
+        (ipad, host_sealer)
+    }
+
+    #[test]
+    fn a_timestamp_at_the_limit_saturates_instead_of_overflowing() {
+        let mut ipad = client();
+        ipad.set_last_timestamp(u64::MAX);
+        assert_eq!(ipad.last_timestamp(), MAX_TIMESTAMP_US);
+        let msg1 = sent(&ipad.connect(T0, key(), u64::MAX)).remove(0);
+        assert_eq!(ipad.last_timestamp(), MAX_TIMESTAMP_US);
+        let parsed = wire::parse_msg1(&msg1).unwrap();
+        let host = Responder::read_msg1(&parsed, &key().k_dev, &HOST).unwrap();
+        assert_eq!(host.payload().timestamp_us, MAX_TIMESTAMP_US);
+    }
+
+    #[test]
+    fn the_receive_direction_near_its_limit_starts_a_reconnect_and_ends_at_it() {
+        let (mut ipad, mut host_sealer) = live_client();
+        // An unauthenticated record with a high counter changes nothing.
+        host_sealer.skip_to(MAX_RECORDS_PER_DIRECTION - 10);
+        let mut forged = host_sealer.seal(0x01, &[0; 8]).unwrap();
+        *forged.last_mut().unwrap() ^= 1;
+        ipad.handle_datagram(T0, &forged, 1_000);
+        assert!(sent(&ipad.poll(T0 + Duration::from_millis(10), 1_000)).is_empty());
+
+        // Authenticated records inside the margin start a reconnect.
+        host_sealer.skip_to(MAX_RECORDS_PER_DIRECTION - RECONNECT_RECORD_MARGIN);
+        let near = host_sealer.seal(0x01, &[0; 8]).unwrap();
+        ipad.handle_datagram(T0, &near, 1_000);
+        let out = ipad.poll(T0 + Duration::from_millis(20), 1_000);
+        assert!(ipad.is_connecting());
+        assert_eq!(sent(&out).len(), 1, "message 1 of the new attempt");
+        assert_eq!(ipad.live_session(), Some(77));
+
+        // The very last counter ends the session.
+        host_sealer.skip_to(MAX_RECORDS_PER_DIRECTION - 1);
+        let last = host_sealer.seal(0x01, &[0; 8]).unwrap();
+        ipad.handle_datagram(T0, &last, 1_000);
+        let out = ipad.poll(T0 + Duration::from_millis(30), 1_000);
+        assert!(out.contains(&ClientOutput::Closed {
+            session_id: 77,
+            reason: ClientClose::Expired
+        }));
+        assert_eq!(ipad.live_session(), None);
+    }
+
+    #[test]
+    fn while_confirming_only_input_is_held_back() {
+        let (mut ipad, _) = live_client();
+        // A second attempt reaches confirming.
+        let msg1 = sent(&ipad.connect(T0, key(), 2_000)).remove(0);
+        let parsed = wire::parse_msg1(&msg1).unwrap();
+        let host = Responder::read_msg1(&parsed, &key().k_dev, &HOST).unwrap();
+        let (msg2, _) = host
+            .write_msg2(&Msg2Payload::Accept(Accept {
+                session_id: 78,
+                ..Default::default()
+            }))
+            .unwrap();
+        ipad.handle_datagram(T0, &msg2, 2_000);
+        assert!(ipad.is_confirming());
+        assert!(ipad
+            .seal(T0, PacketType::InputEvent as u8, &[0; 30])
+            .is_none());
+        assert!(ipad
+            .seal(T0, PacketType::ReceiverReport as u8, &[0; 36])
+            .is_some());
+        assert!(ipad.seal(T0, PacketType::Ping as u8, &[0; 8]).is_some());
+    }
+
+    #[test]
+    fn keys_wipe_themselves() {
+        fn wipes_on_drop<T: ZeroizeOnDrop>() {}
+        wipes_on_drop::<ClientKey>();
+        let mut copy = key().clone();
+        copy.zeroize();
+        assert_eq!(copy.k_dev, [0; 32]);
+        assert_eq!(copy.dev_id, key().dev_id, "the id isn't secret");
+        assert!(
+            !format!("{:?}", key()).contains("36"),
+            "Debug hides the key"
+        );
+    }
+
+    #[test]
+    fn debug_never_prints_a_delivered_body() {
+        let output = ClientOutput::Deliver {
+            session_id: 1,
+            counter: 0,
+            inner_type: 0x01,
+            body: b"frame bytes".to_vec(),
+            draining: false,
+        };
+        let text = format!("{output:?}");
+        assert!(text.contains("body_len: 11"), "{text}");
+        assert!(!text.contains("102, 114"), "{text}");
+    }
 }

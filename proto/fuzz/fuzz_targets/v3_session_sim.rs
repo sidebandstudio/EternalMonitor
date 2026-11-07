@@ -44,7 +44,12 @@ fuzz_target!(|data: &[u8]| {
     let mut sim = Sim::new(seed);
     sim.latency = ms(u64::from(cursor.borrow_mut().byte()) * 4);
     sim.policy.durable_delay = ms(u64::from(cursor.borrow_mut().byte()) * 4);
-    sim.policy.refuse = cursor.borrow_mut().byte() & 1 == 1;
+    let flags = cursor.borrow_mut().byte();
+    sim.policy.refuse = flags & 1 == 1;
+    sim.policy.invalidate_before_refuse = flags & 2 == 2;
+    // Decisions from 0 to about 3 s late.
+    sim.policy.decision_delay = ms(u64::from(cursor.borrow_mut().byte()) * 12);
+    let second = sim.add_ipad(SimAddr { ip: 20, port: 1 });
     let net = cursor.clone();
     sim.fault = Box::new(move |_| {
         let b = net.borrow_mut().byte();
@@ -87,6 +92,21 @@ fuzz_target!(|data: &[u8]| {
             }
             3 => sim.revoke(),
             4 => sim.policy.refuse = !sim.policy.refuse,
+            6 => sim.connect_other(second),
+            7 => {
+                // Device 0 roams to a fuzzer-chosen address.
+                let ip = u16::from(cursor.borrow_mut().byte() % 4);
+                sim.roam(SimAddr { ip: 7 + ip, port: 50_000 });
+            }
+            8 => {
+                // Anything sent so far, replayed from a spoofed source.
+                let pick = usize::from(cursor.borrow_mut().byte());
+                let ip = u16::from(cursor.borrow_mut().byte());
+                if let Some(sent) = sim.sent.get(pick % sim.sent.len().max(1)) {
+                    let datagram = sent.datagram.clone();
+                    sim.inject_from(SimAddr { ip, port: ip }, &datagram);
+                }
+            }
             5 => {
                 let ticks = u64::from(cursor.borrow_mut().byte());
                 sim.run_for(ms(ticks * 8));

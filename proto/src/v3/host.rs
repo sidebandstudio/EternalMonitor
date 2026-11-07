@@ -4,12 +4,21 @@
 //! [`HostOutput`]s it returns. It never reads a clock, a socket or a disk:
 //! `now` is any monotonic [`Duration`], so tests drive it on a simulated
 //! clock. Durable work (the timestamp, Finalize, Remove) stays with the
-//! caller, which answers in three steps:
+//! caller, which answers in steps:
 //!
 //! 1. [`HostOutput::ConfirmRequested`]: a valid `SessionConfirm` arrived for a
 //!    pending session. The caller checks whether its record's Finalize would
-//!    conflict, then calls [`HostSessions::commit`] or, after retiring the
-//!    record durably, [`HostSessions::refuse`]. Every request gets one answer.
+//!    conflict, then either
+//!    - calls [`HostSessions::commit`], or
+//!    - calls [`HostSessions::prepare_refusal`], which keeps only the send key
+//!      and destroys the pending session, retires the record durably (the
+//!      invalidation procedure, whose step 1 may call
+//!      [`HostSessions::revoke`]), and then calls [`HostSessions::refuse`].
+//!
+//!    The decision must come within the pending session's lifetime. If the
+//!    pending session is replaced or times out first, a
+//!    [`HostOutput::ConfirmCancelled`] says so, and a late answer does
+//!    nothing.
 //! 2. [`HostOutput::Committed`]: the old session's keys are gone and the new
 //!    one is live. The caller persists the timestamp, runs the input
 //!    cutover, sends an IDR, and finalizes a pending record durably.
@@ -17,32 +26,44 @@
 //!
 //! Per `dev_id` there is at most one live and one pending session. Every
 //! packet for a `session_id` whose keys are gone is dropped without a reply.
+//! Application records only flow under a committed session.
 
 use std::collections::HashMap;
 use std::hash::Hash;
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use super::handshake::Responder;
 use super::record::{Opener, RecordHeader, Sealer};
-use super::wire::{self, Accept, HelloPayload, Msg2Payload, SessionMessage, SlotStatus, V3Kind};
-use super::{Id16, Key32, Random, MAX_RECORDS_PER_DIRECTION, SESSION_MAX_AGE};
+use super::wire::{
+    self, Accept, HelloPayload, Msg1, Msg2Payload, SessionMessage, SlotStatus, V3Kind,
+};
+use super::{
+    Id16, Key32, Random, Zeroizing, MAX_RECORDS_PER_DIRECTION, MAX_TIMESTAMP_US, SESSION_MAX_AGE,
+};
 use crate::v2::control::ByeReason;
 
 /// Timing and limits. The defaults are the spec's numbers.
 #[derive(Debug, Clone)]
 pub struct HostConfig {
     pub host_id: Id16,
-    /// How long a pending session waits for its `SessionConfirm`.
+    /// How long a pending session waits for its `SessionConfirm` and the
+    /// caller's decision on it.
     pub pending_lifetime: Duration,
     /// How long a timed-out message 1 is remembered and dropped.
     pub expired_msg1_lifetime: Duration,
+    /// Shortest gap between two resends of a cached message 2.
+    pub msg2_resend_interval: Duration,
+    /// `Stale` answers per `dev_id` per second.
+    pub stale_per_second: u32,
     /// Shortest gap between two re-sealed `SessionConfirmAck`s.
     pub confirm_ack_interval: Duration,
     /// How long a sealed `SessionRefused` is resent to its address.
     pub refusal_lifetime: Duration,
     /// Shortest gap between two resends of it.
     pub refusal_resend_interval: Duration,
-    /// Message 1s per source address per second, before any Diffie-Hellman.
+    /// Message 1s per source per second, before any Diffie-Hellman. The
+    /// source is [`PeerAddr::rate_bucket`].
     pub msg1_per_second: u32,
     /// Pending sessions host-wide.
     pub max_pending: usize,
@@ -58,6 +79,8 @@ impl HostConfig {
             host_id,
             pending_lifetime: Duration::from_secs(5),
             expired_msg1_lifetime: Duration::from_secs(30),
+            msg2_resend_interval: Duration::from_millis(100),
+            stale_per_second: 5,
             confirm_ack_interval: Duration::from_millis(50),
             refusal_lifetime: Duration::from_secs(5),
             refusal_resend_interval: Duration::from_millis(100),
@@ -69,12 +92,48 @@ impl HostConfig {
     }
 }
 
+/// A peer address. The message 1 rate limit counts per [`rate_bucket`]: the
+/// source IP, never the port, so one machine can't spread over many buckets.
+///
+/// [`rate_bucket`]: PeerAddr::rate_bucket
+pub trait PeerAddr: Clone + Eq + Hash {
+    type Bucket: Clone + Eq + Hash;
+    fn rate_bucket(&self) -> Self::Bucket;
+}
+
+impl PeerAddr for SocketAddr {
+    type Bucket = IpAddr;
+
+    /// The IPv4 address, or the IPv6 /64 (one host's usual allocation).
+    fn rate_bucket(&self) -> IpAddr {
+        match self.ip() {
+            IpAddr::V4(v4) => IpAddr::V4(v4),
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => IpAddr::V4(v4),
+                None => {
+                    let mut segments = v6.segments();
+                    segments[4..].fill(0);
+                    IpAddr::V6(Ipv6Addr::from(segments))
+                }
+            },
+        }
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl PeerAddr for u32 {
+    type Bucket = u32;
+    fn rate_bucket(&self) -> u32 {
+        *self
+    }
+}
+
 /// What the host's credential store answers. Phase 2 backs this with the
 /// record database; tests back it with a map.
 pub trait HostCredentials {
     /// `K_dev` for a `dev_id` the host accepts for reconnects (an active or
     /// pending record). `None` drops message 1 before any Diffie-Hellman.
-    fn key(&self, dev_id: &Id16) -> Option<Key32>;
+    fn key(&self, dev_id: &Id16) -> Option<Zeroizing<Key32>>;
     /// The last committed timestamp for this `dev_id`, or 0.
     fn last_committed_timestamp(&self, dev_id: &Id16) -> u64;
     /// The HelloAck fields for message 2. `session_id` is filled in here.
@@ -94,7 +153,7 @@ pub enum CloseReason {
     Liveness,
     /// The session reached its maximum age.
     Expired,
-    /// A direction used up its record counters.
+    /// A direction reached its record counter limit.
     Exhausted,
     /// The iPad sent a sealed BYE.
     PeerBye,
@@ -102,14 +161,23 @@ pub enum CloseReason {
     Shutdown,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `Debug` shows a delivered body's length, not its bytes.
+#[derive(Clone, PartialEq, Eq)]
 pub enum HostOutput<A> {
     Send {
         to: A,
         datagram: Vec<u8>,
     },
-    /// Answer with [`HostSessions::commit`] or [`HostSessions::refuse`].
+    /// Answer with [`HostSessions::commit`], or with
+    /// [`HostSessions::prepare_refusal`] and [`HostSessions::refuse`].
     ConfirmRequested {
+        dev_id: Id16,
+        session_id: u32,
+    },
+    /// A requested decision no longer applies: the pending session was
+    /// replaced by a newer attempt, timed out, or was revoked. A later
+    /// `commit` or `refuse` for it does nothing.
+    ConfirmCancelled {
         dev_id: Id16,
         session_id: u32,
     },
@@ -139,11 +207,78 @@ pub enum HostOutput<A> {
     },
 }
 
+impl<A: std::fmt::Debug> std::fmt::Debug for HostOutput<A> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Send { to, datagram } => f
+                .debug_struct("Send")
+                .field("to", to)
+                .field("len", &datagram.len())
+                .finish(),
+            Self::ConfirmRequested { dev_id, session_id } => f
+                .debug_struct("ConfirmRequested")
+                .field("dev_id", dev_id)
+                .field("session_id", session_id)
+                .finish(),
+            Self::ConfirmCancelled { dev_id, session_id } => f
+                .debug_struct("ConfirmCancelled")
+                .field("dev_id", dev_id)
+                .field("session_id", session_id)
+                .finish(),
+            Self::Committed {
+                dev_id,
+                session_id,
+                replaced,
+                timestamp_us,
+                peer,
+                ..
+            } => f
+                .debug_struct("Committed")
+                .field("dev_id", dev_id)
+                .field("session_id", session_id)
+                .field("replaced", replaced)
+                .field("timestamp_us", timestamp_us)
+                .field("peer", peer)
+                .finish_non_exhaustive(),
+            Self::Deliver {
+                dev_id,
+                session_id,
+                counter,
+                inner_type,
+                body,
+            } => f
+                .debug_struct("Deliver")
+                .field("dev_id", dev_id)
+                .field("session_id", session_id)
+                .field("counter", counter)
+                .field("inner_type", inner_type)
+                .field("body_len", &body.len())
+                .finish(),
+            Self::Closed {
+                dev_id,
+                session_id,
+                reason,
+            } => f
+                .debug_struct("Closed")
+                .field("dev_id", dev_id)
+                .field("session_id", session_id)
+                .field("reason", reason)
+                .finish(),
+        }
+    }
+}
+
 type Digest = [u8; 32];
 
-fn digest(bytes: &[u8]) -> Digest {
+/// Identifies a message 1 by its authenticated content only: `dev_id` (bound
+/// through the prologue) and the Noise message. The HELLO2 shell around it
+/// doesn't count, so changing shell bytes never makes a new message 1.
+fn msg1_key(msg1: &Msg1<'_>) -> Digest {
+    let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+    ctx.update(&msg1.dev_id);
+    ctx.update(msg1.noise);
     let mut out = [0u8; 32];
-    out.copy_from_slice(ring::digest::digest(&ring::digest::SHA256, bytes).as_ref());
+    out.copy_from_slice(ctx.finish().as_ref());
     out
 }
 
@@ -151,13 +286,15 @@ struct PendingSession<A> {
     session_id: u32,
     sealer: Sealer,
     opener: Opener,
-    msg1: Vec<u8>,
-    msg1_hash: Digest,
+    msg1_key: Digest,
     msg2: Vec<u8>,
+    last_msg2_sent: Duration,
     deadline: Duration,
     timestamp_us: u64,
     hello: HelloPayload,
     peer: A,
+    /// The counter of the authenticated record that last set `peer`.
+    peer_counter: Option<u64>,
     /// A `SessionConfirm` arrived and the caller hasn't answered yet.
     confirming: bool,
 }
@@ -166,15 +303,27 @@ struct LiveSession<A> {
     session_id: u32,
     sealer: Sealer,
     opener: Opener,
-    msg1_hash: Digest,
+    msg1_key: Digest,
     established: Duration,
     last_rx: Duration,
     peer: A,
+    peer_counter: Option<u64>,
     /// The caller called `ack`: everything the commit needed is durable.
     acked: bool,
     /// A `SessionConfirm` retry arrived before that.
     ack_owed: bool,
     last_ack: Option<Duration>,
+}
+
+impl<A: Clone> LiveSession<A> {
+    /// Follows the peer to a new address, but only for a record newer than
+    /// the one that last moved it, so a delayed copy can't move it back.
+    fn follow(&mut self, from: &A, counter: u64) {
+        if self.peer_counter.is_none_or(|c| counter > c) {
+            self.peer = from.clone();
+            self.peer_counter = Some(counter);
+        }
+    }
 }
 
 struct Device<A> {
@@ -195,6 +344,16 @@ impl<A> Default for Device<A> {
     }
 }
 
+/// A refused pending session between [`HostSessions::prepare_refusal`] and
+/// [`HostSessions::refuse`]: its send key and where to send, nothing else.
+struct RefusalContext<A> {
+    dev_id: Id16,
+    session_id: u32,
+    peer: A,
+    sealer: Sealer,
+    deadline: Duration,
+}
+
 /// A sealed `SessionRefused` kept for resending after its keys are gone.
 struct Refusal<A> {
     session_id: u32,
@@ -210,24 +369,49 @@ struct RateWindow {
     count: u32,
 }
 
-/// Source addresses tracked by the message 1 rate limit. Beyond this, new
-/// addresses share one bucket.
+impl RateWindow {
+    fn allow(&mut self, now: Duration, limit: u32) -> bool {
+        if now.saturating_sub(self.start) >= Duration::from_secs(1) {
+            *self = RateWindow {
+                start: now,
+                count: 0,
+            };
+        }
+        if self.count >= limit {
+            return false;
+        }
+        self.count += 1;
+        true
+    }
+}
+
+/// Per-`dev_id` budget for `Stale` answers, with the last one cached so a
+/// replayed message 1 is answered without another Diffie-Hellman.
+struct StaleBudget {
+    window: RateWindow,
+    last: Option<(Digest, Vec<u8>)>,
+}
+
+/// Sources tracked by the message 1 rate limit. Beyond this, new sources
+/// share one bucket.
 const MAX_RATE_ENTRIES: usize = 1024;
 /// Remembered timed-out message 1s.
 const MAX_EXPIRED_MSG1: usize = 4096;
 
-pub struct HostSessions<A> {
+pub struct HostSessions<A: PeerAddr> {
     config: HostConfig,
     rng: Box<dyn Random + Send>,
     devices: HashMap<Id16, Device<A>>,
     sessions: HashMap<u32, Id16>,
     expired_msg1: HashMap<Digest, Duration>,
+    refusal_contexts: Vec<RefusalContext<A>>,
     refusals: Vec<Refusal<A>>,
-    rate: HashMap<A, RateWindow>,
+    rate: HashMap<A::Bucket, RateWindow>,
     overflow_rate: RateWindow,
+    stale: HashMap<Id16, StaleBudget>,
 }
 
-impl<A: Clone + Eq + Hash> HostSessions<A> {
+impl<A: PeerAddr> HostSessions<A> {
     pub fn new(config: HostConfig, rng: Box<dyn Random + Send>) -> Self {
         Self {
             config,
@@ -235,12 +419,14 @@ impl<A: Clone + Eq + Hash> HostSessions<A> {
             devices: HashMap::new(),
             sessions: HashMap::new(),
             expired_msg1: HashMap::new(),
+            refusal_contexts: Vec::new(),
             refusals: Vec::new(),
             rate: HashMap::new(),
             overflow_rate: RateWindow {
                 start: Duration::ZERO,
                 count: 0,
             },
+            stale: HashMap::new(),
         }
     }
 
@@ -293,27 +479,28 @@ impl<A: Clone + Eq + Hash> HostSessions<A> {
 
     fn allow_msg1(&mut self, now: Duration, from: &A) -> bool {
         let limit = self.config.msg1_per_second;
-        let window = if let Some(w) = self.rate.get_mut(from) {
+        let bucket = from.rate_bucket();
+        let window = if let Some(w) = self.rate.get_mut(&bucket) {
             w
         } else if self.rate.len() < MAX_RATE_ENTRIES {
-            self.rate.entry(from.clone()).or_insert(RateWindow {
+            self.rate.entry(bucket).or_insert(RateWindow {
                 start: now,
                 count: 0,
             })
         } else {
             &mut self.overflow_rate
         };
-        if now.saturating_sub(window.start) >= Duration::from_secs(1) {
-            *window = RateWindow {
+        window.allow(now, limit)
+    }
+
+    fn stale_budget(&mut self, dev_id: &Id16, now: Duration) -> &mut StaleBudget {
+        self.stale.entry(*dev_id).or_insert(StaleBudget {
+            window: RateWindow {
                 start: now,
                 count: 0,
-            };
-        }
-        if window.count >= limit {
-            return false;
-        }
-        window.count += 1;
-        true
+            },
+            last: None,
+        })
     }
 
     fn handle_msg1(
@@ -330,26 +517,40 @@ impl<A: Clone + Eq + Hash> HostSessions<A> {
         if !self.allow_msg1(now, from) {
             return;
         }
-        let hash = digest(datagram);
+        let key = msg1_key(&msg1);
         if self
             .expired_msg1
-            .get(&hash)
+            .get(&key)
             .is_some_and(|&until| now < until)
         {
             return;
         }
         let dev_id = msg1.dev_id;
-        if let Some(device) = self.devices.get(&dev_id) {
-            if let Some(p) = &device.pending {
-                if p.msg1 == datagram {
+        let resend_interval = self.config.msg2_resend_interval;
+        if let Some(device) = self.devices.get_mut(&dev_id) {
+            if let Some(p) = device.pending.as_mut().filter(|p| p.msg1_key == key) {
+                if now.saturating_sub(p.last_msg2_sent) >= resend_interval {
+                    p.last_msg2_sent = now;
                     out.push(HostOutput::Send {
                         to: from.clone(),
                         datagram: p.msg2.clone(),
                     });
-                    return;
                 }
+                return;
             }
-            if device.live.as_ref().is_some_and(|l| l.msg1_hash == hash) {
+            if device.live.as_ref().is_some_and(|l| l.msg1_key == key) {
+                return;
+            }
+        }
+        let stale_limit = self.config.stale_per_second;
+        if let Some(budget) = self.stale.get_mut(&dev_id) {
+            if let Some((_, msg2)) = budget.last.as_ref().filter(|(k, _)| *k == key) {
+                if budget.window.allow(now, stale_limit) {
+                    out.push(HostOutput::Send {
+                        to: from.clone(),
+                        datagram: msg2.clone(),
+                    });
+                }
                 return;
             }
         }
@@ -366,17 +567,26 @@ impl<A: Clone + Eq + Hash> HostSessions<A> {
         let Ok(responder) = Responder::read_msg1(&msg1, &k_dev, &self.config.host_id) else {
             return;
         };
+        drop(k_dev);
         let timestamp_us = responder.payload().timestamp_us;
+        if timestamp_us > MAX_TIMESTAMP_US {
+            return;
+        }
         let committed = creds.last_committed_timestamp(&dev_id).max(
             self.devices
                 .get(&dev_id)
                 .map_or(0, |d| d.committed_timestamp),
         );
         if timestamp_us <= committed {
+            let budget = self.stale_budget(&dev_id, now);
+            if !budget.window.allow(now, stale_limit) {
+                return;
+            }
             let reply = Msg2Payload::Stale {
                 stored_timestamp_us: committed,
             };
             if let Ok((msg2, _)) = responder.write_msg2(&reply) {
+                self.stale_budget(&dev_id, now).last = Some((key, msg2.clone()));
                 out.push(HostOutput::Send {
                     to: from.clone(),
                     datagram: msg2,
@@ -385,9 +595,8 @@ impl<A: Clone + Eq + Hash> HostSessions<A> {
             return;
         }
         if let Some(p) = self.devices.get(&dev_id).and_then(|d| d.pending.as_ref()) {
-            if p.confirming || timestamp_us <= p.timestamp_us {
-                // A late copy from an older attempt, or the current one is
-                // being decided.
+            if timestamp_us <= p.timestamp_us {
+                // A late copy from an older attempt.
                 return;
             }
         }
@@ -399,19 +608,22 @@ impl<A: Clone + Eq + Hash> HostSessions<A> {
             return;
         };
         let (sealer, opener) = keys.responder(session_id);
-        self.destroy_pending(&dev_id, now);
+        // A newer attempt replaces the pending one, even while its
+        // confirmation is being decided.
+        self.destroy_pending(&dev_id, now, out);
         self.sessions.insert(session_id, dev_id);
         self.devices.entry(dev_id).or_default().pending = Some(PendingSession {
             session_id,
             sealer,
             opener,
-            msg1: datagram.to_vec(),
-            msg1_hash: hash,
+            msg1_key: key,
             msg2: msg2.clone(),
+            last_msg2_sent: now,
             deadline: now + self.config.pending_lifetime,
             timestamp_us,
             hello,
             peer: from.clone(),
+            peer_counter: None,
             confirming: false,
         });
         out.push(HostOutput::Send {
@@ -464,6 +676,10 @@ impl<A: Clone + Eq + Hash> HostSessions<A> {
             let Ok(opened) = p.opener.open(datagram) else {
                 return;
             };
+            if p.peer_counter.is_none_or(|c| opened.counter > c) {
+                p.peer = from.clone();
+                p.peer_counter = Some(opened.counter);
+            }
             // Only SessionConfirm commits. Anything else under a pending
             // session is dropped.
             if let Ok(Some(SessionMessage::Confirm)) =
@@ -471,7 +687,6 @@ impl<A: Clone + Eq + Hash> HostSessions<A> {
             {
                 if !p.confirming {
                     p.confirming = true;
-                    p.peer = from.clone();
                     out.push(HostOutput::ConfirmRequested {
                         dev_id,
                         session_id: p.session_id,
@@ -496,7 +711,7 @@ impl<A: Clone + Eq + Hash> HostSessions<A> {
             return;
         };
         live.last_rx = now;
-        live.peer = from.clone();
+        live.follow(from, opened.counter);
         match SessionMessage::parse(opened.inner_type, &opened.body) {
             Ok(None) => out.push(HostOutput::Deliver {
                 dev_id,
@@ -553,17 +768,21 @@ impl<A: Clone + Eq + Hash> HostSessions<A> {
 
     /// Commits the pending session named by a [`HostOutput::ConfirmRequested`].
     /// Zeroes the live session it replaces. Does nothing if that pending
-    /// session is gone (revoked in the meantime).
+    /// session is gone or past its lifetime.
     pub fn commit(&mut self, now: Duration, dev_id: &Id16, session_id: u32) -> Vec<HostOutput<A>> {
         let mut out = Vec::new();
         let Some(device) = self.devices.get_mut(dev_id) else {
             return out;
         };
-        if !device
+        let Some(p) = device
             .pending
             .as_ref()
-            .is_some_and(|p| p.session_id == session_id && p.confirming)
-        {
+            .filter(|p| p.session_id == session_id && p.confirming)
+        else {
+            return out;
+        };
+        if now >= p.deadline {
+            self.destroy_pending(dev_id, now, &mut out);
             return out;
         }
         let p = device.pending.take().expect("checked above");
@@ -581,10 +800,11 @@ impl<A: Clone + Eq + Hash> HostSessions<A> {
             session_id,
             sealer: p.sealer,
             opener: p.opener,
-            msg1_hash: p.msg1_hash,
+            msg1_key: p.msg1_key,
             established: now,
             last_rx: now,
             peer: p.peer.clone(),
+            peer_counter: p.peer_counter,
             acked: false,
             ack_owed: false,
             last_ack: None,
@@ -622,11 +842,42 @@ impl<A: Clone + Eq + Hash> HostSessions<A> {
         out
     }
 
-    /// Refuses a pending session whose record conflicted at Finalize. Call it
-    /// after the record is retired durably, so `creds.slot_status` carries
-    /// its tombstone. Seals `SessionRefused` once, keeps only those bytes for
-    /// resending to the same address, and destroys the keys. The live
-    /// session is untouched.
+    /// Starts refusing a pending session whose record conflicts at Finalize.
+    /// Keeps a send-only context (its send key, its `session_id`, the
+    /// confirm's address) and destroys everything else, including the
+    /// receive key. Nothing that later ends the `dev_id`'s sessions, such as
+    /// [`revoke`](Self::revoke) at step 1 of the invalidation procedure,
+    /// touches the context. Returns false if the pending session is gone.
+    pub fn prepare_refusal(&mut self, now: Duration, dev_id: &Id16, session_id: u32) -> bool {
+        let Some(device) = self.devices.get_mut(dev_id) else {
+            return false;
+        };
+        if !device
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.session_id == session_id && p.confirming && now < p.deadline)
+        {
+            return false;
+        }
+        let p = device.pending.take().expect("checked above");
+        self.sessions.remove(&session_id);
+        self.remember_expired(p.msg1_key, now);
+        self.refusal_contexts.push(RefusalContext {
+            dev_id: *dev_id,
+            session_id,
+            peer: p.peer,
+            sealer: p.sealer,
+            deadline: now + self.config.pending_lifetime,
+        });
+        true
+    }
+
+    /// Seals `SessionRefused` for a prepared refusal. Call it once the record
+    /// is retired durably, so `creds.slot_status` carries its tombstone. The
+    /// send key is destroyed right after this one seal; only the sealed bytes
+    /// are kept, for resending to the same address. A confirming pending
+    /// session that wasn't prepared is prepared here first. The live session
+    /// is untouched.
     pub fn refuse(
         &mut self,
         now: Duration,
@@ -635,27 +886,40 @@ impl<A: Clone + Eq + Hash> HostSessions<A> {
         creds: &dyn HostCredentials,
     ) -> Vec<HostOutput<A>> {
         let mut out = Vec::new();
-        let Some(device) = self.devices.get_mut(dev_id) else {
-            return out;
+        let find = |contexts: &[RefusalContext<A>]| {
+            contexts
+                .iter()
+                .position(|c| c.session_id == session_id && c.dev_id == *dev_id)
         };
-        if !device
-            .pending
-            .as_ref()
-            .is_some_and(|p| p.session_id == session_id && p.confirming)
-        {
+        let index = match find(&self.refusal_contexts) {
+            Some(index) => index,
+            None => {
+                if !self.prepare_refusal(now, dev_id, session_id) {
+                    return out;
+                }
+                find(&self.refusal_contexts).expect("just prepared")
+            }
+        };
+        let mut context = self.refusal_contexts.swap_remove(index);
+        if now >= context.deadline {
+            out.push(HostOutput::ConfirmCancelled {
+                dev_id: *dev_id,
+                session_id,
+            });
             return out;
         }
-        let mut p = device.pending.take().expect("checked above");
-        self.sessions.remove(&session_id);
         let message = SessionMessage::Refused(creds.slot_status(dev_id));
-        if let Ok(sealed) = p.sealer.seal(message.inner_type(), &message.encode_body()) {
+        if let Ok(sealed) = context
+            .sealer
+            .seal(message.inner_type(), &message.encode_body())
+        {
             out.push(HostOutput::Send {
-                to: p.peer.clone(),
+                to: context.peer.clone(),
                 datagram: sealed.clone(),
             });
             self.refusals.push(Refusal {
                 session_id,
-                peer: p.peer,
+                peer: context.peer,
                 sealed,
                 until: now + self.config.refusal_lifetime,
                 last_sent: now,
@@ -689,7 +953,7 @@ impl<A: Clone + Eq + Hash> HostSessions<A> {
         reason: CloseReason,
         out: &mut Vec<HostOutput<A>>,
     ) {
-        self.destroy_pending(dev_id, now);
+        self.destroy_pending(dev_id, now, out);
         let Some(device) = self.devices.get_mut(dev_id) else {
             return;
         };
@@ -722,14 +986,23 @@ impl<A: Clone + Eq + Hash> HostSessions<A> {
         }
     }
 
-    fn destroy_pending(&mut self, dev_id: &Id16, now: Duration) {
+    /// Destroys the pending session for `dev_id`, if any, and remembers its
+    /// message 1 so late copies are dropped. A decision still owed on it is
+    /// cancelled.
+    fn destroy_pending(&mut self, dev_id: &Id16, now: Duration, out: &mut Vec<HostOutput<A>>) {
         if let Some(p) = self.devices.get_mut(dev_id).and_then(|d| d.pending.take()) {
             self.sessions.remove(&p.session_id);
-            self.remember_expired(p.msg1_hash, now);
+            self.remember_expired(p.msg1_key, now);
+            if p.confirming {
+                out.push(HostOutput::ConfirmCancelled {
+                    dev_id: *dev_id,
+                    session_id: p.session_id,
+                });
+            }
         }
     }
 
-    fn remember_expired(&mut self, hash: Digest, now: Duration) {
+    fn remember_expired(&mut self, key: Digest, now: Duration) {
         if self.expired_msg1.len() >= MAX_EXPIRED_MSG1 {
             self.expired_msg1.retain(|_, until| *until > now);
             if self.expired_msg1.len() >= MAX_EXPIRED_MSG1 {
@@ -737,7 +1010,7 @@ impl<A: Clone + Eq + Hash> HostSessions<A> {
             }
         }
         self.expired_msg1
-            .insert(hash, now + self.config.expired_msg1_lifetime);
+            .insert(key, now + self.config.expired_msg1_lifetime);
     }
 
     /// Seals an application message for the live session of `dev_id`.
@@ -758,26 +1031,25 @@ impl<A: Clone + Eq + Hash> HostSessions<A> {
         Some((live.peer.clone(), record))
     }
 
-    /// Runs the timers: pending deadlines, liveness, maximum age, counter
-    /// limits, and the expiry of remembered message 1s, refusals and rate
-    /// windows. Call it often; every 10-50 ms is plenty.
+    /// Runs the timers: pending and decision deadlines, liveness, maximum
+    /// age, counter limits in both directions, and the expiry of remembered
+    /// message 1s, refusals and rate windows. Call it often; every 10-50 ms is
+    /// plenty.
     pub fn poll(&mut self, now: Duration) -> Vec<HostOutput<A>> {
         let mut out = Vec::new();
         let ids: Vec<Id16> = self.devices.keys().copied().collect();
         for dev_id in ids {
             let device = &self.devices[&dev_id];
-            if device
-                .pending
-                .as_ref()
-                .is_some_and(|p| !p.confirming && now >= p.deadline)
-            {
-                self.destroy_pending(&dev_id, now);
+            if device.pending.as_ref().is_some_and(|p| now >= p.deadline) {
+                self.destroy_pending(&dev_id, now, &mut out);
             }
             let device = &self.devices[&dev_id];
             if let Some(live) = &device.live {
                 let reason = if now.saturating_sub(live.established) >= self.config.max_age {
                     Some(CloseReason::Expired)
-                } else if live.sealer.sealed() >= MAX_RECORDS_PER_DIRECTION {
+                } else if live.sealer.sealed() >= MAX_RECORDS_PER_DIRECTION
+                    || live.opener.highest() == Some(MAX_RECORDS_PER_DIRECTION - 1)
+                {
                     Some(CloseReason::Exhausted)
                 } else if now.saturating_sub(live.last_rx) >= self.config.liveness_timeout {
                     Some(CloseReason::Liveness)
@@ -793,10 +1065,24 @@ impl<A: Clone + Eq + Hash> HostSessions<A> {
                 self.devices.remove(&dev_id);
             }
         }
+        let mut cancelled = Vec::new();
+        self.refusal_contexts.retain(|c| {
+            let keep = now < c.deadline;
+            if !keep {
+                cancelled.push(HostOutput::ConfirmCancelled {
+                    dev_id: c.dev_id,
+                    session_id: c.session_id,
+                });
+            }
+            keep
+        });
+        out.extend(cancelled);
         self.expired_msg1.retain(|_, until| *until > now);
         self.refusals.retain(|r| r.until > now);
         self.rate
             .retain(|_, w| now.saturating_sub(w.start) < Duration::from_secs(1));
+        self.stale
+            .retain(|_, b| now.saturating_sub(b.window.start) < Duration::from_secs(1));
         out
     }
 
@@ -808,6 +1094,7 @@ impl<A: Clone + Eq + Hash> HostSessions<A> {
             if id != 0
                 && !self.sessions.contains_key(&id)
                 && !self.refusals.iter().any(|r| r.session_id == id)
+                && !self.refusal_contexts.iter().any(|c| c.session_id == id)
             {
                 return id;
             }
@@ -837,6 +1124,10 @@ impl<A: Clone + Eq + Hash> HostSessions<A> {
         for r in &self.refusals {
             assert!(!self.sessions.contains_key(&r.session_id));
         }
+        for c in &self.refusal_contexts {
+            assert!(!self.sessions.contains_key(&c.session_id));
+            assert!(!self.refusals.iter().any(|r| r.session_id == c.session_id));
+        }
     }
 }
 
@@ -844,6 +1135,7 @@ impl<A: Clone + Eq + Hash> HostSessions<A> {
 mod tests {
     use super::*;
     use crate::v3::handshake::Initiator;
+    use crate::v3::record::SessionKeys;
     use crate::v3::SeededRandom;
     use std::cell::RefCell;
 
@@ -859,8 +1151,8 @@ mod tests {
     }
 
     impl HostCredentials for Creds {
-        fn key(&self, dev_id: &Id16) -> Option<Key32> {
-            self.keys.get(dev_id).copied()
+        fn key(&self, dev_id: &Id16) -> Option<Zeroizing<Key32>> {
+            self.keys.get(dev_id).copied().map(Zeroizing::new)
         }
         fn last_committed_timestamp(&self, _: &Id16) -> u64 {
             *self.timestamp.borrow()
@@ -895,7 +1187,7 @@ mod tests {
         }
     }
 
-    fn sends(out: &[HostOutput<u32>]) -> Vec<Vec<u8>> {
+    fn sends<A: Clone>(out: &[HostOutput<A>]) -> Vec<Vec<u8>> {
         out.iter()
             .filter_map(|o| match o {
                 HostOutput::Send { datagram, .. } => Some(datagram.clone()),
@@ -906,21 +1198,94 @@ mod tests {
 
     const T0: Duration = Duration::from_secs(100);
 
+    fn ms(value: u64) -> Duration {
+        Duration::from_millis(value)
+    }
+
+    /// Runs a handshake up to a confirm the host has seen. Returns the iPad's
+    /// halves and the session id.
+    fn confirming(
+        host: &mut HostSessions<u32>,
+        creds: &Creds,
+        ts: u64,
+        at: Duration,
+    ) -> (Sealer, Opener, u32) {
+        let mut ipad = Initiator::start(&K, &DEV, &HOST, ts as u32, &hello(ts)).unwrap();
+        let msg2 = sends(&host.handle_datagram(at, &ADDR, ipad.msg1(), creds)).remove(0);
+        let (reply, keys) = ipad.read_msg2(&msg2).unwrap();
+        let Msg2Payload::Accept(accept) = reply else {
+            panic!()
+        };
+        let (mut sealer, opener) = keys.unwrap().initiator(accept.session_id);
+        let confirm = sealer.seal(wire::INNER_SESSION_CONFIRM, &[]).unwrap();
+        let out = host.handle_datagram(at, &ADDR, &confirm, creds);
+        assert!(matches!(out[..], [HostOutput::ConfirmRequested { .. }]));
+        (sealer, opener, accept.session_id)
+    }
+
+    fn live(
+        host: &mut HostSessions<u32>,
+        creds: &Creds,
+        ts: u64,
+        at: Duration,
+    ) -> (Sealer, Opener, u32) {
+        let (sealer, opener, sid) = confirming(host, creds, ts, at);
+        host.commit(at, &DEV, sid);
+        host.ack(at, &DEV, sid, creds);
+        (sealer, opener, sid)
+    }
+
     #[test]
     fn identical_message_1_gets_the_same_message_2_and_no_second_pending() {
         let (mut host, creds) = setup();
         let ipad = Initiator::start(&K, &DEV, &HOST, 1, &hello(10)).unwrap();
         let first = sends(&host.handle_datagram(T0, &ADDR, ipad.msg1(), &creds));
         let pending = host.pending_session(&DEV).unwrap();
-        let again = sends(&host.handle_datagram(
-            T0 + Duration::from_millis(250),
-            &ADDR,
-            ipad.msg1(),
-            &creds,
-        ));
+        let again = sends(&host.handle_datagram(T0 + ms(250), &ADDR, ipad.msg1(), &creds));
         assert_eq!(first, again);
         assert_eq!(host.pending_session(&DEV), Some(pending));
         host.check_invariants();
+    }
+
+    #[test]
+    fn cached_message_2_is_resent_at_most_every_100_ms() {
+        let (mut host, creds) = setup();
+        let ipad = Initiator::start(&K, &DEV, &HOST, 1, &hello(10)).unwrap();
+        assert_eq!(
+            sends(&host.handle_datagram(T0, &ADDR, ipad.msg1(), &creds)).len(),
+            1
+        );
+        let replies: usize = (1..=10)
+            .map(|i| {
+                sends(&host.handle_datagram(T0 + ms(10 * i), &ADDR, ipad.msg1(), &creds)).len()
+            })
+            .sum();
+        assert_eq!(replies, 1, "only the copy at 100 ms is answered");
+    }
+
+    #[test]
+    fn shell_bytes_never_make_a_new_message_1() {
+        let (mut host, creds) = setup();
+        let ipad = Initiator::start(&K, &DEV, &HOST, 1, &hello(10)).unwrap();
+        let msg2 = sends(&host.handle_datagram(T0, &ADDR, ipad.msg1(), &creds));
+        let pending = host.pending_session(&DEV).unwrap();
+        let mut renonced = ipad.msg1().to_vec();
+        renonced[18] ^= 0xFF; // client_nonce, outside the authenticated part
+        assert_eq!(
+            sends(&host.handle_datagram(T0 + ms(200), &ADDR, &renonced, &creds)),
+            msg2,
+            "same message 1: the cached message 2"
+        );
+        assert_eq!(host.pending_session(&DEV), Some(pending));
+
+        // Once timed out, a copy with changed shell bytes is still dropped.
+        host.poll(T0 + Duration::from_secs(5));
+        assert!(host.pending_session(&DEV).is_none());
+        renonced[19] ^= 0x55;
+        assert!(host
+            .handle_datagram(T0 + Duration::from_secs(6), &ADDR, &renonced, &creds)
+            .is_empty());
+        assert!(host.pending_session(&DEV).is_none());
     }
 
     #[test]
@@ -944,15 +1309,115 @@ mod tests {
     }
 
     #[test]
+    fn a_newer_message_1_replaces_a_confirming_pending_and_cancels_its_decision() {
+        let (mut host, creds) = setup();
+        let (mut old_sealer, _, s) = live(&mut host, &creds, 10, T0);
+        let (_, _, n) = confirming(&mut host, &creds, 20, T0 + ms(10));
+        let newer = Initiator::start(&K, &DEV, &HOST, 3, &hello(30)).unwrap();
+        let out = host.handle_datagram(T0 + ms(2100), &ADDR, newer.msg1(), &creds);
+        assert!(out.contains(&HostOutput::ConfirmCancelled {
+            dev_id: DEV,
+            session_id: n
+        }));
+        assert_ne!(host.pending_session(&DEV), Some(n));
+        // The late decision changes nothing: the live session survives.
+        assert!(host.commit(T0 + ms(2500), &DEV, n).is_empty());
+        assert_eq!(host.live_session(&DEV), Some(s));
+        let report = old_sealer.seal(0x15, &[0; 36]).unwrap();
+        assert!(matches!(
+            host.handle_datagram(T0 + ms(2600), &ADDR, &report, &creds)[..],
+            [HostOutput::Deliver { .. }]
+        ));
+        host.check_invariants();
+    }
+
+    #[test]
+    fn a_confirming_pending_still_times_out_and_a_late_commit_does_nothing() {
+        let (mut host, creds) = setup();
+        let (mut old_sealer, _, s) = live(&mut host, &creds, 10, T0);
+        let (_, _, n) = confirming(&mut host, &creds, 20, T0 + ms(10));
+        let report = old_sealer.seal(0x15, &[0; 36]).unwrap();
+        host.handle_datagram(T0 + Duration::from_secs(4), &ADDR, &report, &creds);
+        let out = host.poll(T0 + ms(10) + Duration::from_secs(5));
+        assert!(out.contains(&HostOutput::ConfirmCancelled {
+            dev_id: DEV,
+            session_id: n
+        }));
+        assert!(host.pending_session(&DEV).is_none());
+        assert!(host.commit(T0 + Duration::from_secs(6), &DEV, n).is_empty());
+        assert_eq!(host.live_session(&DEV), Some(s));
+    }
+
+    #[test]
+    fn a_commit_after_the_deadline_but_before_poll_does_nothing() {
+        let (mut host, creds) = setup();
+        let (_, _, s) = live(&mut host, &creds, 10, T0);
+        let (_, _, n) = confirming(&mut host, &creds, 20, T0);
+        let out = host.commit(T0 + Duration::from_secs(5), &DEV, n);
+        assert_eq!(
+            out,
+            vec![HostOutput::ConfirmCancelled {
+                dev_id: DEV,
+                session_id: n
+            }]
+        );
+        assert_eq!(host.live_session(&DEV), Some(s));
+    }
+
+    #[test]
+    fn a_prepared_refusal_survives_revoke_and_seals_once_after_retirement() {
+        let (mut host, creds) = setup();
+        let (mut sealer, opener, n) = confirming(&mut host, &creds, 20, T0);
+        assert!(host.prepare_refusal(T0, &DEV, n));
+        assert!(host.pending_session(&DEV).is_none(), "pending destroyed");
+        // Step 1 of the invalidation procedure ends the dev_id's sessions.
+        host.revoke(T0 + ms(1), &DEV);
+        // Confirm retries meanwhile get nothing: no receive key, no reply.
+        let retry = sealer.seal(wire::INNER_SESSION_CONFIRM, &[]).unwrap();
+        assert!(host
+            .handle_datagram(T0 + ms(50), &ADDR, &retry, &creds)
+            .is_empty());
+        let out = host.refuse(T0 + ms(300), &DEV, n, &creds);
+        let sealed = sends(&out);
+        assert_eq!(sealed.len(), 1);
+        let opened = opener.open(&sealed[0]).unwrap();
+        assert_eq!(opened.inner_type, wire::INNER_SESSION_REFUSED);
+        // Sealed once: a second refuse finds no context, and retries get the
+        // same bytes.
+        assert!(host.refuse(T0 + ms(301), &DEV, n, &creds).is_empty());
+        let retry = sealer.seal(wire::INNER_SESSION_CONFIRM, &[]).unwrap();
+        assert_eq!(
+            sends(&host.handle_datagram(T0 + ms(450), &ADDR, &retry, &creds)),
+            sealed
+        );
+        host.check_invariants();
+    }
+
+    #[test]
+    fn an_unused_refusal_context_expires() {
+        let (mut host, creds) = setup();
+        let (_, _, n) = confirming(&mut host, &creds, 20, T0);
+        assert!(host.prepare_refusal(T0, &DEV, n));
+        let out = host.poll(T0 + Duration::from_secs(5));
+        assert!(out.contains(&HostOutput::ConfirmCancelled {
+            dev_id: DEV,
+            session_id: n
+        }));
+        assert!(host
+            .refuse(T0 + Duration::from_secs(6), &DEV, n, &creds)
+            .is_empty());
+    }
+
+    #[test]
     fn pending_times_out_after_5_s_and_its_message_1_is_dropped_for_30_s() {
         let (mut host, creds) = setup();
         let ipad = Initiator::start(&K, &DEV, &HOST, 1, &hello(10)).unwrap();
         host.handle_datagram(T0, &ADDR, ipad.msg1(), &creds);
-        host.poll(T0 + Duration::from_millis(4999));
+        host.poll(T0 + ms(4999));
         assert!(host.pending_session(&DEV).is_some());
         host.poll(T0 + Duration::from_secs(5));
         assert!(host.pending_session(&DEV).is_none());
-        let late = T0 + Duration::from_secs(5) + Duration::from_millis(29_999);
+        let late = T0 + Duration::from_secs(5) + ms(29_999);
         assert!(host
             .handle_datagram(late, &ADDR, ipad.msg1(), &creds)
             .is_empty());
@@ -1000,6 +1465,29 @@ mod tests {
     }
 
     #[test]
+    fn the_rate_limit_counts_per_ip_not_per_port() {
+        let mut creds = Creds::default();
+        creds.keys.insert(DEV, K);
+        let mut host: HostSessions<SocketAddr> =
+            HostSessions::new(HostConfig::new(HOST), Box::new(SeededRandom::new(2)));
+        let answered = (0..25u16)
+            .filter(|&i| {
+                let ipad = Initiator::start(&K, &DEV, &HOST, 1, &hello(10 + u64::from(i))).unwrap();
+                let from = SocketAddr::from(([10, 0, 0, 7], 40_000 + i));
+                !host
+                    .handle_datagram(T0, &from, ipad.msg1(), &creds)
+                    .is_empty()
+            })
+            .count();
+        assert_eq!(answered, 20, "25 ports, one IP, one bucket");
+        let v6 =
+            |tail: u16| SocketAddr::from((Ipv6Addr::new(0x2001, 0xdb8, 1, 2, 0, 0, tail, 1), 9));
+        assert_eq!(v6(1).rate_bucket(), v6(2).rate_bucket(), "one /64");
+        let mapped = SocketAddr::from((Ipv6Addr::from([0, 0, 0, 0, 0, 0xffff, 0x0a00, 7]), 9));
+        assert_eq!(mapped.rate_bucket(), IpAddr::from([10, 0, 0, 7]));
+    }
+
+    #[test]
     fn pending_sessions_are_capped_host_wide() {
         let (mut host, mut creds) = setup();
         for i in 0..20u8 {
@@ -1032,6 +1520,44 @@ mod tests {
     }
 
     #[test]
+    fn stale_answers_are_capped_at_5_per_second_per_dev_id_and_replays_reuse_the_cache() {
+        let (mut host, creds) = setup();
+        *creds.timestamp.borrow_mut() = 1000;
+        let answered = (0..10u32)
+            .filter(|&i| {
+                let ipad =
+                    Initiator::start(&K, &DEV, &HOST, i, &hello(500 + u64::from(i))).unwrap();
+                !host
+                    .handle_datagram(T0, &(100 + i), ipad.msg1(), &creds)
+                    .is_empty()
+            })
+            .count();
+        assert_eq!(answered, 5);
+
+        let replayed = Initiator::start(&K, &DEV, &HOST, 1, &hello(900)).unwrap();
+        let later = T0 + Duration::from_secs(2);
+        let first = sends(&host.handle_datagram(later, &7, replayed.msg1(), &creds));
+        let again = sends(&host.handle_datagram(later, &8, replayed.msg1(), &creds));
+        assert_eq!(first.len(), 1);
+        assert_eq!(first, again, "the cached answer, not a new handshake");
+    }
+
+    #[test]
+    fn a_timestamp_beyond_the_bound_is_dropped() {
+        let (mut host, creds) = setup();
+        let ipad = Initiator::start(&K, &DEV, &HOST, 1, &hello(MAX_TIMESTAMP_US + 1)).unwrap();
+        assert!(host
+            .handle_datagram(T0, &ADDR, ipad.msg1(), &creds)
+            .is_empty());
+        assert!(host.pending_session(&DEV).is_none());
+        let ipad = Initiator::start(&K, &DEV, &HOST, 2, &hello(MAX_TIMESTAMP_US)).unwrap();
+        assert_eq!(
+            sends(&host.handle_datagram(T0, &ADDR, ipad.msg1(), &creds)).len(),
+            1
+        );
+    }
+
+    #[test]
     fn records_under_a_pending_session_other_than_confirm_are_dropped() {
         let (mut host, creds) = setup();
         let mut ipad = Initiator::start(&K, &DEV, &HOST, 1, &hello(10)).unwrap();
@@ -1059,5 +1585,59 @@ mod tests {
         let mut unknown = confirm.clone();
         unknown[8] ^= 1;
         assert!(host.handle_datagram(T0, &ADDR, &unknown, &creds).is_empty());
+    }
+
+    #[test]
+    fn the_receive_direction_at_its_limit_ends_the_session_but_a_forged_counter_does_not() {
+        let (mut host, creds) = setup();
+        let (mut sealer, _, sid) = live(&mut host, &creds, 10, T0);
+        sealer.skip_to(MAX_RECORDS_PER_DIRECTION - 1);
+        let last = sealer.seal(0x15, &[0; 36]).unwrap();
+        let mut forged = last.clone();
+        *forged.last_mut().unwrap() ^= 1;
+        host.handle_datagram(T0 + ms(10), &ADDR, &forged, &creds);
+        assert!(
+            host.poll(T0 + ms(20)).is_empty(),
+            "an unauthenticated counter changes nothing"
+        );
+        assert_eq!(host.live_session(&DEV), Some(sid));
+        host.handle_datagram(T0 + ms(30), &ADDR, &last, &creds);
+        let out = host.poll(T0 + ms(40));
+        assert!(out.contains(&HostOutput::Closed {
+            dev_id: DEV,
+            session_id: sid,
+            reason: CloseReason::Exhausted
+        }));
+    }
+
+    #[test]
+    fn a_delayed_older_record_never_moves_the_peer_back() {
+        let (mut host, creds) = setup();
+        let (mut sealer, _, _) = live(&mut host, &creds, 10, T0);
+        let older = sealer.seal(0x15, &[0; 36]).unwrap();
+        let newer = sealer.seal(0x15, &[0; 36]).unwrap();
+        host.handle_datagram(T0 + ms(10), &2, &newer, &creds);
+        assert_eq!(host.seal(T0 + ms(11), &DEV, 1, &[]).unwrap().0, 2, "roamed");
+        host.handle_datagram(T0 + ms(20), &1, &older, &creds);
+        assert_eq!(
+            host.seal(T0 + ms(21), &DEV, 1, &[]).unwrap().0,
+            2,
+            "not moved back"
+        );
+    }
+
+    #[test]
+    fn debug_never_prints_a_delivered_body() {
+        let output: HostOutput<u32> = HostOutput::Deliver {
+            dev_id: DEV,
+            session_id: 1,
+            counter: 2,
+            inner_type: 0x20,
+            body: b"typed secret".to_vec(),
+        };
+        let text = format!("{output:?}");
+        assert!(text.contains("body_len: 12"), "{text}");
+        assert!(!text.contains("116, 121, 112"), "{text}");
+        let _ = SessionKeys::from_raw([0; 32], [1; 32]);
     }
 }

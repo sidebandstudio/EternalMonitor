@@ -81,6 +81,12 @@ fuzz_target!(|data: &[u8]| {
     let (got, ipad_keys) = ipad.read_msg2(&msg2).expect("real message 2 still reads");
     assert_eq!(got, reply);
     let (host_keys, ipad_keys) = (host_keys.unwrap(), ipad_keys.unwrap());
-    assert_eq!(host_keys.initiator_to_responder, ipad_keys.initiator_to_responder);
-    assert_eq!(host_keys.responder_to_initiator, ipad_keys.responder_to_initiator);
+    assert_eq!(host_keys.handshake_hash(), ipad_keys.handshake_hash());
+    let (mut ipad_send, ipad_recv) = ipad_keys.initiator(9);
+    let (mut host_send, host_recv) = host_keys.responder(9);
+    let up = ipad_send.seal(0x20, data).unwrap();
+    let down = host_send.seal(0x01, data).unwrap();
+    assert_eq!(host_recv.open(&up).unwrap().body, data);
+    assert_eq!(ipad_recv.open(&down).unwrap().body, data);
+    assert!(ipad_recv.open(&up).is_err(), "directions use different keys");
 });

@@ -1,9 +1,13 @@
-//! A deterministic simulation of one iPad and one host running the v3
+//! A deterministic simulation of iPads and one host running the v3
 //! reconnect state machines over a lossy network, on a simulated clock.
 //!
 //! Nothing here sleeps or reads a real clock, so results don't depend on
 //! machine load. Shared by `tests/v3_session_sim.rs` and the
 //! `v3_session_sim` fuzz target.
+//!
+//! Device 0 is `sim.client` / `sim.key` / `sim.addr`, and its events go to
+//! `sim.events` with the host's events for it. Further devices live in
+//! `sim.others`, each with its own events.
 
 #![allow(dead_code)]
 
@@ -13,15 +17,36 @@ use std::time::Duration;
 
 use eternal_wire::v2::PacketType;
 use eternal_wire::v3::client::{Client, ClientClose, ClientConfig, ClientKey, ClientOutput};
-use eternal_wire::v3::host::{CloseReason, HostConfig, HostCredentials, HostOutput, HostSessions};
+use eternal_wire::v3::host::{
+    CloseReason, HostConfig, HostCredentials, HostOutput, HostSessions, PeerAddr,
+};
+use eternal_wire::v3::record::RecordHeader;
 use eternal_wire::v3::wire::{self, Accept, HelloPayload, RecordState, SlotStatus, V3Kind};
-use eternal_wire::v3::{Id16, Key32, Random};
+use eternal_wire::v3::{Id16, Key32, Random, Zeroizing};
 
 pub const HOST_ID: Id16 = [0xB1; 16];
-pub const IPAD: u32 = 7;
 pub const TICK: Duration = Duration::from_millis(5);
 pub const REPORT_BODY: usize = 36;
 pub const MEDIA_BODY: usize = 1200;
+
+/// An IPv4-like address: the rate limit counts per `ip`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SimAddr {
+    pub ip: u16,
+    pub port: u16,
+}
+
+impl PeerAddr for SimAddr {
+    type Bucket = u16;
+    fn rate_bucket(&self) -> u16 {
+        self.ip
+    }
+}
+
+pub const IPAD: SimAddr = SimAddr {
+    ip: 7,
+    port: 50_000,
+};
 
 pub fn ms(value: u64) -> Duration {
     Duration::from_millis(value)
@@ -106,6 +131,8 @@ pub struct Sent {
     pub kind: Kind,
     /// Index among packets of this kind and direction, from 0.
     pub nth: usize,
+    pub from: SimAddr,
+    pub to: SimAddr,
     pub datagram: Vec<u8>,
 }
 
@@ -119,11 +146,11 @@ pub struct Store {
 }
 
 impl HostCredentials for Store {
-    fn key(&self, dev_id: &Id16) -> Option<Key32> {
+    fn key(&self, dev_id: &Id16) -> Option<Zeroizing<Key32>> {
         if self.tombstones.borrow().contains(dev_id) {
             return None;
         }
-        self.keys.get(dev_id).copied()
+        self.keys.get(dev_id).copied().map(Zeroizing::new)
     }
     fn last_committed_timestamp(&self, dev_id: &Id16) -> u64 {
         self.timestamps.borrow().get(dev_id).copied().unwrap_or(0)
@@ -139,11 +166,17 @@ impl HostCredentials for Store {
         }
     }
     fn slot_status(&self, dev_id: &Id16) -> SlotStatus {
-        let tombstones = self.tombstones.borrow().clone();
-        let held = if tombstones.contains(dev_id) {
-            vec![]
-        } else {
+        let tombstones: Vec<Id16> = self
+            .tombstones
+            .borrow()
+            .iter()
+            .filter(|t| *t == dev_id)
+            .copied()
+            .collect();
+        let held = if tombstones.is_empty() {
             vec![(*dev_id, RecordState::Active)]
+        } else {
+            vec![]
         };
         SlotStatus { held, tombstones }
     }
@@ -154,12 +187,18 @@ impl HostCredentials for Store {
 pub struct Policy {
     /// Refuse every confirm as a Finalize conflict.
     pub refuse: bool,
-    /// Time from `Committed` to `ack` (the durable writes).
+    /// Run step 1 of the invalidation procedure (`revoke` of the refused
+    /// `dev_id`) between `prepare_refusal` and `refuse`.
+    pub invalidate_before_refuse: bool,
+    /// Time from `ConfirmRequested` to the caller's decision.
+    pub decision_delay: Duration,
+    /// Time from `Committed` to `ack`, and from `prepare_refusal` to
+    /// `refuse` (the durable writes).
     pub durable_delay: Duration,
     /// Media cadence on a live session. The first packet after a commit is
     /// the IDR.
     pub media_every: Option<Duration>,
-    /// Report cadence from the iPad while live.
+    /// Report cadence from each iPad while it has a live session.
     pub report_every: Option<Duration>,
 }
 
@@ -167,6 +206,8 @@ impl Default for Policy {
     fn default() -> Self {
         Self {
             refuse: false,
+            invalidate_before_refuse: true,
+            decision_delay: Duration::ZERO,
             durable_delay: ms(5),
             media_every: Some(ms(50)),
             report_every: Some(ms(500)),
@@ -192,6 +233,10 @@ pub enum Event {
         inner_type: u8,
     },
     HostConfirmRequested {
+        at: Duration,
+        session_id: u32,
+    },
+    HostConfirmCancelled {
         at: Duration,
         session_id: u32,
     },
@@ -225,30 +270,86 @@ pub enum Event {
     },
 }
 
+impl Event {
+    pub fn at(&self) -> Duration {
+        match self {
+            Event::HostCommitted { at, .. }
+            | Event::HostClosed { at, .. }
+            | Event::HostDelivered { at, .. }
+            | Event::HostConfirmRequested { at, .. }
+            | Event::HostConfirmCancelled { at, .. }
+            | Event::IpadLive { at, .. }
+            | Event::IpadReleased { at }
+            | Event::IpadStatus { at, .. }
+            | Event::IpadRefused { at, .. }
+            | Event::IpadAttemptFailed { at }
+            | Event::IpadDelivered { at, .. }
+            | Event::IpadClosed { at, .. } => *at,
+        }
+    }
+}
+
+/// A further iPad.
+pub struct Ipad {
+    pub client: Client,
+    pub key: ClientKey,
+    pub addr: SimAddr,
+    pub events: Vec<Event>,
+    next_report: Duration,
+}
+
 enum Job {
-    Ack { session_id: u32 },
+    Decide { dev_id: Id16, session_id: u32 },
+    Refuse { dev_id: Id16, session_id: u32 },
+    Ack { dev_id: Id16, session_id: u32 },
+}
+
+struct Packet {
+    dir: Dir,
+    from: SimAddr,
+    to: SimAddr,
+    datagram: Vec<u8>,
 }
 
 pub struct Sim {
     pub now: Duration,
-    pub host: HostSessions<u32>,
+    pub host: HostSessions<SimAddr>,
     pub client: Client,
-    pub store: Store,
     pub key: ClientKey,
+    pub addr: SimAddr,
+    pub others: Vec<Ipad>,
+    pub store: Store,
     pub policy: Policy,
     pub latency: Duration,
     pub fault: FaultFn,
     pub events: Vec<Event>,
+    /// Host events for devices other than device 0, with their `dev_id`.
+    pub other_host_events: Vec<(Id16, Event)>,
     pub sent: Vec<Sent>,
+    /// Packets addressed to nobody (after a roam, or to a spoofed source).
+    pub undelivered: usize,
     /// The iPad's wall clock in µs, as an offset from `now`.
     pub clock_offset_us: i64,
-    in_flight: BTreeMap<(Duration, u64), (Dir, Vec<u8>)>,
+    in_flight: BTreeMap<(Duration, u64), Packet>,
     seq: u64,
     counts: HashMap<(Dir, Kind), usize>,
     jobs: Vec<(Duration, Job)>,
-    host_live: Option<u32>,
+    host_live: HashMap<Id16, u32>,
+    sealed: HashMap<(Dir, u32, u64), Vec<u8>>,
+    rng: XorShift,
     next_media: Duration,
     next_report: Duration,
+}
+
+fn hello() -> HelloPayload {
+    HelloPayload {
+        listen_port: 50_000,
+        screen_px_w: 2732,
+        screen_px_h: 2048,
+        refresh_hz: 120,
+        device_name: "Sim iPad".into(),
+        ..Default::default()
+    }
 }
 
 impl Sim {
@@ -258,45 +359,66 @@ impl Sim {
 
     pub fn with_configs(seed: u64, host: HostConfig, client: ClientConfig) -> Self {
         let mut rng = XorShift(seed | 1);
-        let mut dev_id = [0u8; 16];
-        let mut k_dev = [0u8; 32];
-        rng.fill(&mut dev_id);
-        rng.fill(&mut k_dev);
-        let key = ClientKey { dev_id, k_dev };
+        let key = Self::new_key(&mut rng);
         let mut keys = HashMap::new();
-        keys.insert(dev_id, k_dev);
-        let hello = HelloPayload {
-            listen_port: 50_000,
-            screen_px_w: 2732,
-            screen_px_h: 2048,
-            refresh_hz: 120,
-            device_name: "Sim iPad".into(),
-            ..Default::default()
-        };
+        keys.insert(key.dev_id, key.k_dev);
         Self {
             now: Duration::from_secs(1000),
             host: HostSessions::new(host, Box::new(XorShift(rng.next() | 1))),
-            client: Client::new(client, hello, Box::new(XorShift(rng.next() | 1))),
+            client: Client::new(client, hello(), Box::new(XorShift(rng.next() | 1))),
+            key,
+            addr: IPAD,
+            others: Vec::new(),
             store: Store {
                 keys,
                 timestamps: RefCell::new(HashMap::new()),
                 tombstones: RefCell::new(Vec::new()),
             },
-            key,
             policy: Policy::default(),
             latency: ms(10),
             fault: Box::new(|_| Fate::Deliver),
             events: Vec::new(),
+            other_host_events: Vec::new(),
             sent: Vec::new(),
+            undelivered: 0,
             clock_offset_us: 1_762_000_000_000_000,
             in_flight: BTreeMap::new(),
             seq: 0,
             counts: HashMap::new(),
             jobs: Vec::new(),
-            host_live: None,
+            host_live: HashMap::new(),
+            sealed: HashMap::new(),
+            rng,
             next_media: Duration::ZERO,
             next_report: Duration::ZERO,
         }
+    }
+
+    fn new_key(rng: &mut XorShift) -> ClientKey {
+        let mut dev_id = [0u8; 16];
+        let mut k_dev = [0u8; 32];
+        rng.fill(&mut dev_id);
+        rng.fill(&mut k_dev);
+        ClientKey { dev_id, k_dev }
+    }
+
+    /// Adds a paired iPad at `addr` and returns its index in `others`.
+    pub fn add_ipad(&mut self, addr: SimAddr) -> usize {
+        let key = Self::new_key(&mut self.rng);
+        self.store.keys.insert(key.dev_id, key.k_dev);
+        let client = Client::new(
+            ClientConfig::new(HOST_ID),
+            hello(),
+            Box::new(XorShift(self.rng.next() | 1)),
+        );
+        self.others.push(Ipad {
+            client,
+            key,
+            addr,
+            events: Vec::new(),
+            next_report: Duration::ZERO,
+        });
+        self.others.len() - 1
     }
 
     pub fn clock_us(&self) -> u64 {
@@ -307,10 +429,37 @@ impl Sim {
         let out = self
             .client
             .connect(self.now, self.key.clone(), self.clock_us());
-        self.client_outputs(out);
+        self.client_outputs(None, out);
     }
 
-    fn send(&mut self, dir: Dir, datagram: Vec<u8>) {
+    pub fn connect_other(&mut self, index: usize) {
+        let (now, clock) = (self.now, self.clock_us());
+        let key = self.others[index].key.clone();
+        let out = self.others[index].client.connect(now, key, clock);
+        self.client_outputs(Some(index), out);
+    }
+
+    /// Connects device 0 with another key it holds for this host.
+    pub fn connect_with(&mut self, key: ClientKey) {
+        let out = self.client.connect(self.now, key, self.clock_us());
+        self.client_outputs(None, out);
+    }
+
+    /// Device 0 moves to a new address.
+    pub fn roam(&mut self, addr: SimAddr) {
+        self.addr = addr;
+    }
+
+    fn send(&mut self, dir: Dir, from: SimAddr, to: SimAddr, datagram: Vec<u8>) {
+        if let Ok(header) = RecordHeader::parse(&datagram) {
+            // No (key, counter) is ever sealed twice: a repeat under the same
+            // direction, session and counter must be the identical bytes.
+            let entry = self
+                .sealed
+                .entry((dir, header.session_id, header.counter))
+                .or_insert_with(|| datagram.clone());
+            assert_eq!(*entry, datagram, "a counter sealed twice under one key");
+        }
         let kind = kind_of(dir, &datagram);
         let nth = {
             let count = self.counts.entry((dir, kind)).or_insert(0);
@@ -322,72 +471,135 @@ impl Sim {
             dir,
             kind,
             nth,
+            from,
+            to,
             datagram,
         };
         let fate = (self.fault)(&sent);
         let base = self.now + self.latency;
+        let packet = |sent: &Sent| Packet {
+            dir,
+            from,
+            to,
+            datagram: sent.datagram.clone(),
+        };
         match fate {
-            Fate::Deliver => self.enqueue(base, dir, sent.datagram.clone()),
+            Fate::Deliver => self.enqueue(base, packet(&sent)),
             Fate::Drop => {}
             Fate::Duplicate { extra } => {
-                self.enqueue(base, dir, sent.datagram.clone());
-                self.enqueue(base + extra, dir, sent.datagram.clone());
+                self.enqueue(base, packet(&sent));
+                self.enqueue(base + extra, packet(&sent));
             }
-            Fate::Delay { extra } => self.enqueue(base + extra, dir, sent.datagram.clone()),
+            Fate::Delay { extra } => self.enqueue(base + extra, packet(&sent)),
         }
         self.sent.push(sent);
     }
 
-    fn enqueue(&mut self, at: Duration, dir: Dir, datagram: Vec<u8>) {
+    fn enqueue(&mut self, at: Duration, packet: Packet) {
         self.seq += 1;
-        self.in_flight.insert((at, self.seq), (dir, datagram));
+        self.in_flight.insert((at, self.seq), packet);
     }
 
-    /// The host user removes the iPad's record.
+    /// Injects a datagram as if it arrived now: to the host from device 0's
+    /// address, or to device 0.
+    pub fn inject(&mut self, dir: Dir, datagram: &[u8]) {
+        let addr = self.addr;
+        self.deliver(Packet {
+            dir,
+            from: addr,
+            to: addr,
+            datagram: datagram.to_vec(),
+        });
+    }
+
+    /// Injects a datagram to the host from any source address.
+    pub fn inject_from(&mut self, from: SimAddr, datagram: &[u8]) {
+        self.deliver(Packet {
+            dir: Dir::ToHost,
+            from,
+            to: from,
+            datagram: datagram.to_vec(),
+        });
+    }
+
+    /// The host user removes device 0's record.
     pub fn revoke(&mut self) {
         let out = self.host.revoke(self.now, &self.key.dev_id);
         self.host_outputs(out);
     }
 
-    /// Injects a datagram as if it arrived from the network now.
-    pub fn inject(&mut self, dir: Dir, datagram: &[u8]) {
-        self.deliver(dir, datagram.to_vec());
-    }
-
-    fn deliver(&mut self, dir: Dir, datagram: Vec<u8>) {
-        match dir {
+    fn deliver(&mut self, packet: Packet) {
+        match packet.dir {
             Dir::ToHost => {
-                let out = self
-                    .host
-                    .handle_datagram(self.now, &IPAD, &datagram, &self.store);
+                let out = self.host.handle_datagram(
+                    self.now,
+                    &packet.from,
+                    &packet.datagram,
+                    &self.store,
+                );
                 self.host_outputs(out);
             }
             Dir::ToIpad => {
-                let out = self
-                    .client
-                    .handle_datagram(self.now, &datagram, self.clock_us());
-                self.client_outputs(out);
+                let clock = self.clock_us();
+                if packet.to == self.addr {
+                    let out = self
+                        .client
+                        .handle_datagram(self.now, &packet.datagram, clock);
+                    self.client_outputs(None, out);
+                } else if let Some(index) = self.others.iter().position(|o| o.addr == packet.to) {
+                    let out = self.others[index].client.handle_datagram(
+                        self.now,
+                        &packet.datagram,
+                        clock,
+                    );
+                    self.client_outputs(Some(index), out);
+                } else {
+                    self.undelivered += 1;
+                }
             }
         }
     }
 
-    fn host_outputs(&mut self, out: Vec<HostOutput<u32>>) {
+    fn host_event(&mut self, dev_id: Id16, event: Event) {
+        if dev_id == self.key.dev_id {
+            self.events.push(event);
+        } else {
+            self.other_host_events.push((dev_id, event));
+        }
+    }
+
+    fn host_outputs(&mut self, out: Vec<HostOutput<SimAddr>>) {
         let now = self.now;
         for output in out {
             match output {
-                HostOutput::Send { datagram, .. } => self.send(Dir::ToIpad, datagram),
+                HostOutput::Send { to, datagram } => {
+                    self.send(Dir::ToIpad, to, to, datagram);
+                }
                 HostOutput::ConfirmRequested { dev_id, session_id } => {
-                    self.events.push(Event::HostConfirmRequested {
-                        at: now,
-                        session_id,
-                    });
-                    let next = if self.policy.refuse {
-                        self.store.tombstones.borrow_mut().push(dev_id);
-                        self.host.refuse(now, &dev_id, session_id, &self.store)
+                    self.host_event(
+                        dev_id,
+                        Event::HostConfirmRequested {
+                            at: now,
+                            session_id,
+                        },
+                    );
+                    if self.policy.decision_delay.is_zero() {
+                        self.decide(dev_id, session_id);
                     } else {
-                        self.host.commit(now, &dev_id, session_id)
-                    };
-                    self.host_outputs(next);
+                        self.jobs.push((
+                            now + self.policy.decision_delay,
+                            Job::Decide { dev_id, session_id },
+                        ));
+                    }
+                }
+                HostOutput::ConfirmCancelled { dev_id, session_id } => {
+                    self.host_event(
+                        dev_id,
+                        Event::HostConfirmCancelled {
+                            at: now,
+                            session_id,
+                        },
+                    );
                 }
                 HostOutput::Committed {
                     dev_id,
@@ -396,90 +608,140 @@ impl Sim {
                     timestamp_us,
                     ..
                 } => {
-                    self.events.push(Event::HostCommitted {
-                        at: now,
-                        session_id,
-                        replaced,
-                    });
+                    self.host_event(
+                        dev_id,
+                        Event::HostCommitted {
+                            at: now,
+                            session_id,
+                            replaced,
+                        },
+                    );
                     self.store
                         .timestamps
                         .borrow_mut()
                         .insert(dev_id, timestamp_us);
-                    self.host_live = Some(session_id);
+                    self.host_live.insert(dev_id, session_id);
                     self.next_media = now;
-                    self.jobs
-                        .push((now + self.policy.durable_delay, Job::Ack { session_id }));
+                    self.jobs.push((
+                        now + self.policy.durable_delay,
+                        Job::Ack { dev_id, session_id },
+                    ));
                 }
                 HostOutput::Deliver {
+                    dev_id,
                     session_id,
                     inner_type,
                     ..
-                } => self.events.push(Event::HostDelivered {
-                    at: now,
-                    session_id,
-                    inner_type,
-                }),
-                HostOutput::Closed {
-                    session_id, reason, ..
-                } => {
-                    if self.host_live == Some(session_id) {
-                        self.host_live = None;
-                    }
-                    self.events.push(Event::HostClosed {
+                } => self.host_event(
+                    dev_id,
+                    Event::HostDelivered {
                         at: now,
                         session_id,
-                        reason,
-                    });
+                        inner_type,
+                    },
+                ),
+                HostOutput::Closed {
+                    dev_id,
+                    session_id,
+                    reason,
+                } => {
+                    if self.host_live.get(&dev_id) == Some(&session_id) {
+                        self.host_live.remove(&dev_id);
+                    }
+                    self.host_event(
+                        dev_id,
+                        Event::HostClosed {
+                            at: now,
+                            session_id,
+                            reason,
+                        },
+                    );
                 }
             }
         }
     }
 
-    fn client_outputs(&mut self, out: Vec<ClientOutput>) {
+    fn decide(&mut self, dev_id: Id16, session_id: u32) {
+        let now = self.now;
+        if self.policy.refuse {
+            if !self.host.prepare_refusal(now, &dev_id, session_id) {
+                return;
+            }
+            // Retire the record: tombstone it, and step 1 ends its sessions.
+            self.store.tombstones.borrow_mut().push(dev_id);
+            if self.policy.invalidate_before_refuse {
+                let out = self.host.revoke(now, &dev_id);
+                self.host_outputs(out);
+            }
+            if self.policy.durable_delay.is_zero() {
+                let out = self.host.refuse(now, &dev_id, session_id, &self.store);
+                self.host_outputs(out);
+            } else {
+                self.jobs.push((
+                    now + self.policy.durable_delay,
+                    Job::Refuse { dev_id, session_id },
+                ));
+            }
+        } else {
+            let out = self.host.commit(now, &dev_id, session_id);
+            self.host_outputs(out);
+        }
+    }
+
+    fn client_outputs(&mut self, device: Option<usize>, out: Vec<ClientOutput>) {
         let now = self.now;
         for output in out {
-            match output {
-                ClientOutput::Send(datagram) => self.send(Dir::ToHost, datagram),
-                ClientOutput::ReleaseAllInput => self.events.push(Event::IpadReleased { at: now }),
+            let from = match device {
+                None => self.addr,
+                Some(i) => self.others[i].addr,
+            };
+            let event = match output {
+                ClientOutput::Send(datagram) => {
+                    self.send(Dir::ToHost, from, from, datagram);
+                    continue;
+                }
+                ClientOutput::ReleaseAllInput => Event::IpadReleased { at: now },
                 ClientOutput::Live { session_id, .. } => {
-                    self.events.push(Event::IpadLive {
+                    match device {
+                        None => self.next_report = now,
+                        Some(i) => self.others[i].next_report = now,
+                    }
+                    Event::IpadLive {
                         at: now,
                         session_id,
-                    });
-                    self.next_report = now;
+                    }
                 }
-                ClientOutput::Status { status, .. } => {
-                    self.events.push(Event::IpadStatus { at: now, status })
-                }
-                ClientOutput::Refused { status, .. } => {
-                    self.events.push(Event::IpadRefused { at: now, status })
-                }
-                ClientOutput::AttemptFailed { .. } => {
-                    self.events.push(Event::IpadAttemptFailed { at: now })
-                }
+                ClientOutput::Status { status, .. } => Event::IpadStatus { at: now, status },
+                ClientOutput::Refused { status, .. } => Event::IpadRefused { at: now, status },
+                ClientOutput::AttemptFailed { .. } => Event::IpadAttemptFailed { at: now },
                 ClientOutput::Deliver {
                     session_id,
                     draining,
                     inner_type,
                     ..
                 } => {
-                    self.events.push(Event::IpadDelivered {
+                    if !draining && inner_type == PacketType::Media as u8 {
+                        let more = match device {
+                            None => self.client.first_idr_decoded(session_id),
+                            Some(i) => self.others[i].client.first_idr_decoded(session_id),
+                        };
+                        self.client_outputs(device, more);
+                    }
+                    Event::IpadDelivered {
                         at: now,
                         session_id,
                         draining,
-                    });
-                    if !draining && inner_type == PacketType::Media as u8 {
-                        let more = self.client.first_idr_decoded(session_id);
-                        self.client_outputs(more);
                     }
                 }
-                ClientOutput::Closed { session_id, reason } => {
-                    self.events.push(Event::IpadClosed {
-                        at: now,
-                        session_id,
-                        reason,
-                    })
-                }
+                ClientOutput::Closed { session_id, reason } => Event::IpadClosed {
+                    at: now,
+                    session_id,
+                    reason,
+                },
+            };
+            match device {
+                None => self.events.push(event),
+                Some(i) => self.others[i].events.push(event),
             }
         }
     }
@@ -491,51 +753,75 @@ impl Sim {
             if at > self.now {
                 break;
             }
-            let (dir, datagram) = self.in_flight.remove(&(at, seq)).unwrap();
-            self.deliver(dir, datagram);
+            let packet = self.in_flight.remove(&(at, seq)).unwrap();
+            self.deliver(packet);
         }
         let now = self.now;
         let (due, keep): (Vec<_>, Vec<_>) = self.jobs.drain(..).partition(|(at, _)| *at <= now);
         self.jobs = keep;
         for (_, job) in due {
             match job {
-                Job::Ack { session_id } => {
-                    let out = self
-                        .host
-                        .ack(self.now, &self.key.dev_id, session_id, &self.store);
+                Job::Decide { dev_id, session_id } => self.decide(dev_id, session_id),
+                Job::Refuse { dev_id, session_id } => {
+                    let out = self.host.refuse(now, &dev_id, session_id, &self.store);
+                    self.host_outputs(out);
+                }
+                Job::Ack { dev_id, session_id } => {
+                    let out = self.host.ack(now, &dev_id, session_id, &self.store);
                     self.host_outputs(out);
                 }
             }
         }
-        if let (Some(every), Some(_)) = (self.policy.media_every, self.host_live) {
-            if self.now >= self.next_media {
-                self.next_media = self.now + every;
-                if let Some((_, datagram)) = self.host.seal(
-                    self.now,
-                    &self.key.dev_id,
-                    PacketType::Media as u8,
-                    &[0x5A; MEDIA_BODY],
-                ) {
-                    self.send(Dir::ToIpad, datagram);
+        if let Some(every) = self.policy.media_every {
+            if !self.host_live.is_empty() && now >= self.next_media {
+                self.next_media = now + every;
+                let mut devices: Vec<Id16> = self.host_live.keys().copied().collect();
+                devices.sort();
+                for dev_id in devices {
+                    if let Some((to, datagram)) =
+                        self.host
+                            .seal(now, &dev_id, PacketType::Media as u8, &[0x5A; MEDIA_BODY])
+                    {
+                        self.send(Dir::ToIpad, to, to, datagram);
+                    }
                 }
             }
         }
         if let Some(every) = self.policy.report_every {
-            if self.client.live_session().is_some() && self.now >= self.next_report {
-                self.next_report = self.now + every;
-                if let Some(datagram) = self.client.seal(
-                    self.now,
-                    PacketType::ReceiverReport as u8,
-                    &[0; REPORT_BODY],
-                ) {
-                    self.send(Dir::ToHost, datagram);
+            if self.client.live_session().is_some() && now >= self.next_report {
+                self.next_report = now + every;
+                if let Some(datagram) =
+                    self.client
+                        .seal(now, PacketType::ReceiverReport as u8, &[0; REPORT_BODY])
+                {
+                    let addr = self.addr;
+                    self.send(Dir::ToHost, addr, addr, datagram);
+                }
+            }
+            for i in 0..self.others.len() {
+                let other = &mut self.others[i];
+                if other.client.live_session().is_some() && now >= other.next_report {
+                    other.next_report = now + every;
+                    if let Some(datagram) =
+                        other
+                            .client
+                            .seal(now, PacketType::ReceiverReport as u8, &[0; REPORT_BODY])
+                    {
+                        let addr = other.addr;
+                        self.send(Dir::ToHost, addr, addr, datagram);
+                    }
                 }
             }
         }
-        let out = self.host.poll(self.now);
+        let out = self.host.poll(now);
         self.host_outputs(out);
-        let out = self.client.poll(self.now, self.clock_us());
-        self.client_outputs(out);
+        let clock = self.clock_us();
+        let out = self.client.poll(now, clock);
+        self.client_outputs(None, out);
+        for i in 0..self.others.len() {
+            let out = self.others[i].client.poll(now, clock);
+            self.client_outputs(Some(i), out);
+        }
         self.host.check_invariants();
     }
 
@@ -564,6 +850,12 @@ impl Sim {
 
     pub fn both_live_on_same_session(&self) -> bool {
         self.host_live().is_some() && self.host_live() == self.client.live_session()
+    }
+
+    pub fn other_live_on_same_session(&self, index: usize) -> bool {
+        let other = &self.others[index];
+        let host = self.host.live_session(&other.key.dev_id);
+        host.is_some() && host == other.client.live_session()
     }
 
     pub fn commits(&self) -> Vec<u32> {

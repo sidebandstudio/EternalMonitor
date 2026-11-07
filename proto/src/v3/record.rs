@@ -84,16 +84,17 @@ fn aead_key(key: &Key32) -> LessSafeKey {
     LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, key).expect("32-byte key"))
 }
 
-/// One AEAD operation with the record nonce. `in_out` holds the plaintext and
-/// gets the tag appended. Used by [`Sealer`] and by the vector tests.
-pub fn seal_raw(key: &Key32, counter: u64, aad: &[u8], in_out: &mut Vec<u8>) {
+/// One AEAD operation with the record nonce, for the vector tests.
+#[cfg(test)]
+pub(crate) fn seal_raw(key: &Key32, counter: u64, aad: &[u8], in_out: &mut Vec<u8>) {
     aead_key(key)
         .seal_in_place_append_tag(nonce(counter), Aad::from(aad), in_out)
         .expect("plaintext within AEAD limits");
 }
 
 /// Opens one AEAD operation in place, returning the plaintext length.
-pub fn open_raw(
+#[cfg(test)]
+pub(crate) fn open_raw(
     key: &Key32,
     counter: u64,
     aad: &[u8],
@@ -105,7 +106,9 @@ pub fn open_raw(
         .map_err(|_| V3Error::Auth)
 }
 
-/// One direction's sending half.
+/// One direction's sending half. Only [`SessionKeys`] makes one in shipped
+/// code, and it makes exactly one per key, so a counter never repeats under a
+/// key.
 pub struct Sealer {
     key: LessSafeKey,
     session_id: u32,
@@ -113,12 +116,25 @@ pub struct Sealer {
 }
 
 impl Sealer {
-    pub fn new(key: &Key32, session_id: u32) -> Self {
+    fn from_key(key: &Key32, session_id: u32) -> Self {
         Self {
             key: aead_key(key),
             session_id,
             next: 0,
         }
+    }
+
+    /// A sealer on a caller's key, for tests, benchmarks and fuzzing only.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn new(key: &Key32, session_id: u32) -> Self {
+        Self::from_key(key, session_id)
+    }
+
+    /// Moves the next counter forward, for tests of the counter limits. It
+    /// can't move backwards.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn skip_to(&mut self, counter: u64) {
+        self.next = self.next.max(counter);
     }
 
     pub fn session_id(&self) -> u32 {
@@ -168,12 +184,23 @@ impl Sealer {
     }
 }
 
-/// An authenticated record's content.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// An authenticated record's content. `Debug` shows the body's length, not
+/// its bytes.
+#[derive(Clone, PartialEq, Eq)]
 pub struct Opened {
     pub counter: u64,
     pub inner_type: u8,
     pub body: Vec<u8>,
+}
+
+impl std::fmt::Debug for Opened {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Opened")
+            .field("counter", &self.counter)
+            .field("inner_type", &self.inner_type)
+            .field("body_len", &self.body.len())
+            .finish()
+    }
 }
 
 /// One direction's receiving half. `open` takes `&self` and is safe to call
@@ -185,7 +212,7 @@ pub struct Opener {
 }
 
 impl Opener {
-    pub fn new(key: &Key32, session_id: u32) -> Self {
+    fn from_key(key: &Key32, session_id: u32) -> Self {
         Self {
             key: aead_key(key),
             session_id,
@@ -193,8 +220,20 @@ impl Opener {
         }
     }
 
+    /// An opener on a caller's key, for tests, benchmarks and fuzzing only.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn new(key: &Key32, session_id: u32) -> Self {
+        Self::from_key(key, session_id)
+    }
+
     pub fn session_id(&self) -> u32 {
         self.session_id
+    }
+
+    /// The highest counter that has authenticated so far. Only authenticated
+    /// records move it.
+    pub fn highest(&self) -> Option<u64> {
+        self.window.lock().unwrap().top()
     }
 
     /// Opens a record in place. On success returns the counter, the inner
@@ -244,28 +283,45 @@ impl Opener {
 }
 
 /// The two directions' keys from Noise `Split()`, and the handshake hash.
+/// Only the handshake makes one. Turning it into a sealer and an opener
+/// consumes it, so each key gets exactly one sealer.
 pub struct SessionKeys {
     /// Initiator (iPad) → responder (host).
-    pub initiator_to_responder: Key32,
+    pub(crate) initiator_to_responder: Key32,
     /// Responder (host) → initiator (iPad).
-    pub responder_to_initiator: Key32,
-    pub handshake_hash: [u8; 32],
+    pub(crate) responder_to_initiator: Key32,
+    pub(crate) handshake_hash: [u8; 32],
 }
 
 impl SessionKeys {
+    /// Keys from raw bytes, for tests and fuzzing only.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn from_raw(initiator_to_responder: Key32, responder_to_initiator: Key32) -> Self {
+        Self {
+            initiator_to_responder,
+            responder_to_initiator,
+            handshake_hash: [0; 32],
+        }
+    }
+
+    /// The Noise handshake hash `h`, which later pairing messages bind to.
+    pub fn handshake_hash(&self) -> &[u8; 32] {
+        &self.handshake_hash
+    }
+
     /// The iPad's halves for `session_id`.
-    pub fn initiator(&self, session_id: u32) -> (Sealer, Opener) {
+    pub fn initiator(self, session_id: u32) -> (Sealer, Opener) {
         (
-            Sealer::new(&self.initiator_to_responder, session_id),
-            Opener::new(&self.responder_to_initiator, session_id),
+            Sealer::from_key(&self.initiator_to_responder, session_id),
+            Opener::from_key(&self.responder_to_initiator, session_id),
         )
     }
 
     /// The host's halves for `session_id`.
-    pub fn responder(&self, session_id: u32) -> (Sealer, Opener) {
+    pub fn responder(self, session_id: u32) -> (Sealer, Opener) {
         (
-            Sealer::new(&self.responder_to_initiator, session_id),
-            Opener::new(&self.initiator_to_responder, session_id),
+            Sealer::from_key(&self.responder_to_initiator, session_id),
+            Opener::from_key(&self.initiator_to_responder, session_id),
         )
     }
 }
@@ -358,13 +414,8 @@ mod tests {
         let record = sealer.seal(1, b"x").unwrap();
         assert_eq!(Opener::new(&[8; 32], 42).open(&record), Err(V3Error::Auth));
         assert!(Opener::new(&[7; 32], 43).open(&record).is_err());
-        let keys = SessionKeys {
-            initiator_to_responder: [1; 32],
-            responder_to_initiator: [2; 32],
-            handshake_hash: [0; 32],
-        };
-        let (mut ipad_send, ipad_recv) = keys.initiator(5);
-        let (mut host_send, host_recv) = keys.responder(5);
+        let (mut ipad_send, ipad_recv) = SessionKeys::from_raw([1; 32], [2; 32]).initiator(5);
+        let (mut host_send, host_recv) = SessionKeys::from_raw([1; 32], [2; 32]).responder(5);
         let up = ipad_send.seal(1, b"up").unwrap();
         let down = host_send.seal(1, b"down").unwrap();
         assert_eq!(host_recv.open(&up).unwrap().body, b"up");
@@ -430,5 +481,31 @@ mod tests {
             .collect();
         let total: usize = handles.into_iter().map(|h| h.join().unwrap()).sum();
         assert_eq!(total, 500);
+    }
+
+    #[test]
+    fn debug_never_prints_plaintext() {
+        let (mut sealer, opener) = pair();
+        let record = sealer.seal(0x20, b"secret keystrokes").unwrap();
+        let opened = opener.open(&record).unwrap();
+        let text = format!("{opened:?}");
+        assert!(!text.contains("115, 101, 99"), "{text}"); // "sec"
+        assert!(text.contains("body_len: 17"), "{text}");
+    }
+
+    #[test]
+    fn highest_moves_only_on_authenticated_records() {
+        let (mut sealer, opener) = pair();
+        assert_eq!(opener.highest(), None);
+        sealer.skip_to(1000);
+        let record = sealer.seal(1, b"x").unwrap();
+        let mut forged = record.clone();
+        *forged.last_mut().unwrap() ^= 1;
+        assert!(opener.open(&forged).is_err());
+        assert_eq!(opener.highest(), None);
+        opener.open(&record).unwrap();
+        assert_eq!(opener.highest(), Some(1000));
+        sealer.skip_to(5);
+        assert_eq!(sealer.sealed(), 1001, "skip_to never moves back");
     }
 }

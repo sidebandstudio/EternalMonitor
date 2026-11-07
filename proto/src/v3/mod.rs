@@ -123,6 +123,14 @@ pub const SESSION_MAX_AGE: Duration = Duration::from_secs(12 * 60 * 60);
 /// Sealed packets per direction before a fresh handshake is required.
 pub const MAX_RECORDS_PER_DIRECTION: u64 = 1 << 32;
 
+/// The largest message 1 timestamp either side uses or accepts, in µs. Far
+/// beyond any clock (about 146,000 years), and far enough below `u64::MAX`
+/// that a stored value can always be passed by `+ 1`.
+pub const MAX_TIMESTAMP_US: u64 = 1 << 62;
+
+/// Key buffers that wipe themselves on drop.
+pub use zeroize::Zeroizing;
+
 /// Why a v3 datagram or payload was rejected. Callers drop and count these;
 /// none of them ever produces a reply.
 #[derive(Debug, Clone, PartialEq, Eq)]

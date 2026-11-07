@@ -22,19 +22,7 @@ fn live_ids(sim: &Sim) -> Vec<u32> {
 }
 
 fn first_at(sim: &Sim, pred: impl Fn(&Event) -> bool) -> Option<Duration> {
-    sim.events.iter().find(|e| pred(e)).map(|e| match e {
-        Event::HostCommitted { at, .. }
-        | Event::HostClosed { at, .. }
-        | Event::HostDelivered { at, .. }
-        | Event::HostConfirmRequested { at, .. }
-        | Event::IpadLive { at, .. }
-        | Event::IpadReleased { at }
-        | Event::IpadStatus { at, .. }
-        | Event::IpadRefused { at, .. }
-        | Event::IpadAttemptFailed { at }
-        | Event::IpadDelivered { at, .. }
-        | Event::IpadClosed { at, .. } => *at,
-    })
+    sim.events.iter().find(|e| pred(e)).map(Event::at)
 }
 
 fn connect_live(sim: &mut Sim) -> u32 {
@@ -617,4 +605,276 @@ fn after_a_refusal_the_automatic_reconnect_uses_the_live_sessions_key() {
     let live = sim.host_live().expect("reconnected under the first key");
     assert_ne!(live, first);
     assert!(sim.both_live_on_same_session());
+}
+
+/// The caller's decision on a confirm arrives 0 to 3 s late. A decision the
+/// iPad has outwaited never commits a session it abandoned, and its old
+/// session keeps running meanwhile.
+#[test]
+fn slow_decisions_never_cut_off_the_session_the_ipad_still_uses() {
+    for delay_ms in [0u64, 500, 1500, 1900, 2500, 3000] {
+        let mut sim = Sim::new(30 + delay_ms);
+        let old = connect_live(&mut sim);
+        sim.policy.decision_delay = ms(delay_ms);
+        sim.connect();
+        sim.run_for(Duration::from_secs(12));
+        let ipad_live = live_ids(&sim);
+        for event in &sim.events {
+            if let Event::HostCommitted { session_id, .. } = event {
+                assert!(
+                    ipad_live.contains(session_id),
+                    "delay {delay_ms} ms: committed {session_id}, which the iPad abandoned"
+                );
+            }
+        }
+        assert!(
+            !sim.events.iter().any(|e| matches!(e,
+                Event::HostClosed { session_id, reason: CloseReason::Liveness, .. } if *session_id == old)),
+            "delay {delay_ms} ms"
+        );
+        assert!(sim.both_live_on_same_session(), "delay {delay_ms} ms");
+        if delay_ms >= 2000 {
+            // Every attempt is outwaited: the old session carries on.
+            assert_eq!(sim.host_live(), Some(old), "delay {delay_ms} ms");
+            assert!(sim
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::HostConfirmCancelled { .. })));
+        } else {
+            assert_ne!(sim.host_live(), Some(old), "delay {delay_ms} ms");
+        }
+    }
+}
+
+/// Refusal with the full invalidation sequence in between: prepare, then
+/// step 1 ends the record's sessions, then the durable writes, then refuse.
+#[test]
+fn a_refusal_reaches_the_ipad_through_the_full_invalidation_sequence() {
+    for (decision, durable) in [(0u64, 5u64), (200, 300), (900, 900)] {
+        let mut sim = Sim::new(40 + decision);
+        let live = connect_live(&mut sim);
+        let other = ClientKey {
+            dev_id: [0x5A; 16],
+            k_dev: [0xA5; 32],
+        };
+        sim.store.keys.insert(other.dev_id, other.k_dev);
+        sim.policy.refuse = true;
+        sim.policy.invalidate_before_refuse = true;
+        sim.policy.decision_delay = ms(decision);
+        sim.policy.durable_delay = ms(durable);
+        sim.connect_with(other.clone());
+        assert!(
+            sim.run_until(ms(2000), |s| s
+                .events
+                .iter()
+                .any(|e| matches!(e, Event::IpadRefused { .. }))),
+            "decision {decision} ms, durable {durable} ms"
+        );
+        let status = sim
+            .events
+            .iter()
+            .find_map(|e| match e {
+                Event::IpadRefused { status, .. } => Some(status.clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert!(status.tombstones.contains(&other.dev_id));
+        assert_eq!(sim.host_live(), Some(live));
+        assert_eq!(sim.client.live_session(), Some(live));
+    }
+}
+
+/// Reports keep the old session alive while two whole confirm windows are
+/// lost; only input waits for the cutover.
+#[test]
+fn the_old_session_survives_two_lost_confirm_windows() {
+    let mut sim = Sim::new(50);
+    let old = connect_live(&mut sim);
+    sim.fault = Box::new(|sent| match sent.kind {
+        Kind::Confirm if sent.nth < 40 => Fate::Drop,
+        _ => Fate::Deliver,
+    });
+    sim.connect();
+    assert!(
+        sim.run_until(Duration::from_secs(8), |s| s.host_live() != Some(old)
+            && s.both_live_on_same_session())
+    );
+    assert!(
+        !sim.events.iter().any(|e| matches!(e,
+        Event::HostClosed { session_id, reason: CloseReason::Liveness, .. } if *session_id == old))
+    );
+    let old_reports = sim
+        .events
+        .iter()
+        .filter(|e| matches!(e, Event::HostDelivered { session_id, .. } if *session_id == old))
+        .count();
+    assert!(old_reports >= 8, "{old_reports} reports on the old session");
+}
+
+#[test]
+fn a_delayed_older_record_from_the_old_address_never_moves_the_host_back() {
+    let mut sim = Sim::new(51);
+    sim.policy.media_every = None;
+    connect_live(&mut sim);
+    let held = sim
+        .client
+        .seal(sim.now, PacketType::ReceiverReport as u8, &[0; REPORT_BODY])
+        .unwrap();
+    let roamed = SimAddr {
+        ip: 9,
+        port: 40_000,
+    };
+    sim.roam(roamed);
+    sim.run_for(ms(1200));
+    let dev_id = sim.key.dev_id;
+    assert_eq!(sim.host.seal(sim.now, &dev_id, 1, &[]).unwrap().0, roamed);
+    sim.inject_from(IPAD, &held);
+    assert_eq!(
+        sim.host.seal(sim.now, &dev_id, 1, &[]).unwrap().0,
+        roamed,
+        "a delayed copy from the old address doesn't move the destination"
+    );
+    assert!(sim.both_live_on_same_session());
+}
+
+#[test]
+fn refusal_resends_go_only_to_the_address_that_confirmed() {
+    let mut sim = Sim::new(52);
+    connect_live(&mut sim);
+    let other = ClientKey {
+        dev_id: [0x3C; 16],
+        k_dev: [0xC3; 32],
+    };
+    sim.store.keys.insert(other.dev_id, other.k_dev);
+    sim.policy.refuse = true;
+    // The first refusal is lost; the iPad then moves and retries from there.
+    sim.fault = Box::new(|sent| match sent.kind {
+        Kind::AckOrRefused if sent.nth == 1 => Fate::Drop,
+        _ => Fate::Deliver,
+    });
+    sim.connect_with(other);
+    assert!(sim.run_until(ms(500), |s| s
+        .sent_of(Dir::ToIpad, Kind::AckOrRefused)
+        .len()
+        == 2));
+    let roamed = SimAddr { ip: 11, port: 1 };
+    sim.roam(roamed);
+    sim.run_for(ms(3000));
+    let refusals = sim.sent_of(Dir::ToIpad, Kind::AckOrRefused);
+    assert!(refusals.iter().skip(1).all(|r| r.to == IPAD));
+    assert!(!sim
+        .events
+        .iter()
+        .any(|e| matches!(e, Event::IpadRefused { .. })));
+}
+
+#[test]
+fn two_ipads_run_independently() {
+    let mut sim = Sim::new(53);
+    let second = sim.add_ipad(SimAddr {
+        ip: 20,
+        port: 50_000,
+    });
+    sim.connect();
+    sim.connect_other(second);
+    assert!(sim.run_until(ms(1000), |s| s.both_live_on_same_session()
+        && s.other_live_on_same_session(second)));
+    let first = sim.host_live().unwrap();
+    let commits = sim.commits().len();
+    // The second iPad reconnects, loses a confirm window, and is revoked.
+    sim.fault = Box::new(|sent| match (sent.kind, sent.from.ip) {
+        (Kind::Confirm, 20) if sent.nth < 25 => Fate::Drop,
+        _ => Fate::Deliver,
+    });
+    sim.connect_other(second);
+    sim.run_for(ms(4000));
+    let dev2 = sim.others[second].key.dev_id;
+    let out = sim.host.revoke(sim.now, &dev2);
+    assert!(!out.is_empty());
+    sim.run_for(ms(2000));
+    assert_eq!(sim.host_live(), Some(first), "the first iPad never noticed");
+    assert_eq!(sim.commits().len(), commits);
+    assert!(sim.both_live_on_same_session());
+}
+
+#[test]
+fn a_flood_from_other_sources_never_blocks_the_ipad() {
+    use eternal_wire::v3::handshake::Initiator;
+    use eternal_wire::v3::wire::HelloPayload;
+    let mut sim = Sim::new(54);
+    let dev_id = sim.key.dev_id;
+    let mut forged = Vec::new();
+    for i in 0..50u16 {
+        // The right dev_id with a wrong key, and unknown dev_ids.
+        let wrong = Initiator::start(
+            &[i as u8; 32],
+            &dev_id,
+            &HOST_ID,
+            1,
+            &HelloPayload::default(),
+        )
+        .unwrap();
+        let unknown = Initiator::start(
+            &[1; 32],
+            &[i as u8; 16],
+            &HOST_ID,
+            1,
+            &HelloPayload::default(),
+        )
+        .unwrap();
+        forged.push(wrong.msg1().to_vec());
+        forged.push(unknown.msg1().to_vec());
+    }
+    sim.connect();
+    let mut i = 0usize;
+    let done = sim.run_until(ms(1000), |s| s.both_live_on_same_session());
+    assert!(done);
+    // Again with the flood running every tick from 100 spoofed sources.
+    let mut sim2 = Sim::new(55);
+    sim2.connect();
+    let mut live = false;
+    for _ in 0..200 {
+        for _ in 0..10 {
+            let from = SimAddr {
+                ip: 100 + (i % 100) as u16,
+                port: i as u16,
+            };
+            sim2.inject_from(from, &forged[i % forged.len()]);
+            i += 1;
+        }
+        sim2.step();
+        if sim2.both_live_on_same_session() {
+            live = true;
+            break;
+        }
+    }
+    assert!(live, "the iPad connects through the flood");
+    assert_eq!(sim2.host.pending_count(), 0);
+}
+
+#[test]
+fn the_pending_cap_holds_with_many_ipads_connecting() {
+    let mut sim = Sim::new(56);
+    let others: Vec<usize> = (0..17u16)
+        .map(|i| {
+            sim.add_ipad(SimAddr {
+                ip: 200 + i,
+                port: 1,
+            })
+        })
+        .collect();
+    // Their confirms are lost, so they hold pending sessions.
+    sim.fault = Box::new(|sent| match (sent.kind, sent.from.ip) {
+        (Kind::Confirm, ip) if ip >= 200 => Fate::Drop,
+        _ => Fate::Deliver,
+    });
+    for &i in &others {
+        sim.connect_other(i);
+    }
+    sim.run_for(ms(100));
+    assert_eq!(sim.host.pending_count(), 16);
+    sim.connect();
+    sim.run_for(ms(100));
+    assert!(sim.host.pending_session(&sim.key.dev_id).is_none());
+    assert!(sim.host.pending_count() <= 16);
 }
