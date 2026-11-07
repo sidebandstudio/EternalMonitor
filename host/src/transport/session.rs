@@ -735,7 +735,16 @@ impl Session {
         }
         match message {
             ControlMessage::Hello2(hello) => {
-                self.handle_hello(source, hello, datagram.map(|(_, len)| len), config, now)
+                let len = datagram.map(|(_, len)| len);
+                let mut actions = self.handle_hello(source, hello, len, config, now);
+                // While no stream runs, no answer to a HELLO2 is larger than
+                // it: refusals included, after the checks that chose them.
+                if self.not_streaming.is_some() {
+                    if let Some(len) = len {
+                        actions.replies.retain(|(_, reply)| reply.len() <= len);
+                    }
+                }
+                actions
             }
             ControlMessage::Identify(request) => self.answer_identify(source, request, config, now),
             ControlMessage::Bye(reason) => self.handle_bye(source, reason, now),
@@ -4334,5 +4343,94 @@ mod tests {
             (ack.status, ack.reason.as_str()),
             (HelloStatus::Failed, "encoder")
         );
+    }
+
+    /// While no stream runs, every answer to a HELLO2 is bounded by its
+    /// size, the version and pairing refusals too. A padded HELLO2 still
+    /// hears them; while streaming, nothing changes.
+    #[test]
+    fn every_hello_answer_is_bounded_while_not_streaming() {
+        use eternal_wire::v2::control::{encode_control, parse_control};
+        let peer = addr([192, 0, 2, 1], 50000);
+        let send = |session: &mut Session, config: &PairConfig, hello: &Hello2| {
+            let datagram = encode_control(0, 1, &ControlMessage::Hello2(hello.clone()));
+            let (header, message) = parse_control(&datagram).unwrap();
+            let actions = session.handle_datagram(
+                peer,
+                &header,
+                message,
+                datagram.len(),
+                config,
+                Instant::now(),
+            );
+            for (_, reply) in &actions.replies {
+                assert!(
+                    reply.len() <= datagram.len(),
+                    "{} > {}",
+                    reply.len(),
+                    datagram.len()
+                );
+            }
+            actions
+                .replies
+                .first()
+                .map(|(_, reply)| match parse_control(reply) {
+                    Ok((_, ControlMessage::HelloAck(ack))) => ack.status,
+                    other => panic!("not an ACK: {other:?}"),
+                })
+        };
+        let small = |nonce: u32, caps: u16| {
+            let mut hello = pair_hello(nonce);
+            hello.device_name = String::new();
+            hello.device_id = 0;
+            hello.feature_caps = caps;
+            hello
+        };
+
+        let config = pair_config(true);
+        let mut session = Session::new(10);
+        session.set_not_streaming(Some(NotStreaming::Stopped));
+        // The version check.
+        let mut old_version = small(1, 0);
+        old_version.proto_min = 1;
+        old_version.proto_max = 1;
+        assert_eq!(send(&mut session, &config, &old_version), None);
+        old_version.feature_caps = FEATURE_STANDBY_STATUS;
+        assert_eq!(
+            send(&mut session, &config, &old_version),
+            Some(HelloStatus::VersionUnsupported)
+        );
+        // The pairing checks: no code, then wrong codes until rate limited.
+        assert_eq!(send(&mut session, &config, &small(2, 0)), None);
+        for attempt in 0..6 {
+            let mut guess = small(10 + attempt, 0);
+            guess.pairing_code = 1_000_000 + attempt;
+            assert_eq!(
+                send(&mut session, &config, &guess),
+                None,
+                "attempt {attempt}"
+            );
+        }
+        let mut padded = small(20, FEATURE_STANDBY_STATUS);
+        padded.pairing_code = 1_000_020;
+        assert_eq!(
+            send(&mut session, &config, &padded),
+            Some(HelloStatus::RateLimited)
+        );
+
+        // Streaming: the refusals are as they always were.
+        let config = pair_config(true);
+        let mut session = Session::new(10);
+        let datagram = encode_control(0, 1, &ControlMessage::Hello2(small(30, 0)));
+        let (header, message) = parse_control(&datagram).unwrap();
+        let actions = session.handle_datagram(
+            peer,
+            &header,
+            message,
+            datagram.len(),
+            &config,
+            Instant::now(),
+        );
+        assert_eq!(pair_ack(&actions).status, HelloStatus::Unauthorized);
     }
 }
