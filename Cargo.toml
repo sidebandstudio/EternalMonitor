@@ -1,8 +1,13 @@
 # docs/ contains the static website (GitHub Pages). Never write build output here.
 [workspace]
 members = ["host", "proto", "updater"]
+exclude = ["vendor"]
 resolver = "2"
 
 [profile.release]
 strip = "symbols"
 opt-level = 3
+
+# Patched copies of upstream crates; vendor/README.md says why.
+[patch.crates-io]
+egui-wgpu = { path = "vendor/egui-wgpu" }
