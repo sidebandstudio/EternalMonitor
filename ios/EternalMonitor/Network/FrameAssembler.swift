@@ -17,6 +17,10 @@ final class FrameAssembler {
     var onInfo: ((String) -> Void)?
     var onNack: ((Nack) -> Void)?
     var onNeedsKeyframe: ((_ epoch: UInt32, _ lastCompleteSeq: UInt32) -> Void)?
+    /// Video has arrived for `noFrameYetUs` and no frame has completed, and
+    /// again after each further `noFrameYetUs` while video still arrives.
+    /// `missing` names the fragments the latest incomplete frames lack.
+    var onNoFrameYet: ((_ epoch: UInt32, _ missing: String) -> Void)?
     var repairEnabled = false
     var framePeriodUs: UInt64 = 16_667
     var rttUs: () -> UInt64 = { 10_000 }
@@ -62,6 +66,10 @@ final class FrameAssembler {
     /// Without repair, a partial frame is dropped when no fragment of it has
     /// arrived for this long.
     static let staleFrameUs: UInt64 = 100_000
+    /// The first keyframe is the largest frame of a session. On lossy Wi-Fi,
+    /// or a path that drops full-size datagrams, it can lose fragments every
+    /// time while the frames after it wait for it.
+    static let noFrameYetUs: UInt64 = 2_000_000
 
     /// Cumulative per-connection loss accounting, safe to read from any
     /// thread (feeds receiver reports and the HUD).
@@ -117,6 +125,16 @@ final class FrameAssembler {
     /// because the new run's fragments interleave and reset the streak.
     private var staleEpochStreak: UInt32 = 0
     private static let epochResyncThreshold: UInt32 = 512
+
+    /// Until a frame completes: when the first fragment arrived, then when
+    /// `onNoFrameYet` last ran. The incomplete frames dropped so far, as
+    /// `onNoFrameYet` words them, and the largest fragment payload, which
+    /// is smaller than the PC sends when full-size datagrams are lost.
+    /// `reset()` keeps them: they span the attempt, not one stream epoch.
+    private var noFrameSince: UInt64?
+    private var deliveredAny = false
+    private var droppedBeforeFirstFrame: [String] = []
+    private var largestPayload = 0
 
     struct PendingFrame {
         let fragmentCount: UInt16
@@ -199,6 +217,7 @@ final class FrameAssembler {
         if repairEnabled { resumeAfterStall(at: now) }
         lastArrivalUs = now
         if isRetransmit { lastRepairUs = now }
+        if !deliveredAny && noFrameSince == nil { noFrameSince = now }
 
         let latestRetired = max(latestCompletedSeq, retiredSeq)
         if latestRetired > 0 {
@@ -275,6 +294,7 @@ final class FrameAssembler {
         frame.lastFragmentAt = now
         frame.byteCount += payload.count
         frame.highestIndex = max(frame.highestIndex, index)
+        largestPayload = max(largestPayload, payload.count)
         while frame.contiguous < count && frame.fragments[frame.contiguous] != nil {
             frame.contiguous += 1
         }
@@ -393,6 +413,43 @@ final class FrameAssembler {
         }
         if repairEnabled { drainReady(at: now) }
         updateDepth()
+        reportNoFrameYet(at: now)
+    }
+
+    /// See `onNoFrameYet`. Repeats only while fragments still arrive: a PC
+    /// that went silent is the liveness and connect timeouts' business.
+    private func reportNoFrameYet(at now: UInt64) {
+        guard !deliveredAny, let since = noFrameSince, now >= since + Self.noFrameYetUs,
+              let arrived = lastArrivalUs, arrived >= since else { return }
+        noFrameSince = now
+        let waiting = pending.keys.sorted().compactMap { seq in
+            pending[seq].flatMap { $0.isComplete ? nil : Self.describe(seq, $0, dropped: false) }
+        }
+        let frames = (droppedBeforeFirstFrame + waiting).suffix(3)
+        onNoFrameYet?(currentEpoch ?? 0, (frames.isEmpty ? "no incomplete frame" : frames.joined(separator: "; "))
+            + "; largest fragment \(largestPayload) bytes")
+    }
+
+    /// One incomplete frame for the support log, such as
+    /// "seq=1 keyframe dropped with 95/97 fragments, missing 3,90".
+    static func describe(_ seq: UInt32, _ frame: PendingFrame, dropped: Bool) -> String {
+        let missing = (0..<frame.fragmentCount).filter { frame.fragments[$0] == nil }
+        return "seq=\(seq)\(frame.isKeyframe ? " keyframe" : "") \(dropped ? "dropped with" : "has")"
+            + " \(frame.fragments.count)/\(frame.fragmentCount) fragments, missing \(ranges(missing))"
+    }
+
+    /// Ascending indices as ranges, "3-5,7,90-96", the first eight only.
+    static func ranges(_ indices: [UInt16]) -> String {
+        var runs: [ClosedRange<UInt16>] = []
+        for index in indices {
+            if let last = runs.last, last.upperBound &+ 1 == index {
+                runs[runs.count - 1] = last.lowerBound...index
+            } else {
+                runs.append(index...index)
+            }
+        }
+        let shown = runs.prefix(8).map { $0.count == 1 ? "\($0.lowerBound)" : "\($0.lowerBound)-\($0.upperBound)" }
+        return shown.joined(separator: ",") + (runs.count > 8 ? " and \(runs.count - 8) more ranges" : "")
     }
 
     /// How long this waiting frame has been stalled, not yet counted, within
@@ -516,6 +573,8 @@ final class FrameAssembler {
         }
         latestCompletedSeq = seq
         retiredSeq = max(retiredSeq, seq)
+        deliveredAny = true
+        droppedBeforeFirstFrame = []
         counters.withLock {
             $0.framesComplete += 1
             $0.fragsRepaired += frame.repaired
@@ -526,6 +585,9 @@ final class FrameAssembler {
     private func dropPending(_ seq: UInt32) {
         requestKeyframe(seq)
         if let frame = pending.removeValue(forKey: seq) {
+            if !deliveredAny && !frame.isComplete {
+                droppedBeforeFirstFrame = Array(droppedBeforeFirstFrame.suffix(2)) + [Self.describe(seq, frame, dropped: true)]
+            }
             pendingBytes -= frame.byteCount
             counters.withLock {
                 $0.framesDropped += 1

@@ -162,6 +162,8 @@ final class ConnectionProblemTests: XCTestCase {
         XCTAssertEqual(wifi(LinkError(.connectionFailed, "UDP connection failed: PolicyDenied", underlying: NWError.dns(-65570))), .localNetworkBlocked)
         // Offline.
         XCTAssertEqual(wifi(LinkError(.pathUnavailable, "UDP path not ready: Network is down", underlying: NWError.posix(.ENETDOWN))), .noNetwork)
+        XCTAssertEqual(ConnectionProblem.noNetwork.title, "Wi-Fi is off")
+        XCTAssertTrue(ConnectionProblem.noNetwork.detail.contains("Turn on Wi-Fi"), ConnectionProblem.noNetwork.detail)
         // Unknown failures get general advice, never the raw error.
         let unknown = LinkError(.connectionFailed, "UDP socket failed: Address already in use", underlying: POSIXError(.EADDRINUSE))
         XCTAssertEqual(wifi(unknown), .couldNotConnect)
@@ -298,6 +300,19 @@ final class ConnectionProblemTests: XCTestCase {
         XCTAssertTrue(USBStatusText.describe("USB: disconnected").contains("Connect USB"))
         for status in ["USB: off", "USB: waiting for a cable", "USB: disconnected", "USB: connecting", "USB: unavailable", "USB: connected to PC"] {
             XCTAssertFalse(USBStatusText.describe(status).hasPrefix("USB:"), status)
+        }
+    }
+
+    /// The PC's last session said it can't reach Apple's USB service: the
+    /// waiting card says why the cable won't connect. Other states don't
+    /// change, and a cable session (which reaches it) clears the flag.
+    func testUSBCardSaysWhenThePCLacksAppleDevices() {
+        let waiting = USBStatusText.describe("USB: waiting for a cable", pcLacksAppleDevices: true)
+        XCTAssertEqual(waiting, "Apple Devices isn't running on your PC, so the cable can't connect. "
+            + "Open it, or install it from the Microsoft Store. Wi-Fi still works.")
+        XCTAssertNotEqual(waiting, USBStatusText.describe("USB: waiting for a cable"))
+        for status in ["USB: off", "USB: disconnected", "USB: connecting", "USB: unavailable", "USB: connected to PC"] {
+            XCTAssertEqual(USBStatusText.describe(status, pcLacksAppleDevices: true), USBStatusText.describe(status), status)
         }
     }
 

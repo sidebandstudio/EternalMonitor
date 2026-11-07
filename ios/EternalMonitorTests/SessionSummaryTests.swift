@@ -1,3 +1,4 @@
+import Network
 import XCTest
 @testable import EternalMonitor
 
@@ -13,7 +14,7 @@ final class SessionSummaryTests: XCTestCase {
             + #" transport=(usb|wifi) mode=(mirror|second_screen|unknown)"#
             + #" stage=(started|hello_sent|accepted|video_sent|first_frame|steady)"#
             + #" outcome=(streamed|no_reply|no_picture|pairing|user_ended|app_ended|error)"#
-            + #" failure=(none|no_reply|no_video|no_frame|vdd_enable_failed|vdd_attach_timeout|vdd_not_attached|capture_failed|encoder_failed|usb_lost|signal_lost|other)"#
+            + #" failure=(none|no_reply|no_video|no_frame|vdd_enable_failed|vdd_attach_timeout|vdd_not_attached|capture_failed|encoder_failed|usb_lost|signal_lost|no_network|other)"#
             + #" fallback=(none|attach_timeout|enable_failed|no_driver|no_frames|duplication_failed|remembered|other)"#
             + #" end=(goodbye|liveness|superseded|shutdown|timeout|user|background|error)"#
             + #" ttff_ms=(0|[1-9][0-9]{0,5}|-) duration_ms=(0|[1-9][0-9]{0,9})"#
@@ -85,6 +86,7 @@ final class SessionSummaryTests: XCTestCase {
             (summary(.usbLinkFailed, usb: true), ["accepted", "error", "usb_lost", "error"]),
             (summary(.closedBeforePicture, usb: true), ["accepted", "no_picture", "usb_lost", "error"]),
             (summary(.linkFailed, session: nil, nonce: 0, duration: 0.2), ["started", "error", "other", "error"]),
+            (summary(.noNetwork, session: nil, nonce: 0, duration: 0.2), ["started", "error", "no_network", "error"]),
             (summary(.receiverFailed, session: nil, nonce: 0, duration: 0), ["started", "error", "other", "error"]),
             (retried, ["hello_sent", "pairing", "none", "superseded"]),
         ]
@@ -104,7 +106,7 @@ final class SessionSummaryTests: XCTestCase {
         XCTAssertEqual(AttemptEnd.superseded.bye, .superseded)
         for end in [AttemptEnd.pcGoodbye, .pcRefused, .legacyPC, .connectTimeout, .pcStoppedResponding,
                     .pictureStalled, .cableUnplugged, .usbLinkFailed, .closedBeforePicture, .linkFailed,
-                    .receiverFailed, .retriedWithCode] {
+                    .noNetwork, .receiverFailed, .retriedWithCode] {
             XCTAssertEqual(end.bye, .error, "\(end)")
         }
         XCTAssertEqual(AttemptEnd.linkFailed.name, "linkFailed")
@@ -162,6 +164,25 @@ final class SessionSummaryTests: XCTestCase {
         XCTAssertTrue(line.hasPrefix("session_summary v=1 role=ipad session_id=- nonce=- transport=wifi mode=unknown"
             + " stage=started outcome=error failure=other fallback=none end=error ttff_ms=- duration_ms="), line)
         XCTAssertFalse(line.contains("192.168"), line)
+        Self.assertContract(line)
+    }
+
+    /// Wi-Fi is off: Network.framework waits with "Network is down". The
+    /// card says so, and the summary gives it its own failure instead of
+    /// `other`.
+    func testWiFiOffHasItsOwnCardAndFailure() async throws {
+        let link = DeniedLink()
+        let manager = ConnectionManager(udpReceiver: { _ in link })
+        manager.connect(host: "192.168.1.20", port: 9876)
+        link.onError?(LinkError(.pathUnavailable, "UDP path not ready: The operation couldn’t be completed. (Network.NWError error 50 - Network is down)",
+                                underlying: NWError.posix(.ENETDOWN)))
+        try await until("ended") { manager.state == .disconnected }
+        XCTAssertEqual(manager.problem, .noNetwork)
+        XCTAssertEqual(manager.problem?.title, "Wi-Fi is off")
+        XCTAssertEqual(logged(manager, "connection").filter { $0.hasPrefix("Disconnect ") },
+                       ["Disconnect state=connecting reason=noNetwork"])
+        let line = logged(manager, "summary").first ?? ""
+        XCTAssertTrue(line.contains(" stage=started outcome=error failure=no_network fallback=none end=error "), line)
         Self.assertContract(line)
     }
 

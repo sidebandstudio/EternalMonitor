@@ -66,7 +66,7 @@ enum ConnectionProblem: Equatable {
         case .badAddress: return "That address doesn't look right"
         case .pairingCodeAsAddress: return "That looks like the pairing code, not the PC's address"
         case .routerAddress: return "That looks like your router's address, not your PC's"
-        case .noNetwork: return "This iPad isn't connected to a network"
+        case .noNetwork: return "Wi-Fi is off"
         case .localNetworkBlocked: return "Local Network is turned off for EternalMonitor"
         case .couldNotConnect: return "Couldn't connect to your PC"
         case .usbFailed: return "The connection over the cable stopped"
@@ -346,9 +346,16 @@ struct NoPictureStreak: Equatable {
 
 /// What the USB cable card says for each listener status.
 enum USBStatusText {
-    static func describe(_ status: String) -> String {
+    /// `pcLacksAppleDevices`: the PC said in its last session that it can't
+    /// reach Apple's USB service, so Apple Devices isn't running there or
+    /// isn't installed. Only a cable session would show the PC more.
+    static func describe(_ status: String, pcLacksAppleDevices: Bool = false) -> String {
         switch status {
         case "USB: off": return L("Off. Turn on to connect with a cable.")
+        case "USB: waiting for a cable" where pcLacksAppleDevices:
+            // A problem: stays English, like the other problem text.
+            return "Apple Devices isn't running on your PC, so the cable can't connect. "
+                + "Open it, or install it from the Microsoft Store. Wi-Fi still works."
         case "USB: waiting for a cable": return L("Plug this iPad into your PC. Keep Apple Devices open on the PC.")
         case "USB: disconnected": return L("Paused. Tap Connect USB to use the cable again.")
         case "USB: connecting": return L("Connecting over the cable…")

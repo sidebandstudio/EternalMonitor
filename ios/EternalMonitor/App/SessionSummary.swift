@@ -27,6 +27,8 @@ enum AttemptEnd: Equatable {
     case closedBeforePicture
     /// This iPad's network side failed, for example Local Network denied.
     case linkFailed
+    /// This iPad has no network: Wi-Fi is off or joined to none.
+    case noNetwork
     case receiverFailed
     /// The PC asked for the pairing code, and a new HELLO2 sends it: the
     /// refused one is over, the attempt goes on.
@@ -104,6 +106,7 @@ struct SessionSummary: Equatable {
         case .connectTimeout: return datagramsReceived == 0 ? "no_video" : "no_frame"
         case .pcStoppedResponding: return "signal_lost"
         case .cableUnplugged, .usbLinkFailed, .closedBeforePicture: return "usb_lost"
+        case .noNetwork: return "no_network"
         case .pcRefused, .legacyPC, .linkFailed, .receiverFailed, .pictureStalled: return "other"
         default: return "none"
         }

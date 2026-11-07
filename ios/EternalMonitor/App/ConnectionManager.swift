@@ -140,6 +140,9 @@ final class ConnectionManager: ObservableObject {
     @Published private(set) var hostStreamConfig: StreamConfig?
 
     @Published private(set) var usbStatus = "USB: waiting for a cable"
+    /// The PC of the last session could not reach Apple's USB service; see
+    /// `USBStatusText.describe`.
+    @Published private(set) var pcLacksAppleDevices = false
     private var mediaLink: (any MediaLink)?
     private var usbListener: USBListener?
     private var isForeground = true
@@ -558,6 +561,16 @@ final class ConnectionManager: ObservableObject {
         assembler.onNeedsKeyframe = { [weak channel] epoch, seq in
             channel?.sendKeyframeRequest(streamEpoch: epoch, lastCompleteSeq: seq, reason: .gapLoss)
         }
+        // Video arrives but the first frame never completes: ask for a fresh
+        // keyframe. The PC's packet size is its own setting; no message
+        // asks it for smaller datagrams.
+        assembler.onNoFrameYet = { [weak self, weak channel] epoch, missing in
+            channel?.sendKeyframeRequest(streamEpoch: epoch, lastCompleteSeq: 0, reason: .startup)
+            Task { @MainActor in
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                self.record(.warning, "assembly", "Video arrives but no frame completed in 2 s; asked the PC for a fresh keyframe: \(missing)")
+            }
+        }
         channel.reportProvider = { [weak assembler, weak channel, weak decoder, weak audio] in
             var report = metrics.makeReport(assembler: assembler?.counters.withLock { $0 } ?? .init(),
                 decodeDepth: decoder?.decodeDepth ?? 0,
@@ -595,6 +608,7 @@ final class ConnectionManager: ObservableObject {
                                               at: isUSB ? nil : "\(normalizedHost):\(port)")
                 self.livenessTimeoutUs = UInt64(info.livenessTimeoutMs) * 1000
                 self.hostInfo = info
+                self.pcLacksAppleDevices = info.hostCaps & HelloAck.hostCapUSB == 0
                 if self.awaitingPairing {
                     self.awaitingPairing = false
                     self.pairingPrompt = nil
@@ -778,7 +792,7 @@ final class ConnectionManager: ObservableObject {
                     return
                 }
                 guard isUSB else {
-                    self.disconnect(.linkFailed)
+                    self.disconnect(failure == .noNetwork ? .noNetwork : .linkFailed)
                     self.problem = failure
                     return
                 }

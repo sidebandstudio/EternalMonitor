@@ -296,7 +296,10 @@ final class ControlChannel {
         queue.async { [self] in
             guard sessionId != 0 else { return }
             let now = nowUs()
-            if let last = lastKeyframeRequestUs, now &- last < Self.keyframeRequestSpacingUs { return }
+            // Startup comes at most every 2 s, while no frame completes. The
+            // dropped frames' own requests then keep the spacing busy, and
+            // would always hide it from the PC's log.
+            if reason != .startup, let last = lastKeyframeRequestUs, now &- last < Self.keyframeRequestSpacingUs { return }
             lastKeyframeRequestUs = now
             onDiagnostic?("Requesting keyframe (\(reason))")
             sendMessage(.keyframeRequest(KeyframeRequest(

@@ -649,4 +649,78 @@ final class FrameAssemblerTests: XCTestCase {
         XCTAssertEqual(assembler.mismatchedCountFragments.withLock { $0 }, 6)
         XCTAssertEqual(FrameAssembler().mismatchedCountFragments.withLock { $0 }, 0, "a new session starts at zero")
     }
+
+    /// The session's first keyframe loses fragments for good, and the frames
+    /// after it never complete either. 2 s after the first fragment, and
+    /// again every 2 s while fragments still arrive, the app hears which
+    /// fragments are missing, so it can ask for a fresh keyframe. A
+    /// completed frame ends it.
+    func testAFirstFrameThatNeverCompletesIsReportedWithItsMissingFragments() {
+        now = 0
+        assembler = FrameAssembler(nowUs: { [weak self] in self?.now ?? 0 })
+        assembler.onFrameAssembled = { [weak self] data, _, _, _ in self?.completed.append(data) }
+        var reports: [(epoch: UInt32, missing: String)] = []
+        assembler.onNoFrameYet = { reports.append(($0, $1)) }
+
+        for index: UInt16 in [0, 1, 3] { add(seq: 1, index: index, count: 5, epoch: 7, byte: 1, keyframe: true) }
+        now = 200_000
+        assembler.tick()
+        now = 1_000_000
+        add(seq: 2, index: 0, count: 2, epoch: 7, byte: 2)
+        now = 1_999_999
+        assembler.tick()
+        XCTAssertTrue(reports.isEmpty, "\(reports)")
+
+        now = 2_000_000
+        assembler.tick()
+        XCTAssertEqual(reports.map(\.epoch), [7])
+        XCTAssertEqual(reports.first?.missing, "seq=1 keyframe dropped with 3/5 fragments, missing 2,4;"
+            + " seq=2 dropped with 1/2 fragments, missing 1; largest fragment 1 bytes")
+
+        // Nothing arrived since: no second report, however long it waits.
+        now = 9_000_000
+        assembler.tick()
+        XCTAssertEqual(reports.count, 1)
+        // Video again: reported at once, as 2 s have passed.
+        add(seq: 3, index: 1, count: 2, epoch: 7, byte: 3)
+        XCTAssertEqual(reports.count, 2)
+
+        add(seq: 4, index: 0, count: 1, epoch: 7, byte: 4)
+        XCTAssertEqual(completed, [Data([4])])
+        for step in UInt64(1)...5 {
+            now = 9_000_000 + step * 2_000_000
+            add(seq: 4 + UInt32(step), index: 0, count: 2, epoch: 7, byte: 5)
+            assembler.tick()
+        }
+        XCTAssertEqual(reports.count, 2, "a frame completed")
+    }
+
+    /// With repair on, the missing fragment is asked for as before; the
+    /// report names it once the frame has waited 2 s without completing.
+    func testARepairedSessionAlsoReportsAFirstKeyframeThatNeverCompletes() {
+        enableRepair()
+        var reports: [String] = []
+        assembler.onNoFrameYet = { _, missing in reports.append(missing) }
+        add(seq: 1, index: 0, count: 3, byte: 1, keyframe: true)
+        add(seq: 1, index: 2, count: 3, byte: 3, keyframe: true)
+        while now < 1_990_000 {
+            now += 10_000
+            assembler.tick()
+        }
+        XCTAssertTrue(reports.isEmpty, "\(reports)")
+        XCTAssertEqual(nacks.first?.missing, [1])
+        now = 2_000_000
+        add(seq: 2, index: 0, count: 2, byte: 4)
+        XCTAssertEqual(reports.count, 1, "\(reports)")
+        XCTAssertTrue(reports.first?.hasPrefix("seq=1 keyframe dropped with 2/3 fragments, missing 1;") == true, "\(reports)")
+        XCTAssertTrue(completed.isEmpty)
+    }
+
+    func testMissingFragmentsAreListedAsRanges() {
+        XCTAssertEqual(FrameAssembler.ranges([0, 1, 2, 5, 7, 8]), "0-2,5,7-8")
+        XCTAssertEqual(FrameAssembler.ranges(stride(from: 0, to: 40, by: 4).map { UInt16($0) }),
+                       "0,4,8,12,16,20,24,28 and 2 more ranges")
+        XCTAssertEqual(FrameAssembler.ranges([UInt16.max - 1, UInt16.max]), "65534-65535")
+        XCTAssertEqual(FrameAssembler.ranges([]), "")
+    }
 }
