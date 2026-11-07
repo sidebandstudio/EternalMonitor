@@ -2621,7 +2621,7 @@ mod tests {
     fn the_watchdog_leaves_a_second_screen_proving_itself_alone() {
         let shared = second_screen_selected();
         connect_viewer(&shared);
-        let machine = crate::supervisor::Machine::new(1);
+        let mut machine = crate::supervisor::Machine::new(1);
         let now_ms = 100_000;
         shared.hb_capture_loop_ms.store(now_ms, Ordering::Relaxed);
         shared
@@ -2633,12 +2633,12 @@ mod tests {
         note_attached(&shared, "virtual".into());
         start_proving(&shared, 7, Instant::now());
         assert_eq!(
-            crate::supervisor::wedge_reason_at(&shared, &machine, now_ms),
+            crate::supervisor::wedge_reason_at(&shared, &mut machine, now_ms),
             None
         );
         // After its first image a stalled second screen is a wedge again.
         note_image(&shared, 7);
-        assert!(crate::supervisor::wedge_reason_at(&shared, &machine, now_ms).is_some());
+        assert!(crate::supervisor::wedge_reason_at(&shared, &mut machine, now_ms).is_some());
     }
 
     /// Review round 2, defect 1: when no tick ended the proof before the

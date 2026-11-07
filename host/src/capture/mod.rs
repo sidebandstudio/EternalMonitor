@@ -1029,7 +1029,7 @@ mod tests {
     fn a_viewer_arriving_after_idle_is_not_taken_for_a_wedge() {
         use crate::supervisor::{wedge_reason_at, Machine};
         use std::sync::atomic::Ordering;
-        let machine = Machine::new(1);
+        let mut machine = Machine::new(1);
         let start_ms = 1_000_000;
         let arrival_ms = start_ms + 17_458;
 
@@ -1041,14 +1041,14 @@ mod tests {
             .hb_capture_loop_ms
             .store(arrival_ms, Ordering::Relaxed);
         connect_viewer(&stale);
-        let reason = wedge_reason_at(&stale, &machine, arrival_ms).unwrap();
+        let reason = wedge_reason_at(&stale, &mut machine, arrival_ms).unwrap();
         assert!(reason.starts_with("no captured frame"), "{reason}");
         // The first keepalive refreshes the frame stamp before the encoder
         // has output anything.
         stale
             .hb_capture_frame_ms
             .store(arrival_ms, Ordering::Relaxed);
-        let reason = wedge_reason_at(&stale, &machine, arrival_ms).unwrap();
+        let reason = wedge_reason_at(&stale, &mut machine, arrival_ms).unwrap();
         assert!(reason.starts_with("encoder silent"), "{reason}");
 
         // With idle heartbeats the arrival is healthy at every step.
@@ -1060,16 +1060,16 @@ mod tests {
             idle_heartbeat(&idle, now);
         }
         connect_viewer(&idle);
-        assert_eq!(wedge_reason_at(&idle, &machine, arrival_ms), None);
+        assert_eq!(wedge_reason_at(&idle, &mut machine, arrival_ms), None);
         idle.hb_capture_frame_ms
             .store(arrival_ms + 10, Ordering::Relaxed);
-        assert_eq!(wedge_reason_at(&idle, &machine, arrival_ms + 10), None);
+        assert_eq!(wedge_reason_at(&idle, &mut machine, arrival_ms + 10), None);
     }
 
     #[test]
     fn a_viewer_arriving_during_access_lost_recovery_is_not_taken_for_a_wedge() {
         use crate::supervisor::{wedge_reason_at, Machine};
-        let machine = Machine::new(1);
+        let mut machine = Machine::new(1);
         let shared = SharedControl::new(0, 1);
         let start_ms = 1_000_000;
         startup_heartbeat(&shared, start_ms);
@@ -1081,7 +1081,7 @@ mod tests {
         }
         // A viewer registers 30 ms after a poll, before the next one.
         connect_viewer(&shared);
-        assert_eq!(wedge_reason_at(&shared, &machine, now + 30), None);
+        assert_eq!(wedge_reason_at(&shared, &mut machine, now + 30), None);
         // The next poll resends the last picture to it.
         assert!(recovery_poll(&shared, now + 50, Duration::from_secs(6)));
     }
@@ -1327,7 +1327,7 @@ mod tests {
     #[test]
     fn slow_virtual_attach_keeps_watchdog_alive_without_hiding_a_stall() {
         let shared = SharedControl::new(9876, 15_000_000);
-        let machine = crate::supervisor::Machine::new(1);
+        let mut machine = crate::supervisor::Machine::new(1);
         let start = Instant::now();
         let elapsed = Cell::new(Duration::ZERO);
         let before = vec!["primary".to_string(), "physical-secondary".to_string()];
@@ -1348,7 +1348,7 @@ mod tests {
                 assert!(
                     crate::supervisor::wedge_reason_at(
                         &shared,
-                        &machine,
+                        &mut machine,
                         1_000 + elapsed.get().as_millis() as u64
                     )
                     .is_none(),
@@ -1360,14 +1360,18 @@ mod tests {
             panic!("virtual display did not attach")
         };
         assert_eq!(output.device_name, "virtual");
+        // The driver stalls now. The supervisor looks every 250 ms; a longer
+        // gap between looks is a sleeping PC, not a stall.
+        let stalled = 1_000 + elapsed.get().as_millis() as u64;
+        let mut now = stalled;
+        while now < stalled + 3_000 {
+            now += 250;
+            assert!(crate::supervisor::wedge_reason_at(&shared, &mut machine, now).is_none());
+        }
         assert!(
-            crate::supervisor::wedge_reason_at(
-                &shared,
-                &machine,
-                1_000 + elapsed.get().as_millis() as u64 + 3_001
-            )
-            .unwrap()
-            .contains("capture loop silent"),
+            crate::supervisor::wedge_reason_at(&shared, &mut machine, now + 250)
+                .unwrap()
+                .contains("capture loop silent"),
             "the normal watchdog must still detect a stalled driver"
         );
     }
