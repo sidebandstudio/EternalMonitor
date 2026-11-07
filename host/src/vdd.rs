@@ -599,9 +599,12 @@ mod tests {
         let tasks = DriverTasks::new();
         assert!(tasks.found_off(DeviceState::Problem(22)));
         // Neither the startup cleanup nor a quit before any stream runs one.
-        assert!(tasks.set_enabled(false, Purpose::Cleanup, || {}, |_, _| {
-            panic!("ran the Disable task for a display that is off")
-        }));
+        assert!(tasks.set_enabled(
+            false,
+            Purpose::Cleanup,
+            || {},
+            |_, _| { panic!("ran the Disable task for a display that is off") }
+        ));
         // The first Enable runs, and so does the Disable after it.
         let ran = Cell::new(Vec::new());
         let run = |enabled: bool, _: &mut dyn FnMut()| {
@@ -627,10 +630,15 @@ mod tests {
             let tasks = DriverTasks::new();
             assert!(!tasks.found_off(device), "{device:?}");
             let ran = Cell::new(false);
-            tasks.set_enabled(false, Purpose::Cleanup, || {}, |_, _| {
-                ran.set(true);
-                TaskOutcome::Done
-            });
+            tasks.set_enabled(
+                false,
+                Purpose::Cleanup,
+                || {},
+                |_, _| {
+                    ran.set(true);
+                    TaskOutcome::Done
+                },
+            );
             assert!(ran.get(), "no Disable for {device:?}");
         }
     }
