@@ -125,6 +125,8 @@ static STATUS: Mutex<Option<Status>> = Mutex::new(None);
 /// Adapters chosen for the window this launch. After the first, each
 /// replaces a lost device (`vendor/egui-wgpu`).
 static SELECTIONS: AtomicU64 = AtomicU64::new(0);
+/// The painter's count of devices dropped as lost, when last looked at.
+static LOSSES_SEEN: AtomicU64 = AtomicU64::new(0);
 
 /// How this launch draws its window, for Settings > Troubleshooting.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -438,6 +440,11 @@ fn save_marker(directory: &Path, owner: ProcessId, marker: &Marker) -> bool {
 /// window has kept drawing without a surface error.
 pub(super) fn frame_started(ctx: &egui::Context) {
     crate::startup::simulate_surface_error(&FAILED_ACQUIRES);
+    // Whether or not a replacement is ever made.
+    let lost = eframe::egui_wgpu::winit::DEVICES_LOST.load(Ordering::SeqCst);
+    if LOSSES_SEEN.swap(lost, Ordering::SeqCst) != lost {
+        lost_before_drawing();
+    }
     let visible = ctx.input(|input| input.viewport().minimized != Some(true));
     let Ok(mut tracker) = PRESENT.lock() else {
         return;
@@ -468,17 +475,25 @@ fn failures() -> u64 {
         + eframe::egui_wgpu::winit::SKIPPED_FRAMES.load(Ordering::SeqCst)
 }
 
-/// The window's device was lost before the window was confirmed working: the
-/// backend it started on failed to draw. Record that, and end this launch's
-/// marker, so the replacement drawing later is not counted for it.
+/// The painter dropped a lost device. Before the window was confirmed
+/// working, that means the backend it started on failed to draw.
 fn lost_before_drawing() {
-    if PRESENT.lock().is_ok_and(|tracker| tracker.confirmed) {
+    let confirmed = PRESENT.lock().is_ok_and(|tracker| tracker.confirmed);
+    if let (Some(directory), Ok(mut started)) = (STATE_DIR.get(), STARTED.lock()) {
+        lose_started(directory, &mut started, confirmed, ProcessId::current());
+    }
+}
+
+/// Record the failure of this launch's `started` backend, once, unless the
+/// window was `confirmed`. The marker ends with it, so neither a replacement
+/// that draws later nor a normal quit counts that backend as drawing.
+fn lose_started(directory: &Path, started: &mut Option<Marker>, confirmed: bool, owner: ProcessId) {
+    if confirmed {
         return;
     }
-    let marker = STARTED.lock().ok().and_then(|mut started| started.take());
-    if let (Some(directory), Some(marker)) = (STATE_DIR.get(), marker) {
+    if let Some(marker) = started.take() {
         warn!(gpu = %marker.gpu, backend = %marker.backend, "Window device lost before the window worked");
-        lose_launch(directory, &marker, ProcessId::current());
+        lose_launch(directory, &marker, owner);
     }
 }
 
@@ -645,13 +660,10 @@ fn select(
     rules: &[RendererRule],
     overruled: Option<&'static str>,
 ) -> Result<wgpu::Adapter, String> {
-    // A replacement for a lost device chooses as the start did, and starts no
-    // marker. The window may have worked, so a later end is not a failed
-    // start; if it hadn't yet, the backend it started on failed.
+    // A replacement for a lost device (on egui-wgpu's replacement thread)
+    // chooses as the start did, and starts no marker: the loss itself was
+    // recorded when the device was dropped (`frame_started`).
     let replacing = SELECTIONS.fetch_add(1, Ordering::SeqCst) > 0;
-    if replacing {
-        lost_before_drawing();
-    }
     #[cfg(any(debug_assertions, feature = "fault-injection"))]
     if replacing {
         crate::startup::simulate_replacement_failure()?;
@@ -2149,6 +2161,43 @@ mod tests {
         assert!(!marker_path(&directory, owner).exists());
         // Not a driver crash: retried after clean launches, like any other end.
         assert!(!history[0].in_driver());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_device_lost_before_the_window_works_is_recorded_once_even_if_never_replaced() {
+        let directory = temp_dir("lost-unreplaced");
+        let owner = ProcessId::current();
+        let gpu = "10de:2c02 32.0.15.9186";
+        let mut started = Some(marker(gpu, "vulkan"));
+        assert!(save_marker(&directory, owner, started.as_ref().unwrap()));
+        // The painter drops the device, then every replacement fails making
+        // its surface, so no adapter is ever chosen, until it gives up. The
+        // host sees the drop on the next frames.
+        for _ in 0..3 {
+            lose_started(&directory, &mut started, false, owner);
+        }
+        // Then a normal quit (`window_closed`).
+        if let Some(marker) = started.as_ref() {
+            assert!(finish_launch(&directory, marker, owner, false));
+        }
+        let history = read_history(&directory);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].backend, "vulkan");
+        assert_eq!(history[0].failures, 1);
+        assert_eq!(history[0].fault.as_deref(), Some(DEVICE_LOST));
+        assert!(!marker_path(&directory, owner).exists());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn a_device_lost_after_the_window_works_is_not_a_failed_start() {
+        let directory = temp_dir("lost-confirmed");
+        let owner = ProcessId::current();
+        let mut started = Some(marker("10de:2c02 32.0.15.9186", "dx12"));
+        lose_started(&directory, &mut started, true, owner);
+        assert!(started.is_some());
+        assert!(read_history(&directory).is_empty());
         fs::remove_dir_all(directory).unwrap();
     }
 
