@@ -1,3 +1,4 @@
+import Combine
 import XCTest
 @testable import EternalMonitor
 
@@ -61,13 +62,58 @@ final class PCNoticeTests: XCTestCase {
         manager.cancel()
     }
 
-    /// A sighting is one sample: it stops applying after a while.
+    /// A sighting is one sample: it applies from when it was seen until it
+    /// expires, and not under a clock set back.
     func testASightingGoesStale() {
         let at = Date(timeIntervalSince1970: 1_000_000)
-        let sighting = ConnectionManager.AppleDevicesSighting(target: "192.168.1.20:9876", at: at)
+        let until = at + ConnectionManager.AppleDevicesSighting.lifetime
+        let sighting = ConnectionManager.AppleDevicesSighting(target: "192.168.1.20:9876", at: at, until: until)
         XCTAssertTrue(sighting.applies(now: at))
-        XCTAssertTrue(sighting.applies(now: at + ConnectionManager.AppleDevicesSighting.lifetime - 1))
-        XCTAssertFalse(sighting.applies(now: at + ConnectionManager.AppleDevicesSighting.lifetime))
+        XCTAssertTrue(sighting.applies(now: until - 1))
+        XCTAssertFalse(sighting.applies(now: until))
         XCTAssertFalse(sighting.applies(now: at - 60), "a clock set back")
+    }
+
+    /// The Connect screen may sit idle after the session: the published
+    /// hint goes by itself when it expires, with nothing else happening.
+    func testThePublishedHintExpiresByItself() async throws {
+        let seen = Date(timeIntervalSince1970: 2_000_000)
+        var timing = ConnectionManager.Timing()
+        timing.appleDevicesNoteSeconds = 0.5
+        let manager = ConnectionManager(timing: timing)
+        manager.now = { seen }
+        addTeardownBlock { await MainActor.run { manager.cancel() } }
+        var published: [ConnectionManager.AppleDevicesSighting?] = []
+        let watch = manager.$appleDevicesUnreachable.dropFirst().sink { published.append($0) }
+        defer { watch.cancel() }
+
+        try await session(manager, FakeUDPHost(), caps: 0)
+        let sighting = try XCTUnwrap(manager.appleDevicesUnreachable)
+        XCTAssertEqual(sighting.at, seen)
+        XCTAssertEqual(sighting.until, seen + 0.5)
+        try await until("expired", seconds: 10) { manager.appleDevicesUnreachable == nil }
+        XCTAssertEqual(published.last, .some(nil), "the change was published: \(published)")
+        XCTAssertEqual(USBStatusText.describe("USB: waiting for a cable",
+                                              appleDevicesUnreachable: manager.appleDevicesUnreachable != nil),
+                       USBStatusText.describe("USB: waiting for a cable"))
+    }
+
+    /// Back in the foreground the sighting is checked against the clock,
+    /// since a suspended app's timer may have missed its time.
+    func testComingBackChecksTheClock() async throws {
+        var clock = Date(timeIntervalSince1970: 3_000_000)
+        let manager = ConnectionManager()
+        manager.now = { clock }
+        addTeardownBlock { await MainActor.run { manager.cancel() } }
+        try await session(manager, FakeUDPHost(), caps: 0)
+        let sighting = try XCTUnwrap(manager.appleDevicesUnreachable)
+        XCTAssertEqual(sighting.until, clock + ConnectionManager.AppleDevicesSighting.lifetime)
+
+        clock = sighting.until - 60
+        manager.recheckAppleDevicesSighting()
+        XCTAssertEqual(manager.appleDevicesUnreachable, sighting, "a minute left")
+        clock = sighting.until
+        manager.recheckAppleDevicesSighting()
+        XCTAssertNil(manager.appleDevicesUnreachable)
     }
 }

@@ -597,7 +597,7 @@ struct ConnectView: View {
                     .font(.app(15, .medium, relativeTo: .subheadline))
                     .foregroundStyle(Theme.text)
                 Text(USBStatusText.describe(connectionManager.usbStatus,
-                    appleDevicesUnreachable: connectionManager.appleDevicesUnreachable?.applies(now: Date()) == true))
+                    appleDevicesUnreachable: connectionManager.appleDevicesUnreachable != nil))
                     .font(.app(13.5, relativeTo: .footnote))
                     .foregroundStyle(Theme.textMuted)
                     .fixedSize(horizontal: false, vertical: true)
