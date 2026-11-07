@@ -275,7 +275,8 @@ struct ConnectView: View {
         case .connect(let host, let port):
             hostIP = host
             self.port = String(port)
-            connectionManager.connect(host: host, port: port)
+            // Setup offers only the PCs Bonjour found.
+            connectionManager.connect(host: host, port: port, found: true)
             return
         case .scanQR:
             showQRScanner = true
@@ -700,7 +701,7 @@ struct ConnectView: View {
                         guard let address = host.address else { return }
                         hostIP = address
                         port = "\(host.port)"
-                        connectionManager.connect(host: address, port: host.port)
+                        connectionManager.connect(host: address, port: host.port, found: true)
                     } label: {
                         hostRow(
                             icon: "desktopcomputer",

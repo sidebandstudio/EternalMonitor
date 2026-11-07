@@ -12,7 +12,7 @@ import SwiftUI
 /// Launch with `-allowUSB NO` so the USB listener stays off as well.
 enum UIPreview {
     static let mode = ProcessInfo.processInfo.environment["EM_UI_PREVIEW"] ?? ""
-    static var showsBackdrop: Bool { mode == "display" || mode == "quality" || mode == "restoring" }
+    static var showsBackdrop: Bool { mode == "display" || mode == "quality" || mode == "restoring" || mode == "locked" }
     static var opensQuality: Bool { mode == "quality" }
     static var opensSettings: Bool { mode == "settings" || mode == "settings-about" }
     /// Scrolls Settings to Support and About.
@@ -46,6 +46,10 @@ enum UIPreview {
             manager.transportMode = "WiFi"
             manager.state = .connected
             manager.pictureRestoring = true
+        case "locked":
+            manager.transportMode = "WiFi"
+            manager.state = .connected
+            manager.pcLocked = true
         case "connecting":
             manager.state = .connecting
         case "error":

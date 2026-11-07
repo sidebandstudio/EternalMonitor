@@ -169,11 +169,21 @@ pub struct HelloAck {
     pub host_caps: u16,
 }
 
+/// [`Heartbeat::notice`] values. A notice is appended to the heartbeat only
+/// when it is not [`NOTICE_NONE`]: iPads older than the field ignore the byte,
+/// and an iPad ignores a value it does not know.
+pub const NOTICE_NONE: u8 = 0;
+/// The PC is locked or shows a permission prompt, so Windows lets nothing
+/// capture its screen and the picture stops until the user returns.
+pub const NOTICE_PC_LOCKED: u8 = 1;
+
 /// Host → client, every heartbeat interval while a session is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Heartbeat {
     pub host_time_us: u64,
     pub stream_config: StreamConfig,
+    /// What the iPad should say over the picture, for as long as it lasts.
+    pub notice: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,6 +325,58 @@ pub struct InputEvent {
     pub tilt_y: i16,
 }
 
+/// [`Identify`] and [`Identity`] layout version.
+pub const IDENTIFY_VERSION: u8 = 1;
+/// What an [`Identity`] proof signs after the nonce.
+pub const IDENTIFY_CONTEXT: &[u8] = b"EternalMonitor identify v1";
+
+/// At most this many addresses in an [`Identity`].
+pub const IDENTITY_MAX_ADDRESSES: usize = 4;
+
+/// Client → host, session_id 0: before reconnecting to a PC it found at a new
+/// address, the iPad checks that it is the same PC, at that address. The host
+/// answers with an [`Identity`] whose proof only the PC holding the pairing
+/// token can make. Reserved bytes keep the request as long as the answer.
+/// Hosts before 0.3.5 don't know the type and drop it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Identify {
+    pub version: u8,
+    pub nonce: [u8; 16],
+}
+
+/// Host → client, session_id 0: the port the host receives the stream on and
+/// its home network IPv4 addresses (at most [`IDENTITY_MAX_ADDRESSES`]), and
+/// `proof`, HMAC-SHA256 keyed with the pairing token over
+/// [`identity_message`]. The iPad goes on only when the address it asked at
+/// is one of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    pub version: u8,
+    pub nonce: [u8; 16],
+    pub port: u16,
+    pub addresses: Vec<[u8; 4]>,
+    pub proof: [u8; 32],
+}
+
+/// Both bodies: version, nonce, port, address count, the address slots
+/// (unused ones zero) and the proof.
+pub const IDENTIFY_BODY_SIZE: usize = 1 + 16 + 2 + 1 + 4 * IDENTITY_MAX_ADDRESSES + 32;
+
+/// What an [`Identity`] proof signs: `nonce ‖ IDENTIFY_CONTEXT ‖ port (LE) ‖
+/// count ‖ addresses`. Only the first [`IDENTITY_MAX_ADDRESSES`] count.
+pub fn identity_message(nonce: &[u8; 16], port: u16, addresses: &[[u8; 4]]) -> Vec<u8> {
+    let addresses = &addresses[..addresses.len().min(IDENTITY_MAX_ADDRESSES)];
+    let mut message = Vec::with_capacity(16 + IDENTIFY_CONTEXT.len() + 3 + 4 * addresses.len());
+    message.extend_from_slice(nonce);
+    message.extend_from_slice(IDENTIFY_CONTEXT);
+    message.extend_from_slice(&port.to_le_bytes());
+    message.push(addresses.len() as u8);
+    for address in addresses {
+        message.extend_from_slice(address);
+    }
+    message
+}
+
 pub const INPUT_EVENT_SIZE: usize = 30;
 pub const PEN_INPUT_EVENT_SIZE: usize = INPUT_EVENT_SIZE + 4;
 
@@ -332,6 +394,8 @@ pub enum ControlMessage {
     Pong(Pong),
     StreamConfig(StreamConfig),
     InputEvent(InputEvent),
+    Identify(Identify),
+    Identity(Identity),
 }
 
 impl ControlMessage {
@@ -348,6 +412,8 @@ impl ControlMessage {
             Self::Pong(_) => PacketType::Pong,
             Self::StreamConfig(_) => PacketType::StreamConfig,
             Self::InputEvent(_) => PacketType::InputEvent,
+            Self::Identify(_) => PacketType::Identify,
+            Self::Identity(_) => PacketType::Identity,
         }
     }
 }
@@ -405,6 +471,9 @@ pub fn encode_control(session_id: u32, msg_seq: u32, message: &ControlMessage) -
             let mut cfg = [0u8; STREAM_CONFIG_SIZE];
             hb.stream_config.encode_into(&mut cfg);
             body.extend_from_slice(&cfg);
+            if hb.notice != NOTICE_NONE {
+                body.push(hb.notice);
+            }
         }
         ControlMessage::Bye(reason) => body.push(*reason as u8),
         ControlMessage::KeyframeRequest(k) => {
@@ -456,6 +525,22 @@ pub fn encode_control(session_id: u32, msg_seq: u32, message: &ControlMessage) -
             let mut block = [0u8; STREAM_CONFIG_SIZE];
             cfg.encode_into(&mut block);
             body.extend_from_slice(&block);
+        }
+        ControlMessage::Identify(i) => {
+            body.push(i.version);
+            body.extend_from_slice(&i.nonce);
+            body.extend_from_slice(&[0; IDENTIFY_BODY_SIZE - 17]);
+        }
+        ControlMessage::Identity(i) => {
+            let count = i.addresses.len().min(IDENTITY_MAX_ADDRESSES);
+            body.push(i.version);
+            body.extend_from_slice(&i.nonce);
+            body.extend_from_slice(&i.port.to_le_bytes());
+            body.push(count as u8);
+            for slot in 0..IDENTITY_MAX_ADDRESSES {
+                body.extend_from_slice(i.addresses.get(slot).unwrap_or(&[0; 4]));
+            }
+            body.extend_from_slice(&i.proof);
         }
         ControlMessage::InputEvent(e) => {
             body.push(e.input_ver);
@@ -589,6 +674,11 @@ pub fn parse_control(datagram: &[u8]) -> Result<(ControlHeader, ControlMessage),
         PacketType::Heartbeat => ControlMessage::Heartbeat(Heartbeat {
             host_time_us: r.u64()?,
             stream_config: StreamConfig::decode(r.take(STREAM_CONFIG_SIZE)?)?,
+            notice: if r.remaining() >= 1 {
+                r.u8()?
+            } else {
+                NOTICE_NONE
+            },
         }),
         PacketType::Bye => ControlMessage::Bye(
             ByeReason::from_u8(r.u8()?).ok_or(WireError::InvalidField("bye_reason"))?,
@@ -675,6 +765,30 @@ pub fn parse_control(datagram: &[u8]) -> Result<(ControlHeader, ControlMessage),
                 client_time_us: r.u64()?,
                 tilt_x: if input_ver == 2 { r.i16()? } else { 0 },
                 tilt_y: if input_ver == 2 { r.i16()? } else { 0 },
+            })
+        }
+        PacketType::Identify => {
+            let version = r.u8()?;
+            let nonce = r.take(16)?.try_into().unwrap();
+            r.take(IDENTIFY_BODY_SIZE - 17)?;
+            ControlMessage::Identify(Identify { version, nonce })
+        }
+        PacketType::Identity => {
+            let version = r.u8()?;
+            let nonce = r.take(16)?.try_into().unwrap();
+            let port = r.u16()?;
+            let count = usize::from(r.u8()?);
+            if count > IDENTITY_MAX_ADDRESSES {
+                return Err(WireError::InvalidField("identity_addresses"));
+            }
+            let slots = r.take(4 * IDENTITY_MAX_ADDRESSES)?;
+            let addresses = slots.as_chunks::<4>().0[..count].to_vec();
+            ControlMessage::Identity(Identity {
+                version,
+                nonce,
+                port,
+                addresses,
+                proof: r.take(32)?.try_into().unwrap(),
             })
         }
         PacketType::Media | PacketType::MediaFec | PacketType::Audio | PacketType::Error => {
@@ -908,6 +1022,7 @@ mod tests {
             ControlMessage::Heartbeat(Heartbeat {
                 host_time_us: 987_654_321,
                 stream_config: sample_config(),
+                notice: NOTICE_NONE,
             }),
             ControlMessage::Bye(ByeReason::AppBackground),
             ControlMessage::KeyframeRequest(KeyframeRequest {
@@ -937,6 +1052,17 @@ mod tests {
                 t3_us: 44,
             }),
             ControlMessage::StreamConfig(sample_config()),
+            ControlMessage::Identify(Identify {
+                version: IDENTIFY_VERSION,
+                nonce: [7; 16],
+            }),
+            ControlMessage::Identity(Identity {
+                version: IDENTIFY_VERSION,
+                nonce: [7; 16],
+                port: 9876,
+                addresses: vec![[192, 0, 2, 7], [198, 51, 100, 7]],
+                proof: [9; 32],
+            }),
             ControlMessage::InputEvent(InputEvent {
                 input_ver: 1,
                 kind: 0,
@@ -986,6 +1112,33 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn a_heartbeat_notice_is_appended_only_when_there_is_one() {
+        let heartbeat = |notice| {
+            ControlMessage::Heartbeat(Heartbeat {
+                host_time_us: 987_654_321,
+                stream_config: sample_config(),
+                notice,
+            })
+        };
+        // No notice: the bytes every earlier iPad already reads.
+        let plain = encode_control(7, 1, &heartbeat(NOTICE_NONE));
+        assert_eq!(plain.len(), CONTROL_HEADER_SIZE + 8 + STREAM_CONFIG_SIZE);
+        // A notice is one byte more. Such a body, cut back to the old length
+        // as an older iPad reads it, is the plain heartbeat; an unknown value
+        // reaches the iPad as it is, for it to ignore.
+        for notice in [NOTICE_PC_LOCKED, 0xC8] {
+            let datagram = encode_control(7, 1, &heartbeat(notice));
+            assert_eq!(datagram.len(), plain.len() + 1);
+            assert_eq!(datagram[..plain.len()][8..], plain[8..]);
+            assert_eq!(parse_control(&datagram).unwrap().1, heartbeat(notice));
+            for len in 0..datagram.len() {
+                assert!(parse_control(&datagram[..len]).is_err());
+            }
+        }
+        assert_eq!(parse_control(&plain).unwrap().1, heartbeat(NOTICE_NONE));
     }
 
     #[test]

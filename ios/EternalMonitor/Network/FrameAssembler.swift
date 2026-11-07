@@ -151,11 +151,14 @@ final class FrameAssembler {
         var deadline: UInt64?
         var retryAt: UInt64?
         var requestedAt: UInt64?
+        /// The latest request for this frame; see `keyframeRetryDue(_:at:)`.
+        var askedAt: UInt64?
         var completedAt: UInt64?
         var stallAllowanceUsed: UInt64 = 0
         var stallCountedUntil: UInt64 = 0
         /// Indices already requested; each is requested when first seen
-        /// missing and at most once more by the frame's single retry.
+        /// missing and at most once more by the frame's single retry. A
+        /// keyframe retries until it completes; see `keyframeRetryDue(_:at:)`.
         var requested = Set<UInt16>()
         var retried = false
         var keyframeRequested = false
@@ -285,7 +288,7 @@ final class FrameAssembler {
             // A held frame now delays a newer one: one more repair window
             // once a complete frame waits.
             let latest = now + repairWindow()
-            for held in pending.keys where pending[held]?.holdRetryUs ?? 0 > 0 {
+            for held in pending.keys where pending[held]?.holdRetryUs ?? 0 > 0 && pending[held]?.isKeyframe == false {
                 let dropBy = min(pending[held]?.dropBy ?? latest, latest)
                 pending[held]?.dropBy = dropBy
             }
@@ -379,7 +382,13 @@ final class FrameAssembler {
                     // Retire in sequence order. Expiring a later partial
                     // first must not make an older repair look stale.
                     if pending.keys.min() == seq {
-                        let blocking = pending.values.contains { $0.isComplete }
+                        // Every frame up to the next keyframe refers to this
+                        // keyframe, so a complete one behind it is no reason
+                        // to drop it: the decoder would hold the picture
+                        // until another keyframe, and on lossy WiFi each
+                        // replacement arrived incomplete too, for seconds.
+                        // It is held, as a frame alone is.
+                        let blocking = !frame.isKeyframe && pending.values.contains { $0.isComplete }
                         if !blocking, let gap = frame.gapAt, now < gap + Self.maxHoldUs {
                             hold(seq, now: now)
                         } else if blocking {
@@ -401,10 +410,12 @@ final class FrameAssembler {
                     }
                 } else if frame.gapAt == nil, now >= frame.createdAt + framePeriodUs {
                     beginGap(seq, through: frame.fragmentCount - 1, now: now)
-                } else if let retry = frame.retryAt, now >= retry, !frame.retried {
-                    pending[seq]?.retried = true
-                    request(seq, through: frame.fragmentCount - 1, again: true, now: now)
+                } else if !frame.isKeyframe, let retryAt = frame.retryAt, now >= retryAt, !frame.retried {
+                    retry(seq, now: now)
                 }
+                // A keyframe's requests follow their own schedule, apart from
+                // its hold: one request per retry, never two in one interval.
+                if keyframeRetryDue(seq, at: now) { retry(seq, now: now) }
             } else if now >= frame.lastFragmentAt + Self.staleFrameUs {
                 // Timed from the latest fragment: over a slow USB tunnel a
                 // big keyframe is still arriving long after its first one.
@@ -503,6 +514,31 @@ final class FrameAssembler {
         request(seq, through: index, again: false, now: now)
     }
 
+    /// A keyframe has many fragments, and at 10% loss one round of requests
+    /// and repairs leaves some missing, so a keyframe asks again every RTT
+    /// plus 5 ms, not once: sooner, its repair can't have come back, and the
+    /// PC resends a fragment at most every 5 ms. This one schedule covers all
+    /// its repeated requests; its hold only moves its deadline. After its
+    /// first retry it asks only once something has arrived since it last
+    /// asked: while WiFi holds traffic, its request and the repair are still
+    /// queued, and with nothing arriving it does not ask again. A fragment
+    /// arriving now may be the missing one, so it asks only on a later tick.
+    private func keyframeRetryDue(_ seq: UInt32, at now: UInt64) -> Bool {
+        guard let frame = pending[seq], frame.isKeyframe, !frame.isComplete, let retryAt = frame.retryAt,
+              now >= retryAt else { return false }
+        guard frame.retried else { return true }
+        guard let asked = frame.askedAt, let arrival = lastArrivalUs else { return false }
+        return arrival > asked && arrival < now
+    }
+
+    /// Asks again for every missing fragment and schedules the next retry.
+    private func retry(_ seq: UInt32, now: UInt64) {
+        guard let frame = pending[seq] else { return }
+        pending[seq]?.retried = true
+        pending[seq]?.retryAt = now + min(rttUs(), 1_000_000) + 5_000
+        request(seq, through: frame.fragmentCount - 1, again: true, now: now)
+    }
+
     private func repairWindow() -> UInt64 {
         max(8_000, min(25_000, 2 * min(rttUs(), 1_000_000) + framePeriodUs * 3 / 2))
     }
@@ -515,15 +551,18 @@ final class FrameAssembler {
     /// keyframes in an afternoon. A starved PC can also stop sending for
     /// several hundred milliseconds with two frames incomplete and then send
     /// both repairs together. Ask again, less often each time, until a newer
-    /// frame completes or the frame has waited `maxHoldUs`.
+    /// frame completes or the frame has waited `maxHoldUs`. A keyframe waits
+    /// for a newer keyframe instead of a newer frame, and its hold only moves
+    /// its deadline: its requests follow `keyframeRetryDue(_:at:)`.
     private func hold(_ seq: UInt32, now: UInt64) {
         guard let frame = pending[seq] else { return }
         let wait = frame.holdRetryUs == 0
             ? repairWindow() : min(frame.holdRetryUs * 2, Self.maxHoldRetryUs)
         pending[seq]?.holdRetryUs = wait
         pending[seq]?.deadline = now + wait
-        if pending.count > 1 { pending[seq]?.dropBy = min(frame.dropBy ?? now, now) }
+        if pending.count > 1 && !frame.isKeyframe { pending[seq]?.dropBy = min(frame.dropBy ?? now, now) }
         pending[seq]?.stallAllowanceUsed = Self.maxStallAllowanceUs
+        guard !frame.isKeyframe else { return }
         pending[seq]?.retried = true
         request(seq, through: frame.fragmentCount - 1, again: true, now: now)
     }
@@ -539,6 +578,7 @@ final class FrameAssembler {
         guard !missing.isEmpty else { return }
         pending[seq]?.requested.formUnion(missing)
         if pending[seq]?.requestedAt == nil { pending[seq]?.requestedAt = now }
+        pending[seq]?.askedAt = now
         for start in stride(from: 0, to: missing.count, by: 64) {
             counters.withLock { $0.nacksSent += 1 }
             onNack?(Nack(streamEpoch: currentEpoch ?? 0, frameSeq: seq, fragCount: frame.fragmentCount,

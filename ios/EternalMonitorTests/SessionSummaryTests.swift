@@ -78,6 +78,8 @@ final class SessionSummaryTests: XCTestCase {
             (pairing, ["hello_sent", "pairing", "none", "user"]),
             (summary(.legacyPC, session: nil), ["hello_sent", "error", "other", "error"]),
             (summary(.connectTimeout, session: nil, duration: 10), ["hello_sent", "no_reply", "no_reply", "timeout"]),
+            (summary(.pcMoved, session: nil, duration: 3), ["hello_sent", "no_reply", "no_reply", "superseded"]),
+            (summary(.otherPC), ["accepted", "error", "other", "error"]),
             (summary(.connectTimeout, duration: 10), ["accepted", "no_picture", "no_video", "timeout"]),
             (noFrame, ["accepted", "no_picture", "no_frame", "timeout"]),
             (summary(.pcStoppedResponding, firstFrame: 0.3, duration: 90), ["steady", "streamed", "signal_lost", "liveness"]),

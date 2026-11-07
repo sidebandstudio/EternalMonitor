@@ -87,6 +87,28 @@ final class StreamRecoveryTests: XCTestCase {
         }
     }
 
+    /// The lock screen or a permission prompt holds the picture on the PC.
+    /// Its heartbeats say so, and the iPad says so over the held picture,
+    /// still connected, until a heartbeat says capture works again.
+    func testALockedPCIsShownOverTheHeldPictureUntilItCapturesAgain() async throws {
+        let host = FakeUDPHost()
+        let manager = try await streaming(host)
+        XCTAssertFalse(manager.pcLocked)
+        host.sendHeartbeat(notice: Heartbeat.noticePCLocked)
+        try await until("the PC says it is locked") { manager.pcLocked }
+        XCTAssertEqual(manager.state, .connected)
+        host.sendHeartbeat()
+        try await until("the PC captures again") { !manager.pcLocked }
+        // A notice this iPad doesn't know says nothing.
+        host.sendHeartbeat(notice: 0xC8)
+        try await Task.sleep(nanoseconds: 500_000_000)
+        XCTAssertFalse(manager.pcLocked)
+        host.sendHeartbeat(notice: Heartbeat.noticePCLocked)
+        try await until("locked again") { manager.pcLocked }
+        manager.cancel()
+        XCTAssertFalse(manager.pcLocked, "the next session starts without it")
+    }
+
     func testContiguousNumberingRevealsALostReopenKeyframe() async throws {
         // The PC reopened its encoder and its new keyframe (seq 2) was lost;
         // the new encoder's first P-frame continues the codec's count. A PC
