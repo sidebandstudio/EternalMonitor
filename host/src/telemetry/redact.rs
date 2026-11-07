@@ -138,6 +138,7 @@ const DIAGNOSTIC_KEYS: &[&str] = &[
     "ss_rule",
     // A silent client's session held, kept or ended.
     "silent_ms",
+    "stalled_ms",
     "held_ms",
     "last_heard",
     "heard",
@@ -1993,6 +1994,10 @@ mod tests {
                 "input",
                 "WARN Client liveness expired — tearing session down peer=192.0.2.7:50000 silent_ms=10000 \
                  held_ms=7000 last_heard=input late_input=0 device=iPad",
+            ),
+            (
+                "2750",
+                "INFO The stream's transport loop moved again phase=input stalled_ms=2750",
             ),
         ];
         for (name, message) in cases {

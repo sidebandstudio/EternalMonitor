@@ -1,6 +1,7 @@
 pub mod abr;
 pub mod apple_usb;
 mod audio;
+pub mod beat;
 pub mod fault;
 pub mod link;
 pub mod pacer;
@@ -28,6 +29,7 @@ use crate::control::{CaptureTarget, SharedControl, SupervisorCommand, VddStatus}
 use crate::encoder::NALUnit;
 use crate::stats::PIPELINE_STATS;
 use abr::AbrController;
+use beat::Phase;
 use fault::FaultInjector;
 use link::{LinkId, PeerId};
 use pacer::{Deadline, FramePacer, PacingClock};
@@ -267,6 +269,11 @@ pub async fn start_sender(
     // Capture numbers skip the frames the encoder never took, and the iPad
     // held the frame after each skip waiting for one that never existed.
     let mut frame_seq: u32 = 0;
+    // The encoder closes its channel when it exits, before it reports why.
+    // The loop goes on until `running` goes false, so a goodbye the
+    // supervisor leaves on hearing that report (the storm brake) still goes
+    // out.
+    let mut video_open = true;
 
     let mut state = LoopState {
         retransmit_ring: RetransmitRing::default(),
@@ -278,7 +285,20 @@ pub async fn start_sender(
     let pacing_clock = PacingClock::new()?;
 
     let mut links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
-    shared.session.lock().transport_resumed(now());
+    // One lock, with `running` read under it: a stop
+    // (`diagnostics::stop_session`) queues its goodbye and clears `running`
+    // under the same lock, so this either sees that stop and keeps its
+    // goodbye, or comes first and the stop's goodbye is kept anyway.
+    let retired = {
+        let mut session = shared.session.lock();
+        let stopping = !shared.running.load(Ordering::SeqCst);
+        session.transport_resumed(now(), stopping)
+    };
+    if retired {
+        debug!("Dropped a goodbye left while the stream was stopped");
+    }
+    let beat = std::sync::Arc::clone(&shared.transport_beat);
+    let _beat_ends = BeatEnds(&beat);
     let mut deferred_control = VecDeque::new();
     let mut dgram_scratch = [0u8; MAX_DGRAM_SIZE];
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -302,11 +322,13 @@ pub async fn start_sender(
             .pen_spaced_until()
             .is_some_and(|at| at <= Instant::now())
         {
+            beat.mark(Phase::Input);
             state
                 .input_relay
                 .keep_pen_alive(*shared.capture_geometry.lock());
         }
         pen_spacing.arm(state.input_relay.pen_spaced_until());
+        beat.mark(Phase::Waiting);
         tokio::select! {
             // Service timers and queued control before another paced frame.
             // Random branch selection can delay a NACK by multiple frame
@@ -315,19 +337,23 @@ pub async fn start_sender(
             // Not while a backlog is held: its chunk went at the top of
             // this pass, and a second one would leave nothing between them.
             _ = pen_tick.tick(), if state.input_relay.pen_tick_needed() && state.input_relay.pen_spaced_until().is_none() => {
+                beat.mark(Phase::Input);
                 state.input_relay.keep_pen_alive(*shared.capture_geometry.lock());
             }
             _ = tokio::time::sleep_until(state.fault.next_deadline().unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)).into()), if state.fault.enabled() => {
+                beat.mark(Phase::Video);
                 let destination = *shared.target_addr.lock();
                 for datagram in state.fault.drain_due(Instant::now()) {
                     let _ = links.send_to(&datagram, destination).await;
                 }
             }
             _ = heartbeat.tick() => {
+                beat.mark(Phase::Tick);
                 let actions = shared.session.lock().tick(&config, true, now());
                 act(actions, &mut state, &links, &shared, &config, &supervisor_tx).await;
             }
             _ = network_check.tick(), if listen_on != crate::network::ListenOn::All => {
+                beat.mark(Phase::Tick);
                 if !shared.client_connected() && crate::network::listen_ip_now(&listen_on) != bind_ip {
                     info!(listen_on = listen_on.label(), "The chosen network changed: restarting the stream to listen on it");
                     shared.stop();
@@ -337,6 +363,7 @@ pub async fn start_sender(
                 }
             }
             _ = liveness_tick.tick() => {
+                beat.mark(Phase::Tick);
                 links.update_stats();
                 if !shared.running.load(Ordering::SeqCst) {
                     info!("Transport loop stopping on running=false");
@@ -347,6 +374,7 @@ pub async fn start_sender(
             }
 
             result = receive_control(&mut links, &mut deferred_control) => {
+                beat.mark(Phase::Control);
                 match result {
                     Ok(LinkEvent::Closed(id)) => {
                         let actions = shared.session.lock().link_lost(id);
@@ -389,10 +417,16 @@ pub async fn start_sender(
             }
 
             Some(packet) = audio_rx.recv() => {
+                beat.mark(Phase::Audio);
                 audio_sender.send(packet, &links, &shared, stream_epoch).await;
             }
-            nal_opt = nal_rx.recv() => {
-                let Some(nal) = nal_opt else { break; };
+            nal_opt = nal_rx.recv(), if video_open => {
+                beat.mark(Phase::Video);
+                let Some(nal) = nal_opt else {
+                    info!("The encoder closed its channel; the transport runs until the stream stops");
+                    video_open = false;
+                    continue;
+                };
                 let Some(session_id) = shared.session.lock().session_id() else { continue; };
                 let target_addr = *shared.target_addr.lock();
                 if target_addr.link == LinkId::Udp && target_addr.addr.is_none_or(|a| a.ip().is_unspecified() || a.port() == 0) {
@@ -528,13 +562,24 @@ pub async fn start_sender(
     }
 
     // Every way out of the loop comes here, before the links close: an update
-    // that just stopped the stream must still tell the iPad.
+    // or a Stop that just stopped the stream must still tell the iPad.
+    beat.mark(Phase::Actions);
     let goodbye = shared.session.lock().take_goodbye();
     if let Some(goodbye) = goodbye {
         say_goodbye(&links, goodbye).await;
     }
     info!("NAL channel closed, transport sender shutting down");
     Ok(())
+}
+
+/// Marks the transport ended however `start_sender` stops, so the watch
+/// never reads a finished loop's last mark as a stuck one.
+struct BeatEnds<'a>(&'a beat::Beat);
+
+impl Drop for BeatEnds<'_> {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -722,6 +767,7 @@ async fn act(
         send_repairs(&links.udp.socket, &mut state.retransmit_ring, shared, &nack).await;
     }
     if let Some((session_id, event)) = actions.input.take() {
+        shared.transport_beat.mark(Phase::Input);
         if let Some(geometry) = *shared.capture_geometry.lock() {
             if actions.input_late {
                 state.input_relay.relay_late(session_id, &event, geometry);
@@ -784,6 +830,7 @@ async fn execute_actions(
     shared: &SharedControl,
     supervisor_tx: &std_mpsc::Sender<SupervisorCommand>,
 ) {
+    shared.transport_beat.mark(Phase::Actions);
     // An ended session's summary waits for this pass's second screen step,
     // which can give the second screen up for it, unless a new session
     // starts now: second screen news from here on is the new one's.
@@ -859,6 +906,7 @@ async fn execute_actions(
         }
     }
 
+    shared.transport_beat.mark(Phase::SecondScreen);
     let restart = match second_screen::next_step(shared, now()) {
         second_screen::Step::Nothing => false,
         second_screen::Step::Attach => {

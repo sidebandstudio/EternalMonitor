@@ -246,7 +246,7 @@ final class GoodbyeTests: XCTestCase {
         host.sendBye(.error)
         try await until("disconnected") { manager.state == .disconnected }
         XCTAssertEqual(manager.problem, .pcEndedSessionOnError)
-        XCTAssertEqual(manager.problem?.title, "Your PC ended the session")
+        XCTAssertEqual(manager.problem?.title, "The connection to your PC ended")
         XCTAssertTrue(manager.problem?.detail.hasPrefix("The connection to your PC dropped") == true,
                       manager.problem?.detail ?? "")
         XCTAssertEqual(manager.problem?.actions, [.retry])

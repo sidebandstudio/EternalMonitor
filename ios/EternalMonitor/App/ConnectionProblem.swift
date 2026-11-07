@@ -75,7 +75,9 @@ enum ConnectionProblem: Equatable {
         case .lost(.usbTurnedOff): return "USB connections were turned off"
         case .reconnecting: return "Reconnecting to your PC…"
         case .reconnectFailed: return "Couldn't reconnect to your PC"
-        case .pcEndedSession, .pcEndedSessionOnError: return "Your PC ended the session"
+        case .pcEndedSession: return "Your PC ended the session"
+        // Also what a PC that restarts by itself sends: true for both.
+        case .pcEndedSessionOnError: return "The connection to your PC ended"
         case .pcBusy: return "Your PC is already streaming to another device"
         case .pcUpdating(.reconnecting), .pcUpdating(.manual): return "Your PC is updating EternalMonitor"
         case .pcUpdating(.notBack): return "Your PC hasn't come back from its update yet"
