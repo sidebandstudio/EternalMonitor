@@ -34,8 +34,8 @@
 //! it is refused, and only a restart gives it back. The guard tells that
 //! case apart, on a PC with more than one graphics card, by the panel's
 //! target: the virtual display is on, the panel is not, no built-in target
-//! is offered any more, and Windows doesn't say the lid is closed (a closed
-//! lid withdraws the panel on purpose). It then makes no `SetDisplayConfig`
+//! is offered any more, and Windows has said the lid is open (a closed lid
+//! withdraws the panel on purpose). It then makes no `SetDisplayConfig`
 //! call, and while the host runs it doesn't turn the display off: the
 //! desktop stays on it, which the iPad still shows. A turn off that nothing
 //! streams after, at start-up, at quit, in the failure reporter or once
@@ -162,9 +162,8 @@ pub trait Displays {
     fn built_in(&mut self) -> Option<BuiltIn>;
     /// The PC has more than one graphics card.
     fn hybrid(&self) -> bool;
-    /// Windows says the laptop's lid is closed. False when it hasn't said,
-    /// as on a PC without a lid.
-    fn lid_closed(&self) -> bool;
+    /// The laptop's lid, as Windows last said.
+    fn lid(&self) -> Lid;
     /// Windows is ending the session: shutting down, restarting or signing out.
     fn session_ending(&self) -> bool;
     /// This turn off is a cleanup, after which nothing streams the display:
@@ -189,6 +188,51 @@ pub trait Displays {
 pub trait Saved: Sized {
     fn encode(&self) -> String;
     fn decode(text: &str) -> Option<Self>;
+}
+
+/// The laptop's lid, from Windows' GUID_LIDSWITCH_STATE_CHANGE
+/// notifications.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Lid {
+    /// Windows hasn't said: before its first notification, which comes once
+    /// it knows the lid device and its state with no bound on when, after a
+    /// failed registration, and on a PC without a lid.
+    #[default]
+    Unknown,
+    Open,
+    Closed,
+}
+
+/// What the lid notifications said so far: [`Lid::Unknown`] until the
+/// first one, and for good when there is none.
+pub struct LidWatch(std::sync::atomic::AtomicU8);
+
+impl LidWatch {
+    const UNKNOWN: u8 = u8::MAX;
+
+    pub const fn new() -> Self {
+        Self(std::sync::atomic::AtomicU8::new(Self::UNKNOWN))
+    }
+
+    /// One notification's value: 0 closed, 1 open.
+    pub fn note(&self, value: u32) {
+        let state = u8::from(value != 0);
+        self.0.store(state, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn lid(&self) -> Lid {
+        match self.0.load(std::sync::atomic::Ordering::Relaxed) {
+            Self::UNKNOWN => Lid::Unknown,
+            0 => Lid::Closed,
+            _ => Lid::Open,
+        }
+    }
+}
+
+impl Default for LidWatch {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// The built-in panel's targets, as `QDC_ALL_PATHS` lists them.
@@ -472,17 +516,24 @@ impl<S: Saved> Guard<S> {
             );
             return true;
         }
-        if lost_panel(displays, screens) {
-            if displays.cleanup() {
-                let text = format!(
-                    "The built-in screen is still unavailable, and nothing streams the virtual \
-                     display after this — turning it off, so the restart that brings the screen \
-                     back starts without it outcome=released reason=panel_lost {}",
-                    line(Some(screens))
-                );
-                displays.log(true, &text);
-                return true;
-            }
+        let withdrawn = withdrawn_panel(displays, screens);
+        let lid = displays.lid();
+        // Also with the lid unknown: a lid in fact closed loses nothing.
+        if withdrawn && lid != Lid::Closed && displays.cleanup() {
+            let reason = match lid {
+                Lid::Open => "reason=panel_lost",
+                _ => "reason=panel_withdrawn lid=unknown",
+            };
+            let text = format!(
+                "The built-in screen is still unavailable, and nothing streams the virtual \
+                 display after this — turning it off, so the restart that brings the screen \
+                 back starts without it outcome=released {reason} {}",
+                line(Some(screens))
+            );
+            displays.log(true, &text);
+            return true;
+        }
+        if withdrawn && lid == Lid::Open {
             let text = format!(
                 "Leaving the virtual display on: the built-in screen is still unavailable, and \
                  turning the display off would leave the PC with no screen outcome=kept_on \
@@ -775,19 +826,23 @@ fn alone(screens: &[Screen]) -> bool {
     has_vdd(screens) && real(screens).next().is_none()
 }
 
-/// The hybrid laptop's black panel: on a PC with more than one graphics
-/// card, the virtual display is on in `screens`, the built-in panel is off,
-/// and Windows no longer offers any built-in target, with the lid open.
-/// After a turn on this is read once the screens settle ([`SETTLE`] after
-/// the Enable, while no real screen came back). A lid the user closed
-/// withdraws the panel too, and is no failure: the panel comes back when it
-/// opens.
-fn lost_panel<D: Displays>(displays: &mut D, screens: &[Screen]) -> bool {
+/// On a PC with more than one graphics card, the virtual display is on in
+/// `screens`, the built-in panel is off, and Windows no longer offers any
+/// built-in target: the hybrid laptop's black panel, or a closed lid.
+fn withdrawn_panel<D: Displays>(displays: &mut D, screens: &[Screen]) -> bool {
     has_vdd(screens)
         && !screens.iter().any(|screen| screen.internal)
         && displays.hybrid()
-        && !displays.lid_closed()
         && displays.built_in() == Some(BuiltIn::Withdrawn)
+}
+
+/// The hybrid laptop's black panel: [`withdrawn_panel`] with the lid known
+/// to be open. After a turn on this is read once the screens settle
+/// ([`SETTLE`] after the Enable, while no real screen came back). A lid the
+/// user closed withdraws the panel too, and is no failure: the panel comes
+/// back when it opens. Nor is a lid Windows hasn't reported yet.
+fn lost_panel<D: Displays>(displays: &mut D, screens: &[Screen]) -> bool {
+    displays.lid() == Lid::Open && withdrawn_panel(displays, screens)
 }
 
 /// The screens once a real one is back, or as they are after [`SETTLE`]. A
@@ -972,13 +1027,11 @@ mod windows_impl {
         }
     }
 
-    /// Whether Windows says the lid is closed, from its
-    /// GUID_LIDSWITCH_STATE_CHANGE notifications: it sends the current state
-    /// once the callback is registered, and each change after it.
+    /// The lid from Windows' GUID_LIDSWITCH_STATE_CHANGE notifications: the
+    /// current state comes once Windows knows the lid device and its state,
+    /// then each change.
     mod lid {
-        use std::sync::atomic::{AtomicU8, Ordering};
         use std::sync::Once;
-        use std::time::Duration;
 
         use windows::core::GUID;
         use windows::Win32::Foundation::{ERROR_SUCCESS, HANDLE};
@@ -992,9 +1045,7 @@ mod windows_impl {
 
         const LIDSWITCH_STATE_CHANGE: GUID =
             GUID::from_u128(0xba3e0f4d_b817_4094_a2d1_d56379e6a0f3);
-        const UNKNOWN: u8 = u8::MAX;
-        /// 0 closed, 1 open.
-        static STATE: AtomicU8 = AtomicU8::new(UNKNOWN);
+        static WATCH: super::super::LidWatch = super::super::LidWatch::new();
 
         unsafe extern "system" fn changed(
             _context: *const core::ffi::c_void,
@@ -1006,8 +1057,7 @@ mod windows_impl {
                 let header = unsafe { std::ptr::read_unaligned(setting) };
                 if header.PowerSetting == LIDSWITCH_STATE_CHANGE && header.DataLength >= 4 {
                     let data = unsafe { std::ptr::addr_of!((*setting).Data) }.cast::<u32>();
-                    let value = unsafe { std::ptr::read_unaligned(data) };
-                    STATE.store(value.min(1) as u8, Ordering::Relaxed);
+                    WATCH.note(unsafe { std::ptr::read_unaligned(data) });
                 }
             }
             0
@@ -1015,8 +1065,8 @@ mod windows_impl {
 
         /// Start listening. Later calls do nothing.
         pub(super) fn watch() {
-            static WATCH: Once = Once::new();
-            WATCH.call_once(|| {
+            static REGISTER: Once = Once::new();
+            REGISTER.call_once(|| {
                 // Windows keeps both for as long as the process runs.
                 let parameters = Box::leak(Box::new(DEVICE_NOTIFY_SUBSCRIBE_PARAMETERS {
                     Callback: Some(changed),
@@ -1034,24 +1084,16 @@ mod windows_impl {
                 if result != ERROR_SUCCESS {
                     tracing::warn!(
                         error = result.0,
-                        "Could not watch the lid; a built-in screen Windows withdraws counts as \
-                         lost"
+                        "Could not watch the lid; a built-in screen Windows withdraws is not \
+                         taken for lost"
                     );
                 }
             });
         }
 
-        /// Closed, as Windows last said. A process that just started waits
-        /// briefly for the first notification.
-        pub(super) fn closed() -> bool {
+        pub(super) fn lid() -> super::super::Lid {
             watch();
-            for _ in 0..20 {
-                match STATE.load(Ordering::Relaxed) {
-                    UNKNOWN => std::thread::sleep(Duration::from_millis(10)),
-                    state => return state == 0,
-                }
-            }
-            false
+            WATCH.lid()
         }
     }
 
@@ -1117,8 +1159,8 @@ mod windows_impl {
             crate::diagnostics::host_facts().hybrid == Some(true)
         }
 
-        fn lid_closed(&self) -> bool {
-            lid::closed()
+        fn lid(&self) -> super::Lid {
+            lid::lid()
         }
 
         fn session_ending(&self) -> bool {
@@ -1242,7 +1284,7 @@ mod tests {
         /// What `QDC_ALL_PATHS` says of the panel; `None` (unread) by default.
         built_in: Option<BuiltIn>,
         hybrid: bool,
-        lid_closed: bool,
+        lid: Lid,
         session_ending: bool,
         cleanup: bool,
         slept: Duration,
@@ -1342,8 +1384,8 @@ mod tests {
             self.hybrid
         }
 
-        fn lid_closed(&self) -> bool {
-            self.lid_closed
+        fn lid(&self) -> Lid {
+            self.lid
         }
 
         fn session_ending(&self) -> bool {
@@ -1632,7 +1674,7 @@ mod tests {
     fn hybrid_laptop() -> Fake {
         let mut fake = Fake::reading([vec![laptop_panel()], vec![lone_vdd()]]);
         fake.owner = Some(HOST.into());
-        (fake.hybrid, fake.built_in) = (true, Some(BuiltIn::Withdrawn));
+        (fake.hybrid, fake.built_in, fake.lid) = (true, Some(BuiltIn::Withdrawn), Lid::Open);
         (fake.refuse_extend, fake.refuse_reapply) = (true, true);
         fake
     }
@@ -1790,7 +1832,7 @@ mod tests {
     #[test]
     fn a_lid_closed_during_the_turn_on_is_not_a_lost_panel() {
         let mut fake = hybrid_laptop();
-        fake.lid_closed = true;
+        fake.lid = Lid::Closed;
         fake.reads = VecDeque::from([
             Some(vec![laptop_panel(), monitor()]),
             Some(vec![monitor(), lone_vdd()]),
@@ -1803,12 +1845,74 @@ mod tests {
         assert!(!fake.text().contains("panel_lost"), "{}", fake.text());
 
         let mut fake = hybrid_laptop();
-        fake.lid_closed = true;
+        fake.lid = Lid::Closed;
         let mut guard = Guard::new();
         guard.before(true, false, &mut fake);
         assert_eq!(guard.after(true, true, &mut fake), Outcome::Failed);
         assert!(!guard.panel_lost());
         assert!(!fake.text().contains("panel_lost"), "{}", fake.text());
+    }
+
+    /// Windows sends the lid's first state once it knows the lid device,
+    /// with no bound on when. Until then the lid is unknown, and a
+    /// withdrawn panel is not taken for lost: it goes through #185's steps,
+    /// and nothing records a lost panel. Once Windows says the lid is open,
+    /// the next turn on is.
+    #[test]
+    fn a_lid_state_windows_has_not_sent_yet_is_no_lost_panel() {
+        let watch = LidWatch::new();
+        let mut fake = hybrid_laptop();
+        fake.lid = watch.lid();
+        assert_eq!(fake.lid, Lid::Unknown);
+        let mut guard = Guard::new();
+        guard.before(true, false, &mut fake);
+        assert_eq!(guard.after(true, true, &mut fake), Outcome::Failed);
+        assert!(!guard.panel_lost());
+        assert!(!fake.text().contains("panel_lost"), "{}", fake.text());
+        // The first notification, late: open.
+        watch.note(1);
+        let mut fake = hybrid_laptop();
+        fake.lid = watch.lid();
+        let mut guard = Guard::new();
+        guard.before(true, false, &mut fake);
+        assert_eq!(guard.after(true, true, &mut fake), Outcome::PanelLost);
+        watch.note(0);
+        assert_eq!(watch.lid(), Lid::Closed);
+    }
+
+    /// With the lid watch's registration failed, the lid stays unknown for
+    /// good. No lost panel is ever recorded, so a lid closed on purpose
+    /// can't become one; while the host runs, a turn off goes as #185's do.
+    /// The cleanup at quit still turns the display off, so the restart
+    /// starts without it whatever the lid was.
+    #[test]
+    fn a_failed_lid_registration_records_no_lost_panel_yet_quitting_turns_it_off() {
+        let mut fake = hybrid_laptop();
+        fake.lid = LidWatch::new().lid();
+        let mut guard = Guard::new();
+        guard.before(true, false, &mut fake);
+        assert_eq!(guard.after(true, true, &mut fake), Outcome::Failed);
+        assert!(!guard.panel_lost());
+        let calls = fake.set_display_config_calls();
+        // While the host runs: #185's steps, then held.
+        assert!(!turn_off_allowed(&mut guard, &mut fake));
+        assert!(fake.set_display_config_calls() > calls);
+        assert!(
+            !fake.text().contains("reason=panel_lost"),
+            "{}",
+            fake.text()
+        );
+        // The quit.
+        let calls = fake.set_display_config_calls();
+        fake.cleanup = true;
+        assert!(turn_off_allowed(&mut guard, &mut fake));
+        assert_eq!(fake.set_display_config_calls(), calls);
+        assert!(fake
+            .logs
+            .last()
+            .unwrap()
+            .1
+            .contains("outcome=released reason=panel_withdrawn lid=unknown"));
     }
 
     /// The start-up turn off of a closed laptop whose virtual display is
@@ -1817,7 +1921,7 @@ mod tests {
     #[test]
     fn a_closed_lid_start_up_turn_off_runs_as_before() {
         let mut fake = hybrid_laptop();
-        fake.lid_closed = true;
+        fake.lid = Lid::Closed;
         fake.reads = VecDeque::from([Some(vec![lone_vdd()])]);
         let mut guard = Guard::new();
         assert!(turn_off_allowed(&mut guard, &mut fake));
@@ -2130,8 +2234,8 @@ mod tests {
         fn hybrid(&self) -> bool {
             self.0.hybrid()
         }
-        fn lid_closed(&self) -> bool {
-            self.0.lid_closed()
+        fn lid(&self) -> Lid {
+            self.0.lid()
         }
         fn session_ending(&self) -> bool {
             self.0.session_ending()
