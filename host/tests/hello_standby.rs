@@ -243,7 +243,7 @@ impl FakeIpad {
 }
 
 /// The smallest HELLO2 there is: no name, no device id or token, no
-/// feature bits. 38 bytes, as a forged one from an unpaired sender can be.
+/// feature bits: 38 bytes.
 fn minimal_hello(nonce: u32) -> Vec<u8> {
     encode_control(
         0,
@@ -270,21 +270,20 @@ fn minimal_hello(nonce: u32) -> Vec<u8> {
 }
 
 /// While no stream runs, the PC never answers with more bytes than it was
-/// sent, so a forged source address can't make it send more than it got.
-/// A small HELLO2 from an unpaired sender hears nothing; an iPad that asks
-/// for standby answers pads its HELLO2 and hears every answer.
+/// sent. A small HELLO2 from an unpaired sender hears nothing; an iPad that
+/// asks for standby answers pads its HELLO2 and hears every answer.
 #[test]
 fn a_stopped_pc_never_answers_with_more_than_it_was_sent() {
     let host = Host::start(GpuInfo::software_fallback(), true);
     host.send(SupervisorCommand::Stop);
     host.wait_until_stopped();
 
-    let forged = FakeIpad::new(&host, 1, OLD);
+    let small_sender = FakeIpad::new(&host, 1, OLD);
     let small = minimal_hello(1);
     assert_eq!(small.len(), 38);
-    forged.send(&small);
+    small_sender.send(&small);
     assert!(
-        forged.ack(1, Duration::from_secs(2)).is_none(),
+        small_sender.ack(1, Duration::from_secs(2)).is_none(),
         "an answer larger than a 38-byte HELLO2 went out"
     );
 

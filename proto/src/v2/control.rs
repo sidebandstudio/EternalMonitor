@@ -198,9 +198,8 @@ pub const MAX_HELLO_ACK_LEN: usize =
 
 /// A HELLO2 that sets [`FEATURE_STANDBY_STATUS`] is padded with zeros to at
 /// least this size, so any answer to it is no larger than the question. A
-/// PC answers while it isn't streaming only within that bound, and can't be
-/// used to send a forged address more bytes than it was sent. Older parsers
-/// ignore the padding, as any trailing body bytes.
+/// PC answers while it isn't streaming only within that bound. Older
+/// parsers ignore the padding, as any trailing body bytes.
 pub const STANDBY_HELLO2_LEN: usize = MAX_HELLO_ACK_LEN;
 
 /// Why a PC stopped streaming after repeated errors, as [`HelloAck::reason`]

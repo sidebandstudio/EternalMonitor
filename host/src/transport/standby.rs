@@ -217,9 +217,8 @@ async fn answer(links: &TransportLinks, shared: &SharedControl, peer: PeerId, da
         crate::diagnostics::log_session_end(end, shared);
     }
     for (destination, reply) in &actions.replies {
-        // Never more than was sent: a forged source address must not get
-        // more bytes than the forger spent. iPads that understand these
-        // answers pad their HELLO2 so every answer fits
+        // An answer is never larger than the HELLO2 it answers. iPads that
+        // understand these answers pad their HELLO2 so every answer fits
         // (`STANDBY_HELLO2_LEN`); an older one may get today's silence.
         if reply.len() > datagram.len() {
             debug!(
