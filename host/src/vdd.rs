@@ -214,6 +214,17 @@ impl DriverTasks {
         self.gate.lock().health
     }
 
+    /// Before any request, with the device as Configuration Manager reports
+    /// it: one Windows reports disabled (problem 22) is off already, so no
+    /// Disable needs to run. True when so.
+    fn found_off(&self, device: crate::vdd_device::DeviceState) -> bool {
+        let off = device == crate::vdd_device::DeviceState::Problem(22);
+        if off {
+            self.gate.lock().known_enabled = Some(false);
+        }
+        off
+    }
+
     #[cfg(test)]
     fn set_enabled(
         &self,
@@ -499,7 +510,16 @@ pub fn disable() -> bool {
 /// runs on its own thread, and this returns once it holds the turn, so
 /// every later request (an Enable, the quit's Disable) still runs after it.
 /// A hung task no longer keeps a Mirror stream black for up to 30 s.
+///
+/// A display Windows already reports disabled, as at almost every start,
+/// runs no task. That Disable was the task that hung most often in the
+/// field, and every later request waited behind it and failed.
 pub fn disable_in_background() {
+    #[cfg(windows)]
+    if TASKS.found_off(crate::vdd_device::query()) {
+        info!("Virtual display already off — not running the Disable task");
+        return;
+    }
     let (held, turn) = std::sync::mpsc::channel();
     let spawned = std::thread::Builder::new()
         .name("vdd-startup-off".into())
@@ -570,6 +590,49 @@ mod tests {
         gate.after(true, TaskOutcome::Done, now);
         assert_eq!(gate.before(true, Purpose::Attempt, now), Gate::AlreadyDone);
         assert_eq!(gate.before(false, Purpose::Attempt, now), Gate::Run);
+    }
+
+    #[test]
+    fn a_display_windows_reports_disabled_at_startup_runs_no_disable_task() {
+        use crate::vdd_device::DeviceState;
+        use std::cell::Cell;
+        let tasks = DriverTasks::new();
+        assert!(tasks.found_off(DeviceState::Problem(22)));
+        // Neither the startup cleanup nor a quit before any stream runs one.
+        assert!(tasks.set_enabled(false, Purpose::Cleanup, || {}, |_, _| {
+            panic!("ran the Disable task for a display that is off")
+        }));
+        // The first Enable runs, and so does the Disable after it.
+        let ran = Cell::new(Vec::new());
+        let run = |enabled: bool, _: &mut dyn FnMut()| {
+            let mut calls = ran.take();
+            calls.push(enabled);
+            ran.set(calls);
+            TaskOutcome::Done
+        };
+        assert!(tasks.set_enabled(true, Purpose::Attempt, || {}, run));
+        assert!(tasks.set_enabled(false, Purpose::Cleanup, || {}, run));
+        assert_eq!(ran.take(), vec![true, false]);
+
+        // Any other state may be a display left on, or is unknown: the
+        // Disable runs as before.
+        for device in [
+            DeviceState::Ready,
+            DeviceState::NoMonitor,
+            DeviceState::NotStarted,
+            DeviceState::Problem(43),
+            DeviceState::NoDriver,
+            DeviceState::Missing,
+        ] {
+            let tasks = DriverTasks::new();
+            assert!(!tasks.found_off(device), "{device:?}");
+            let ran = Cell::new(false);
+            tasks.set_enabled(false, Purpose::Cleanup, || {}, |_, _| {
+                ran.set(true);
+                TaskOutcome::Done
+            });
+            assert!(ran.get(), "no Disable for {device:?}");
+        }
     }
 
     #[test]
