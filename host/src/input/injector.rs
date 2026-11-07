@@ -54,6 +54,10 @@ const PEN_TICK: Duration = Duration::from_millis(50);
 /// A Windows call this slow is logged: it would have stalled the stream.
 const SLOW_CALL: Duration = Duration::from_millis(250);
 
+/// A Windows call held this long is logged while it is still held, from
+/// the transport's next input: one that never returns would log nothing.
+const HELD_LOGGED: Duration = Duration::from_secs(5);
+
 /// Waits this short are timed precisely, for pen frames held back to keep
 /// them `FRAME_SPACING` apart; a condition variable wakes in whole
 /// milliseconds or worse on Windows.
@@ -186,8 +190,13 @@ struct Queued {
 #[derive(Debug, Default)]
 struct State {
     commands: VecDeque<Queued>,
-    /// The thread is handing a command to Windows.
-    busy: bool,
+    /// Since when the thread has been in Windows, with a command or a pen
+    /// refresh.
+    in_windows_since: Option<Instant>,
+    /// That call was logged as held.
+    held_logged: bool,
+    #[cfg(test)]
+    held_logs: u64,
     merged: u64,
     dropped: u64,
     /// Releases that came while the queue was full, each now part of a
@@ -197,6 +206,13 @@ struct State {
     /// know one is behind another.
     #[cfg(any(test, feature = "test-hooks"))]
     relays_queued: u64,
+}
+
+impl State {
+    fn leave_windows(&mut self) {
+        self.in_windows_since = None;
+        self.held_logged = false;
+    }
 }
 
 /// What the transport's handles and the thread share.
@@ -217,6 +233,20 @@ impl Shared {
     fn push(&self, generation: u64, command: Command, now: Instant) {
         let mut state = self.state.lock();
         let waiting = state.commands.len();
+        if let Some(since) = state.in_windows_since {
+            let held = now.saturating_duration_since(since);
+            if held >= HELD_LOGGED && !state.held_logged {
+                state.held_logged = true;
+                #[cfg(test)]
+                {
+                    state.held_logs += 1;
+                }
+                warn!(
+                    held_s = held.as_secs(),
+                    waiting, "Windows has held input for seconds and has not returned"
+                );
+            }
+        }
         if waiting >= self.limits.merge_from {
             // The newest move of this kind, unless a press or release, or
             // another generation, came after it.
@@ -333,7 +363,7 @@ impl InputThread {
         };
         let deadline = Instant::now() + limit;
         let mut state = shared.state.lock();
-        while state.busy || !state.commands.is_empty() {
+        while state.in_windows_since.is_some() || !state.commands.is_empty() {
             if shared.idle.wait_until(&mut state, deadline).timed_out() {
                 warn!(
                     waiting = state.commands.len(),
@@ -487,10 +517,10 @@ fn run<S: Sink>(shared: &Shared, sink: &mut S) {
     loop {
         let next = {
             let mut state = shared.state.lock();
-            state.busy = false;
+            state.leave_windows();
             loop {
                 if let Some(queued) = state.commands.pop_front() {
-                    state.busy = true;
+                    state.in_windows_since = Some(Instant::now());
                     break Next::Command(queued);
                 }
                 shared.idle.notify_all();
@@ -607,7 +637,9 @@ fn run<S: Sink>(shared: &Shared, sink: &mut S) {
             // input datagram, and Windows can hold the refresh.
             let output = *current.geometry.lock();
             let started = Instant::now();
+            shared.state.lock().in_windows_since = Some(started);
             sink.keep_alive(output);
+            shared.state.lock().leave_windows();
             note_slow(started, "pen_refresh");
         }
     }
@@ -1064,6 +1096,33 @@ mod tests {
         harness.settled(expected.len());
         drop(newest);
         assert_eq!(harness.wait_for(4)[3], Call::Reset);
+    }
+
+    /// A Windows call that never returns is logged once, from the input
+    /// that queues behind it, and again only for the next held call.
+    #[test]
+    fn a_call_windows_holds_for_seconds_is_logged_once() {
+        let harness = harness(Limits::default());
+        harness.stuck();
+        let logs = || {
+            harness
+                .injector
+                .as_ref()
+                .unwrap()
+                .shared
+                .state
+                .lock()
+                .held_logs
+        };
+        let later = |seconds| Instant::now() + Duration::from_secs(seconds);
+        harness.send(KIND_HOVER, PHASE_MOVED, 1);
+        assert_eq!(logs(), 0);
+        harness.send_at(KIND_HOVER, PHASE_MOVED, 2, later(6));
+        harness.send_at(KIND_HOVER, PHASE_MOVED, 3, later(60));
+        assert_eq!(logs(), 1);
+        harness.go.send(()).unwrap();
+        assert!(harness.thread.finish(Duration::from_secs(5)));
+        assert_eq!(logs(), 1);
     }
 
     #[test]
