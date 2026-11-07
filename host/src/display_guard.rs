@@ -35,10 +35,13 @@
 //! case apart, on a PC with more than one graphics card, by the panel's
 //! target: the virtual display is on, the panel is not, no built-in target
 //! is offered any more, and Windows doesn't say the lid is closed (a closed
-//! lid withdraws the panel on purpose). It then makes no `SetDisplayConfig` call and
-//! never turns the display off: the desktop stays on it, which the iPad
-//! still shows. Only when Windows ends the session does the turn off run,
-//! so the restart that brings the panel back starts without the display.
+//! lid withdraws the panel on purpose). It then makes no `SetDisplayConfig`
+//! call, and while the host runs it doesn't turn the display off: the
+//! desktop stays on it, which the iPad still shows. A turn off that nothing
+//! streams after, at start-up, at quit, in the failure reporter or once
+//! Windows ends the session, runs, so the restart that brings the panel
+//! back starts without the display: its enabled state would outlast the
+//! restart.
 //!
 //! The layout from before a turn on is also kept on disk, so the failure
 //! reporter, a new process, compares with it when the host that turned
@@ -164,6 +167,9 @@ pub trait Displays {
     fn lid_closed(&self) -> bool;
     /// Windows is ending the session: shutting down, restarting or signing out.
     fn session_ending(&self) -> bool;
+    /// This turn off is a cleanup, after which nothing streams the display:
+    /// at start-up, at quit, or in the failure reporter once the host ended.
+    fn cleanup(&self) -> bool;
     fn sleep(&mut self, duration: Duration);
     fn log(&mut self, warn: bool, text: &str);
     /// The host whose layout from before its turn on is kept on disk: this
@@ -467,6 +473,16 @@ impl<S: Saved> Guard<S> {
             return true;
         }
         if lost_panel(displays, screens) {
+            if displays.cleanup() {
+                let text = format!(
+                    "The built-in screen is still unavailable, and nothing streams the virtual \
+                     display after this — turning it off, so the restart that brings the screen \
+                     back starts without it outcome=released reason=panel_lost {}",
+                    line(Some(screens))
+                );
+                displays.log(true, &text);
+                return true;
+            }
             let text = format!(
                 "Leaving the virtual display on: the built-in screen is still unavailable, and \
                  turning the display off would leave the PC with no screen outcome=kept_on \
@@ -806,7 +822,8 @@ static GUARD: parking_lot::Mutex<Guard<windows_impl::Saved>> =
 
 /// Run a driver change for `owner`'s display with the guard around it.
 /// `log` writes one line; `display_off` says the driver tasks know the
-/// display is off; `done` tells a change that succeeded. A turn off that
+/// display is off; `cleanup`, that nothing streams the display after this
+/// turn off; `done` tells a change that succeeded. A turn off that
 /// would leave the PC with no screen does not run: `kept_on` is its result.
 #[cfg(windows)]
 pub(crate) fn around<T>(
@@ -814,11 +831,12 @@ pub(crate) fn around<T>(
     owner: crate::startup::ProcessId,
     log: fn(bool, &str),
     display_off: bool,
+    cleanup: bool,
     change: impl FnOnce() -> T,
     done: impl FnOnce(&T) -> bool,
     kept_on: impl FnOnce() -> T,
 ) -> T {
-    let mut displays = windows_impl::Windows::new(owner, log);
+    let mut displays = windows_impl::Windows::new(owner, log, cleanup);
     if !GUARD.lock().before(enabled, display_off, &mut displays) {
         return kept_on();
     }
@@ -864,15 +882,17 @@ mod windows_impl {
 
     pub struct Windows {
         log: fn(bool, &str),
+        cleanup: bool,
         owner: Option<String>,
         file: Option<std::path::PathBuf>,
     }
 
     impl Windows {
-        pub fn new(owner: crate::startup::ProcessId, log: fn(bool, &str)) -> Self {
+        pub fn new(owner: crate::startup::ProcessId, log: fn(bool, &str), cleanup: bool) -> Self {
             lid::watch();
             Self {
                 log,
+                cleanup,
                 // Without its start time a process id could be a later process's.
                 owner: (owner.start != 0).then(|| owner.to_string()),
                 file: crate::settings::app_data_dir().map(|directory| directory.join(RECORD_FILE)),
@@ -1105,6 +1125,10 @@ mod windows_impl {
             unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) != 0 }
         }
 
+        fn cleanup(&self) -> bool {
+            self.cleanup
+        }
+
         fn sleep(&mut self, duration: Duration) {
             std::thread::sleep(duration);
         }
@@ -1220,6 +1244,7 @@ mod tests {
         hybrid: bool,
         lid_closed: bool,
         session_ending: bool,
+        cleanup: bool,
         slept: Duration,
         logs: Vec<(bool, String)>,
         owner: Option<String>,
@@ -1323,6 +1348,10 @@ mod tests {
 
         fn session_ending(&self) -> bool {
             self.session_ending
+        }
+
+        fn cleanup(&self) -> bool {
+            self.cleanup
         }
 
         fn sleep(&mut self, duration: Duration) {
@@ -1659,16 +1688,54 @@ mod tests {
         assert_eq!(fake.reapply_calls, [1]);
     }
 
-    /// The host that starts after a restart with the display still on
-    /// (Windows ended before the turn off ran) has no layout from before.
-    /// Its start-up turn off must not leave the PC with no screen either.
+    /// Quitting before the restart. Once the host quits, nothing streams the
+    /// display: the iPad's stream ends with it. The quit's turn off, a
+    /// cleanup, runs then, with no `SetDisplayConfig` call, so the restart
+    /// starts without the display, whose enabled state would outlast it. So
+    /// does the failure reporter's after a host that ended on its own,
+    /// comparing with the layout that host kept.
     #[test]
-    fn a_start_up_turn_off_with_the_panel_withdrawn_leaves_the_display_on() {
+    fn quitting_with_the_panel_lost_turns_the_display_off_for_the_restart() {
         let mut fake = hybrid_laptop();
+        let mut guard = Guard::new();
+        guard.before(true, false, &mut fake);
+        assert_eq!(guard.after(true, true, &mut fake), Outcome::PanelLost);
+        // While the host runs, held.
+        assert!(!turn_off_allowed(&mut guard, &mut fake));
+        // The quit.
+        fake.cleanup = true;
+        assert!(turn_off_allowed(&mut guard, &mut fake));
+        assert_eq!(fake.set_display_config_calls(), 0);
+        let (warn, text) = fake.logs.last().unwrap();
+        assert!(*warn);
+        assert_eq!(
+            text,
+            "The built-in screen is still unavailable, and nothing streams the virtual display \
+             after this — turning it off, so the restart that brings the screen back starts \
+             without it outcome=released reason=panel_lost paths=0 [] vdd=1"
+        );
+        // The failure reporter, a new process, after the host ended.
+        let mut reporter = Guard::new();
+        assert!(fake.kept.is_some());
+        assert!(turn_off_allowed(&mut reporter, &mut fake));
+        assert!(fake.text().contains(
+            "Comparing with the screens kept from before the virtual display turned on: paths=1"
+        ));
+        assert_eq!(fake.set_display_config_calls(), 0);
+    }
+
+    /// The host that starts after a restart with the display still on (a
+    /// power cut ended the last one) has no layout from before. Its
+    /// start-up turn off is a cleanup too: it runs, with no call.
+    #[test]
+    fn a_start_up_turn_off_with_the_panel_withdrawn_turns_it_off() {
+        let mut fake = hybrid_laptop();
+        fake.cleanup = true;
         fake.reads = VecDeque::from([Some(vec![lone_vdd()])]);
         let mut guard = Guard::new();
-        assert!(!turn_off_allowed(&mut guard, &mut fake));
+        assert!(turn_off_allowed(&mut guard, &mut fake));
         assert_eq!(fake.set_display_config_calls(), 0);
+        assert!(fake.text().contains("outcome=released reason=panel_lost"));
         // On a PC with one graphics card, it goes as before.
         fake.hybrid = false;
         assert!(turn_off_allowed(&mut guard, &mut fake));
@@ -2068,6 +2135,9 @@ mod tests {
         }
         fn session_ending(&self) -> bool {
             self.0.session_ending()
+        }
+        fn cleanup(&self) -> bool {
+            self.0.cleanup()
         }
         fn sleep(&mut self, duration: Duration) {
             self.0.sleep(duration)

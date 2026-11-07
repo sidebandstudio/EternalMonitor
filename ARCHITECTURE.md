@@ -201,8 +201,10 @@ acts while the virtual display is still on: a turn on that leaves it alone
 switches Windows to "Extend" (else the saved layout or "PC screen only"), and a
 turn off never runs while it is the only screen, until Windows ends the session.
 On a hybrid laptop whose panel the virtual display takes away until a restart
-(Windows withdraws its target), it tries nothing and keeps the display on, and
-Second screen mirrors there until the user chooses it again. It also ships a UDP
+(Windows withdraws its target while the lid is open), it tries nothing and
+keeps the display on while the host runs; the turn offs at start-up, quit and
+in the failure reporter run, so the restart starts without it. Second screen
+mirrors there until the user chooses it again. It also ships a UDP
 firewall rule. Runtime upgrade, task-ACL and
 uninstall checks remain hardware gates.
 

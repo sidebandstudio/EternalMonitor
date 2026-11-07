@@ -470,6 +470,8 @@ fn request_on_turn(
                     crate::startup::ProcessId::current(),
                     log_screens,
                     display_off,
+                    // Start-up, quit and panics: nothing streams it after.
+                    !enabled && purpose == Purpose::Cleanup,
                     || run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress),
                     |outcome| *outcome == TaskOutcome::Done,
                     // Left on: the next turn off tries again.
@@ -539,6 +541,8 @@ pub(crate) fn disable_for_ended(
                 crate::startup::reporter_log,
                 // Only for a turn on.
                 false,
+                // The host ended.
+                true,
                 || run_task(TASK_DISABLE, &mut || {}),
                 |outcome| *outcome == TaskOutcome::Done,
                 || TaskOutcome::Failed(None),
