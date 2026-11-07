@@ -9,6 +9,10 @@
 //! (no clicks, no ink) and taps of Right Ctrl alone.
 //!
 //! `input_soak <host:port> <seconds> <log.jsonl>`
+//!
+//! Keep the log, and stdout if redirected, on a disk nothing else is busy
+//! writing: a log write that waits seconds stops the input with it, and the
+//! host then rightly ends the session for silence.
 use std::io::Write;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
