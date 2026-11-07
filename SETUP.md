@@ -261,7 +261,7 @@ try fewer words. If your problem isn't here, see [Known issues](https://eternalm
 | **That looks like the pairing code, not the PC's address** | A six-digit number was typed where the address goes. | Type the **Address** from the PC window, for example 192.168.1.20. The iPad asks for the code after it connects. |
 | **That looks like your router's address, not your PC's** | Nothing answered at an address ending in .1, which is usually the Wi-Fi router. | Type the **Address** shown in the PC window. |
 | **That address doesn't look right** | The iPad couldn't find anything by that name. | Type the **Address** exactly as the PC window shows it. |
-| **This iPad isn't connected to a network** | Wi-Fi is off on the iPad, or it hasn't joined a network. | Turn on Wi-Fi and join the same network as the PC, or use a USB cable. |
+| **Wi-Fi is off** | Wi-Fi is off on the iPad, or it hasn't joined a network. | Turn on Wi-Fi and join the same network as the PC, or use a USB cable. |
 | **Local Network is turned off for EternalMonitor** | Local Network access is off for EternalMonitor on the iPad, so it can't reach the PC over Wi-Fi. | Tap **Open Settings** and turn on **Local Network**, or go to **Settings > Privacy & Security > Local Network** and turn on **EternalMonitor**. Then tap **Try again**. A USB cable works without this setting. |
 | **Couldn't connect to your PC** | The connection failed for another reason. | Check that both are on the same Wi-Fi and that EternalMonitor is open on the PC, then tap **Try again**. |
 | **This iPad couldn't start the connection** | Something on the iPad side didn't start. | Close EternalMonitor on the iPad and open it again. |
