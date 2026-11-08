@@ -3,10 +3,13 @@
 //!
 //! - macOS: a generic password in the data-protection Keychain, accessible
 //!   after first unlock on this device only, never synchronized.
-//! - Windows: one DPAPI-protected (current user) binary value under `HKCU`.
+//! - Windows: one DPAPI-protected (current user) binary value under `HKCU`,
+//!   flushed before `store` returns.
 //!
-//! [`MemKeyring`] (tests and fuzzing) keeps the blob in memory and can fail
-//! at any write, which then never happened.
+//! A store that returns an error may still have replaced the blob, and on
+//! macOS a stored blob may not be durable yet: the store's recovery never
+//! relies on either (see `store.rs`). `MemKeyring` (tests and fuzzing)
+//! models both.
 
 use std::io;
 
@@ -17,23 +20,43 @@ pub trait Keyring {
     /// The blob, or `None` if there isn't one.
     fn load(&self) -> io::Result<Option<Zeroizing<Vec<u8>>>>;
     /// Replaces the blob. Either the new blob is stored, or the old one
-    /// still is.
+    /// still is; an error doesn't say which.
     fn store(&mut self, blob: &[u8]) -> io::Result<()>;
 }
 
-/// An in-memory [`Keyring`] that can fail, for tests and fuzzing.
+/// An in-memory [`Keyring`] for tests and fuzzing that separates what a
+/// reader sees from what survives a crash.
+///
+/// Every stored blob is visible at once. Unless the keyring flushes, a crash
+/// may keep any blob stored since the last durable point, or the one before
+/// them all: [`MemKeyring::after_crash`] picks one.
 #[cfg(any(test, feature = "test-hooks"))]
 #[derive(Clone, Default)]
 pub struct MemKeyring {
-    blob: Option<Vec<u8>>,
+    visible: Option<Vec<u8>>,
+    /// What a crash may leave, oldest first: the last durable blob, then
+    /// every blob stored since.
+    durable: Vec<Option<Vec<u8>>>,
+    /// A successful store is durable at once (Windows); otherwise a stored
+    /// blob may be lost (the macOS Keychain has no flush).
+    flushes: bool,
     calls: usize,
     crash_at: Option<usize>,
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
 impl MemKeyring {
+    /// A keyring whose stores may be lost on a crash.
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A keyring whose successful stores are durable.
+    pub fn flushing() -> Self {
+        Self {
+            flushes: true,
+            ..Self::default()
+        }
     }
 
     /// Fails store number `n` (from 0) and every store after it.
@@ -45,29 +68,59 @@ impl MemKeyring {
         self.calls
     }
 
-    /// The keyring after a restart: the last stored blob, no crash pending.
-    pub fn after_crash(&self) -> Self {
+    /// How many different blobs a crash now may leave.
+    pub fn crash_choices(&self) -> usize {
+        self.durable.len().max(1)
+    }
+
+    /// The keyring after a crash and restart, keeping choice `n` (from 0,
+    /// oldest first; clamped) of what may survive.
+    pub fn after_crash(&self, n: usize) -> Self {
+        let kept = match self.durable.len() {
+            0 => self.visible.clone(),
+            len => self.durable[n.min(len - 1)].clone(),
+        };
         Self {
-            blob: self.blob.clone(),
+            visible: kept.clone(),
+            durable: vec![kept],
+            flushes: self.flushes,
             calls: 0,
             crash_at: None,
         }
     }
 
-    /// Replaces or removes the blob directly, for restore tests.
+    /// Makes a stored blob visible, and durable only if `durable`.
+    pub fn store_visible(&mut self, blob: &[u8], durable: bool) {
+        if self.durable.is_empty() {
+            self.durable.push(self.visible.clone());
+        }
+        self.visible = Some(blob.to_vec());
+        if durable {
+            self.durable = vec![self.visible.clone()];
+        } else {
+            self.durable.push(self.visible.clone());
+        }
+    }
+
+    /// Replaces or removes the blob directly and durably, for restore tests.
     pub fn put(&mut self, blob: Option<Vec<u8>>) {
-        self.blob = blob;
+        self.visible = blob;
+        self.durable = vec![self.visible.clone()];
     }
 
     pub fn get(&self) -> Option<&Vec<u8>> {
-        self.blob.as_ref()
+        self.visible.as_ref()
+    }
+
+    pub fn flushes(&self) -> bool {
+        self.flushes
     }
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
 impl Keyring for MemKeyring {
     fn load(&self) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
-        Ok(self.blob.clone().map(Zeroizing::new))
+        Ok(self.visible.clone().map(Zeroizing::new))
     }
 
     fn store(&mut self, blob: &[u8]) -> io::Result<()> {
@@ -76,7 +129,7 @@ impl Keyring for MemKeyring {
         if self.crash_at.is_some_and(|at| n >= at) {
             return Err(io::Error::other("simulated crash"));
         }
-        self.blob = Some(blob.to_vec());
+        self.store_visible(blob, self.flushes);
         Ok(())
     }
 }
@@ -89,6 +142,131 @@ pub struct MacKeychain {
 }
 
 #[cfg(target_os = "macos")]
+mod mac {
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::data::CFData;
+    use core_foundation::dictionary::CFDictionary;
+    use core_foundation::string::{CFString, CFStringRef};
+    use security_framework_sys::base::{errSecDuplicateItem, errSecItemNotFound, errSecSuccess};
+    use security_framework_sys::item::{
+        kSecAttrAccount, kSecAttrService, kSecAttrSynchronizable, kSecClass,
+        kSecClassGenericPassword, kSecReturnData, kSecUseDataProtectionKeychain, kSecValueData,
+    };
+    use security_framework_sys::keychain_item::{
+        SecItemAdd, SecItemCopyMatching, SecItemDelete, SecItemUpdate,
+    };
+    use std::io;
+
+    use super::Zeroizing;
+
+    #[link(name = "Security", kind = "framework")]
+    extern "C" {
+        static kSecAttrAccessible: CFStringRef;
+        static kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly: CFStringRef;
+    }
+
+    fn key(k: CFStringRef) -> CFString {
+        // SAFETY: a Security framework constant, valid for the process.
+        unsafe { CFString::wrap_under_get_rule(k) }
+    }
+
+    fn error(status: i32) -> io::Error {
+        io::Error::other(format!("Keychain status {status}"))
+    }
+
+    /// The item: generic password, service and account, in the
+    /// data-protection Keychain, never synchronized.
+    fn query(service: &str, account: &str) -> Vec<(CFString, CFType)> {
+        // SAFETY (each `key`): Security framework constants.
+        unsafe {
+            vec![
+                (key(kSecClass), key(kSecClassGenericPassword).as_CFType()),
+                (key(kSecAttrService), CFString::new(service).as_CFType()),
+                (key(kSecAttrAccount), CFString::new(account).as_CFType()),
+                (
+                    key(kSecUseDataProtectionKeychain),
+                    CFBoolean::true_value().as_CFType(),
+                ),
+                (
+                    key(kSecAttrSynchronizable),
+                    CFBoolean::false_value().as_CFType(),
+                ),
+            ]
+        }
+    }
+
+    pub fn load(service: &str, account: &str) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
+        let mut q = query(service, account);
+        // SAFETY: a Security framework constant.
+        q.push((
+            unsafe { key(kSecReturnData) },
+            CFBoolean::true_value().as_CFType(),
+        ));
+        let q = CFDictionary::from_CFType_pairs(&q);
+        let mut out = std::ptr::null();
+        // SAFETY: `q` is a valid dictionary; `out` receives a +1 reference.
+        let status = unsafe { SecItemCopyMatching(q.as_concrete_TypeRef(), &mut out) };
+        if status == errSecItemNotFound {
+            return Ok(None);
+        }
+        if status != errSecSuccess {
+            return Err(error(status));
+        }
+        // SAFETY: with kSecReturnData and one match, the result is a CFData
+        // we own.
+        let data = unsafe { CFData::wrap_under_create_rule(out as _) };
+        Ok(Some(Zeroizing::new(data.bytes().to_vec())))
+    }
+
+    /// Adds the item, or replaces only its data if it exists.
+    pub fn store(service: &str, account: &str, blob: &[u8]) -> io::Result<()> {
+        let value = CFData::from_buffer(blob);
+        let mut add = query(service, account);
+        // SAFETY: Security framework constants.
+        unsafe {
+            add.push((
+                key(kSecAttrAccessible),
+                key(kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly).as_CFType(),
+            ));
+            add.push((key(kSecValueData), value.as_CFType()));
+        }
+        let add = CFDictionary::from_CFType_pairs(&add);
+        // SAFETY: `add` is a valid dictionary; no result is requested.
+        let status = unsafe { SecItemAdd(add.as_concrete_TypeRef(), std::ptr::null_mut()) };
+        if status == errSecSuccess {
+            return Ok(());
+        }
+        if status != errSecDuplicateItem {
+            return Err(error(status));
+        }
+        let search = CFDictionary::from_CFType_pairs(&query(service, account));
+        // SAFETY: a Security framework constant.
+        let update =
+            CFDictionary::from_CFType_pairs(&[(unsafe { key(kSecValueData) }, value.as_CFType())]);
+        // SAFETY: both dictionaries are valid.
+        let status =
+            unsafe { SecItemUpdate(search.as_concrete_TypeRef(), update.as_concrete_TypeRef()) };
+        if status == errSecSuccess {
+            Ok(())
+        } else {
+            Err(error(status))
+        }
+    }
+
+    pub fn delete(service: &str, account: &str) -> io::Result<()> {
+        let q = CFDictionary::from_CFType_pairs(&query(service, account));
+        // SAFETY: a valid dictionary.
+        let status = unsafe { SecItemDelete(q.as_concrete_TypeRef()) };
+        if status == errSecSuccess || status == errSecItemNotFound {
+            Ok(())
+        } else {
+            Err(error(status))
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
 impl MacKeychain {
     /// One item, identified by `service` and `account`.
     pub fn new(service: &str, account: &str) -> Self {
@@ -98,50 +276,20 @@ impl MacKeychain {
         }
     }
 
-    fn options(&self) -> security_framework::passwords::PasswordOptions {
-        let mut options = security_framework::passwords::PasswordOptions::new_generic_password(
-            &self.service,
-            &self.account,
-        );
-        options.use_protected_keychain();
-        options.set_access_synchronized(Some(false));
-        options
-    }
-
     /// Removes the item, for tests.
     pub fn delete(&self) -> io::Result<()> {
-        match security_framework::passwords::delete_generic_password_options(self.options()) {
-            Ok(()) => Ok(()),
-            Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(()),
-            Err(e) => Err(io::Error::other(e)),
-        }
+        mac::delete(&self.service, &self.account)
     }
 }
 
 #[cfg(target_os = "macos")]
-const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
-
-#[cfg(target_os = "macos")]
 impl Keyring for MacKeychain {
     fn load(&self) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
-        match security_framework::passwords::generic_password(self.options()) {
-            Ok(blob) => Ok(Some(Zeroizing::new(blob))),
-            Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => Ok(None),
-            Err(e) => Err(io::Error::other(e)),
-        }
+        mac::load(&self.service, &self.account)
     }
 
     fn store(&mut self, blob: &[u8]) -> io::Result<()> {
-        use security_framework::access_control::{ProtectionMode, SecAccessControl};
-        let mut options = self.options();
-        let access = SecAccessControl::create_with_protection(
-            Some(ProtectionMode::AccessibleAfterFirstUnlockThisDeviceOnly),
-            0,
-        )
-        .map_err(io::Error::other)?;
-        options.set_access_control(access);
-        security_framework::passwords::set_generic_password_options(blob, options)
-            .map_err(io::Error::other)
+        mac::store(&self.service, &self.account, blob)
     }
 }
 
@@ -263,13 +411,31 @@ impl Keyring for DpapiRegistry {
     }
 
     fn store(&mut self, blob: &[u8]) -> io::Result<()> {
+        use windows::Win32::System::Registry::RegFlushKey;
+        // SAFETY: `store_with` passes a key it holds open.
+        self.store_with(blob, |key| unsafe { RegFlushKey(key) })
+    }
+}
+
+#[cfg(windows)]
+impl DpapiRegistry {
+    /// Seals `blob`, writes it, and runs `flush` on the open key. An error
+    /// is returned unless every step succeeded, even if the value was
+    /// written.
+    fn store_with(
+        &mut self,
+        blob: &[u8],
+        flush: impl FnOnce(
+            windows::Win32::System::Registry::HKEY,
+        ) -> windows::Win32::Foundation::WIN32_ERROR,
+    ) -> io::Result<()> {
         use windows::core::PCWSTR;
         use windows::Win32::Foundation::{LocalFree, ERROR_SUCCESS, HLOCAL};
         use windows::Win32::Security::Cryptography::{
             CryptProtectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
         };
         use windows::Win32::System::Registry::{
-            RegCloseKey, RegCreateKeyExW, RegFlushKey, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
+            RegCloseKey, RegCreateKeyExW, RegSetValueExW, HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE,
             KEY_SET_VALUE, REG_BINARY, REG_OPTION_NON_VOLATILE,
         };
 
@@ -304,7 +470,8 @@ impl Keyring for DpapiRegistry {
                 0,
                 PCWSTR::null(),
                 REG_OPTION_NON_VOLATILE,
-                KEY_SET_VALUE,
+                // RegFlushKey is documented to need KEY_QUERY_VALUE too.
+                KEY_SET_VALUE | KEY_QUERY_VALUE,
                 None,
                 &mut key,
                 None,
@@ -325,7 +492,7 @@ impl Keyring for DpapiRegistry {
                     )),
                 );
                 if status == ERROR_SUCCESS {
-                    status = RegFlushKey(key);
+                    status = flush(key);
                 }
                 let _ = RegCloseKey(key);
             }
@@ -347,18 +514,34 @@ mod tests {
     use super::*;
 
     #[test]
-    fn mem_keyring_store_is_all_or_nothing() {
+    fn mem_keyring_separates_visible_from_durable() {
         let mut k = MemKeyring::new();
         assert!(k.load().unwrap().is_none());
         k.store(b"one").unwrap();
-        k.crash_at(1);
-        assert!(k.store(b"two").is_err());
-        assert_eq!(&**k.after_crash().load().unwrap().unwrap(), b"one");
+        k.store(b"two").unwrap();
+        assert_eq!(&**k.load().unwrap().unwrap(), b"two");
+        // A crash may keep nothing, "one" or "two".
+        assert_eq!(k.crash_choices(), 3);
+        assert!(k.after_crash(0).get().is_none());
+        assert_eq!(k.after_crash(1).get().unwrap(), b"one");
+        assert_eq!(k.after_crash(2).get().unwrap(), b"two");
+        // A failed store never happened.
+        k.crash_at(2);
+        assert!(k.store(b"three").is_err());
+        assert_eq!(k.crash_choices(), 3);
+        // A flushing keyring keeps only the last successful store.
+        let mut f = MemKeyring::flushing();
+        f.store(b"one").unwrap();
+        f.store(b"two").unwrap();
+        assert_eq!(f.crash_choices(), 1);
+        assert_eq!(f.after_crash(0).get().unwrap(), b"two");
+        // Unless it was only made visible.
+        f.store_visible(b"three", false);
+        assert_eq!(f.crash_choices(), 2);
+        assert_eq!(f.after_crash(0).get().unwrap(), b"two");
     }
 
-    /// Needs a signed binary or an unlocked login session on some setups;
-    /// run with `--ignored` on a Mac.
-    // The data-protection Keychain needs a signed binary with a keychain
+    // The data-protection Keychain needs a binary signed with a keychain
     // access group; a plain test binary gets errSecMissingEntitlement.
     #[cfg(target_os = "macos")]
     #[test]
@@ -370,18 +553,45 @@ mod tests {
         );
         k.delete().unwrap();
         assert!(k.load().unwrap().is_none());
+        // Add, then update twice: the update path replaces only the data.
         k.store(b"first").unwrap();
         k.store(b"second").unwrap();
-        assert_eq!(&**k.load().unwrap().unwrap(), b"second");
+        k.store(&[7u8; 300]).unwrap();
+        assert_eq!(&**k.load().unwrap().unwrap(), &[7u8; 300][..]);
         k.delete().unwrap();
         assert!(k.load().unwrap().is_none());
     }
 
     #[cfg(windows)]
+    /// Removes `HKCU\<root>` and everything under it.
+    fn remove_test_key(root: &str) {
+        let root: Vec<u16> = root.encode_utf16().chain(std::iter::once(0)).collect();
+        let _ = unsafe {
+            // SAFETY: a NUL-terminated string, alive for the call.
+            windows::Win32::System::Registry::RegDeleteTreeW(
+                windows::Win32::System::Registry::HKEY_CURRENT_USER,
+                windows::core::PCWSTR(root.as_ptr()),
+            )
+        };
+    }
+
+    /// Removes its test key when dropped, also when a test panics.
+    #[cfg(windows)]
+    struct TestKey(&'static str);
+
+    #[cfg(windows)]
+    impl Drop for TestKey {
+        fn drop(&mut self) {
+            remove_test_key(self.0);
+        }
+    }
+
+    #[cfg(windows)]
     #[test]
     fn dpapi_registry_round_trip() {
+        let _cleanup = TestKey(r"Software\EternalMonitor-Test-RoundTrip");
         let mut k = DpapiRegistry::new(
-            r"Software\EternalMonitor-Test\credstore",
+            r"Software\EternalMonitor-Test-RoundTrip\credstore",
             &format!("keyring-{}", std::process::id()),
         );
         k.delete().unwrap();
@@ -391,14 +601,24 @@ mod tests {
         assert_eq!(&**k.load().unwrap().unwrap(), &[7u8; 300][..]);
         k.delete().unwrap();
         assert!(k.load().unwrap().is_none());
-        // Remove the test key itself.
-        let root: Vec<u16> = "Software\\EternalMonitor-Test\0".encode_utf16().collect();
-        let _ = unsafe {
-            // SAFETY: a NUL-terminated string, alive for the call.
-            windows::Win32::System::Registry::RegDeleteTreeW(
-                windows::Win32::System::Registry::HKEY_CURRENT_USER,
-                windows::core::PCWSTR(root.as_ptr()),
-            )
-        };
+    }
+
+    /// A failed flush is reported, even though the value was written.
+    #[cfg(windows)]
+    #[test]
+    fn dpapi_registry_reports_a_failed_flush() {
+        use windows::Win32::Foundation::ERROR_ACCESS_DENIED;
+        let _cleanup = TestKey(r"Software\EternalMonitor-Test-Flush");
+        let mut k = DpapiRegistry::new(
+            r"Software\EternalMonitor-Test-Flush\credstore",
+            &format!("keyring-{}", std::process::id()),
+        );
+        k.delete().unwrap();
+        assert!(k.store_with(b"written", |_| ERROR_ACCESS_DENIED).is_err());
+        assert_eq!(&**k.load().unwrap().unwrap(), b"written");
+        // The real flush succeeds.
+        k.store(b"flushed").unwrap();
+        assert_eq!(&**k.load().unwrap().unwrap(), b"flushed");
+        k.delete().unwrap();
     }
 }

@@ -55,9 +55,16 @@ pub const MAX_TOMBSTONES_PER_SLOT: usize = 8;
 pub const MAX_TOMBSTONE_SLOTS: usize = 1024;
 /// Longest device name, in UTF-8 bytes.
 pub const MAX_NAME_LEN: usize = 64;
-/// Largest generation either format accepts. One rotation per user action
-/// never gets near it; the bound keeps `generation + 1` from overflowing.
+/// Pending records a slot may hold, next to its one active record.
+pub const MAX_PENDING_PER_SLOT: usize = 3;
+/// Every generation, in either format, is at least 1 and below this. One
+/// rotation per user action never gets near it.
 pub const MAX_GENERATION: u64 = 1 << 62;
+
+/// True for a generation either format accepts.
+pub fn valid_generation(g: u64) -> bool {
+    (1..MAX_GENERATION).contains(&g)
+}
 
 const DB_MAGIC: &[u8; 8] = b"EMV3CRED";
 const KEYRING_MAGIC: &[u8; 8] = b"EMV3KRNG";
@@ -200,17 +207,20 @@ impl GenerationKeys {
 
     /// Wraps `key` for `dev_id` under a fresh random nonce.
     pub fn wrap(&self, dev_id: &Id16, key: &Key32, nonce: [u8; 12]) -> [u8; WRAPPED_LEN] {
-        let mut buf = key.to_vec();
+        // Room for the tag up front: the key is never copied by a regrowth.
+        let mut buf = Zeroizing::new(Vec::with_capacity(WRAPPED_LEN));
+        let at = buf.as_ptr();
+        buf.extend_from_slice(key);
         self.wrap
             .seal_in_place_append_tag(
                 Nonce::assume_unique_for_key(nonce),
                 Aad::from(&self.aad(dev_id)),
-                &mut buf,
+                &mut *buf,
             )
             .expect("32-byte plaintext");
+        debug_assert_eq!(buf.as_ptr(), at, "never reallocated");
         let mut out = [0u8; WRAPPED_LEN];
         out.copy_from_slice(&buf);
-        zeroize::Zeroize::zeroize(&mut buf);
         out
     }
 
@@ -310,7 +320,7 @@ pub fn parse_db(file: &[u8]) -> Result<DbFile, FormatError> {
         return Err(FormatError::UnsupportedVersion(version));
     }
     let generation = r.u64()?;
-    if generation == 0 || generation > MAX_GENERATION {
+    if !valid_generation(generation) {
         return Err(FormatError::InvalidField("generation"));
     }
     let count = usize::from(r.u16()?);
@@ -383,9 +393,15 @@ pub fn parse_db(file: &[u8]) -> Result<DbFile, FormatError> {
     Ok(db)
 }
 
-/// The invariants every database file holds: unique `dev_id`s and slots, at
-/// most one active record per slot, no record tombstoned, and a pending
-/// record replaces only a record in its own slot.
+/// Every invariant the store keeps, so a file that breaks one (even with a
+/// valid MAC) is never loaded:
+/// - unique `dev_id`s across records and tombstones, and unique slots in the
+///   tombstone list, each with 1 to 8 entries;
+/// - per slot, at most one active and three pending records;
+/// - an active record replaces nothing; a pending record never replaces
+///   itself, and if the record it replaces is still held, that's its slot's
+///   active record;
+/// - no held record is tombstoned.
 fn check_db(db: &DbFile) -> Result<(), FormatError> {
     let mut ids: Vec<&Id16> = db.records.iter().map(|r| &r.dev_id).collect();
     ids.sort_unstable();
@@ -397,27 +413,70 @@ fn check_db(db: &DbFile) -> Result<(), FormatError> {
     if slots.windows(2).any(|w| w[0] == w[1]) {
         return Err(FormatError::InvalidField("duplicate_slot"));
     }
+    let mut retired: Vec<&Id16> = db.tombstones.iter().flat_map(|(_, t)| t).collect();
+    retired.sort_unstable();
+    if retired.windows(2).any(|w| w[0] == w[1]) {
+        return Err(FormatError::InvalidField("duplicate_tombstone"));
+    }
+    if db.tombstones.iter().any(|(_, t)| t.is_empty()) {
+        return Err(FormatError::InvalidField("empty_tombstones"));
+    }
     for r in &db.records {
-        let active_in_slot = db
-            .records
-            .iter()
-            .filter(|o| o.slot_id == r.slot_id && o.state == RecordState::Active)
-            .count();
-        if active_in_slot > 1 {
+        let in_slot = |state| {
+            db.records
+                .iter()
+                .filter(|o| o.slot_id == r.slot_id && o.state == state)
+                .count()
+        };
+        if in_slot(RecordState::Active) > 1 {
             return Err(FormatError::InvalidField("two_active"));
         }
-        if db.tombstones.iter().any(|(_, t)| t.contains(&r.dev_id)) {
+        if in_slot(RecordState::Pending) > MAX_PENDING_PER_SLOT {
+            return Err(FormatError::InvalidField("too_many_pending"));
+        }
+        if retired.binary_search(&&r.dev_id).is_ok() {
             return Err(FormatError::InvalidField("tombstoned_record"));
         }
-        if r.state == RecordState::Active && r.replaces.is_some() {
-            return Err(FormatError::InvalidField("active_replaces"));
+        match (r.state, r.replaces) {
+            (RecordState::Active, Some(_)) => {
+                return Err(FormatError::InvalidField("active_replaces"));
+            }
+            (RecordState::Pending, Some(old)) => {
+                if old == r.dev_id {
+                    return Err(FormatError::InvalidField("replaces_itself"));
+                }
+                if let Some(o) = db.records.iter().find(|o| o.dev_id == old) {
+                    if o.slot_id != r.slot_id || o.state != RecordState::Active {
+                        return Err(FormatError::InvalidField("replaces_not_active"));
+                    }
+                }
+            }
+            _ => {}
         }
     }
     Ok(())
 }
 
+/// The encoded size of `state`.
+fn keyring_len(state: &KeyringState) -> usize {
+    8 + 1
+        + 8
+        + 32
+        + match &state.staged {
+            Some((_, _, i)) => {
+                1 + 8 + 32 + 1 + 16 + 1 + 16 * i.invalidate.len() + 1 + 16 * i.promote.len()
+            }
+            None => 2,
+        }
+}
+
+/// Encodes the keyring blob into one buffer of exactly its size, so no key
+/// is ever left behind by a regrowth.
 pub fn encode_keyring(state: &KeyringState) -> Zeroizing<Vec<u8>> {
-    let mut out = Zeroizing::new(Vec::with_capacity(128));
+    let len = keyring_len(state);
+    let mut out = Zeroizing::new(Vec::with_capacity(len));
+    let at = out.as_ptr();
+    assert!(valid_generation(state.committed.0));
     out.extend_from_slice(KEYRING_MAGIC);
     out.push(VERSION);
     out.extend_from_slice(&state.committed.0.to_le_bytes());
@@ -425,6 +484,7 @@ pub fn encode_keyring(state: &KeyringState) -> Zeroizing<Vec<u8>> {
     match &state.staged {
         Some((g, w, intent)) => {
             assert_eq!(*g, state.committed.0 + 1);
+            assert!(valid_generation(*g));
             assert!(intent.invalidate.len() <= MAX_RECORDS && intent.promote.len() <= MAX_RECORDS);
             out.push(1);
             out.extend_from_slice(&g.to_le_bytes());
@@ -445,6 +505,8 @@ pub fn encode_keyring(state: &KeyringState) -> Zeroizing<Vec<u8>> {
             out.push(0);
         }
     }
+    assert_eq!(out.len(), len);
+    debug_assert_eq!(out.as_ptr(), at, "never reallocated");
     out
 }
 
@@ -458,7 +520,7 @@ pub fn parse_keyring(blob: &[u8]) -> Result<KeyringState, FormatError> {
         return Err(FormatError::UnsupportedVersion(version));
     }
     let g = r.u64()?;
-    if g == 0 || g >= MAX_GENERATION {
+    if !valid_generation(g) {
         return Err(FormatError::InvalidField("generation"));
     }
     let w = r.key()?;
@@ -471,7 +533,7 @@ pub fn parse_keyring(blob: &[u8]) -> Result<KeyringState, FormatError> {
         }
         (1, ()) => {
             let staged_g = r.u64()?;
-            if Some(staged_g) != g.checked_add(1) {
+            if staged_g != g + 1 || !valid_generation(staged_g) {
                 return Err(FormatError::InvalidField("staged_generation"));
             }
             let staged_w = r.key()?;
@@ -646,6 +708,135 @@ mod tests {
         let mut longer = bytes.clone();
         longer.insert(bytes.len() - MAC_LEN, 0);
         assert_eq!(parse_db(&longer), Err(FormatError::TrailingBytes));
+    }
+
+    #[test]
+    fn db_parser_enforces_every_store_invariant() {
+        let keys = GenerationKeys::new(&[0x11; 32], 3);
+        let check = |db: &DbFile, field: &'static str| {
+            assert_eq!(
+                parse_db(&encode_db(db, &keys)),
+                Err(FormatError::InvalidField(field)),
+                "{field}"
+            );
+        };
+        // Four pending records in one slot.
+        let mut pending = sample(&keys);
+        for dev in 3..=5 {
+            pending
+                .records
+                .push(record(dev, 9, RecordState::Pending, &keys));
+        }
+        check(&pending, "too_many_pending");
+        pending.records.pop();
+        assert!(
+            parse_db(&encode_db(&pending, &keys)).is_ok(),
+            "three is fine"
+        );
+        // Replacing itself, or a held record that isn't the slot's active.
+        let mut itself = sample(&keys);
+        itself.records[1].replaces = Some(itself.records[1].dev_id);
+        check(&itself, "replaces_itself");
+        let mut not_active = sample(&keys);
+        not_active
+            .records
+            .push(record(3, 9, RecordState::Pending, &keys));
+        not_active.records[2].replaces = Some([2; 16]);
+        check(&not_active, "replaces_not_active");
+        let mut other_slot = sample(&keys);
+        other_slot
+            .records
+            .push(record(3, 8, RecordState::Pending, &keys));
+        other_slot.records[2].replaces = Some([1; 16]);
+        check(&other_slot, "replaces_not_active");
+        // A replaced record that's gone is fine (it was retired).
+        let mut gone = sample(&keys);
+        gone.records[1].replaces = Some([0x77; 16]);
+        assert!(parse_db(&encode_db(&gone, &keys)).is_ok());
+        // An active record replacing anything.
+        let mut active = sample(&keys);
+        active.records[0].replaces = Some([0x77; 16]);
+        check(&active, "active_replaces");
+        // Tombstones: duplicate ids, empty lists.
+        let mut dup = sample(&keys);
+        dup.tombstones.push(([8; 16], vec![[5; 16]]));
+        check(&dup, "duplicate_tombstone");
+        let mut empty = sample(&keys);
+        empty.tombstones.push(([8; 16], Vec::new()));
+        check(&empty, "empty_tombstones");
+    }
+
+    #[test]
+    fn both_formats_share_one_generation_bound() {
+        let ok = |g| {
+            let keys = GenerationKeys::new(&[0x11; 32], g);
+            let mut db = sample(&keys);
+            db.generation = g;
+            db.records.clear();
+            parse_db(&encode_db(&db, &keys)).is_ok()
+        };
+        assert!(ok(1) && ok(MAX_GENERATION - 1));
+        // Encoded by hand: the encoders refuse these.
+        let mut db = encode_db(
+            &DbFile {
+                generation: 5,
+                records: Vec::new(),
+                tombstones: Vec::new(),
+            },
+            &GenerationKeys::new(&[0x11; 32], 5),
+        );
+        for bad in [0, MAX_GENERATION, u64::MAX] {
+            db[9..17].copy_from_slice(&bad.to_le_bytes());
+            assert_eq!(parse_db(&db), Err(FormatError::InvalidField("generation")));
+        }
+        let at = |committed: u64, staged: bool| {
+            let mut blob = encode_keyring(&KeyringState {
+                committed: (5, Zeroizing::new([1; 32])),
+                staged: staged.then(|| (6, Zeroizing::new([2; 32]), Intent::default())),
+            })
+            .to_vec();
+            blob[9..17].copy_from_slice(&committed.to_le_bytes());
+            if staged {
+                blob[50..58].copy_from_slice(&(committed.wrapping_add(1)).to_le_bytes());
+            }
+            parse_keyring(&blob).is_ok()
+        };
+        assert!(at(MAX_GENERATION - 1, false));
+        assert!(at(MAX_GENERATION - 2, true));
+        assert!(
+            !at(MAX_GENERATION - 1, true),
+            "staged would reach the bound"
+        );
+        assert!(!at(MAX_GENERATION, false));
+        assert!(!at(0, false));
+        assert!(valid_generation(MAX_GENERATION - 1) && !valid_generation(MAX_GENERATION));
+    }
+
+    #[test]
+    fn the_largest_keyring_blob_is_encoded_without_reallocating() {
+        // The debug assertion in encode_keyring checks the buffer never
+        // moved; this makes it run at the largest size.
+        let ids: Vec<Id16> = (0..MAX_RECORDS as u8).map(|i| [i; 16]).collect();
+        let state = KeyringState {
+            committed: (5, Zeroizing::new([1; 32])),
+            staged: Some((
+                6,
+                Zeroizing::new([2; 32]),
+                Intent {
+                    op_id: [3; 16],
+                    invalidate: ids[..32].to_vec(),
+                    promote: ids[32..].to_vec(),
+                },
+            )),
+        };
+        let blob = encode_keyring(&state);
+        assert_eq!(blob.len(), blob.capacity());
+        assert_eq!(parse_keyring(&blob).unwrap(), state);
+        let plain = encode_keyring(&KeyringState {
+            committed: (5, Zeroizing::new([1; 32])),
+            staged: None,
+        });
+        assert_eq!(plain.len(), plain.capacity());
     }
 
     #[test]

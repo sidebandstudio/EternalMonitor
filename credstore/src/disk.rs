@@ -3,7 +3,7 @@
 //!
 //! A database write is always: write the temporary file and sync it, rename
 //! it over the database, sync the directory. [`StdDisk`] does that with
-//! `std::fs`; [`MemDisk`] (tests and fuzzing) keeps files in memory and can
+//! `std::fs`; `MemDisk` (tests and fuzzing) keeps files in memory and can
 //! fail at any call, losing whatever wasn't durable yet.
 
 use std::io;
@@ -13,6 +13,8 @@ use std::path::PathBuf;
 pub trait Disk {
     /// The file's contents, or `None` if it doesn't exist.
     fn read(&self, name: &str) -> io::Result<Option<Vec<u8>>>;
+    /// The names of the files in the directory.
+    fn list(&self) -> io::Result<Vec<String>>;
     /// Creates or replaces `name` with `bytes`, synced: on disk before any
     /// later rename, and durable once [`sync_dir`](Self::sync_dir) returns.
     fn write_synced(&mut self, name: &str, bytes: &[u8]) -> io::Result<()>;
@@ -45,6 +47,16 @@ impl Disk for StdDisk {
             Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    fn list(&self) -> io::Result<Vec<String>> {
+        let mut names = Vec::new();
+        for entry in std::fs::read_dir(&self.dir)? {
+            if let Ok(name) = entry?.file_name().into_string() {
+                names.push(name);
+            }
+        }
+        Ok(names)
     }
 
     fn write_synced(&mut self, name: &str, bytes: &[u8]) -> io::Result<()> {
@@ -197,6 +209,10 @@ impl Disk for MemDisk {
         Ok(self.visible.get(name).cloned())
     }
 
+    fn list(&self) -> io::Result<Vec<String>> {
+        Ok(self.visible.keys().cloned().collect())
+    }
+
     fn write_synced(&mut self, name: &str, bytes: &[u8]) -> io::Result<()> {
         if let Err(e) = self.step() {
             self.write_torn(name, bytes);
@@ -246,6 +262,7 @@ mod tests {
         disk.sync_dir().unwrap();
         assert_eq!(disk.read("a").unwrap().unwrap(), b"one");
         assert_eq!(disk.read("a.tmp").unwrap(), None);
+        assert_eq!(disk.list().unwrap(), vec!["a".to_string()]);
         disk.remove("a").unwrap();
         disk.remove("a").unwrap();
         std::fs::remove_dir_all(&dir).unwrap();

@@ -3,8 +3,11 @@
 mod common;
 
 use common::*;
+use eternal_credstore::format::{
+    encode_db, encode_keyring, DbFile, GenerationKeys, KeyringState, MAX_GENERATION,
+};
 use eternal_credstore::format::{parse_db, parse_keyring};
-use eternal_credstore::store::{DB_FILE, DB_TMP};
+use eternal_credstore::store::{db_file, DB_TMP};
 use eternal_credstore::{Finalize, NewRecord, Recovery, StoreCredentials, StoreError};
 use eternal_wire::v3::host::HostCredentials;
 use eternal_wire::v3::wire::{Accept, RecordState};
@@ -33,7 +36,7 @@ fn a_new_store_is_empty_with_a_fresh_keyring() {
     assert!(store.records().is_empty());
     assert_eq!(store.generation(), 1);
     drop(store);
-    let (store, report, _) = live.after_crash(false).open();
+    let (store, report, _) = live.at_rest().open();
     assert!(report.recovery.is_empty(), "nothing to do: {report:?}");
     assert_eq!(store.generation(), 1);
 }
@@ -183,7 +186,7 @@ fn committed_timestamps_only_grow_and_survive_a_restart() {
     store.add_pending(new_record(2, 2, None), NOW).unwrap();
     store.remove(&[id(2)]).unwrap();
     drop(store);
-    let (store, _, _) = live.after_crash(false).open();
+    let (store, _, _) = live.at_rest().open();
     assert_eq!(store.snapshot().last_committed_timestamp(&id(1)), 500);
     assert_eq!(*store.snapshot().key(&id(1)).unwrap(), [1; 32]);
 }
@@ -236,7 +239,7 @@ fn tombstones_keep_the_last_8_per_slot() {
     let tombstones = store.tombstones();
     assert_eq!(tombstones, vec![(id(1), (3..=10).map(id).collect())]);
     drop(store);
-    let (store, _, _) = live.after_crash(false).open();
+    let (store, _, _) = live.at_rest().open();
     assert_eq!(store.tombstones(), tombstones);
 }
 
@@ -310,9 +313,10 @@ fn a_failed_plain_write_changes_nothing() {
 fn the_database_holds_no_plaintext_key() {
     let (mut store, _, live) = World::default().open();
     store.add_pending(new_record(0xAB, 1, None), NOW).unwrap();
+    let name = db_file(store.generation());
     drop(store);
     let disk = live.disk.borrow();
-    let bytes = disk.get(DB_FILE).unwrap();
+    let bytes = disk.get(&name).unwrap();
     assert!(!bytes.windows(32).any(|w| w == [0xAB; 32]));
     let blob = live.keyring.borrow().get().cloned().unwrap();
     assert!(parse_keyring(&blob).is_ok());
@@ -329,7 +333,7 @@ fn a_database_restored_from_before_an_invalidation_is_discarded() {
     let (mut store, _, live) = base.open();
     store.remove(&[id(0x11)]).unwrap();
     drop(store);
-    let mut restored = live.after_crash(false);
+    let mut restored = live.at_rest();
     restored.disk = base.disk.clone();
     let (store, report, _) = restored.open();
     assert_eq!(report.recovery, vec![Recovery::Discarded]);
@@ -347,7 +351,7 @@ fn a_restored_database_from_the_same_generation_only_loses_additions() {
     store.add_pending(new_record(0x51, 5, None), NOW).unwrap();
     store.persist_timestamp(&id(0x11), 9_000).unwrap();
     drop(store);
-    let mut restored = live.after_crash(false);
+    let mut restored = live.at_rest();
     restored.disk = base.disk.clone();
     let (store, report, _) = restored.open();
     assert!(report.recovery.is_empty());
@@ -357,12 +361,16 @@ fn a_restored_database_from_the_same_generation_only_loses_additions() {
 }
 
 #[test]
-fn a_keyring_rolled_back_past_a_rotation_discards() {
+fn a_keyring_rolled_back_past_an_observed_rotation_discards() {
     let base = base_world();
     let (mut store, _, live) = base.open();
     store.expire(NOW).unwrap();
     drop(store);
-    let mut rolled_back = live.after_crash(false);
+    // A later open sees the new generation and removes the old file.
+    let (store, _, live) = live.at_rest().open();
+    drop(store);
+    let mut rolled_back = live.at_rest();
+    assert_eq!(db_generations(&rolled_back).len(), 1);
     rolled_back.keyring = base.keyring.clone();
     let (store, report, _) = rolled_back.open();
     assert_eq!(report.recovery, vec![Recovery::Discarded]);
@@ -370,29 +378,206 @@ fn a_keyring_rolled_back_past_a_rotation_discards() {
     assert!(is_tombstoned(&store, 0x31));
 }
 
+/// Until an open has seen the new generation, a keyring back at the old
+/// one is a store that was lost: the operation never happened, and nothing
+/// else is touched.
+#[test]
+fn a_lost_rotation_keyring_comes_back_exactly_before() {
+    let base = base_world();
+    let before = logical(&base.open().0);
+    let (mut store, _, live) = base.open();
+    store.expire(NOW).unwrap();
+    drop(store);
+    let mut lost = live.at_rest();
+    assert_eq!(db_generations(&lost).len(), 2, "both generations kept");
+    lost.keyring = base.keyring.clone();
+    let (store, report, live) = lost.open();
+    assert!(report.recovery.is_empty());
+    assert_eq!(logical(&store), before);
+    drop(store);
+    // The orphaned newer file is removed.
+    assert_eq!(db_generations(&live.at_rest()), db_generations(&base));
+}
+
+#[test]
+fn old_generation_files_stay_until_an_open_sees_the_new_one() {
+    let base = base_world();
+    let g = db_generations(&base);
+    assert_eq!(g.len(), 1);
+    let (mut store, _, live) = base.open();
+    store.remove(&[id(0x21)]).unwrap();
+    drop(store);
+    let world = live.at_rest();
+    assert_eq!(db_generations(&world), vec![g[0], g[0] + 1]);
+    let (store, _, live) = world.open();
+    drop(store);
+    assert_eq!(db_generations(&live.at_rest()), vec![g[0] + 1]);
+}
+
+#[test]
+fn files_that_aren_t_a_generation_are_ignored() {
+    let mut world = base_world();
+    for name in [
+        "credentials-01.db",
+        "credentials-x.db",
+        "credentials-.db",
+        "other",
+    ] {
+        world.disk.put(name, b"junk".to_vec());
+    }
+    world.disk.put(&db_file(MAX_GENERATION), b"junk".to_vec());
+    let (store, report, live) = world.open();
+    assert!(report.recovery.is_empty());
+    assert_eq!(store.records().len(), 5);
+    drop(store);
+    assert!(live.disk.borrow().get("other").is_some(), "left alone");
+}
+
+#[test]
+fn an_unreadable_keyring_is_never_replaced() {
+    let base = base_world();
+    let blob = base.keyring.get().unwrap().clone();
+    let mut newer = blob.clone();
+    newer[8] = 2; // a later version
+    for bad in [newer, b"garbage".to_vec(), Vec::new()] {
+        let mut world = base.clone();
+        world.keyring.put(Some(bad.clone()));
+        let (live, opened) = world.open_live(1, None, false);
+        assert!(matches!(opened, Err(StoreError::KeyringUnreadable(_))));
+        assert_eq!(live.keyring.borrow().get(), Some(&bad), "untouched");
+        assert_eq!(
+            live.steps.count.get(),
+            1,
+            "only the stray temporary file check"
+        );
+        assert_eq!(db_generations(&live.at_rest()), db_generations(&base));
+    }
+    // A keyring that can't be read at all: the same.
+    let (live, opened) = base.open_live_with(1, |steps| steps.fail_load.set(true));
+    assert!(matches!(opened, Err(StoreError::Io(_))));
+    assert_eq!(live.keyring.borrow().get(), base.keyring.get());
+}
+
+/// A failed step 1 whose outcome can't be read back: the records are
+/// invalid in memory, writes are refused, and a reopen settles it either
+/// way, never touching another record.
+#[test]
+fn an_unknown_step_1_outcome_fails_closed() {
+    let base = base_world();
+    let before = logical(&base.open().0);
+    for ambiguous in [false, true] {
+        let (mut store, _, live) = base.open();
+        live.steps.crash_at.set(Some(live.steps.count.get()));
+        live.steps.ambiguous.set(ambiguous);
+        live.steps.fail_load.set(true);
+        assert!(store.remove(&[id(0x21)]).is_err());
+        assert!(
+            store.snapshot().key(&id(0x21)).is_none(),
+            "invalid in memory"
+        );
+        assert!(matches!(
+            store.add_pending(new_record(0x51, 5, None), NOW),
+            Err(StoreError::NeedsReopen)
+        ));
+        drop(store);
+        for choice in 0..live.keyring_choices() {
+            let (store, _, _) = live.after_crash(false, choice).open();
+            let reached = logical(&store);
+            let mut after = before.clone();
+            after.records.retain(|r| r.0 != id(0x21));
+            if live.after_crash(false, choice).keyring.get() == base.keyring.get() {
+                assert_eq!(reached, before);
+            } else {
+                assert_eq!(reached.records, after.records);
+            }
+        }
+    }
+}
+
+fn world_at(generation: u64) -> World {
+    let w = [9u8; 32];
+    let mut world = World::default();
+    world.keyring.put(Some(
+        encode_keyring(&KeyringState {
+            committed: (generation, eternal_wire::v3::Zeroizing::new(w)),
+            staged: None,
+        })
+        .to_vec(),
+    ));
+    let db = DbFile {
+        generation,
+        records: Vec::new(),
+        tombstones: Vec::new(),
+    };
+    world.disk.put(
+        &db_file(generation),
+        encode_db(&db, &GenerationKeys::new(&w, generation)),
+    );
+    world
+}
+
+#[test]
+fn a_rotation_past_the_generation_bound_is_refused_before_any_change() {
+    let world = world_at(MAX_GENERATION - 1);
+    let (mut store, report, live) = world.open();
+    assert!(report.recovery.is_empty());
+    store.add_pending(new_record(1, 1, None), NOW).unwrap();
+    let before = logical(&store);
+    let keyring = live.keyring.borrow().get().cloned();
+    let files = db_generations(&live.at_rest());
+    assert!(matches!(store.remove(&[id(1)]), Err(StoreError::Exhausted)));
+    assert!(matches!(
+        store.expire(NOW + 30 * DAY),
+        Err(StoreError::Exhausted)
+    ));
+    assert_eq!(logical(&store), before);
+    assert_eq!(live.keyring.borrow().get().cloned(), keyring);
+    assert_eq!(db_generations(&live.at_rest()), files);
+    // Not stuck: plain writes still work.
+    store.persist_timestamp(&id(1), 5).unwrap();
+}
+
+#[test]
+fn a_fresh_keyring_is_seeded_only_with_room_to_rotate() {
+    for (on_disk, fresh) in [
+        (MAX_GENERATION - 3, MAX_GENERATION - 2),
+        (MAX_GENERATION - 2, 1),
+        (MAX_GENERATION - 1, 1),
+        (5, 6),
+    ] {
+        let mut world = world_at(on_disk);
+        world.keyring.put(None);
+        let (store, report, _) = world.open();
+        assert_eq!(report.recovery[0], Recovery::FreshKeyring);
+        // The startup discard rotates once from the fresh generation.
+        assert_eq!(store.generation(), fresh + 1, "{on_disk}");
+    }
+}
+
 #[test]
 fn a_corrupt_database_is_discarded() {
     let base = base_world();
     // A flipped MAC byte: still listed and tombstoned.
+    let name = db_file(*db_generations(&base).last().unwrap());
     let mut bad_mac = base.clone();
-    let mut bytes = bad_mac.disk.get(DB_FILE).unwrap().clone();
+    let mut bytes = bad_mac.disk.get(&name).unwrap().clone();
     *bytes.last_mut().unwrap() ^= 1;
     assert!(parse_db(&bytes).is_ok());
-    bad_mac.disk.put(DB_FILE, bytes.clone());
+    bad_mac.disk.put(&name, bytes.clone());
     let (store, report, _) = bad_mac.open();
     assert_eq!(report.recovery, vec![Recovery::Discarded]);
     assert_eq!(report.discarded.len(), 5);
     assert!(store.records().is_empty());
     // Unparseable: nothing to list, still discarded.
     let mut garbage = base.clone();
-    garbage.disk.put(DB_FILE, bytes[..40].to_vec());
+    garbage.disk.put(&name, bytes[..40].to_vec());
     let (store, report, live) = garbage.open();
     assert_eq!(report.recovery, vec![Recovery::Discarded]);
     assert!(report.discarded.is_empty());
     assert!(store.records().is_empty());
     drop(store);
     // The next start is clean.
-    let (_, report, _) = live.after_crash(false).open();
+    let (_, report, _) = live.at_rest().open();
     assert!(report.recovery.is_empty());
 }
 

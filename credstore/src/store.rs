@@ -4,21 +4,31 @@
 //!
 //! # Durability
 //!
+//! Each generation `g` has its own database file, `credentials-<g>.db`.
+//!
 //! - **Additions** (a new pending record, a Finalize that only promotes, a
-//!   committed timestamp) are one plain write of the database under the
-//!   committed generation: temporary file, sync, rename, sync the directory.
+//!   committed timestamp) are one plain write of generation `g`'s file:
+//!   temporary file, sync, rename, sync the directory.
 //! - **Every invalidation** goes through one procedure, which rotates the
 //!   wrapping key:
 //!   1. record the intent: store the keyring with the next generation's key
 //!      staged and the intent; from here the records it invalidates are
 //!      invalid in memory;
-//!   2. rewrite the database at the next generation, without them, every
-//!      survivor wrapped under the new key, their `dev_id`s tombstoned;
+//!   2. write generation `g+1`'s file, without them, every survivor wrapped
+//!      under the new key, their `dev_id`s tombstoned;
 //!   3. commit the keyring: the new generation alone.
+//!
+//! A keyring store can be visible and later lost (the macOS Keychain has no
+//! flush), so generation `g`'s file stays until an open sees the keyring at
+//! `g+1` with nothing staged. Whichever keyring survives a crash, the file
+//! of its committed (or staged) generation is still there: the store comes
+//! back exactly as it was before the operation, or after it. Any other file
+//! is removed at that open.
 //!
 //! [`CredentialStore::open`] finishes or discards whatever a crash left, by
 //! the design's startup recovery table, and runs a startup discard (through
-//! the same procedure) for any database it can't authenticate.
+//! the same procedure) when no file opens under the keyring. A keyring blob
+//! that exists but can't be read is never replaced.
 //!
 //! # Reads
 //!
@@ -36,19 +46,30 @@ use eternal_wire::v3::wire::{Accept, RecordState, SlotStatus};
 use eternal_wire::v3::{Id16, Key32, Random, Zeroizing};
 
 use crate::disk::Disk;
+pub use crate::format::MAX_PENDING_PER_SLOT;
 use crate::format::{
-    encode_db, encode_keyring, parse_db, parse_keyring, DbFile, DiskRecord, FormatError,
-    GenerationKeys, Intent, KeyringState, MAX_GENERATION, MAX_NAME_LEN, MAX_RECORDS,
+    encode_db, encode_keyring, parse_db, parse_keyring, valid_generation, DbFile, DiskRecord,
+    FormatError, GenerationKeys, Intent, KeyringState, MAX_GENERATION, MAX_NAME_LEN, MAX_RECORDS,
     MAX_TOMBSTONES_PER_SLOT, MAX_TOMBSTONE_SLOTS,
 };
 use crate::keyring::Keyring;
 
-/// The database file.
-pub const DB_FILE: &str = "credentials.db";
-/// Its temporary file during a write.
-pub const DB_TMP: &str = "credentials.db.tmp";
-/// Pending records a slot may hold, next to its one active record.
-pub const MAX_PENDING_PER_SLOT: usize = 3;
+/// The temporary file of a database write.
+pub const DB_TMP: &str = "credentials.tmp";
+
+/// The database file of generation `g`.
+pub fn db_file(g: u64) -> String {
+    format!("credentials-{g}.db")
+}
+
+/// The generation a file name is the database of, if it is one.
+fn generation_of(name: &str) -> Option<u64> {
+    let digits = name.strip_prefix("credentials-")?.strip_suffix(".db")?;
+    if digits.is_empty() || digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok().filter(|g| valid_generation(*g))
+}
 /// A pending record older than this expires.
 pub const PENDING_LIFETIME_S: u64 = 7 * 24 * 60 * 60;
 
@@ -63,9 +84,14 @@ pub enum StoreError {
     Unknown,
     /// `replaces` doesn't name the slot's current active record.
     InvalidReplaces,
-    /// An earlier operation failed after recording its intent. Reads still
-    /// work; reopen the store to finish the operation.
+    /// An earlier operation may have recorded its intent and didn't
+    /// finish. Reads still work; reopen the store to settle it.
     NeedsReopen,
+    /// The keyring holds a blob this build can't read (damaged, or from a
+    /// newer version). It is left untouched; the store can't open.
+    KeyringUnreadable(FormatError),
+    /// The generation counter is at its bound; nothing was changed.
+    Exhausted,
 }
 
 impl std::fmt::Display for StoreError {
@@ -77,6 +103,8 @@ impl std::fmt::Display for StoreError {
             Self::Unknown => write!(f, "unknown dev_id"),
             Self::InvalidReplaces => write!(f, "replaces isn't the slot's active record"),
             Self::NeedsReopen => write!(f, "the store must be reopened"),
+            Self::KeyringUnreadable(e) => write!(f, "keyring unreadable: {e}"),
+            Self::Exhausted => write!(f, "generation limit reached"),
         }
     }
 }
@@ -157,7 +185,8 @@ struct Record {
     created_at_s: u64,
     committed_timestamp_us: u64,
     device_name: String,
-    key: Zeroizing<Key32>,
+    /// Boxed, so moving a record never leaves a copy of the key behind.
+    key: Box<Zeroizing<Key32>>,
     /// The wrap under the current generation, once computed.
     wrapped: Option<([u8; 12], [u8; 48])>,
 }
@@ -179,6 +208,19 @@ fn random_key(rng: &mut dyn Random) -> Zeroizing<Key32> {
     let mut key = Zeroizing::new([0u8; 32]);
     rng.fill(&mut key[..]);
     key
+}
+
+/// What a startup discard lists and tombstones: the newest file that
+/// parses, or the parse error if none does. `None` with no files.
+fn newest_parseable(files: &[(u64, Vec<u8>)]) -> Option<Result<DbFile, FormatError>> {
+    let mut last = None;
+    for (_, bytes) in files.iter().rev() {
+        match parse_db(bytes) {
+            Ok(db) => return Some(Ok(db)),
+            Err(e) => last = last.or(Some(Err(e))),
+        }
+    }
+    last
 }
 
 fn truncated_name(name: &str) -> String {
@@ -217,70 +259,106 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
     fn recover(&mut self, report: &mut OpenReport) -> Result<(), StoreError> {
         // A stray temporary file is never the database.
         self.disk.remove(DB_TMP)?;
-        let db_bytes = self.disk.read(DB_FILE)?;
-        let parsed = db_bytes.as_deref().map(parse_db);
-        let state = match self.keyring.load()? {
-            Some(blob) => parse_keyring(&blob).ok(),
-            None => None,
-        };
-
-        let Some(state) = state else {
-            // No keyring (a new machine, or the OS store was wiped), or one
-            // that can't be read: make a fresh one past any generation the
-            // database claims, then discard what it can't open.
-            let generation = match &parsed {
-                Some(Ok(db)) if db.generation < MAX_GENERATION - 1 => db.generation + 1,
-                _ => 1,
-            };
-            let w = random_key(self.rng.as_mut());
-            self.keyring.store(&encode_keyring(&KeyringState {
-                committed: (generation, w.clone()),
-                staged: None,
-            }))?;
-            self.generation = generation;
-            self.w = w;
-            report.recovery.push(Recovery::FreshKeyring);
-            if db_bytes.is_some() {
-                self.discard(parsed, None, report)?;
+        let mut files: Vec<(u64, Vec<u8>)> = Vec::new();
+        for name in self.disk.list()? {
+            if let Some(g) = generation_of(&name) {
+                if let Some(bytes) = self.disk.read(&name)? {
+                    files.push((g, bytes));
+                }
             }
-            return Ok(());
+        }
+        files.sort_by_key(|(g, _)| *g);
+        // Only a missing keyring makes a fresh one; one that can't be read
+        // is left as it is.
+        let Some(blob) = self.keyring.load()? else {
+            return self.fresh_keyring(&files, report);
         };
-
-        self.generation = state.committed.0;
+        let state = parse_keyring(&blob).map_err(StoreError::KeyringUnreadable)?;
+        let g = state.committed.0;
+        self.generation = g;
         self.w = state.committed.1.clone();
-        let current = GenerationKeys::new(&self.w, self.generation);
+        let current = GenerationKeys::new(&self.w, g);
+        let file = |want: u64| {
+            files
+                .iter()
+                .find(|(fg, _)| *fg == want)
+                .map(|(_, b)| b.as_slice())
+        };
 
         match state.staged {
-            None => match (&db_bytes, &parsed) {
-                (None, _) => Ok(()),
-                (Some(bytes), Some(Ok(db))) if current.verify(bytes) && self.load(db, &current) => {
-                    Ok(())
+            None => {
+                if file(g).is_some_and(|bytes| self.load_verified(bytes, &current)) {
+                    // The keyring is at g: every other file is from before
+                    // it, or from a rotation whose keyring store was lost.
+                    let mut removed = false;
+                    for (other, _) in files.iter().filter(|(fg, _)| *fg != g) {
+                        self.disk.remove(&db_file(*other))?;
+                        removed = true;
+                    }
+                    if removed {
+                        self.disk.sync_dir()?;
+                    }
+                    return Ok(());
+                }
+                if files.is_empty() {
+                    return Ok(());
                 }
                 // Restored from before an invalidation, rolled back, corrupt,
                 // or from elsewhere: fail closed.
-                _ => self.discard(parsed, None, report),
-            },
+                self.discard(newest_parseable(&files), None, report)
+            }
             Some((next_g, next_w, intent)) => {
                 let next = GenerationKeys::new(&next_w, next_g);
-                match (&db_bytes, &parsed) {
-                    // Crash during step 2, before the rename (from the
-                    // committed generation), or after it, before step 3 (from
-                    // the staged one, with the intent already applied): redo
-                    // step 2 from memory, then step 3.
-                    (Some(bytes), Some(Ok(db)))
-                        if (current.verify(bytes) && self.load(db, &current))
-                            || (next.verify(bytes) && self.load(db, &next)) =>
-                    {
-                        self.apply_intent(&intent);
-                        self.finish_rotation(next_g, next_w, report)
-                    }
-                    // The rotation started before any database existed.
-                    (None, _) => self.finish_rotation(next_g, next_w, report),
-                    // Neither generation opens it: discard, folding the
-                    // recorded intent into the same rotation.
-                    _ => self.discard(parsed, Some(&intent), report),
+                // After step 2 (from the staged generation's file, intent
+                // already applied) or before it (from the committed one):
+                // redo step 2 from memory, then step 3. With no file at
+                // all, the rotation started on an empty store.
+                let loaded = file(next_g).is_some_and(|b| self.load_verified(b, &next))
+                    || file(g).is_some_and(|b| self.load_verified(b, &current));
+                if loaded || files.is_empty() {
+                    self.apply_intent(&intent);
+                    return self.finish_rotation(next_g, next_w, report);
                 }
+                // Neither generation opens: discard, folding the recorded
+                // intent into the same rotation.
+                self.discard(newest_parseable(&files), Some(&intent), report)
             }
+        }
+    }
+
+    /// No keyring (a new machine, or the OS store was wiped): make a fresh
+    /// one past every generation on disk, then discard what's there.
+    fn fresh_keyring(
+        &mut self,
+        files: &[(u64, Vec<u8>)],
+        report: &mut OpenReport,
+    ) -> Result<(), StoreError> {
+        let newest = files.last().map_or(0, |(g, _)| *g);
+        // Room for the fresh generation and the discard's rotation.
+        let generation = if newest + 2 < MAX_GENERATION {
+            newest + 1
+        } else {
+            1
+        };
+        let w = random_key(self.rng.as_mut());
+        self.keyring.store(&encode_keyring(&KeyringState {
+            committed: (generation, w.clone()),
+            staged: None,
+        }))?;
+        self.generation = generation;
+        self.w = w;
+        report.recovery.push(Recovery::FreshKeyring);
+        if files.is_empty() {
+            return Ok(());
+        }
+        self.discard(newest_parseable(files), None, report)
+    }
+
+    /// Parses and authenticates `bytes` under `keys`, then loads it.
+    fn load_verified(&mut self, bytes: &[u8], keys: &GenerationKeys) -> bool {
+        match parse_db(bytes) {
+            Ok(db) => keys.verify(bytes) && self.load(&db, keys),
+            Err(_) => false,
         }
     }
 
@@ -301,7 +379,7 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
                 created_at_s: r.created_at_s,
                 committed_timestamp_us: r.committed_timestamp_us,
                 device_name: r.device_name.clone(),
-                key,
+                key: Box::new(key),
                 wrapped: Some((r.wrap_nonce, r.wrapped_key)),
             });
         }
@@ -348,6 +426,9 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
         report.recovery.push(Recovery::Discarded);
         // Steps 1 to 3, with nothing left to keep.
         let next_g = self.generation + 1;
+        if !valid_generation(next_g) {
+            return Err(StoreError::Exhausted);
+        }
         let next_w = random_key(self.rng.as_mut());
         let mut op_id = [0u8; 16];
         self.rng.fill(&mut op_id);
@@ -378,7 +459,7 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
             r.wrapped = None;
         }
         let bytes = self.encode(&keys, next_g);
-        self.write_db(&bytes)?;
+        self.write_db(&db_file(next_g), &bytes)?;
         self.keyring.store(&encode_keyring(&KeyringState {
             committed: (next_g, next_w.clone()),
             staged: None,
@@ -391,9 +472,9 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
         Ok(())
     }
 
-    fn write_db(&mut self, bytes: &[u8]) -> io::Result<()> {
+    fn write_db(&mut self, name: &str, bytes: &[u8]) -> io::Result<()> {
         self.disk.write_synced(DB_TMP, bytes)?;
-        self.disk.rename(DB_TMP, DB_FILE)?;
+        self.disk.rename(DB_TMP, name)?;
         self.disk.sync_dir()
     }
 
@@ -508,7 +589,7 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
         let keys = GenerationKeys::new(&self.w, self.generation);
         let g = self.generation;
         let bytes = self.encode(&keys, g);
-        if let Err(e) = self.write_db(&bytes) {
+        if let Err(e) = self.write_db(&db_file(g), &bytes) {
             undo(self);
             return Err(e.into());
         }
@@ -520,6 +601,9 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
     fn rotate(&mut self, invalidate: Vec<Id16>, promote: Vec<Id16>) -> Result<(), StoreError> {
         self.usable()?;
         let next_g = self.generation + 1;
+        if !valid_generation(next_g) {
+            return Err(StoreError::Exhausted);
+        }
         let next_w = random_key(self.rng.as_mut());
         let mut op_id = [0u8; 16];
         self.rng.fill(&mut op_id);
@@ -528,25 +612,28 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
             invalidate,
             promote,
         };
-        // Step 1. The store is atomic, but a failure may still have stored
-        // it: read it back to tell.
+        // Step 1. Step 2 starts only after a store that succeeded (on
+        // Windows, flushed).
         if let Err(e) = self.keyring.store(&encode_keyring(&KeyringState {
             committed: (self.generation, self.w.clone()),
             staged: Some((next_g, next_w.clone(), intent.clone())),
         })) {
-            match self.keyring.load() {
-                Ok(blob) => {
-                    let recorded = blob
-                        .and_then(|b| parse_keyring(&b).ok())
+            // A failed store may still have replaced the blob: read it back.
+            let ours = match self.keyring.load() {
+                Ok(blob) => Some(
+                    blob.and_then(|b| parse_keyring(&b).ok())
                         .and_then(|k| k.staged)
-                        .is_some_and(|(_, _, i)| i.op_id == op_id);
-                    if !recorded {
-                        // Nothing happened.
-                        return Err(e.into());
-                    }
-                }
-                Err(_) => {
-                    // Unknown: invalid in memory now, settled on reopen.
+                        .is_some_and(|(_, _, i)| i.op_id == op_id),
+                ),
+                Err(_) => None,
+            };
+            match ours {
+                // The old blob: nothing happened.
+                Some(false) => return Err(e.into()),
+                // Ours is visible, maybe not durable; or we can't tell. The
+                // records are invalid in memory from now on, and a reopen
+                // settles which way it went.
+                _ => {
                     self.apply_intent(&intent);
                     self.refresh_snapshot();
                     self.needs_reopen = true;
@@ -599,7 +686,7 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
             created_at_s: now_s,
             committed_timestamp_us: 0,
             device_name: truncated_name(&record.device_name),
-            key: record.key,
+            key: Box::new(record.key),
             wrapped: None,
         });
         self.plain_write(|s| s.records.retain(|r| r.dev_id != dev_id))
@@ -744,7 +831,12 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
     }
 
     fn refresh_snapshot(&mut self) {
-        let mut snapshot = CredentialSnapshot::default();
+        let n = self.records.len();
+        let mut snapshot = CredentialSnapshot {
+            keys: HashMap::with_capacity(n),
+            timestamps: HashMap::with_capacity(n),
+            ..Default::default()
+        };
         for r in &self.records {
             snapshot.keys.insert(r.dev_id, r.key.clone());
             snapshot
@@ -790,7 +882,8 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
 /// one does no I/O; reading one never waits for the writer.
 #[derive(Default)]
 pub struct CredentialSnapshot {
-    keys: HashMap<Id16, Zeroizing<Key32>>,
+    /// Boxed, so the map never moves a key.
+    keys: HashMap<Id16, Box<Zeroizing<Key32>>>,
     timestamps: HashMap<Id16, u64>,
     slot_of: HashMap<Id16, Id16>,
     statuses: HashMap<Id16, SlotStatus>,
@@ -798,7 +891,7 @@ pub struct CredentialSnapshot {
 
 impl CredentialSnapshot {
     pub fn key(&self, dev_id: &Id16) -> Option<Zeroizing<Key32>> {
-        self.keys.get(dev_id).cloned()
+        self.keys.get(dev_id).map(|k| Zeroizing::new(***k))
     }
 
     pub fn last_committed_timestamp(&self, dev_id: &Id16) -> u64 {

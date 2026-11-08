@@ -1289,11 +1289,12 @@ checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
 name = "eternal-credstore"
 version = "0.1.0"
 dependencies = [
+ "core-foundation 0.10.1",
  "eternal-credstore",
  "eternal-wire",
  "libc",
  "ring",
- "security-framework",
+ "security-framework-sys",
  "windows 0.58.0",
  "zeroize",
 ]
@@ -3474,19 +3475,6 @@ dependencies = [
  "memmap2",
  "smithay-client-toolkit 0.19.2",
  "tiny-skia",
-]
-
-[[package]]
-name = "security-framework"
-version = "3.7.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b7f4bc775c73d9a02cde8bf7b2ec4c9d12743edf609006c7facc23998404cd1d"
-dependencies = [
- "bitflags 2.13.2",
- "core-foundation 0.10.1",
- "core-foundation-sys",
- "libc",
- "security-framework-sys",
 ]
 
 [[package]]

@@ -21,8 +21,11 @@ use crate::store::{CredentialStore, OpenReport, StoreError};
 pub struct Steps {
     pub count: Rc<Cell<usize>>,
     pub crash_at: Rc<Cell<Option<usize>>>,
-    /// The failing keyring store happens anyway, then reports the error.
+    /// The failing keyring store is made visible anyway (not durable), then
+    /// reports the error.
     pub ambiguous: Rc<Cell<bool>>,
+    /// Keyring loads fail.
+    pub fail_load: Rc<Cell<bool>>,
 }
 
 impl Steps {
@@ -45,6 +48,9 @@ pub struct SharedDisk {
 impl Disk for SharedDisk {
     fn read(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
         self.inner.borrow().read(name)
+    }
+    fn list(&self) -> io::Result<Vec<String>> {
+        self.inner.borrow().list()
     }
     fn write_synced(&mut self, name: &str, bytes: &[u8]) -> io::Result<()> {
         if let Err(e) = self.steps.step() {
@@ -75,12 +81,15 @@ pub struct SharedKeyring {
 
 impl Keyring for SharedKeyring {
     fn load(&self) -> io::Result<Option<Zeroizing<Vec<u8>>>> {
+        if self.steps.fail_load.get() {
+            return Err(io::Error::other("simulated load failure"));
+        }
         self.inner.borrow().load()
     }
     fn store(&mut self, blob: &[u8]) -> io::Result<()> {
         if let Err(e) = self.steps.step() {
             if self.steps.ambiguous.get() {
-                self.inner.borrow_mut().put(Some(blob.to_vec()));
+                self.inner.borrow_mut().store_visible(blob, false);
             }
             return Err(e);
         }
@@ -104,13 +113,24 @@ pub struct Live {
 }
 
 impl Live {
-    /// What a restart finds: durable files (unsynced renames kept or
-    /// lost) and the last stored keyring blob.
-    pub fn after_crash(&self, keep_unsynced: bool) -> World {
+    /// What a restart finds: durable files (unsynced renames kept or lost)
+    /// and keyring choice `keyring` of what may have survived (see
+    /// [`MemKeyring::after_crash`]).
+    pub fn after_crash(&self, keep_unsynced: bool, keyring: usize) -> World {
         World {
             disk: self.disk.borrow().after_crash(keep_unsynced),
-            keyring: self.keyring.borrow().after_crash(),
+            keyring: self.keyring.borrow().after_crash(keyring),
         }
+    }
+
+    /// Everything synced and the last keyring blob kept: a clean shutdown.
+    pub fn at_rest(&self) -> World {
+        self.after_crash(false, usize::MAX)
+    }
+
+    /// How many keyring blobs a crash now may leave.
+    pub fn keyring_choices(&self) -> usize {
+        self.keyring.borrow().crash_choices()
     }
 }
 
@@ -131,9 +151,20 @@ impl World {
         crash_at: Option<usize>,
         ambiguous: bool,
     ) -> (Live, Result<(Store, OpenReport), StoreError>) {
+        self.open_live_with(seed, |steps| {
+            steps.crash_at.set(crash_at);
+            steps.ambiguous.set(ambiguous);
+        })
+    }
+
+    /// Opens after `setup` has set the failure hooks.
+    pub fn open_live_with(
+        &self,
+        seed: u64,
+        setup: impl FnOnce(&Steps),
+    ) -> (Live, Result<(Store, OpenReport), StoreError>) {
         let live = self.live();
-        live.steps.crash_at.set(crash_at);
-        live.steps.ambiguous.set(ambiguous);
+        setup(&live.steps);
         let disk = SharedDisk {
             inner: live.disk.clone(),
             steps: live.steps.clone(),
