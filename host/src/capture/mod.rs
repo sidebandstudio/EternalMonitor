@@ -490,6 +490,8 @@ const VDD_POLL_INTERVAL: Duration = Duration::from_millis(120);
 enum AttachResult {
     Attached(OutputInfo),
     TimedOut,
+    /// The driver runs, but Windows added no monitor for it, and won't.
+    NoMonitor,
     Cancelled,
 }
 
@@ -502,6 +504,7 @@ fn wait_for_virtual_output(
     mut poll: impl FnMut() -> Option<Vec<OutputInfo>>,
     mut now: impl FnMut() -> Instant,
     mut wait: impl FnMut(Duration),
+    mut no_monitor: impl FnMut() -> bool,
 ) -> AttachResult {
     let deadline = now() + timeout;
     loop {
@@ -513,6 +516,9 @@ fn wait_for_virtual_output(
         }
         if now() >= deadline {
             return AttachResult::TimedOut;
+        }
+        if no_monitor() {
+            return AttachResult::NoMonitor;
         }
         wait(VDD_POLL_INTERVAL);
     }
@@ -1948,6 +1954,7 @@ mod tests {
                     "driver startup must not trip the 3s/5s watchdogs"
                 );
             },
+            || false,
         );
         let AttachResult::Attached(output) = result else {
             panic!("virtual display did not attach")
@@ -1980,6 +1987,7 @@ mod tests {
             || Some(Vec::new()),
             || start + elapsed.get(),
             |duration| elapsed.set(elapsed.get() + duration),
+            || false,
         );
         assert!(matches!(result, AttachResult::TimedOut));
         assert!(elapsed.get() >= timeout && elapsed.get() < timeout + VDD_POLL_INTERVAL);
@@ -2000,6 +2008,7 @@ mod tests {
                 elapsed.set(elapsed.get() + duration);
                 cancelled_at.set(true);
             },
+            || false,
         );
         assert!(matches!(result, AttachResult::Cancelled));
     }

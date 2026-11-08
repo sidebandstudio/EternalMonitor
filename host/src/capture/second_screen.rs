@@ -103,6 +103,17 @@ pub(crate) const EXTEND_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(any(windows, test, debug_assertions))]
 pub(crate) const BLOCKED_EXTEND_RETRY: Duration = Duration::from_secs(120);
 
+/// How long the device may run with no monitor, while the attach waits,
+/// before the attempt ends. Where the second screen works, the monitor is
+/// there by the time the Enable task returns; where it never came, waiting
+/// out the whole attach timeout only delayed the fallback.
+#[cfg(any(windows, test, debug_assertions))]
+pub(crate) const NO_MONITOR_WAIT: Duration = Duration::from_secs(10);
+
+/// How often the attach wait reads the device's state.
+#[cfg(any(windows, test, debug_assertions))]
+const DEVICE_READ_EVERY: Duration = Duration::from_secs(1);
+
 /// How long quitting waits for the worker to exit after the last Enable.
 const QUIT_JOIN: Duration = Duration::from_secs(5);
 
@@ -1492,6 +1503,11 @@ pub(crate) trait Driver {
     /// Say why the display did not appear or showed no picture, while it is
     /// still on.
     fn report(&self, _failure: Failure) {}
+    /// The device's state while the attach waits, `None` when it can't be
+    /// read.
+    fn device(&self) -> Option<DeviceState> {
+        None
+    }
     fn now(&self) -> Instant;
     fn sleep(&self, duration: Duration);
 }
@@ -1523,6 +1539,33 @@ pub(crate) enum Failure {
     Cancelled(Duration),
     /// The display attached but showed no picture.
     Unproven(&'static str),
+}
+
+/// Whether the device has run with no monitor for [`NO_MONITOR_WAIT`],
+/// read every [`DEVICE_READ_EVERY`] while the attach waits. Any other state,
+/// or one that can't be read, starts the count again.
+#[cfg(any(windows, test, debug_assertions))]
+#[derive(Default)]
+struct NoMonitorWatch {
+    since: Option<Instant>,
+    next_read: Option<Instant>,
+}
+
+#[cfg(any(windows, test, debug_assertions))]
+impl NoMonitorWatch {
+    fn gave_up(&mut self, now: Instant, read: impl FnOnce() -> Option<DeviceState>) -> bool {
+        if self.next_read.is_some_and(|at| now < at) {
+            return false;
+        }
+        self.next_read = Some(now + DEVICE_READ_EVERY);
+        if read() == Some(DeviceState::NoMonitor) {
+            let since = *self.since.get_or_insert(now);
+            now.duration_since(since) >= NO_MONITOR_WAIT
+        } else {
+            self.since = None;
+            false
+        }
+    }
 }
 
 /// However [`attach`] ends, its claim ends with it: a start that did not
@@ -1619,12 +1662,14 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
     let result = if turned_on != TurnedOn::Beside {
         AttachResult::TimedOut
     } else {
+        let mut watch = NoMonitorWatch::default();
         wait_for_virtual_output(
             &before,
             timeout,
             || selected().then(|| listed(shared, driver)),
             || driver.now(),
             |duration| driver.sleep(duration),
+            || watch.gave_up(driver.now(), || driver.device()),
         )
     };
     #[cfg(windows)]
@@ -1682,8 +1727,16 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
             state.panel_lost_this_run = true;
             state.remember_panel_lost(now);
         }
-        AttachResult::TimedOut => {
-            if turned_on == TurnedOn::Alone {
+        ended @ (AttachResult::TimedOut | AttachResult::NoMonitor) => {
+            if matches!(ended, AttachResult::NoMonitor) {
+                warn!(
+                    second_screen_fallback = "attach_timeout",
+                    vdd_device = "no_monitor",
+                    waited_ms = driver.now().duration_since(waiting_since).as_millis() as u64,
+                    "Windows added no monitor for the running virtual display — capturing the \
+                     primary display instead"
+                );
+            } else if turned_on == TurnedOn::Alone {
                 warn!(
                     second_screen_fallback = "vdd_only",
                     "Windows put the desktop on the virtual display alone — capturing the \
@@ -1881,6 +1934,10 @@ impl Driver for WindowsDriver<'_> {
         chosen
     }
 
+    fn device(&self) -> Option<DeviceState> {
+        Some(crate::vdd_device::query())
+    }
+
     fn turned_on(&self) -> TurnedOn {
         if crate::display_guard::last_turn_on_lost_panel() {
             TurnedOn::PanelLost
@@ -2029,6 +2086,9 @@ mod tests {
         on_sleep: &'a dyn Fn(Duration),
         enable_fails: Option<EnableReport>,
         turned_on: TurnedOn,
+        /// What the device reads while it is on and no display has attached
+        /// yet; `None` when it can't be read. Attached, it reads ready.
+        device_until_attached: Option<DeviceState>,
         calls: RefCell<Vec<Call>>,
     }
 
@@ -2049,6 +2109,7 @@ mod tests {
                 on_sleep,
                 enable_fails: None,
                 turned_on: TurnedOn::Beside,
+                device_until_attached: None,
                 calls: RefCell::new(Vec::new()),
             }
         }
@@ -2059,6 +2120,16 @@ mod tests {
     }
 
     impl Driver for FakeDriver<'_> {
+        fn device(&self) -> Option<DeviceState> {
+            if self.on_since.get().is_none() {
+                return Some(DeviceState::Problem(22));
+            }
+            if self.outputs().iter().any(|output| !output.is_primary) {
+                return Some(DeviceState::Ready);
+            }
+            self.device_until_attached
+        }
+
         fn outputs(&self) -> Vec<OutputInfo> {
             let mut outputs = vec![output("primary", true)];
             let attached = self
@@ -2131,6 +2202,71 @@ mod tests {
                 (self.on_sleep)(self.elapsed.get());
             }
         }
+    }
+
+    /// Field data (Windows 10 and 11): the Enable task succeeds, the device
+    /// runs, and Windows never adds its monitor. The attempt waited out the
+    /// whole attach timeout every time. It now ends once the device has run
+    /// with no monitor for NO_MONITOR_WAIT, as an attach timeout, with one
+    /// Enable and one Disable, and is remembered as before.
+    #[test]
+    fn a_device_that_runs_with_no_monitor_ends_the_wait_early() {
+        let shared = second_screen_selected();
+        connect_viewer(&shared);
+        let start = Instant::now();
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        let on_sleep = |_: Duration| {};
+        let mut driver = FakeDriver::new(secs(2.0), None, &on_sleep);
+        driver.device_until_attached = Some(DeviceState::NoMonitor);
+        attach(&shared, &driver, ATTACH_TIMEOUT);
+
+        let toggles = driver.toggles.borrow().clone();
+        assert_eq!(toggles.len(), 2, "{toggles:?}");
+        let waited = toggles[1].0 - toggles[0].0;
+        assert!(!toggles[1].1, "{toggles:?}");
+        assert!(
+            waited >= NO_MONITOR_WAIT && waited < NO_MONITOR_WAIT + DEVICE_READ_EVERY + secs(0.5),
+            "waited {waited:?}"
+        );
+        assert!(driver
+            .calls()
+            .contains(&Call::Report(Failure::AttachTimeout)));
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
+        assert_eq!(remembered_failure(&shared), Some("attach_timeout"));
+    }
+
+    /// The early end needs a device that runs with no monitor all along. A
+    /// monitor that is there (Windows kept the desktop off it, and the user
+    /// may still choose Extend), a device that can't be read, or one that
+    /// attaches before NO_MONITOR_WAIT keeps the whole wait, or attaches.
+    #[test]
+    fn only_a_device_with_no_monitor_all_along_ends_the_wait_early() {
+        for device in [
+            Some(DeviceState::Ready),
+            Some(DeviceState::NotStarted),
+            None,
+        ] {
+            let shared = second_screen_selected();
+            connect_viewer(&shared);
+            assert_eq!(next_step(&shared, Instant::now()), Step::Attach);
+            let on_sleep = |_: Duration| {};
+            let mut driver = FakeDriver::new(secs(2.0), None, &on_sleep);
+            driver.device_until_attached = device;
+            attach(&shared, &driver, ATTACH_TIMEOUT);
+            let toggles = driver.toggles.borrow().clone();
+            let waited = toggles[1].0 - toggles[0].0;
+            assert!(waited >= ATTACH_TIMEOUT, "{device:?}: waited {waited:?}");
+        }
+        // No monitor for a while, then the display attaches in time.
+        let shared = second_screen_selected();
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, Instant::now()), Step::Attach);
+        let on_sleep = |_: Duration| {};
+        let mut driver = FakeDriver::new(secs(2.0), Some(NO_MONITOR_WAIT - secs(1.0)), &on_sleep);
+        driver.device_until_attached = Some(DeviceState::NoMonitor);
+        attach(&shared, &driver, ATTACH_TIMEOUT);
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Active);
+        assert_eq!(remembered_failure(&shared), None);
     }
 
     /// A 0.3.2 log and the 0.3.1 field data: the display never attaches,
