@@ -115,6 +115,12 @@ jobs:
         env:
           PKG_CONFIG_PATH: /opt/homebrew/opt/ffmpeg@7/lib/pkgconfig
         run: cargo test --workspace --locked
+      - name: Test the iPad's transport v3 core against the Rust reference
+        # Golden transcripts, the state machine, fuzz-like parser tests and a
+        # live loopback run against the Rust host table.
+        env:
+          DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
+        run: scripts/v3_swift_interop.sh
       - name: Check the host-gui-snapshots artifact for secret values
         # Artifacts are public and not masked like the job log.
         id: snapshot-scan

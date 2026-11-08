@@ -15,6 +15,11 @@ packages:
   Opus:
     url: https://github.com/alta/swift-opus.git
     revision: 6f3cb6bd3ffed1fe5f06d00a962d5c191a50daf8
+  # Transport v3 core (phase 3a). Only the unit tests link it, for the
+  # Keychain round trip, which needs the app's keychain entitlement; the
+  # app itself doesn't use it yet.
+  EternalTransportV3:
+    path: EternalTransportV3
 
 targets:
   EternalMonitor:
@@ -69,6 +74,7 @@ targets:
         buildPhase: resources
     dependencies:
       - target: EternalMonitor
+      - package: EternalTransportV3
     settings:
       base:
         GENERATE_INFOPLIST_FILE: YES
