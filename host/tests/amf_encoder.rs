@@ -491,6 +491,165 @@ fn amf_hevc_honours_keyframe_requests() {
     assert_keyframe_on_request(&run, Id::HEVC);
 }
 
+/// How long a keyframe requested on a still desktop may take to come out.
+/// Capture resends the last picture once for the request, and then nothing
+/// until the 750 ms keepalive, so an encoder that holds a frame until the
+/// next one arrives kept a new viewer waiting that long. Nothing is published
+/// meanwhile: a keyframe that comes out at all came out without a next frame.
+/// How fast is printed, not checked, because an AMD driver's own reopen took
+/// from 50 to over 400 ms in a fresh test process.
+const STILL_WINDOW: Duration = Duration::from_millis(1500);
+/// How long the encoder may take to open and encode the warm-up frames.
+const WARM_UP_LIMIT: Duration = Duration::from_secs(10);
+/// The warm-up is over once no packet has come for this long.
+const WARM_UP_QUIET: Duration = Duration::from_millis(300);
+
+/// Streams a few frames and waits for the encoder to encode them, goes still,
+/// then requests a keyframe with one resent picture and nothing after it, as
+/// for a reconnecting viewer. Returns how long that picture's keyframe took
+/// to leave the stage, or `None` if it did not within [`STILL_WINDOW`].
+fn keyframe_on_a_still_desktop(encoder: &str) -> (Option<Duration>, bool) {
+    ffmpeg_next::init().unwrap();
+    let (producer, consumer) = frame_slot();
+    let (tx, mut rx) = tokio::sync::mpsc::channel(NAL_CHANNEL_CAPACITY);
+    let shared = SharedControl::new(0, 8_000_000);
+    shared.running.store(true, Ordering::SeqCst);
+    let gpu = GpuInfo {
+        encoder_name: encoder.to_string(),
+        codec_display_name: encoder.to_string(),
+        ..GpuInfo::software_fallback()
+    };
+    let generation = eternal_host::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
+    let stage_shared = shared.clone();
+    let stage = std::thread::spawn(move || {
+        run_encode_stage(consumer, tx, stage_shared, gpu, generation).map_err(|e| e.to_string())
+    });
+    let (packets_tx, packets) = std::sync::mpsc::channel();
+    let collector = std::thread::spawn(move || {
+        while let Some(nal) = rx.blocking_recv() {
+            if packets_tx.send((Instant::now(), nal)).is_err() {
+                break;
+            }
+        }
+    });
+    let publish = |number: u64| {
+        let (width, height) = LARGE;
+        let mut data = frame_buffer((width * height * 4) as usize);
+        render_synthetic_frame(&mut data, width, height, number);
+        producer.publish(RawFrame {
+            frame_number: number,
+            timestamp: Instant::now(),
+            data: Arc::new(data),
+            width,
+            height,
+        });
+    };
+
+    for number in 0..10 {
+        publish(number);
+        std::thread::sleep(FRAME_INTERVAL);
+    }
+    // The request must find a session that has encoded frames, so that it
+    // takes the reopen a reconnect takes, whatever the encoder's open cost.
+    let warm_up_until = Instant::now() + WARM_UP_LIMIT;
+    let mut seen = Vec::new();
+    loop {
+        match packets.recv_timeout(WARM_UP_QUIET) {
+            Ok(packet) => seen.push(packet),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) if !seen.is_empty() => break,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => assert!(
+                Instant::now() < warm_up_until,
+                "{encoder} encoded nothing within {WARM_UP_LIMIT:?}"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!(
+                    "{encoder} stage ended during the warm-up: {:?}",
+                    stage.join()
+                )
+            }
+        }
+    }
+
+    // A viewer connects to the still desktop.
+    const RESENT: u64 = 100;
+    let requested = Instant::now();
+    shared.force_next_idr.store(true, Ordering::SeqCst);
+    publish(RESENT);
+    let mut keyframe = None;
+    while keyframe.is_none() {
+        let left = STILL_WINDOW.saturating_sub(requested.elapsed());
+        match packets.recv_timeout(left) {
+            Ok((at, nal)) => {
+                if nal.is_keyframe && nal.sequence == RESENT {
+                    keyframe = Some(at.duration_since(requested));
+                }
+                seen.push((at, nal));
+            }
+            Err(_) => break,
+        }
+    }
+    producer.close();
+
+    match stage.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => panic!("{encoder} encode stage failed: {error}"),
+        Err(_) => panic!("{encoder} encode stage panicked"),
+    }
+    collector.join().unwrap();
+    let software_fallback = PIPELINE_STATS.lock().using_software_fallback;
+    eprintln!(
+        "{encoder}: still-desktop keyframe after {keyframe:?}; packets {:?}",
+        seen.iter()
+            .map(|(at, nal)| (
+                nal.sequence,
+                nal.is_keyframe,
+                at.saturating_duration_since(requested).as_millis() as i64
+                    - requested.saturating_duration_since(*at).as_millis() as i64
+            ))
+            .collect::<Vec<_>>()
+    );
+    (keyframe, software_fallback)
+}
+
+fn assert_still_keyframe(encoder: &str) {
+    let (keyframe, software_fallback) = keyframe_on_a_still_desktop(encoder);
+    assert!(
+        encoder == "libx264" || !software_fallback,
+        "{encoder} fell back to libx264"
+    );
+    assert!(
+        keyframe.is_some(),
+        "{encoder} held the requested keyframe until the next captured frame"
+    );
+}
+
+#[test]
+fn software_encoder_sends_a_requested_keyframe_on_a_still_desktop() {
+    let _guard = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    assert_still_keyframe("libx264");
+}
+
+#[test]
+fn amf_sends_a_requested_keyframe_on_a_still_desktop() {
+    for name in ["h264_amf", "hevc_amf"] {
+        if !amf_available(name) {
+            continue;
+        }
+        let _guard = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        assert_still_keyframe(name);
+    }
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "native: an NVIDIA card"]
+fn nvenc_sends_a_requested_keyframe_on_a_still_desktop() {
+    let _guard = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for name in ["h264_nvenc", "hevc_nvenc"] {
+        assert_still_keyframe(name);
+    }
+}
+
 #[test]
 fn amf_fails_cleanly_without_an_amd_driver() {
     if amf_expectation() != Some(AmfExpectation::Fallback) {

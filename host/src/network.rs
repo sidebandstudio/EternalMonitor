@@ -1288,6 +1288,7 @@ mod tests {
         let warned = AtomicBool::new(false);
         let levels = Levels::default();
         let subscriber = tracing_subscriber::registry().with(levels.clone());
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(subscriber, || {
             for _ in 0..3 {
                 assert_eq!(fill(&warned, |_, _| 232), None);

@@ -21,6 +21,10 @@ struct LinkError: Error, CustomStringConvertible {
     let kind: Kind
     let message: String
     var underlying: Error?
+    /// The path was unsatisfied for want of any usable network when this
+    /// was reported. Only that is "Wi-Fi is off"; a path that is up but
+    /// can't reach the PC (no route to it) is not.
+    var pathUnsatisfied = false
 
     init(_ kind: Kind, _ message: String, underlying: Error? = nil) {
         self.kind = kind

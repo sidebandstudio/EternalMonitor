@@ -42,6 +42,11 @@ pub struct SharedControl {
     /// Set while Windows blocks screen capture (lock screen, UAC, a display
     /// it will not duplicate); the GUI explains it instead of a frozen picture.
     pub capture_block: Arc<Mutex<Option<crate::capture::recovery::CaptureBlock>>>,
+    /// The stream port between two owners (a generation's transport and the
+    /// standby responder), bound and with its queue, so a HELLO2 sent while
+    /// it changes hands waits for the next one. The supervisor closes it
+    /// when it shuts down.
+    pub stream_socket: Arc<Mutex<Option<std::net::UdpSocket>>>,
     /// With `UnsupportedOnThisGpu`: the card the captured screen is wired to
     /// and the switch that would move EternalMonitor onto it.
     pub gpu_diagnosis: Arc<Mutex<Option<crate::gpu_preference::Diagnosis>>>,
@@ -185,6 +190,7 @@ impl SharedControl {
             vdd_status: Arc::new(Mutex::new(VddStatus::Inactive)),
             vdd_problem: Arc::new(Mutex::new(None)),
             capture_block: Arc::new(Mutex::new(None)),
+            stream_socket: Arc::new(Mutex::new(None)),
             gpu_diagnosis: Arc::new(Mutex::new(None)),
             screen_watch: Arc::new(Mutex::new(crate::gpu_preference::ScreenWatch::new())),
             gpu_switch: Arc::new(Mutex::new(None)),

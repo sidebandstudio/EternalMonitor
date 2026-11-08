@@ -14,7 +14,7 @@ use eternal_wire::h264::{
     normalize_h264_payload_with_info, parameter_sets_from_extradata, H264BitstreamState,
 };
 
-use crate::capture::FrameSlot;
+use crate::capture::{FrameSlot, RawFrame, Taken};
 use crate::control::SharedControl;
 use crate::gpu::{GpuInfo, GpuVendor};
 use crate::stats::PIPELINE_STATS;
@@ -167,7 +167,26 @@ fn run_encode_loop(
         }
     };
 
-    while let Some(raw_frame) = frames.blocking_take() {
+    let mut owed_keyframe: Option<OwedKeyframe> = None;
+    loop {
+        let raw_frame = match owed_keyframe.as_mut() {
+            None => match frames.blocking_take() {
+                Some(frame) => frame,
+                None => break,
+            },
+            Some(owed) => match owed.next(&frames) {
+                Next::Frame(frame) => frame,
+                Next::Closed => break,
+                Next::GaveUp => {
+                    info!(
+                        given = owed.given,
+                        "The encoder still holds the session's first keyframe; waiting for the next capture"
+                    );
+                    owed_keyframe = None;
+                    continue;
+                }
+            },
+        };
         if !shared.running.load(Ordering::SeqCst)
             || !crate::supervisor::generation_is_current(generation)
         {
@@ -491,6 +510,11 @@ fn run_encode_loop(
 
         let convert_start = Instant::now();
         encoder.convert(&raw_frame.data, (raw_frame.width * 4) as usize)?;
+        // The picture is kept only while a session's first keyframe may stay
+        // inside the encoder, to be given to it again.
+        let picture = (holds_last_frame(&encoder.opened_encoder)
+            && (encoder.frames_submitted == 0 || owed_keyframe.is_some()))
+        .then(|| raw_frame.clone());
         // Conversion finished synchronously. Recycle capture's buffer before
         // the codec or sender can block, including on the direct macOS path.
         drop(raw_frame.data);
@@ -516,6 +540,7 @@ fn run_encode_loop(
         let encode_start = Instant::now();
         encoder.send_frame(pts, raw_frame.timestamp, raw_frame.frame_number)?;
 
+        let mut keyframe_out = false;
         loop {
             match encoder.encoder.receive_packet(&mut encoder.packet) {
                 Ok(()) => {
@@ -560,6 +585,7 @@ fn run_encode_loop(
                             au_info.is_keyframe(packet_is_key, &encoder.opened_encoder);
                         (nal_data, is_keyframe)
                     };
+                    keyframe_out |= is_keyframe;
                     if !opened_is_hevc {
                         encoder.observe_amf_diagnostics(
                             &nal_data,
@@ -625,6 +651,8 @@ fn run_encode_loop(
                 Err(e) => return Err(e.into()),
             }
         }
+        owed_keyframe =
+            OwedKeyframe::after_encode(owed_keyframe.take(), picture, keyframe_out, encode_start);
     }
 
     info!("Capture channel closed, encoder shutting down");
@@ -636,7 +664,7 @@ struct EncoderState {
     native_converter: Option<vimage::Converter>,
     encoder: ffmpeg_next::codec::encoder::video::Encoder,
     /// BGRA to the encoder's YUV input, reading capture's buffer directly.
-    scaler: Option<ffmpeg_next::software::scaling::Context>,
+    scaler: Option<input::Scaler>,
     frame: ffmpeg_next::frame::Video,
     packet: ffmpeg_next::Packet,
     h264: H264BitstreamState,
@@ -814,27 +842,43 @@ impl EncoderState {
         let mut h264 = H264BitstreamState::default();
         h264.refresh_parameter_sets_from_extradata(encoder_extradata(&encoder));
 
-        let scaler = input::conversion_context(pixel_format, width, height)?;
-        if scaler.is_some() {
-            info!(output = ?pixel_format, "swscale BGRA conversion context created");
+        #[cfg(target_os = "macos")]
+        let native_converter = if pixel_format == ffmpeg_next::format::Pixel::YUV420P {
+            match vimage::Converter::new() {
+                Ok(converter) => {
+                    info!("Accelerate BGRA->YUV420P converter ready");
+                    Some(converter)
+                }
+                Err(error) => {
+                    warn!(%error, "Using swscale color conversion");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        // Where Accelerate converts, swscale is only its fallback, so it
+        // keeps no threads waiting.
+        #[cfg(target_os = "macos")]
+        let threads = if native_converter.is_some() {
+            1
+        } else {
+            input::scaler_threads()
+        };
+        #[cfg(not(target_os = "macos"))]
+        let threads = input::scaler_threads();
+        let scaler = input::conversion_context(pixel_format, width, height, threads)?;
+        if let Some(scaler) = &scaler {
+            info!(
+                output = ?pixel_format,
+                threads = scaler.threads(),
+                "swscale BGRA conversion context created"
+            );
         }
 
         Ok(Self {
             #[cfg(target_os = "macos")]
-            native_converter: if pixel_format == ffmpeg_next::format::Pixel::YUV420P {
-                match vimage::Converter::new() {
-                    Ok(converter) => {
-                        info!("Accelerate BGRA->YUV420P converter ready");
-                        Some(converter)
-                    }
-                    Err(error) => {
-                        warn!(%error, "Using swscale color conversion");
-                        None
-                    }
-                }
-            } else {
-                None
-            },
+            native_converter,
             encoder,
             scaler,
             frame: ffmpeg_next::frame::Video::new(pixel_format, width, height),
@@ -854,13 +898,15 @@ impl EncoderState {
     }
 
     fn next_pts(&mut self, captured: Instant, frame_number: u64) -> i64 {
-        if self.legacy_pts {
-            return frame_number as i64;
-        }
-        let epoch = *self.pts_epoch.get_or_insert(captured);
-        let real = captured.saturating_duration_since(epoch).as_micros() as i64;
-        // Strict monotonicity (keepalive resends and clock quirks).
-        let pts = real.max(self.last_pts + 1);
+        let pts = if self.legacy_pts {
+            frame_number as i64
+        } else {
+            let epoch = *self.pts_epoch.get_or_insert(captured);
+            captured.saturating_duration_since(epoch).as_micros() as i64
+        };
+        // Strict monotonicity (keepalive resends, a picture given again with
+        // its capture number and time, and clock quirks).
+        let pts = pts.max(self.last_pts + 1);
         self.last_pts = pts;
         pts
     }
@@ -1639,6 +1685,91 @@ pub fn ignores_forced_keyframes(encoder_name: &str) -> bool {
     matches!(encoder_name, "h264_amf" | "hevc_amf")
 }
 
+/// True for encoders that keep each frame until they are given the next.
+/// FFmpeg 7.1's AMF wrapper asks AMF for output only when it submits a frame
+/// (8.0 can wait for it, with `query_timeout`). On a still desktop a new
+/// viewer's opening keyframe sat inside AMF until capture's next picture,
+/// the 750 ms keepalive: AMD PCs were slow on 39-56% of reconnects.
+pub fn holds_last_frame(encoder_name: &str) -> bool {
+    matches!(encoder_name, "h264_amf" | "hevc_amf")
+}
+
+/// How long the encode loop waits for capture's next picture before it gives
+/// an encoder that [holds its last frame](holds_last_frame) the last picture
+/// again, to bring out a session's first keyframe. It is about one frame at
+/// 60 fps, and longer than AMF takes to encode one.
+const KEYFRAME_FLUSH_WAIT: Duration = Duration::from_millis(20);
+/// How long after the keyframe went in the last picture is given again,
+/// before the keyframe is left to capture's next picture: an AMD driver can
+/// take a few hundred ms to encode a fresh session's first frame, and
+/// capture's keepalive follows at 750 ms.
+const KEYFRAME_FLUSH_FOR: Duration = Duration::from_millis(500);
+
+/// A session's first keyframe still inside an encoder that holds its last
+/// frame, and the picture to give it again.
+struct OwedKeyframe {
+    /// The last picture encoded. It pins one of capture's few buffers.
+    picture: Option<RawFrame>,
+    /// When the picture stops being given again.
+    until: Instant,
+    given: u32,
+}
+
+/// What the encode loop encodes next while a keyframe is owed.
+enum Next {
+    Frame(RawFrame),
+    Closed,
+    /// The deadline passed: capture's next picture brings the keyframe out.
+    GaveUp,
+}
+
+impl OwedKeyframe {
+    fn until(until: Instant) -> Self {
+        Self {
+            picture: None,
+            until,
+            given: 0,
+        }
+    }
+
+    /// What is owed after a frame was submitted at `submitted`: nothing once
+    /// the keyframe came out or the encoder holds no frame, else `picture`
+    /// to give again, until [`KEYFRAME_FLUSH_FOR`] after the first try.
+    fn after_encode(
+        owed: Option<Self>,
+        picture: Option<RawFrame>,
+        keyframe_out: bool,
+        submitted: Instant,
+    ) -> Option<Self> {
+        let picture = picture.filter(|_| !keyframe_out)?;
+        let mut owed = owed.unwrap_or_else(|| Self::until(submitted + KEYFRAME_FLUSH_FOR));
+        owed.picture = Some(picture);
+        Some(owed)
+    }
+
+    /// Capture's next picture if one arrives within [`KEYFRAME_FLUSH_WAIT`],
+    /// else the last picture again, until the deadline.
+    fn next(&mut self, frames: &FrameSlot) -> Next {
+        let wait = KEYFRAME_FLUSH_WAIT.min(self.until.saturating_duration_since(Instant::now()));
+        match frames.take_within(wait, &mut self.picture) {
+            Taken::Frame(frame) => Next::Frame(frame),
+            Taken::Closed => Next::Closed,
+            Taken::Nothing => match self.picture.take() {
+                Some(picture) if Instant::now() < self.until => {
+                    self.given += 1;
+                    debug!(
+                        frame = picture.frame_number,
+                        given = self.given,
+                        "Giving the encoder its last picture again to bring out the keyframe"
+                    );
+                    Next::Frame(picture)
+                }
+                _ => Next::GaveUp,
+            },
+        }
+    }
+}
+
 /// Whether a pending keyframe request needs a session reopen: the encoder
 /// ignores per-frame requests, the session has already sent its opening IDR,
 /// and the last such reopen is older than the client's own request limit.
@@ -1830,7 +1961,17 @@ fn prepare_frame_for_encode(
         } else {
             "period"
         };
-        if is_amf {
+        // The period runs all stream long, and FFmpeg 7.1's AMF ignores it
+        // (see `ignores_forced_keyframes`): debug only.
+        if !force_hit {
+            debug!(
+                encoder = encoder_name,
+                frame = frame_number,
+                period = AMF_FORCED_INTRA_PERIOD,
+                reason,
+                "[AMF] Forced IDR"
+            );
+        } else if is_amf {
             info!(
                 encoder = encoder_name,
                 frame = frame_number,
@@ -2351,6 +2492,21 @@ mod tests {
         .unwrap_or_else(|error| panic!("{width}x{height}: {error}"))
     }
 
+    /// swscale gets threads only where it converts every frame: with
+    /// Accelerate converting on macOS it is a fallback and runs on one.
+    #[test]
+    fn swscale_gets_threads_only_where_it_converts_every_frame() {
+        let state = libx264_at(96, 64);
+        let scaler = state.scaler.as_ref().expect("x264 takes YUV420P");
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            (state.native_converter.is_some(), scaler.threads()),
+            (true, 1)
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(scaler.threads(), input::scaler_threads());
+    }
+
     /// A synthetic capture, in a buffer as capture hands it over.
     fn synthetic_capture(width: u32, height: u32, frame_number: u64) -> Vec<u8> {
         let frame_bytes = width as usize * 4 * height as usize;
@@ -2492,7 +2648,13 @@ mod tests {
                     _ => Pixel::YUV420P,
                 };
                 state.frame = ffmpeg_next::frame::Video::new(format, even_width, even_height);
-                state.scaler = input::conversion_context(format, even_width, even_height).unwrap();
+                state.scaler = input::conversion_context(
+                    format,
+                    even_width,
+                    even_height,
+                    input::scaler_threads(),
+                )
+                .unwrap();
                 assert_eq!(state.scaler.is_some(), format != Pixel::BGRA);
                 state.convert(&alone, even_bytes).unwrap();
                 let expected = picture(&state.frame);
@@ -2835,6 +2997,7 @@ mod tests {
             .with_ansi(false)
             .with_writer(move || Sink(Arc::clone(&writer)))
             .finish();
+        crate::logging::prepare_log_capture();
         let result = tracing::subscriber::with_default(subscriber, run);
         let lines = String::from_utf8(out.lock().clone()).unwrap();
         (result, lines.lines().map(str::to_string).collect())
@@ -4156,6 +4319,7 @@ mod tests {
         let start = Instant::now();
         let reads = Arc::new(AtomicU64::new(0));
         let clock_reads = Arc::clone(&reads);
+        crate::logging::prepare_log_capture();
         let opened = tracing::subscriber::with_default(subscriber, || {
             run_in(
                 lanes,
@@ -4578,6 +4742,126 @@ mod tests {
         let mut pending = true;
         assert!(take_keyframe_request(&mut pending, "libx264", 10));
         assert!(!pending);
+    }
+
+    fn raw(frame_number: u64, data: &std::sync::Arc<Vec<u8>>) -> RawFrame {
+        RawFrame {
+            frame_number,
+            timestamp: Instant::now(),
+            data: std::sync::Arc::clone(data),
+            width: 2,
+            height: 2,
+        }
+    }
+
+    /// A picture given again to bring out a keyframe keeps its capture time
+    /// and number, but is a separate frame to the encoder: it must not share
+    /// the PTS of the frame before it, under ETERNAL_LEGACY_PTS too.
+    #[test]
+    fn a_picture_given_again_gets_its_own_pts_in_both_pts_modes() {
+        ffmpeg_next::init().unwrap();
+        for legacy in [false, true] {
+            let mut state = libx264_at(640, 360);
+            state.legacy_pts = legacy;
+            let captured = Instant::now();
+            // Frame 7, given again twice, then capture's next frame.
+            let frames = [(captured, 7), (captured, 7), (captured, 7)]
+                .into_iter()
+                .chain([(captured + Duration::from_millis(16), 8)]);
+            let mut pts = Vec::new();
+            for (at, n) in frames {
+                let next = state.next_pts(at, n);
+                state.frame.set_pts(Some(next));
+                state.send_frame(next, at, n).unwrap();
+                while state.encoder.receive_packet(&mut state.packet).is_ok() {}
+                pts.push(next);
+            }
+            assert!(
+                pts.windows(2).all(|pair| pair[0] < pair[1]),
+                "legacy={legacy}: PTS {pts:?}"
+            );
+        }
+    }
+
+    /// Capture recycles three buffers, and the mailbox may hold one while the
+    /// encoder works on another. A kept picture that outlived a newer capture
+    /// took the third: the synthetic source found no free buffer and panicked.
+    #[test]
+    fn a_newer_capture_releases_the_kept_picture_before_it_is_encoded() {
+        let (producer, consumer) = crate::capture::frame_slot();
+        let kept = std::sync::Arc::new(vec![0u8; 16]);
+        let newer = std::sync::Arc::new(vec![0u8; 16]);
+        let mut owed = OwedKeyframe::until(Instant::now() + Duration::from_secs(5));
+        owed.picture = Some(raw(1, &kept));
+        producer.publish(raw(2, &newer));
+        let Next::Frame(frame) = owed.next(&consumer) else {
+            panic!("no frame");
+        };
+        assert_eq!(frame.frame_number, 2);
+        assert_eq!(
+            std::sync::Arc::strong_count(&kept),
+            1,
+            "the kept picture still pins a capture buffer while the newer one is encoded"
+        );
+    }
+
+    #[test]
+    fn the_deadline_counts_from_the_first_keyframe_submission() {
+        let kept = std::sync::Arc::new(vec![0u8; 16]);
+        let submitted = Instant::now()
+            .checked_sub(Duration::from_millis(200))
+            .unwrap();
+        // The keyframe went in 200 ms ago; sending and receiving took that long.
+        let owed = OwedKeyframe::after_encode(None, Some(raw(1, &kept)), false, submitted)
+            .expect("the keyframe is owed");
+        assert_eq!(owed.until, submitted + KEYFRAME_FLUSH_FOR);
+        // A retry submitted later keeps the first deadline.
+        let owed =
+            OwedKeyframe::after_encode(Some(owed), Some(raw(1, &kept)), false, Instant::now())
+                .expect("still owed");
+        assert_eq!(owed.until, submitted + KEYFRAME_FLUSH_FOR);
+        assert!(
+            OwedKeyframe::after_encode(Some(owed), Some(raw(1, &kept)), true, Instant::now())
+                .is_none(),
+            "the keyframe came out"
+        );
+        assert!(OwedKeyframe::after_encode(None, None, false, submitted).is_none());
+    }
+
+    #[test]
+    fn the_kept_picture_is_given_again_before_the_deadline() {
+        let (_producer, consumer) = crate::capture::frame_slot();
+        let kept = std::sync::Arc::new(vec![0u8; 16]);
+        let mut owed = OwedKeyframe::until(Instant::now() + Duration::from_secs(60));
+        owed.picture = Some(raw(1, &kept));
+        let started = Instant::now();
+        let Next::Frame(frame) = owed.next(&consumer) else {
+            panic!("the picture was not given again");
+        };
+        assert_eq!(frame.frame_number, 1);
+        assert_eq!(owed.given, 1);
+        assert!(
+            started.elapsed() >= KEYFRAME_FLUSH_WAIT,
+            "it did not wait for capture first"
+        );
+    }
+
+    #[test]
+    fn the_kept_picture_is_not_given_again_after_the_deadline() {
+        let (_producer, consumer) = crate::capture::frame_slot();
+        let kept = std::sync::Arc::new(vec![0u8; 16]);
+        let passed = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        let mut owed = OwedKeyframe::until(passed);
+        owed.picture = Some(raw(1, &kept));
+        assert!(matches!(owed.next(&consumer), Next::GaveUp));
+        assert_eq!(owed.given, 0);
+        assert_eq!(
+            std::sync::Arc::strong_count(&kept),
+            1,
+            "the picture is let go"
+        );
     }
 
     #[test]

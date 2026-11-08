@@ -22,6 +22,9 @@ enum ConnectionProblem: Equatable {
     /// usually the router.
     case routerAddress
     case noNetwork
+    /// iPadOS called the path unsatisfied for want of any usable network:
+    /// Wi-Fi is off, or joined to no network.
+    case wifiOff
     case localNetworkBlocked
     case couldNotConnect
     /// The cable connection failed after it had opened.
@@ -38,6 +41,46 @@ enum ConnectionProblem: Equatable {
     case pcBusy
     /// The PC stopped the stream to install an update and restarts on it.
     case pcUpdating(UpdateWait)
+    /// The PC answered but isn't streaming. This iPad keeps asking and
+    /// connects as soon as it is.
+    case pcNotStreaming(StreamWait)
+
+    enum StreamWait: Equatable {
+        /// Someone clicked Stop on the PC.
+        case stopped
+        case restarting
+        /// The PC stopped after repeated errors, for the reason it gave (a
+        /// token; one this iPad doesn't know is no reason).
+        case failed(String)
+
+        /// What the PC's answer means, if it is one of these.
+        init?(_ status: HelloStatus, reason: String) {
+            switch status {
+            case .stopped: self = .stopped
+            case .restarting: self = .restarting
+            case .failed: self = .failed(reason)
+            default: return nil
+            }
+        }
+
+        /// The PC's reason for `.failed`, in words, if this iPad knows it.
+        /// The PC's Stream page says the same.
+        static func failedReason(_ token: String) -> String? {
+            switch token {
+            case "capture": return "Capturing your screen kept failing"
+            case "encoder": return "Encoding the video kept failing"
+            case "transport": return "Sending the video kept failing"
+            case "secure_desktop": return "Your PC is showing the lock screen or a permission prompt"
+            case "display_changing": return "Windows is changing the display"
+            case "no_display": return "No display is on"
+            case "unsupported_gpu": return "Windows won't share this screen from the graphics card EternalMonitor uses"
+            case "too_many_capture_apps": return "Another app is recording or sharing your screen"
+            case "session_disconnected": return "This Windows session is disconnected"
+            case "driver_not_responding": return "The graphics driver isn't responding"
+            default: return nil
+            }
+        }
+    }
 
     /// What this iPad does while the PC updates.
     enum UpdateWait: Equatable {
@@ -71,6 +114,7 @@ enum ConnectionProblem: Equatable {
         case .pairingCodeAsAddress: return "That looks like the pairing code, not the PC's address"
         case .routerAddress: return "That looks like your router's address, not your PC's"
         case .noNetwork: return "This iPad isn't connected to a network"
+        case .wifiOff: return "Wi-Fi is off"
         case .localNetworkBlocked: return "Local Network is turned off for EternalMonitor"
         case .couldNotConnect: return "Couldn't connect to your PC"
         case .usbFailed: return "The connection over the cable stopped"
@@ -85,6 +129,9 @@ enum ConnectionProblem: Equatable {
         case .pcBusy: return "Your PC is already streaming to another device"
         case .pcUpdating(.reconnecting), .pcUpdating(.manual): return "Your PC is updating EternalMonitor"
         case .pcUpdating(.notBack): return "Your PC hasn't come back from its update yet"
+        case .pcNotStreaming(.stopped): return "Your PC isn't streaming"
+        case .pcNotStreaming(.restarting): return "Your PC is restarting the stream…"
+        case .pcNotStreaming(.failed): return "Your PC stopped streaming after repeated errors"
         }
     }
 
@@ -113,7 +160,7 @@ enum ConnectionProblem: Equatable {
         case .routerAddress:
             return "Addresses ending in .1 usually belong to the Wi-Fi router. Type the Address shown in the "
                 + "EternalMonitor window on the PC, for example 192.168.1.20."
-        case .noNetwork:
+        case .noNetwork, .wifiOff:
             return "Turn on Wi-Fi and join the same network as your PC, or connect with a USB cable."
         case .localNetworkBlocked:
             return "iPadOS is stopping this app from reaching your PC over Wi-Fi. "
@@ -144,6 +191,13 @@ enum ConnectionProblem: Equatable {
             return "Check that EternalMonitor opened again on the PC, then try again. Windows may still be waiting for you to approve the update there."
         case .pcBusy:
             return "Disconnect the other iPad first, then try again."
+        case .pcNotStreaming(.stopped):
+            return "Click Start streaming in EternalMonitor on the PC. This iPad connects as soon as it starts."
+        case .pcNotStreaming(.restarting):
+            return "This iPad connects as soon as it's back."
+        case .pcNotStreaming(.failed(let token)):
+            let start = "Click Start streaming in EternalMonitor on the PC to try again. This iPad connects as soon as it starts."
+            return StreamWait.failedReason(token).map { "\($0). \(start)" } ?? start
         }
     }
 
@@ -162,7 +216,8 @@ enum ConnectionProblem: Equatable {
     var canReport: Bool {
         switch self {
         case .reconnecting, .pcUpdating(.reconnecting), .pcUpdating(.manual),
-             .lost(.cableUnplugged), .lost(.usbTurnedOff), .pcBusy, .pairingCodeAsAddress:
+             .lost(.cableUnplugged), .lost(.usbTurnedOff), .pcBusy, .pairingCodeAsAddress,
+             .pcNotStreaming(.stopped), .pcNotStreaming(.restarting):
             return false
         default:
             return true
@@ -172,7 +227,8 @@ enum ConnectionProblem: Equatable {
     var actions: [Action] {
         switch self {
         case .localNetworkBlocked: return [.openSettings, .retry]
-        case .reconnecting, .lost(.cableUnplugged), .lost(.usbTurnedOff), .receiverNotReady, .pairingCodeAsAddress: return []
+        case .reconnecting, .lost(.cableUnplugged), .lost(.usbTurnedOff), .receiverNotReady, .pairingCodeAsAddress,
+             .pcNotStreaming: return []
         default: return [.retry]
         }
     }
@@ -209,7 +265,7 @@ enum ConnectionProblem: Equatable {
     /// never answered.
     static func afterReconnecting(lastAttempt: ConnectionProblem?) -> ConnectionProblem {
         switch lastAttempt {
-        case .localNetworkBlocked, .noNetwork, .badAddress, .usbFailed, .noPicture, .pcBusy, .pcEndedSession,
+        case .localNetworkBlocked, .noNetwork, .wifiOff, .badAddress, .usbFailed, .noPicture, .pcBusy, .pcEndedSession,
              .pcEndedSessionOnError, .pcUpdating:
             return lastAttempt ?? .reconnectFailed
         default:
@@ -257,6 +313,7 @@ enum ConnectionProblem: Equatable {
         // The cable is a local tunnel: Wi-Fi, DNS and Local Network don't apply.
         if isUSB { return .usbFailed }
         if error.kind == .localNetworkDenied { return .localNetworkBlocked }
+        if error.pathUnsatisfied { return .wifiOff }
         if let nw = error.underlying as? NWError {
             switch nw {
             case .dns(let code):
@@ -356,9 +413,17 @@ struct NoPictureStreak: Equatable {
 
 /// What the USB cable card says for each listener status.
 enum USBStatusText {
-    static func describe(_ status: String) -> String {
+    /// `appleDevicesUnreachable`: when this iPad last connected, the PC
+    /// couldn't reach Apple's USB service. That was one sample, and a host
+    /// may leave the capability out for other reasons, so the card gives
+    /// it as what happened and what to try, not as the current state.
+    static func describe(_ status: String, appleDevicesUnreachable: Bool = false) -> String {
         switch status {
         case "USB: off": return L("Off. Turn on to connect with a cable.")
+        case "USB: waiting for a cable" where appleDevicesUnreachable:
+            // A problem: stays English, like the other problem text.
+            return "Last time this iPad connected, your PC couldn't reach Apple Devices. If the cable doesn't connect, "
+                + "open Apple Devices on the PC, or install it from the Microsoft Store. Wi-Fi still works."
         case "USB: waiting for a cable": return L("Plug this iPad into your PC. Keep Apple Devices open on the PC.")
         case "USB: disconnected": return L("Paused. Tap Connect USB to use the cable again.")
         case "USB: connecting": return L("Connecting over the cable…")
