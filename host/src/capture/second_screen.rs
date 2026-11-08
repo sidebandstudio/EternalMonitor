@@ -172,6 +172,11 @@ pub(crate) struct State {
     /// A start is claimed: its Attach is queued or running.
     attaching: bool,
     proving: Option<Proving>,
+    /// The capture generation whose second screen captured its first image.
+    /// The stage opening the display again in that generation (a recovery
+    /// reopen) does not prove it again: a new proof hid a display gone dark
+    /// from the watchdog and then fell back to the mirror.
+    proven: Option<u64>,
     /// Why the second screen last failed, for the log and the backend.
     failure: Option<&'static str>,
     /// The failure saved for later app runs.
@@ -746,6 +751,7 @@ pub fn note_attached(shared: &SharedControl, device_name: String) {
     let mut state = shared.second_screen.lock();
     state.switch_pending = true;
     state.proving = None;
+    state.proven = None;
 }
 
 /// [`note_attached`], unless the mode changed or quitting began. The mode
@@ -765,8 +771,12 @@ fn note_attached_if_selected(shared: &SharedControl, device_name: String) -> boo
 /// Capture `generation` streams the second screen from `now`. The first
 /// generation after the switch starts the [`PROVE_TIMEOUT`] deadline; a
 /// later one inherits it, and any capture failure, until an image arrives.
+/// The generation that proved it is not asked again.
 pub fn start_proving(shared: &SharedControl, generation: u64, now: Instant) {
     let mut state = shared.second_screen.lock();
+    if state.proving.is_none() && state.proven == Some(generation) {
+        return;
+    }
     match state.proving.as_mut() {
         // A call the earlier generation still waits on is not this one's,
         // and its guard can no longer clear the flag.
@@ -824,6 +834,7 @@ pub fn note_image(shared: &SharedControl, generation: u64) {
     let mut state = shared.second_screen.lock();
     if let Some(proving) = state.proving.filter(|p| p.generation == generation) {
         state.proving = None;
+        state.proven = Some(generation);
         tracing::info!(
             after_ms = proving.since.elapsed().as_millis() as u64,
             "Second screen captured its first image — streaming it"
@@ -2432,6 +2443,89 @@ mod tests {
             Step::Fallback("duplication_failed")
         );
         assert_eq!(remembered_failure(&shared), Some("duplication_failed"));
+    }
+
+    /// Review r2 of #205 (P1): a second screen that showed no new image for
+    /// a while after its duplication came back is opened again by the stage.
+    /// Reconciling it again started a new proof: the watchdog skipped its
+    /// missing-frame check while the display proved itself, and 5 s later
+    /// the proof failed back to the mirror. In the generation that proved
+    /// it, it stays proven, so the watchdog judges a display gone dark.
+    #[test]
+    fn a_recovery_reopen_does_not_prove_a_proven_second_screen_again() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let dir = std::env::temp_dir().join(format!(
+            "eternal-capture-recovery-proven-{}",
+            std::process::id()
+        ));
+        let shared = second_screen_selected();
+        let display = fake::FakeDisplay::new(Some(Duration::ZERO), secs(10.0));
+        display.install(&shared, &dir, std::time::SystemTime::now());
+        assert!(Driver::set_enabled(&display, true));
+        connect_viewer(&shared);
+        note_attached(&shared, "virtual".into());
+        let generation = crate::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
+        let streamed = Some(CaptureTarget::Output("virtual".into()));
+        let reconcile =
+            || reconcile_virtual_display(&CaptureTarget::VirtualExtended, &shared, generation);
+        assert_eq!(reconcile(), streamed);
+        assert!(proving(&shared));
+        note_image(&shared, generation);
+        assert!(!proving(&shared));
+        // The loop ended with a reopen; the stage reconciles again.
+        assert_eq!(reconcile(), streamed);
+        assert!(!proving(&shared), "proven in this generation");
+        // Nothing comes from it: the watchdog restarts the pipeline.
+        let mut machine = crate::supervisor::Machine::new(1);
+        let now_ms = 100_000;
+        shared.hb_capture_loop_ms.store(now_ms, Relaxed);
+        shared.hb_capture_frame_ms.store(now_ms - 5_100, Relaxed);
+        shared.hb_encode_frame_ms.store(now_ms - 5_100, Relaxed);
+        let reason = crate::supervisor::wedge_reason_at(&shared, &mut machine, now_ms);
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("no captured frame")),
+            "{reason:?}"
+        );
+        // The next generation, after that restart, proves it again; so does
+        // a display attached anew.
+        start_proving(&shared, generation.wrapping_add(1), Instant::now());
+        assert!(proving(&shared));
+        note_attached(&shared, "virtual".into());
+        assert_eq!(reconcile(), streamed);
+        assert!(proving(&shared));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review r2 of #205 (P2): a display that moved during the first proof
+    /// ends the capture loop with a reopen, and the stage noted it as a
+    /// capture error: the proof failed, and the second screen went back to
+    /// the mirror at once. A reopen keeps the proof, its deadline and the
+    /// interruption.
+    #[test]
+    fn a_reopen_during_the_first_proof_keeps_it_going() {
+        let start = Instant::now();
+        let shared = second_screen_selected();
+        connect_viewer(&shared);
+        note_attached(&shared, "virtual".into());
+        assert_eq!(next_step(&shared, start), Step::Switch);
+        start_proving(&shared, 7, start);
+        let reopen = crate::capture::recovery::Reopen {
+            detail: "the display layout changed".into(),
+        };
+        super::super::note_stage_error(&shared, 7, &reopen);
+        let proving = shared.second_screen.lock().proving.unwrap();
+        assert!(proving.interrupted && !proving.capture_failed);
+        assert_eq!(proving.since, start);
+        assert_eq!(next_step(&shared, start + secs(4.9)), Step::Nothing);
+        // Any other capture error still ends the proof at once.
+        let failed = std::io::Error::other("DuplicateOutput failed");
+        super::super::note_stage_error(&shared, 7, &failed);
+        assert_eq!(
+            next_step(&shared, start + secs(4.9)),
+            Step::Fallback("duplication_failed")
+        );
     }
 
     #[test]

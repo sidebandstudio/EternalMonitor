@@ -377,8 +377,19 @@ impl BlockedRetry {
 /// 200, and the iPad dropped every frame until the count passed 200 again.
 pub fn run_until_unblocked(
     shared: &SharedControl,
+    capture: impl FnMut(&mut u64) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
+    wait: impl FnMut(Duration) -> bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    run_until_unblocked_on(shared, capture, wait, Instant::now)
+}
+
+/// [`run_until_unblocked`] on the clock `clock`, which times the
+/// [`REOPEN_SPACING`].
+pub(crate) fn run_until_unblocked_on(
+    shared: &SharedControl,
     mut capture: impl FnMut(&mut u64) -> Result<(), Box<dyn std::error::Error + Send + Sync>>,
     mut wait: impl FnMut(Duration) -> bool,
+    mut clock: impl FnMut() -> Instant,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut retry = BlockedRetry::default();
     let mut stalled = 0;
@@ -391,7 +402,7 @@ pub fn run_until_unblocked(
         };
         let error: Box<dyn std::error::Error + Send + Sync> = match error.downcast::<Reopen>() {
             Ok(reopen) => {
-                let now = Instant::now();
+                let now = clock();
                 if last_reopen.is_none_or(|at| now.duration_since(at) >= REOPEN_SPACING) {
                     last_reopen = Some(now);
                     info!(detail = %reopen.detail, "Opening the display to capture again");
@@ -1302,14 +1313,23 @@ mod tests {
     /// after waits at that pace instead of reopening in a loop.
     #[test]
     fn a_moved_display_is_reopened_at_once_but_not_in_a_loop() {
+        use std::cell::Cell;
+        let ms = Duration::from_millis;
         let shared = SharedControl::new(0, 1);
-        let mut attempts = 0;
+        // A paused clock: each attempt and each wait moves it.
+        let start = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        // Before each attempt, how far the clock moves; every attempt but
+        // the last asks to reopen.
+        let steps = [ms(0), ms(999), ms(0), ms(1_000), ms(0)];
+        let mut attempt = 0;
         let mut waits = Vec::new();
-        let result = run_until_unblocked(
+        let result = run_until_unblocked_on(
             &shared,
             |_| {
-                attempts += 1;
-                if attempts <= 2 {
+                elapsed.set(elapsed.get() + steps[attempt]);
+                attempt += 1;
+                if attempt < steps.len() {
                     Err(Reopen {
                         detail: "the display layout changed".into(),
                     }
@@ -1319,13 +1339,20 @@ mod tests {
                 }
             },
             |delay| {
-                waits.push(delay.as_millis());
+                waits.push(delay);
+                elapsed.set(elapsed.get() + delay);
                 true
             },
+            || start + elapsed.get(),
         );
         assert!(result.is_ok());
-        assert_eq!(attempts, 3);
-        assert_eq!(waits, [500]);
+        assert_eq!(attempt, steps.len());
+        // At 0 ms: at once. At 999 ms, under a second after it: the blocked
+        // pace, 500 ms. At 1,499 ms, a second and more after the last one
+        // opened at once: at once. At 2,499 ms, exactly a second after
+        // that: at once.
+        assert_eq!(waits, [ms(500)]);
+        assert_eq!(elapsed.get(), ms(2_499));
         assert_eq!(
             *shared.capture_block.lock(),
             Some(CaptureBlock::DisplayChanging)

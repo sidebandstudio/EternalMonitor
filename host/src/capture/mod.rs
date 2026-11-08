@@ -948,12 +948,7 @@ pub fn run_capture_stage(
         |frame_number| {
             let result = run_platform_loop(&guard.0, shared.clone(), generation, frame_number);
             if let Err(error) = &result {
-                if recovery::passing_error(error.as_ref()) {
-                    second_screen::note_interruption(&shared, generation);
-                } else {
-                    second_screen::note_persistent_error(&shared, generation);
-                }
-                second_screen::note_capture_error(&shared, generation);
+                note_stage_error(&shared, generation, error.as_ref());
             }
             result
         },
@@ -963,6 +958,26 @@ pub fn run_capture_stage(
         error!(error = %e, "Capture loop exited with error");
     }
     result
+}
+
+/// What a capture attempt's error says about a second screen proving
+/// itself. A [`recovery::Reopen`] is not a capture error: the stage opens
+/// the display again at once, and the proof keeps its deadline. Noting it
+/// as one failed the proof, and a display that moved during the first
+/// proof went back to the mirror.
+fn note_stage_error(
+    shared: &SharedControl,
+    generation: u64,
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+) {
+    if recovery::passing_error(error) {
+        second_screen::note_interruption(shared, generation);
+    } else {
+        second_screen::note_persistent_error(shared, generation);
+    }
+    if error.downcast_ref::<recovery::Reopen>().is_none() {
+        second_screen::note_capture_error(shared, generation);
+    }
 }
 
 /// While no display is on, how often the wait looks for one to come back.
@@ -988,11 +1003,31 @@ fn wait_while_blocked(
     shared: &SharedControl,
     generation: u64,
     delay: Duration,
+    display_back: impl FnMut() -> bool,
+) -> bool {
+    wait_while_blocked_on(
+        shared,
+        generation,
+        delay,
+        display_back,
+        Instant::now,
+        std::thread::sleep,
+    )
+}
+
+/// [`wait_while_blocked`] on the clock `now`, sleeping with `sleep`.
+fn wait_while_blocked_on(
+    shared: &SharedControl,
+    generation: u64,
+    delay: Duration,
     mut display_back: impl FnMut() -> bool,
+    mut now: impl FnMut() -> Instant,
+    mut sleep: impl FnMut(Duration),
 ) -> bool {
     use std::sync::atomic::Ordering;
-    let deadline = Instant::now() + delay;
-    let mut next_look = Instant::now() + DISPLAY_LOOK;
+    let start = now();
+    let deadline = start + delay;
+    let mut next_look = start + DISPLAY_LOOK;
     loop {
         if !shared.running.load(Ordering::SeqCst)
             || !crate::supervisor::generation_is_current(generation)
@@ -1000,19 +1035,19 @@ fn wait_while_blocked(
             return false;
         }
         hold_heartbeats(shared);
-        let now = Instant::now();
-        if now >= deadline {
+        let at = now();
+        if at >= deadline {
             return true;
         }
-        if now >= next_look {
-            next_look = now + DISPLAY_LOOK;
+        if at >= next_look {
+            next_look = at + DISPLAY_LOOK;
             if *shared.capture_block.lock() == Some(recovery::CaptureBlock::NoDisplay)
                 && display_back()
             {
                 return true;
             }
         }
-        std::thread::sleep((deadline - now).min(Duration::from_millis(50)));
+        sleep((deadline - at).min(Duration::from_millis(50)));
     }
 }
 
@@ -1744,36 +1779,43 @@ mod tests {
         shared.running.store(true, SeqCst);
         let generation = crate::supervisor::CURRENT_GENERATION.load(SeqCst);
         *shared.capture_block.lock() = Some(recovery::CaptureBlock::NoDisplay);
-        let started = Instant::now();
+        // A paused clock: the wait's sleeps move it.
+        let start = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        let now = || start + elapsed.get();
+        let sleep = |by: Duration| elapsed.set(elapsed.get() + by);
         let looks = Cell::new(0);
         let back = || {
             looks.set(looks.get() + 1);
-            started.elapsed() >= Duration::from_millis(600)
+            elapsed.get() >= Duration::from_millis(600)
         };
-        assert!(wait_while_blocked(
+        assert!(wait_while_blocked_on(
             &shared,
             generation,
             Duration::from_secs(5),
-            back
+            back,
+            now,
+            sleep
         ));
-        let waited = started.elapsed();
-        // Well before the 5 s wait ends, with room for a loaded test machine.
-        assert!(waited < Duration::from_millis(4_000), "{waited:?}");
-        assert!(looks.get() >= 2, "{} looks", looks.get());
+        // Looks at 250, 500 and 750 ms: back at the first look after 600.
+        assert_eq!(elapsed.get(), Duration::from_millis(750));
+        assert_eq!(looks.get(), 3);
         // Other blocked states clear by the user's hand; nothing is polled.
         *shared.capture_block.lock() = Some(recovery::CaptureBlock::SecureDesktop);
-        let looks = Cell::new(0);
-        let started = Instant::now();
-        assert!(wait_while_blocked(
+        elapsed.set(Duration::ZERO);
+        looks.set(0);
+        assert!(wait_while_blocked_on(
             &shared,
             generation,
             Duration::from_millis(600),
             || {
                 looks.set(looks.get() + 1);
                 true
-            }
+            },
+            now,
+            sleep
         ));
-        assert!(started.elapsed() >= Duration::from_millis(600));
+        assert_eq!(elapsed.get(), Duration::from_millis(600));
         assert_eq!(looks.get(), 0);
     }
 
