@@ -475,10 +475,7 @@ pub async fn start_sender(
                 if awaiting_keyframe {
                     let started = shared.session.lock().client_info().map(|info| info.connected_at);
                     match first_frame_gate(nal.is_keyframe, nal.timestamp, started) {
-                        FirstFrame::Send => {
-                            awaiting_keyframe = false;
-                            shared.session.lock().note_video_sent(session_id, now());
-                        }
+                        FirstFrame::Send => {}
                         FirstFrame::Skip => continue, // the forced IDR is coming
                         FirstFrame::SkipAndRequestKeyframe => {
                             shared.force_next_idr.store(true, Ordering::SeqCst);
@@ -487,11 +484,23 @@ pub async fn start_sender(
                     }
                 }
 
-                frame_seq = frame_seq.wrapping_add(1);
-                let send_start = Instant::now();
                 let payload = &nal.data;
                 let payload_size = media_payload_size(shared.max_dgram.load(Ordering::SeqCst) as usize).unwrap_or(MAX_MEDIA_PAYLOAD);
                 let frag_count_usize = payload.len().div_ceil(payload_size).max(1);
+                // Held back until the client answers; the frames after it
+                // wait for the keyframe its answer asks for.
+                let wire_bytes = payload.len() + frag_count_usize * MEDIA_HEADER_SIZE;
+                if !shared.session.lock().may_send_media(session_id, wire_bytes, now()) {
+                    awaiting_keyframe = true;
+                    continue;
+                }
+                if awaiting_keyframe {
+                    awaiting_keyframe = false;
+                    shared.session.lock().note_video_sent(session_id, now());
+                }
+
+                frame_seq = frame_seq.wrapping_add(1);
+                let send_start = Instant::now();
                 if frag_count_usize > usize::from(MAX_FRAG_COUNT) {
                     warn!(
                         seq = nal.sequence,

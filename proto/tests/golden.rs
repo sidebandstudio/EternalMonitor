@@ -487,6 +487,29 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
             ),
         ));
     }
+    // A refusal without the PC name and host caps, as a HELLO2 too small
+    // for the whole answer gets: every iPad reads only its status.
+    vectors.push((
+        "hello_ack_busy_bare",
+        encode_control(
+            0,
+            2,
+            &ControlMessage::HelloAck(HelloAck {
+                status: HelloStatus::Busy,
+                accepted_version: 2,
+                client_nonce: 0xDEAD_BEEF,
+                session_id: 0,
+                heartbeat_interval_ms: 1000,
+                report_interval_ms: 500,
+                liveness_timeout_ms: 3000,
+                stream_config: StreamConfig::default(),
+                host_name: String::new(),
+                auth_token: [0; 16],
+                host_caps: 0,
+                reason: String::new(),
+            }),
+        ),
+    ));
     let (_, ControlMessage::Hello2(mut hello)) = parse_control(
         &vectors
             .iter()

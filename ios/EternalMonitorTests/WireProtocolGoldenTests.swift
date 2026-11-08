@@ -35,7 +35,7 @@ final class WireProtocolGoldenTests: XCTestCase {
 
     func testGoldenFileIsBundledAndComplete() throws {
         XCTAssertEqual(
-            Self.vectors.count, 42,
+            Self.vectors.count, 43,
             "golden vector count drifted — update both test suites together"
         )
     }
@@ -451,6 +451,21 @@ final class WireProtocolGoldenTests: XCTestCase {
         XCTAssertEqual(ack.status, .busy)
         XCTAssertEqual(ack.sessionId, 0)
         XCTAssertEqual(ack.streamConfig, StreamConfig())
+    }
+
+    /// A refusal without the PC name and host caps, as a HELLO2 too small
+    /// for the whole answer gets. Every iPad reads only its status.
+    func testHelloAckBusyBareVector() throws {
+        let data = try vector("hello_ack_busy_bare")
+        XCTAssertEqual(data.count, 49)
+        let (header, message) = try XCTUnwrap(Wire.parseControl(data))
+        guard case .helloAck(let ack) = message else { return XCTFail("wrong type") }
+        XCTAssertEqual(ack.status, .busy)
+        XCTAssertEqual(ack.acceptedVersion, 2)
+        XCTAssertEqual(ack.clientNonce, 0xDEAD_BEEF)
+        XCTAssertEqual(ack.hostName, "")
+        XCTAssertEqual(ack.hostCaps, 0)
+        XCTAssertEqual(Wire.encodeControl(sessionId: header.sessionId, msgSeq: header.msgSeq, message: message), data)
     }
 
     func testHeartbeatVector() throws {
