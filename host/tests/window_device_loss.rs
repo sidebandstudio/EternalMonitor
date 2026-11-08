@@ -364,3 +364,44 @@ fn every_dx12_adapter_has_its_own_luid() {
     unique.dedup();
     assert_eq!(unique.len(), luids.len(), "{luids:x?}");
 }
+
+#[test]
+fn an_adapter_with_a_new_luid_after_a_driver_update_is_still_itself() {
+    use wgpu::Backend::Vulkan;
+    // Two of the same card; Vulkan reports each one's own PCI bus.
+    let card = |luid, bus: &str| AdapterKey {
+        luid: Some(luid),
+        pci_bus: bus.into(),
+        ..adapter("RTX 5080", Vulkan, 0x10de)
+    };
+    let drew = card(1, "0000:01:00.0");
+    let twin = card(2, "0000:02:00.0");
+    // A driver update gives the card that drew a new LUID; its twin is listed first.
+    let listed = [twin.clone(), card(3, "0000:01:00.0")];
+    assert_eq!(replacement_candidates(&listed, Some(&drew), &[]), [1]);
+    // An adapter left out stays left out with its new LUID.
+    assert_eq!(
+        replacement_candidates(&listed, None, std::slice::from_ref(&drew)),
+        [0]
+    );
+    assert_eq!(
+        replacement_candidates(&listed, Some(&twin), std::slice::from_ref(&drew)),
+        [0]
+    );
+}
+
+#[test]
+fn two_cards_alike_but_for_their_new_luids_are_no_preference() {
+    use wgpu::Backend::Dx12;
+    // On DX12 identical cards share the bus too: only the LUID tells them apart,
+    // and after an update both have new ones.
+    let card = |luid| AdapterKey {
+        luid: Some(luid),
+        pci_bus: "0000:01:00.0".into(),
+        ..adapter("RTX 5080", Dx12, 0x10de)
+    };
+    let listed = [card(3), card(4)];
+    assert_eq!(replacement_candidates(&listed, Some(&card(1)), &[]), [0, 1]);
+    // Nor is either left out for an old LUID.
+    assert_eq!(replacement_candidates(&listed, None, &[card(2)]), [0, 1]);
+}

@@ -55,7 +55,11 @@ The patch:
   LUID (from DXGI on DX12, and `VkPhysicalDeviceIDProperties` on Vulkan 1.1+
   on Windows, through the `ash` dependency at wgpu-hal's version), else the
   backend, PCI ids, type, name and PCI bus. wgpu's DX12 bus comes from the
-  PCI ids alone, so identical cards differ only by LUID.
+  PCI ids alone, so identical cards differ only by LUID. A driver update or reset can
+  give an adapter a new LUID, so an adapter is also found as the only listed
+  one that differs in the LUID alone; two such are no match (no preference,
+  nothing left out). The Vulkan LUID is read only when both the instance and
+  the device are Vulkan 1.1+.
   The thread is named `winit::REPLACEMENT_THREAD`, so the host's panic hook
   treats a panic there as one failed try: it doesn't turn the virtual display
   off as it does for other background threads.

@@ -343,7 +343,10 @@ fn luid(adapter: &wgpu::Adapter) -> Option<u64> {
     let vulkan = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() };
     if let Some(hal) = vulkan {
         let shared = hal.shared_instance();
-        if shared.instance_api_version() < ash::vk::API_VERSION_1_1 {
+        let device_version = hal.physical_device_capabilities().properties().api_version;
+        if shared.instance_api_version() < ash::vk::API_VERSION_1_1
+            || device_version < ash::vk::API_VERSION_1_1
+        {
             return None;
         }
         let mut id = ash::vk::PhysicalDeviceIDProperties::default();
@@ -367,22 +370,59 @@ fn luid(_adapter: &wgpu::Adapter) -> Option<u64> {
     None
 }
 
+impl AdapterKey {
+    /// EternalMonitor patch: the same adapter as `other` but for the LUID, which a driver
+    /// update or reset can change.
+    fn same_but_luid(&self, other: &Self) -> bool {
+        (
+            self.backend,
+            self.vendor,
+            self.device,
+            self.device_type,
+            &self.name,
+            &self.pci_bus,
+        ) == (
+            other.backend,
+            other.vendor,
+            other.device,
+            other.device_type,
+            &other.name,
+            &other.pci_bus,
+        )
+    }
+}
+
+/// EternalMonitor patch: where `wanted` is in `keys`: itself, else the only one that
+/// differs from it in the LUID alone. Two such (identical cards the key can't otherwise
+/// tell apart) are no match.
+fn find(keys: &[AdapterKey], wanted: &AdapterKey) -> Option<usize> {
+    keys.iter().position(|key| key == wanted).or_else(|| {
+        let mut alike = (0..keys.len()).filter(|&index| keys[index].same_but_luid(wanted));
+        match (alike.next(), alike.next()) {
+            (Some(index), None) => Some(index),
+            _ => None,
+        }
+    })
+}
+
 /// EternalMonitor patch: the adapters, by index into `keys`, that a replacement may choose
 /// from: only `preferred` (the last one that drew on the window) while it is listed and
 /// not `excluded`, else every one not `excluded` (ones that couldn't draw on the window).
+/// An adapter is found as [`find`] says, so one a driver update gave a new LUID is still
+/// itself.
 pub fn replacement_candidates(
     keys: &[AdapterKey],
     preferred: Option<&AdapterKey>,
     excluded: &[AdapterKey],
 ) -> Vec<usize> {
-    let allowed = |key: &AdapterKey| !excluded.contains(key);
-    if let Some(preferred) = preferred.filter(|preferred| allowed(preferred))
-        && let Some(index) = keys.iter().position(|key| key == preferred)
+    let left_out: Vec<usize> = excluded.iter().filter_map(|key| find(keys, key)).collect();
+    if let Some(index) = preferred.and_then(|preferred| find(keys, preferred))
+        && !left_out.contains(&index)
     {
         return vec![index];
     }
     (0..keys.len())
-        .filter(|&index| allowed(&keys[index]))
+        .filter(|index| !left_out.contains(index))
         .collect()
 }
 
