@@ -35,7 +35,7 @@ final class WireProtocolGoldenTests: XCTestCase {
 
     func testGoldenFileIsBundledAndComplete() throws {
         XCTAssertEqual(
-            Self.vectors.count, 40,
+            Self.vectors.count, 41,
             "golden vector count drifted — update both test suites together"
         )
     }
@@ -443,6 +443,15 @@ final class WireProtocolGoldenTests: XCTestCase {
         XCTAssertEqual(counted.dropFirst(16).prefix(plain.count - 16), plain.dropFirst(16))
         guard case .heartbeat(let old) = try XCTUnwrap(Wire.parseControl(plain)).message else { return XCTFail("wrong type") }
         XCTAssertNil(old.framesSent)
+
+        // A notice and the count together: the notice byte, then the count.
+        let both = try vector("heartbeat_no_display_frames_sent")
+        let (bothHeader, bothMessage) = try XCTUnwrap(Wire.parseControl(both))
+        guard case .heartbeat(let noDisplay) = bothMessage else { return XCTFail("wrong type") }
+        XCTAssertEqual(noDisplay.notice, Heartbeat.noticeNoDisplay)
+        XCTAssertEqual(noDisplay.framesSent, 77)
+        XCTAssertEqual(Array(both.dropFirst(plain.count)), [Heartbeat.noticeNoDisplay, 77, 0, 0, 0])
+        XCTAssertEqual(Wire.encodeControl(sessionId: 0x1234_5678, msgSeq: bothHeader.msgSeq, message: bothMessage), both)
     }
 
     func testByeVector() throws {

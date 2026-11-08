@@ -232,6 +232,71 @@ final class NoVideoFallbackTests: XCTestCase {
         XCTAssertEqual(NoVideoPaths.better(than: "127.0.0.1", port: 1, pairing: Data(2...17))?.port, 2)
     }
 
+    /// A remembered address that is outside this iPad's own network now
+    /// gets nothing: no identity check, no HELLO2. The attempt goes to the
+    /// address tapped, and Try again goes there too.
+    func testARememberedAddressOffThisNetworkIsNeverAsked() async throws {
+        let first = FakeUDPHost(), other = FakeUDPHost()
+        let (manager, pairings) = try manager(pairedAt: first)
+        defer { manager.cancel() }
+        manager.localRoute = { _, _ in MovedPC.Route(interface: "en0", direct: true, address: "10.0.0.5", netmask: "255.255.255.0") }
+        let (logged, sink) = lines(manager)
+        defer { sink.cancel() }
+        NoVideoPaths.remember(from: .init(host: "127.0.0.1", port: first.port),
+                              to: .init(host: "127.0.0.1", port: other.port), pairing: Self.token)
+        manager.connect(host: "127.0.0.1", port: first.port)
+        let accepted = await Task.detached { first.acceptSession() }.value
+        XCTAssertTrue(accepted)
+        XCTAssertEqual(first.lastAuthToken, Self.token)
+        let types = await Task.detached { other.received(within: 1) }.value
+        XCTAssertEqual(types, [])
+        XCTAssertTrue(logged().contains("no_video_fallback step=remembered result=not_local"), logged().joined(separator: "\n"))
+        XCTAssertNil(NoVideoPaths.better(than: "127.0.0.1", port: first.port, pairing: Self.token))
+        XCTAssertEqual(try pairings.token(address: PairingStore.address(host: "127.0.0.1", port: first.port)), Self.token)
+    }
+
+    /// The PC at the remembered address passed its proof, then the attempt
+    /// there failed: HELLO2 went unanswered, the session showed no frame,
+    /// or the PC that answered had another name. The entry is forgotten,
+    /// the attempt goes to the address tapped at once, and so does the
+    /// next tap, with no identity check at the remembered address.
+    func testARememberedAddressThatFailsAfterItsProofIsRetired() async throws {
+        for failure in ["no_reply", "no_picture", "other_pc"] {
+            let first = FakeUDPHost(), other = FakeUDPHost()
+            let (manager, _) = try manager(pairedAt: first, connectTimeout: 3)
+            defer { manager.cancel() }
+            let (logged, sink) = lines(manager)
+            defer { sink.cancel() }
+            NoVideoPaths.remember(from: .init(host: "127.0.0.1", port: first.port),
+                                  to: .init(host: "127.0.0.1", port: other.port), pairing: Self.token)
+            manager.connect(host: "127.0.0.1", port: first.port)
+            let atOther = await Task.detached { () -> Bool in
+                guard other.answerIdentify(token: Self.token) else { return false }
+                switch failure {
+                case "no_picture": return other.acceptSession(authToken: Self.token)
+                case "other_pc": return other.acceptSession(hostName: "Other PC", authToken: Data(repeating: 0, count: 16))
+                default: return other.helloAttempts(within: 1) > 0
+                }
+            }.value
+            XCTAssertTrue(atOther, "\(failure): the proof passed and HELLO2 went there")
+            let atFirst = await Task.detached { first.acceptSession() }.value
+            XCTAssertTrue(atFirst, "\(failure): then to the address tapped")
+            try await until("\(failure): handshake at the address tapped", seconds: 20) {
+                manager.hostInfo != nil && manager.debugState.port == first.port
+            }
+            XCTAssertTrue(logged().contains("no_video_fallback step=remembered result=\(failure)"), logged().joined(separator: "\n"))
+            XCTAssertNil(NoVideoPaths.better(than: "127.0.0.1", port: first.port, pairing: Self.token), failure)
+            _ = await Task.detached { other.received(within: 0.5) }.value
+
+            manager.cancel()
+            manager.connect(host: "127.0.0.1", port: first.port)
+            let again = await Task.detached { first.acceptSession() }.value
+            XCTAssertTrue(again, "\(failure): the next tap goes to the address tapped")
+            let types = await Task.detached { other.received(within: 0.5) }.value
+            XCTAssertFalse(types.contains(.identify) || types.contains(.hello2), "\(failure): \(types)")
+        }
+    }
+
     /// The other address the PC signs is outside this iPad's own network:
     /// it is never asked, as for a PC Bonjour moved there.
     func testAnOtherAddressOffThisNetworkIsNeverAsked() async throws {

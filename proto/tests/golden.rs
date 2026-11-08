@@ -303,6 +303,17 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
             }),
         ),
         (
+            "heartbeat_no_display_frames_sent",
+            0x1234_5678,
+            53,
+            ControlMessage::Heartbeat(Heartbeat {
+                host_time_us: 987_654_321,
+                stream_config: stream_config(),
+                notice: NOTICE_NO_DISPLAY,
+                frames_sent: Some(77),
+            }),
+        ),
+        (
             "receiver_report",
             0x1234_5678,
             45,
@@ -771,4 +782,13 @@ fn media_size_vectors_round_trip_and_extend_the_old_bodies() {
     assert_eq!(counted.len(), plain.len() + 5);
     // Past the msg_seq, the old heartbeat is a prefix of the new one.
     assert_eq!(counted[16..plain.len()], plain[16..]);
+
+    // A notice and the count together: the notice byte, then the count.
+    let ControlMessage::Heartbeat(both) = message("heartbeat_no_display_frames_sent") else {
+        panic!("heartbeat_no_display_frames_sent")
+    };
+    assert_eq!(both.notice, NOTICE_NO_DISPLAY);
+    assert_eq!(both.frames_sent, Some(77));
+    let bytes = &vectors["heartbeat_no_display_frames_sent"];
+    assert_eq!(&bytes[plain.len()..], &[NOTICE_NO_DISPLAY, 77, 0, 0, 0]);
 }

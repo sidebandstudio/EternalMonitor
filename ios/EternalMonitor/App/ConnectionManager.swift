@@ -404,14 +404,17 @@ final class ConnectionManager: ObservableObject {
     }
 
     /// Connecting to `from`, where the PC's video didn't arrive before, goes
-    /// to the address where it did, once the PC there shows it holds this
-    /// pairing and receives there: the address may belong to another device
-    /// now. Only then does a HELLO2 with the token go there, as a move, with
-    /// the same-PC checks of one. Without the proof the entry is forgotten
-    /// and the attempt goes to `from`.
+    /// to the address where it did, once that address is on this iPad's own
+    /// network and the PC there shows it holds this pairing and receives
+    /// there: the address may belong to another device now. Only then does a
+    /// HELLO2 with the token go there, as a move, with the same-PC checks of
+    /// one. Otherwise the entry is forgotten and the attempt goes to `from`,
+    /// as it does if that move fails (see `leaveRememberedAddress`).
     private func connectViaRemembered(from: (host: String, port: UInt16),
                                       _ remembered: (to: NoVideoPaths.Address, token: Data, name: String)) {
         endReconnectCycle()
+        // Try again and a resume go to the address tapped.
+        lastTarget = from
         let check = UUID()
         redirectCheck = check
         connectionError = nil
@@ -420,23 +423,42 @@ final class ConnectionManager: ObservableObject {
         Task { @MainActor [weak self] in
             guard let self else { return }
             let to = remembered.to
+            let toFrom = { [weak self] (result: String) in
+                guard let self else { return }
+                self.redirectCheck = nil
+                self.state = .disconnected
+                NoVideoPaths.forget(from: .init(host: from.host, port: from.port))
+                self.startAttempt(.udp(host: from.host, port: from.port))
+                self.record(.info, "connection", "no_video_fallback step=remembered result=\(result)")
+            }
+            let route = await self.localRoute(to.host, to.port)
+            guard self.redirectCheck == check else { return }
+            guard let route, MovedPC.isLocal(to.host, over: route) else { return toFrom("not_local") }
             let same = await MovedPC.confirm(host: to.host, port: to.port, token: remembered.token,
                                              link: self.makeUDPLink(to.port))
             guard self.redirectCheck == check else { return }
+            guard same else { return toFrom("not_confirmed") }
             self.redirectCheck = nil
             self.state = .disconnected
-            guard same else {
-                NoVideoPaths.forget(from: .init(host: from.host, port: from.port))
-                self.startAttempt(.udp(host: from.host, port: from.port))
-                self.record(.info, "connection", "no_video_fallback step=remembered result=not_confirmed")
-                return
-            }
             self.pendingMove = Move(from: from, name: remembered.name, token: remembered.token, noVideo: true)
             self.pendingRedirect = from
             self.explicitPairingToken = remembered.token
             self.startAttempt(.udp(host: to.host, port: to.port))
             self.pendingRedirect = nil
         }
+    }
+
+    /// The attempt at a remembered address (see `connectViaRemembered`)
+    /// passed its proof and failed after it: it ends with `end`, the entry is
+    /// forgotten, and a new attempt goes to the address tapped. False when
+    /// this attempt didn't go to a remembered address.
+    private func leaveRememberedAddress(_ end: AttemptEnd, result: String) -> Bool {
+        guard let from = attemptRedirect else { return false }
+        NoVideoPaths.forget(from: .init(host: from.host, port: from.port))
+        record(.info, "connection", "no_video_fallback step=remembered result=\(result)")
+        disconnect(end)
+        startAttempt(.udp(host: from.host, port: from.port))
+        return true
     }
 
     func submitPairing() {
@@ -759,6 +781,7 @@ final class ConnectionManager: ObservableObject {
                 if let move = self.attemptMove {
                     guard Self.isSamePC(move, info) else {
                         self.record(.warning, "connection", "The PC at the new address isn't the saved one")
+                        if self.leaveRememberedAddress(.otherPC, result: "other_pc") { return }
                         self.disconnect(.otherPC)
                         self.problem = .noReply(usb: false)
                         return
@@ -811,6 +834,7 @@ final class ConnectionManager: ObservableObject {
                 // it is another PC, and the saved pairing stays.
                 if self.attemptMove != nil, status == .unauthorized || status == .rateLimited {
                     self.record(.warning, "connection", "The PC at the new address isn't the saved one: it asked for pairing")
+                    if self.leaveRememberedAddress(.otherPC, result: "other_pc") { return }
                     self.disconnect(.otherPC)
                     self.problem = .noReply(usb: false)
                     return
@@ -876,11 +900,8 @@ final class ConnectionManager: ObservableObject {
                     self.disconnect(.legacyPC)
                 } else {
                     self.record(.warning, "ctrl", "HELLO2 handshake got no reply yet")
-                    if let from = self.attemptRedirect {
-                        // Not on this network now: back to the address asked for.
-                        self.record(.info, "connection", "no_video_fallback step=remembered result=no_reply")
-                        self.disconnect(.pcMoved)
-                        self.startAttempt(.udp(host: from.host, port: from.port))
+                    if self.leaveRememberedAddress(.pcMoved, result: "no_reply") {
+                        // Back to the address tapped.
                     } else if !isUSB {
                         self.lookForMovedPC(connectionID, host: normalizedHost, port: port)
                     }
@@ -1427,6 +1448,7 @@ final class ConnectionManager: ObservableObject {
                 let level = debug.timeoutLevel(handshakeDone: handshakeDone,
                                                answeredHereBefore: self.acceptedAddresses.contains("\(debug.host):\(debug.port)"))
                 self.record(level, "timeout", debug.timeoutSummary(handshakeDone: handshakeDone) + self.attemptTimings)
+                if self.leaveRememberedAddress(.connectTimeout, result: "no_picture") { return }
                 // Only an attempt the PC answered counts.
                 if handshakeDone { self.noPictureStreak.endedWithoutPicture() }
                 // A PC that said it isn't streaming and then went quiet (it
