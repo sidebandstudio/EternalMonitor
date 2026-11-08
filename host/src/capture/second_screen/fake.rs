@@ -55,6 +55,8 @@ struct Inner {
     desktop_away: Arc<AtomicBool>,
     /// The display configuration: see [`FakeDisplay::move_screen`].
     facts: Arc<Mutex<Option<GpuFacts>>>,
+    /// See [`FakeDisplay::move_virtual_display`].
+    virtual_on_other_card: AtomicBool,
 }
 
 impl FakeDisplay {
@@ -72,6 +74,7 @@ impl FakeDisplay {
             toggles: Mutex::new(Vec::new()),
             desktop_away: Arc::new(AtomicBool::new(false)),
             facts: Arc::new(Mutex::new(Some(screen_on(None)))),
+            virtual_on_other_card: AtomicBool::new(false),
         }))
     }
 
@@ -131,6 +134,15 @@ impl FakeDisplay {
         *self.0.facts.lock() = Some(screen_on(card));
     }
 
+    /// List the virtual display, under the same name, on the PC's other
+    /// card (true) or on [`APP_GPU`] (false, at first), as when its driver
+    /// is restarted on another adapter.
+    pub fn move_virtual_display(&self, other_card: bool) {
+        self.0
+            .virtual_on_other_card
+            .store(other_card, Ordering::Relaxed);
+    }
+
     /// Each time it was turned on (true) or off, on its clock, since it was
     /// made.
     pub fn toggles(&self) -> Vec<(Duration, bool)> {
@@ -146,6 +158,11 @@ impl Driver for FakeDisplay {
             .lock()
             .zip(*self.0.attach_after.lock())
             .is_some_and(|(on, after)| self.now() >= on + after);
+        let virtual_card = if self.0.virtual_on_other_card.load(Ordering::Relaxed) {
+            OTHER_CARD
+        } else {
+            APP_CARD
+        };
         let output = |name: &str, primary: bool| OutputInfo {
             adapter_index: 0,
             output_index: u32::from(!primary),
@@ -156,7 +173,7 @@ impl Driver for FakeDisplay {
             top: 0,
             is_primary: primary,
             adapter_name: APP_GPU.to_string(),
-            adapter_id: APP_CARD,
+            adapter_id: if primary { APP_CARD } else { virtual_card },
         };
         let mut outputs = vec![output("primary", true)];
         if attached {

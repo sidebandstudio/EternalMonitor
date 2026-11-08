@@ -628,7 +628,7 @@ pub fn run_capture_loop(
                 let allowed = keepalive_allowed(picture.real(), second_screen);
                 let dims = (tex_width, tex_height);
                 let call = super::second_screen::driver_call(&shared, generation);
-                let moved = target_moved(&output1, &chosen, &target, false, || {
+                let moved = target_moved(&shared, &output1, &chosen, &target, false, || {
                     if crate::supervisor::generation_is_current(generation) {
                         keep_picture_alive(
                             slot,
@@ -756,19 +756,20 @@ pub fn run_capture_loop(
                             let allowed = keepalive_allowed(picture.real(), second_screen);
                             let dims = (tex_width, tex_height);
                             let call = super::second_screen::driver_call(&shared, generation);
-                            let moved = target_moved(&output1, &chosen, &target, true, || {
-                                if crate::supervisor::generation_is_current(generation) {
-                                    keep_picture_alive(
-                                        slot,
-                                        &shared,
-                                        frame_number,
-                                        &mut last_send,
-                                        &last_frame,
-                                        dims,
-                                        allowed,
-                                    );
-                                }
-                            });
+                            let moved =
+                                target_moved(&shared, &output1, &chosen, &target, true, || {
+                                    if crate::supervisor::generation_is_current(generation) {
+                                        keep_picture_alive(
+                                            slot,
+                                            &shared,
+                                            frame_number,
+                                            &mut last_send,
+                                            &last_frame,
+                                            dims,
+                                            allowed,
+                                        );
+                                    }
+                                });
                             drop(call);
                             if moved {
                                 return Err(moved_away(&chosen));
@@ -971,8 +972,11 @@ fn access_lost_or(
 /// primary for a missing display, or when `list` asks after a failed
 /// re-creation. Both run under the stall limits while `progress` keeps the
 /// picture alive; one that does not return in time counts as no move, and
-/// the re-creation goes on.
+/// the re-creation goes on. An output seen off the desktop or renamed is a
+/// detach for a second screen's proof (see
+/// [`super::second_screen::note_detached`]).
 fn target_moved(
+    shared: &SharedControl,
     output: &IDXGIOutput1,
     chosen: &OutputInfo,
     target: &CaptureTarget,
@@ -994,6 +998,7 @@ fn target_moved(
         if same.unwrap_or(true) {
             return false;
         }
+        super::second_screen::note_detached(shared);
     }
     let (target, chosen) = (target.clone(), chosen.clone());
     let started = Instant::now();

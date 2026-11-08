@@ -776,18 +776,29 @@ pub(crate) fn reconcile_virtual_display(
             // Settings and codec changes restart capture without removing the
             // managed monitor, and the stream moves onto it this way once it
             // attaches. Reuse that output rather than turning it on again.
-            let attached = owned.clone().filter(|name| {
+            let attached = owned.as_ref().and_then(|name| {
                 outputs(shared)
-                    .iter()
-                    .any(|output| !output.is_primary && &output.device_name == name)
+                    .into_iter()
+                    .find(|output| !output.is_primary && &output.device_name == name)
             });
-            if let Some(name) = attached {
-                if status == VddStatus::Active
-                    && (connected || shared.second_screen.lock().keep_without_viewer())
-                {
-                    second_screen::start_proving(shared, generation, Instant::now());
-                    return Some(CaptureTarget::Output(name));
+            match attached {
+                Some(output) => {
+                    if status == VddStatus::Active
+                        && (connected || shared.second_screen.lock().keep_without_viewer())
+                    {
+                        let proof_output = (output.adapter_id, output.device_name.clone());
+                        second_screen::start_proving_on(
+                            shared,
+                            generation,
+                            Instant::now(),
+                            Some(proof_output),
+                        );
+                        return Some(CaptureTarget::Output(output.device_name));
+                    }
                 }
+                // Gone from the desktop: if it comes back, it proves itself.
+                None if owned.is_some() => second_screen::note_detached(shared),
+                None => {}
             }
             // The transport's next tick starts the display beside this mirror.
             // A viewer that arrived meanwhile may already have claimed it.
