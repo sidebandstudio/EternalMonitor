@@ -108,17 +108,22 @@ pub(crate) fn frame_has_image(last_present_time: i64, seen_image: bool) -> bool 
     last_present_time != 0 || seen_image
 }
 
-/// Whether the pointer goes apart from the video for this capture. On the
-/// second screen it never does: the virtual display has no hardware
-/// pointer, so Windows draws the pointer into its image, and Desktop
-/// Duplication kept reporting a stale position there (measured on the
-/// reference PC: every pointer move was a new image, and the reported
-/// position never moved). An iPad that draws the pointer would show that
-/// stale one too. There the pointer stays in the video, as before, and the
-/// iPad is told it is hidden.
+/// Whether Windows draws the pointer into the captured picture: on the
+/// second screen, unless the virtual display driver was given a hardware
+/// cursor (`vdd_settings::hardware_cursor`). Without one, measured on the
+/// reference PC, every pointer move there was a new image and Desktop
+/// Duplication kept reporting the pointer at one stale position.
 #[cfg(any(windows, test))]
-pub(crate) fn pointer_apart(client_draws_pointer: bool, second_screen: bool) -> bool {
-    client_draws_pointer && !second_screen
+pub(crate) fn pointer_in_picture(second_screen: bool, driver_cursor: bool) -> bool {
+    second_screen && !driver_cursor
+}
+
+/// Whether the pointer goes apart from the video for this capture: to an
+/// iPad that draws it, unless Windows draws it into the picture. Then it
+/// stays in the video, as before, and the iPad is told it is hidden.
+#[cfg(any(windows, test))]
+pub(crate) fn pointer_apart(client_draws_pointer: bool, pointer_in_picture: bool) -> bool {
+    client_draws_pointer && !pointer_in_picture
 }
 
 /// What the capture loop does with an acquired frame.
@@ -498,6 +503,15 @@ fn prepare_vdd_settings(shared: &SharedControl, outputs: &[OutputInfo]) -> VddRe
         }
         Err(_) => {}
     }
+    // Whatever wrote it, the file the driver reads next decides whether it
+    // gives Windows a hardware cursor, and so whether the second screen's
+    // pointer is reported apart from its picture.
+    let hardware_cursor =
+        std::fs::read_to_string(path).is_ok_and(|xml| crate::vdd_settings::hardware_cursor(&xml));
+    shared
+        .vdd_hardware_cursor
+        .store(hardware_cursor, std::sync::atomic::Ordering::Relaxed);
+    info!(hardware_cursor, "The virtual display's pointer");
     VddRequest {
         pin: crate::vdd_settings::pin_result(wanted, &applied),
         mode,
@@ -1061,15 +1075,25 @@ mod tests {
         );
     }
 
+    /// #183 is a second screen report: with the driver's hardware cursor
+    /// the second screen sends the pointer apart, as Mirror does. A driver
+    /// file without it keeps the pointer in the picture.
     #[test]
-    fn the_second_screen_keeps_the_pointer_in_the_video() {
-        assert!(pointer_apart(true, false), "Mirror, an iPad that draws it");
-        assert!(
-            !pointer_apart(true, true),
-            "second screen: Windows draws it"
-        );
-        assert!(!pointer_apart(false, false), "an older iPad");
-        assert!(!pointer_apart(false, true));
+    fn the_second_screen_sends_the_pointer_apart_with_the_drivers_cursor() {
+        for (second_screen, driver_cursor, in_picture) in [
+            (false, false, false),
+            (false, true, false),
+            (true, true, false),
+            (true, false, true),
+        ] {
+            assert_eq!(
+                pointer_in_picture(second_screen, driver_cursor),
+                in_picture,
+                "second_screen={second_screen} driver_cursor={driver_cursor}"
+            );
+            assert_eq!(pointer_apart(true, in_picture), !in_picture);
+            assert!(!pointer_apart(false, in_picture), "an older iPad");
+        }
     }
 
     pub(super) fn connect_viewer(shared: &SharedControl) {

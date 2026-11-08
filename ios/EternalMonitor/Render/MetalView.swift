@@ -314,10 +314,14 @@ final class MetalRenderer {
     private func drawPointer(_ pointer: PointerOverlay, encoder: MTLRenderCommandEncoder, video: CGSize,
                              drawable: CGSize) {
         let snapshot = pointer.snapshot()
-        guard snapshot.visible, let image = snapshot.image, let textures = textures(for: image) else { return }
+        guard snapshot.visible, let image = snapshot.image, let textures = textures(for: image),
+              let clip = PointerGeometry.clip(video: video, view: drawable, fit: pictureFit)
+        else { return }
         let rect = PointerGeometry.rect(x: snapshot.x, y: snapshot.y, width: image.width, height: image.height,
                                         video: video, view: drawable, fit: pictureFit)
         var uniforms = PointerUniforms(rect: PointerGeometry.ndc(rect, view: drawable))
+        // Both passes stay on the picture, out of the letterbox bars.
+        encoder.setScissorRect(MTLScissorRect(x: clip.x, y: clip.y, width: clip.width, height: clip.height))
         encoder.setRenderPipelineState(pointerPipeline)
         encoder.setVertexBytes(&uniforms, length: MemoryLayout<PointerUniforms>.stride, index: 0)
         encoder.setFragmentTexture(textures.image, index: 0)

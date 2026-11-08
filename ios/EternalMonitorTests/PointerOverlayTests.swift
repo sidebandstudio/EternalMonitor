@@ -57,6 +57,28 @@ final class PointerOverlayTests: XCTestCase {
         XCTAssertEqual(overlay.snapshot().image?.id, 4)
     }
 
+    /// Review r1: image 1's chunks arriving after image 2 completed brought
+    /// image 1 back. Older ids lose against the held image as well as the
+    /// one assembling, across the counter's wrap too.
+    func testAReorderedOlderImageNeverReplacesTheHeldOne() {
+        let overlay = PointerOverlay()
+        for chunk in chunks(id: 2, fill: 9) { overlay.handle(chunk) }
+        for chunk in chunks(id: 1, fill: 7) { overlay.handle(chunk) }
+        XCTAssertEqual(overlay.snapshot().image?.id, 2)
+        XCTAssertEqual(overlay.snapshot().image?.pixels.first, 9)
+        XCTAssertEqual(overlay.completeShapeId, 2)
+        XCTAssertEqual(overlay.counters.shapes, 1)
+
+        let wrapped = PointerOverlay()
+        for chunk in chunks(id: 3) { wrapped.handle(chunk) }
+        for chunk in chunks(id: UInt32.max) { wrapped.handle(chunk) }
+        XCTAssertEqual(wrapped.snapshot().image?.id, 3, "max is older than 3 after the wrap")
+        for chunk in chunks(id: 4) { wrapped.handle(chunk) }
+        XCTAssertEqual(wrapped.snapshot().image?.id, 4, "a newer image still replaces it")
+        XCTAssertTrue(PointerOverlay.isNewer(1, than: UInt32.max))
+        XCTAssertFalse(PointerOverlay.isNewer(UInt32.max, than: 1))
+    }
+
     func testThePositionIsLatestWinsByMessageNumber() {
         let overlay = PointerOverlay()
         overlay.handle(state(10), msgSeq: 5)
@@ -137,6 +159,35 @@ final class PointerOverlayTests: XCTestCase {
                                         view: CGSize(width: 1000, height: 500), fit: .fit)
         XCTAssertEqual(rect.minX, -4)
         XCTAssertEqual(PointerGeometry.rect(x: 0, y: 0, width: 8, height: 8, video: .zero, view: view, fit: .fit), .zero)
+    }
+
+    /// Review r1: a pointer past the picture's edge in Fit drew into the
+    /// letterbox bar. Both passes are clipped to the picture.
+    func testAPointerCrossingThePicturesEdgeStaysOutOfTheBars() throws {
+        let view = CGSize(width: 2388, height: 1668)
+        let video = CGSize(width: 3440, height: 1440)
+        let content = ContentRectMapper(viewSize: view, videoSize: video, fit: .fit).contentRect
+        let clip = try XCTUnwrap(PointerGeometry.clip(video: video, view: view, fit: .fit))
+        // Letterboxed top and bottom: the clip is the picture, not the view.
+        XCTAssertEqual(clip.x, 0)
+        XCTAssertEqual(clip.width, 2388)
+        XCTAssertEqual(clip.y, Int(content.minY.rounded(.down)))
+        XCTAssertEqual(clip.y + clip.height, Int(content.maxY.rounded(.up)))
+        XCTAssertGreaterThan(clip.y, 0)
+        // A pointer hanging over the bottom edge: part of its quad is in the
+        // bar, and the clip cuts it at the picture's edge.
+        let rect = PointerGeometry.rect(x: 1000, y: 1430, width: 32, height: 32, video: video, view: view, fit: .fit)
+        XCTAssertGreaterThan(rect.maxY, content.maxY)
+        let shown = rect.intersection(CGRect(x: clip.x, y: clip.y, width: clip.width, height: clip.height))
+        XCTAssertLessThanOrEqual(shown.maxY, CGFloat(clip.y + clip.height))
+        XCTAssertGreaterThan(shown.height, 0, "the part on the picture still shows")
+        // Pillarboxed, and Fill (the picture covers the view).
+        let tall = try XCTUnwrap(PointerGeometry.clip(video: CGSize(width: 1080, height: 1920), view: view, fit: .fit))
+        XCTAssertGreaterThan(tall.x, 0)
+        XCTAssertEqual(tall.height, 1668)
+        let fill = try XCTUnwrap(PointerGeometry.clip(video: video, view: view, fit: .fill))
+        XCTAssertEqual([fill.x, fill.y, fill.width, fill.height], [0, 0, 2388, 1668])
+        XCTAssertNil(PointerGeometry.clip(video: .zero, view: view, fit: .fit))
     }
 
     // MARK: Channel

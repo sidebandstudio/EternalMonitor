@@ -103,10 +103,11 @@ final class PointerOverlay {
 
     func handle(_ chunk: PointerShapeChunk) {
         let completed = state.withLock { s -> Bool in
-            if s.snapshot.image?.id == chunk.shapeId { return false }
+            // A chunk of the held image or an older one changes nothing: a
+            // late, reordered chunk must not bring back an old image.
+            if let held = s.snapshot.image?.id, !Self.isNewer(chunk.shapeId, than: held) { return false }
             if s.assembly?.chunk.shapeId != chunk.shapeId {
-                // A late chunk of an older image doesn't replace a newer one.
-                if let pending = s.assembly, Int32(bitPattern: chunk.shapeId &- pending.chunk.shapeId) < 0 {
+                if let pending = s.assembly, !Self.isNewer(chunk.shapeId, than: pending.chunk.shapeId) {
                     return false
                 }
                 s.assembly = Assembly(chunk: chunk, bytes: [UInt8](repeating: 0, count: Int(chunk.totalLen)))
@@ -130,6 +131,12 @@ final class PointerOverlay {
             return true
         }
         if completed { onChange?() }
+    }
+
+    /// Image ids count up from 1 and wrap: `id` is newer when it is less
+    /// than half the counter ahead.
+    static func isNewer(_ id: UInt32, than other: UInt32) -> Bool {
+        Int32(bitPattern: id &- other) > 0
     }
 
     static func image(_ chunk: PointerShapeChunk, bytes: [UInt8]) -> Image {
@@ -164,6 +171,21 @@ enum PointerGeometry {
         let sy = content.height / video.height
         return CGRect(x: content.minX + CGFloat(x) * sx, y: content.minY + CGFloat(y) * sy,
                       width: CGFloat(width) * sx, height: CGFloat(height) * sy)
+    }
+
+    /// The pixels the pointer may cover: the picture, inside the drawable.
+    /// A pointer partly past the picture's edge must not draw into Fit's
+    /// letterbox bars. `nil` while there is no picture.
+    static func clip(video: CGSize, view: CGSize, fit: PictureFit) -> (x: Int, y: Int, width: Int, height: Int)? {
+        let content = ContentRectMapper(viewSize: view, videoSize: video, fit: fit).contentRect
+        let visible = content.intersection(CGRect(origin: .zero, size: view))
+        guard !visible.isNull, visible.width > 0, visible.height > 0 else { return nil }
+        let x0 = max(0, Int(visible.minX.rounded(.down)))
+        let y0 = max(0, Int(visible.minY.rounded(.down)))
+        let x1 = min(Int(view.width), Int(visible.maxX.rounded(.up)))
+        let y1 = min(Int(view.height), Int(visible.maxY.rounded(.up)))
+        guard x1 > x0, y1 > y0 else { return nil }
+        return (x0, y0, x1 - x0, y1 - y0)
     }
 
     /// `rect` in Metal's normalized device coordinates: (minX, minY, maxX,

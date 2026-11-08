@@ -17,9 +17,9 @@ use super::recovery::{
 };
 use super::{
     acquired, client_connected, frame_budget_for, frame_buffer, heartbeat, idle_heartbeat,
-    keepalive_allowed, keepalive_due, pointer_apart, read_back_image, reconcile_virtual_display,
-    recovery_poll, resolve_target, Acquired, FrameSlot, FrameUse, IdleGate, OutputInfo, RawFrame,
-    ACQUIRE_TIMEOUT_MS, FPS_WINDOW, FRAME_PADDING,
+    keepalive_allowed, keepalive_due, pointer_apart, pointer_in_picture, read_back_image,
+    reconcile_virtual_display, recovery_poll, resolve_target, Acquired, FrameSlot, FrameUse,
+    IdleGate, OutputInfo, RawFrame, ACQUIRE_TIMEOUT_MS, FPS_WINDOW, FRAME_PADDING,
 };
 use crate::control::{CaptureTarget, SharedControl};
 use crate::gpu_preference::Outcome;
@@ -319,7 +319,11 @@ pub fn run_capture_loop(
     // Whether `last_frame` has the pointer drawn in: it has unless the
     // client draws the pointer itself (`SharedControl::client_draws_pointer`).
     let mut last_frame_has_pointer = true;
-    if second_screen {
+    let pointer_in_image = pointer_in_picture(
+        second_screen,
+        shared.vdd_hardware_cursor.load(Ordering::Relaxed),
+    );
+    if pointer_in_image {
         // A position from a mirror before this one would stay drawn.
         shared.pointer.set_position(super::pointer::Position {
             visible: false,
@@ -362,7 +366,7 @@ pub fn run_capture_loop(
         // other client, or none, one with it. The staging texture still
         // holds the last desktop image, so the cached frame is redrawn from
         // it when the connected client's answer differs from the cache's.
-        let draws_pointer = pointer_apart(shared.client_draws_pointer(), second_screen);
+        let draws_pointer = pointer_apart(shared.client_draws_pointer(), pointer_in_image);
         if seen_image && last_frame_has_pointer == draws_pointer {
             let mut pixel_buf = frame_buffer(frame_bytes);
             copy_staging(
@@ -450,8 +454,8 @@ pub fn run_capture_loop(
                     cursor_x = frame_info.PointerPosition.Position.x;
                     cursor_y = frame_info.PointerPosition.Position.y;
                     shared.pointer.set_position(super::pointer::Position {
-                        // The second screen's picture has the pointer in it.
-                        visible: cursor_visible && !second_screen,
+                        // A picture with the pointer in it has none apart.
+                        visible: cursor_visible && !pointer_in_image,
                         x: cursor_x,
                         y: cursor_y,
                         host_time_us: crate::clock::host_now_us(),
@@ -459,7 +463,7 @@ pub fn run_capture_loop(
                 }
                 if frame_info.PointerShapeBufferSize > 0
                     && cursor.update_shape(dupl, frame_info.PointerShapeBufferSize)
-                    && !second_screen
+                    && !pointer_in_image
                 {
                     if let Some(image) = super::pointer::convert_shape(
                         cursor.shape_type,

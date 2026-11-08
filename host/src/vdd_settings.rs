@@ -126,8 +126,33 @@ pub fn render(modes: &[VddMode], gpu: Option<&str>) -> String {
         ));
     }
     xml.push_str("    </resolutions>\n");
+    xml.push_str(CURSOR);
     xml.push_str("</vdd_settings>\n");
     xml
+}
+
+/// The driver's hardware cursor, as its own sample file sets it. Without
+/// `<cursor>` the driver leaves it off, and Windows draws the pointer into
+/// the virtual display's image, so Desktop Duplication has no pointer to
+/// report apart from it and an iPad can't draw it. With it on, the second
+/// screen reports the pointer like any other screen. The driver reads a
+/// missing size as -1, so the whole block is written.
+const CURSOR: &str = "    <cursor>\n        <HardwareCursor>true</HardwareCursor>\n        \
+                      <CursorMaxY>128</CursorMaxY>\n        <CursorMaxX>128</CursorMaxX>\n        \
+                      <AlphaCursorSupport>true</AlphaCursorSupport>\n        \
+                      <XorCursorSupportLevel>2</XorCursorSupportLevel>\n    </cursor>\n";
+
+/// Whether a settings document turns the driver's hardware cursor on, as
+/// the driver reads it: the text of `<HardwareCursor>`, `true` or `1`.
+pub fn hardware_cursor(xml: &str) -> bool {
+    let Some(start) = xml.find("<HardwareCursor>") else {
+        return false;
+    };
+    let rest = &xml[start + "<HardwareCursor>".len()..];
+    let Some(end) = rest.find("</HardwareCursor>") else {
+        return false;
+    };
+    matches!(rest[..end].trim(), "true" | "1")
 }
 
 fn escape(text: &str) -> String {
@@ -792,6 +817,39 @@ mod tests {
              <refresh_rate>120</refresh_rate>"
         ));
         assert!(xml.ends_with("</vdd_settings>\n"));
+        assert!(
+            hardware_cursor(&xml),
+            "the second screen's pointer is reported apart"
+        );
+        assert!(xml.contains(
+            "    <cursor>\n        <HardwareCursor>true</HardwareCursor>\n        \
+             <CursorMaxY>128</CursorMaxY>\n        <CursorMaxX>128</CursorMaxX>\n        \
+             <AlphaCursorSupport>true</AlphaCursorSupport>\n        \
+             <XorCursorSupportLevel>2</XorCursorSupportLevel>\n    </cursor>\n</vdd_settings>"
+        ));
+    }
+
+    /// The driver turns its hardware cursor on only when the file says so;
+    /// a file from before this version, or the vendor's with it off, keeps
+    /// the pointer in the second screen's picture.
+    #[test]
+    fn the_hardware_cursor_is_read_as_the_driver_reads_it() {
+        assert!(!hardware_cursor(VENDOR));
+        let v032 = render(&modes_for_client(1668, 2420, 60), None).replace(CURSOR, "");
+        assert!(!hardware_cursor(&v032));
+        for (text, on) in [
+            ("true", true),
+            (" 1 ", true),
+            ("false", false),
+            ("0", false),
+            ("", false),
+        ] {
+            let xml = format!("<vdd_settings><cursor><HardwareCursor>{text}</HardwareCursor></cursor></vdd_settings>");
+            assert_eq!(hardware_cursor(&xml), on, "{text:?}");
+        }
+        assert!(!hardware_cursor(
+            "<vdd_settings><HardwareCursor>true</vdd_settings>"
+        ));
     }
 
     #[test]
