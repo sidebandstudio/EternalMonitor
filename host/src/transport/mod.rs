@@ -1125,6 +1125,9 @@ async fn act(
         let clamped = state.abr.set_ceiling(ceiling);
         let tunnel_drops =
             (shared.target_addr.lock().link != LinkId::Udp).then(link::tunnel_congestion_drops);
+        state
+            .abr
+            .encoder_reopens(shared.encoder_reopens_for_bitrate.load(Ordering::Relaxed));
         let reported = state.abr.on_report(&report, tunnel_drops, Instant::now());
         let decision = abr::AbrDecision {
             target_bps: reported.target_bps,

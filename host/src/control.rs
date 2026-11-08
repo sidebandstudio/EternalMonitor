@@ -17,6 +17,10 @@ pub struct SharedControl {
     /// always <= `bitrate_bps`. The encoder reopens its session when this
     /// changes for hardware encoders. libx264 reconfigures the open context.
     pub abr_current_bps: Arc<AtomicU32>,
+    /// The open encoder session takes a new bitrate only by reopening (AMF,
+    /// libx265, or a session that refused a change in place), which costs a
+    /// stutter and an IDR, so ABR steps up less often for it.
+    pub encoder_reopens_for_bitrate: Arc<AtomicBool>,
     pub target_fps: Arc<AtomicU32>,
     pub client_preferred_fps: Arc<AtomicU32>,
     pub encoder_input: Arc<Mutex<crate::encoder::input::EncoderInput>>,
@@ -189,6 +193,7 @@ impl SharedControl {
             running: Arc::new(AtomicBool::new(false)),
             bitrate_bps: Arc::new(AtomicU32::new(initial_bitrate_bps)),
             abr_current_bps: Arc::new(AtomicU32::new(initial_bitrate_bps)),
+            encoder_reopens_for_bitrate: Arc::new(AtomicBool::new(false)),
             target_fps: Arc::new(AtomicU32::new(DEFAULT_TARGET_FPS)),
             client_preferred_fps: Arc::new(AtomicU32::new(0)),
             encoder_input: Arc::new(Mutex::new(Default::default())),

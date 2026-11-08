@@ -16,6 +16,16 @@ const LADDER_BPS: [u32; 11] = [
 
 const DOWN_COOLDOWN: Duration = Duration::from_secs(3);
 const UP_COOLDOWN: Duration = Duration::from_secs(15);
+/// The wait after any change before a step up, while the encoder takes a
+/// new bitrate only by reopening (AMF, libx265): each step there costs a
+/// stutter and an IDR. On a link just below the next rung, a step up is
+/// undone by a step down within seconds, so a probe that fails reopens the
+/// encoder twice. A probe undone within [`PROBE_HOLDS`] doubles the wait,
+/// up to [`REOPEN_UP_COOLDOWN_MAX`]; one that holds that long resets it.
+const REOPEN_UP_COOLDOWN: Duration = Duration::from_secs(30);
+const REOPEN_UP_COOLDOWN_MAX: Duration = Duration::from_secs(120);
+/// A step up held this long, with no step down, worked.
+const PROBE_HOLDS: Duration = Duration::from_secs(30);
 /// This long continuously clean before stepping up.
 const CLEAN_WINDOW: Duration = Duration::from_secs(15);
 /// Freeze the controller when reports stop (liveness machinery owns that).
@@ -50,6 +60,11 @@ pub struct AbrController {
     /// Whether the tunnel dropped frames in each of the latest reports,
     /// newest in bit 0.
     tunnel_drop_history: u8,
+    /// The encoder takes a new bitrate only by reopening (see
+    /// [`Self::encoder_reopens`]).
+    encoder_reopens: bool,
+    /// The wait before a step up while it does.
+    reopen_up_cooldown: Duration,
 }
 
 impl AbrController {
@@ -73,6 +88,50 @@ impl AbrController {
             prev_cumulative: None,
             prev_tunnel_drops: None,
             tunnel_drop_history: 0,
+            encoder_reopens: false,
+            reopen_up_cooldown: REOPEN_UP_COOLDOWN,
+        }
+    }
+
+    /// Whether the open encoder session takes a new bitrate only by
+    /// reopening it, as the transport reads it before each report. Then a
+    /// step up waits [`REOPEN_UP_COOLDOWN`] or more after any change instead
+    /// of [`UP_COOLDOWN`]. Steps down are not held: they relieve a link that
+    /// is losing frames.
+    pub fn encoder_reopens(&mut self, reopens: bool) {
+        self.encoder_reopens = reopens;
+    }
+
+    /// The wait after a change before a step up.
+    fn up_cooldown(&self) -> Duration {
+        if self.encoder_reopens {
+            self.reopen_up_cooldown
+        } else {
+            UP_COOLDOWN
+        }
+    }
+
+    /// A step down at `now`. One soon after a step up undoes that probe:
+    /// the next probe waits twice as long, while the encoder reopens.
+    fn note_down(&mut self, now: Instant) {
+        let undoes_probe = matches!(
+            self.last_change,
+            Some((when, false)) if now.duration_since(when) < PROBE_HOLDS
+        );
+        if undoes_probe && self.encoder_reopens {
+            self.reopen_up_cooldown = (self.reopen_up_cooldown * 2).min(REOPEN_UP_COOLDOWN_MAX);
+        }
+        self.last_change = Some((now, true));
+    }
+
+    /// A step up that has held for [`PROBE_HOLDS`] worked: the next waits
+    /// the shortest time again.
+    fn note_probe_held(&mut self, now: Instant) {
+        if matches!(
+            self.last_change,
+            Some((when, false)) if now.duration_since(when) >= PROBE_HOLDS
+        ) {
+            self.reopen_up_cooldown = REOPEN_UP_COOLDOWN;
         }
     }
 
@@ -123,6 +182,7 @@ impl AbrController {
         if !self.enabled {
             return unchanged;
         }
+        self.note_probe_held(now);
 
         // Interval deltas from cumulative counters.
         let (delta_received, delta_lost, delta_repaired) = match self.prev_cumulative {
@@ -200,7 +260,7 @@ impl AbrController {
                         "ABR stepping bitrate down"
                     );
                     self.current_bps = target;
-                    self.last_change = Some((now, true));
+                    self.note_down(now);
                     return AbrDecision {
                         target_bps: target,
                         changed: true,
@@ -220,7 +280,7 @@ impl AbrController {
         {
             let clean_since = *self.clean_since.get_or_insert(now);
             let up_cooldown_over = match self.last_change {
-                Some((when, _)) => now.duration_since(when) >= UP_COOLDOWN,
+                Some((when, _)) => now.duration_since(when) >= self.up_cooldown(),
                 None => true,
             };
             if now.duration_since(clean_since) >= CLEAN_WINDOW && up_cooldown_over {
@@ -278,7 +338,7 @@ impl AbrController {
             "ABR stepping bitrate down"
         );
         self.current_bps = target;
-        self.last_change = Some((now, true));
+        self.note_down(now);
         AbrDecision {
             target_bps: target,
             changed: true,
@@ -674,5 +734,216 @@ mod tests {
         );
         let d = abr.on_send_refused(t0 + Duration::from_millis(3_100));
         assert_eq!((d.target_bps, d.changed), (10_000_000, true));
+    }
+
+    /// Feeds one clean report a second from `from` to `to` (in s from
+    /// `t0`), with counters continuing from `counter`. The changes, as
+    /// (second, target).
+    fn clean_reports(
+        abr: &mut AbrController,
+        t0: Instant,
+        counter: &mut u32,
+        seconds: std::ops::Range<u64>,
+    ) -> Vec<(u64, u32)> {
+        let mut changes = Vec::new();
+        for second in seconds {
+            *counter += 1_000;
+            let d = abr.on_report(
+                &report(*counter, 0, 0),
+                None,
+                t0 + Duration::from_secs(second),
+            );
+            if d.changed {
+                changes.push((second, d.target_bps));
+            }
+        }
+        changes
+    }
+
+    #[test]
+    fn a_step_up_waits_30_s_after_a_change_while_the_encoder_reopens() {
+        // In place: 15 s clean from the first clean report, at 1 s; then a
+        // rung per 15 s. Reopening: 30 s after the change, then a rung per
+        // 30 s.
+        for (reopens, first_up, wait) in [(false, 16, 15), (true, 30, 30)] {
+            let mut abr = AbrController::new(50_000_000, true);
+            abr.encoder_reopens(reopens);
+            let t0 = Instant::now();
+            // Loss steps 15 -> 12 Mbps at 0 s; clean from then on.
+            assert!(abr.on_report(&report(980, 30, 0), None, t0).changed);
+            let mut counter = 980;
+            let changes = clean_reports(&mut abr, t0, &mut counter, 1..80);
+            assert_eq!(changes[0], (first_up, 15_000_000), "reopens={reopens}");
+            // Then one rung per wait, the clean window being shorter.
+            let gaps: Vec<u64> = changes
+                .windows(2)
+                .map(|pair| pair[1].0 - pair[0].0)
+                .collect();
+            assert!(
+                gaps.iter().all(|&gap| gap == wait),
+                "reopens={reopens}: {changes:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_probe_undone_soon_doubles_the_wait_and_one_that_holds_resets_it() {
+        let mut abr = AbrController::new(50_000_000, true);
+        abr.encoder_reopens(true);
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut counter = 0;
+        // Steps down at 0 s, then probes up once the wait is over, and each
+        // probe is lost 4 s later, on a link that cannot carry it.
+        assert!(abr.on_report(&report(980, 30, 0), None, at(0)).changed);
+        let mut downs = vec![0u64];
+        let mut ups = Vec::new();
+        let mut second = 1;
+        while second < 600 {
+            let since_down = second - downs.last().unwrap();
+            let lossy = ups
+                .last()
+                .is_some_and(|&up: &u64| up > *downs.last().unwrap() && second - up == 4);
+            counter += 1_000;
+            let lost = if lossy { 50 } else { 0 };
+            let d = abr.on_report(&report(counter, lost, 0), None, at(second));
+            if d.changed {
+                if lossy {
+                    downs.push(second);
+                } else {
+                    ups.push(second);
+                }
+            }
+            let _ = since_down;
+            second += 1;
+        }
+        let waits: Vec<u64> = ups
+            .iter()
+            .map(|up| up - downs.iter().rev().find(|down| *down < up).unwrap())
+            .collect();
+        assert_eq!(waits, [30, 60, 120, 120, 120, 120], "{ups:?} {downs:?}");
+        // A probe that holds 30 s: the next one waits 30 s again.
+        let mut abr = AbrController::new(50_000_000, true);
+        abr.encoder_reopens(true);
+        assert!(abr.on_report(&report(980, 30, 0), None, at(0)).changed);
+        let mut counter = 980;
+        let ups = clean_reports(&mut abr, t0, &mut counter, 1..31);
+        assert_eq!(ups, [(30, 15_000_000)]);
+        assert!(
+            abr.on_report(&report(counter + 900, 60, 0), None, at(32))
+                .changed
+        );
+        counter += 900;
+        // Undone at 32 s: the wait doubles to 60 s.
+        assert_eq!(clean_reports(&mut abr, t0, &mut counter, 33..95)[0].0, 92);
+        // That probe holds; after 30 s the wait is 30 s again.
+        let ups = clean_reports(&mut abr, t0, &mut counter, 95..160);
+        assert_eq!(ups, [(122, 20_000_000), (152, 25_000_000)]);
+    }
+
+    #[test]
+    fn steps_down_and_in_place_encoders_are_not_held() {
+        // A reopening encoder steps down as before: at once, then 3 s apart.
+        let mut abr = AbrController::new(50_000_000, true);
+        abr.encoder_reopens(true);
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let (mut counter, mut lost) = (0, 0);
+        let mut downs = Vec::new();
+        for ms in (0..10_000).step_by(1_000) {
+            counter += 1_000;
+            lost += 50;
+            if abr
+                .on_report(&report(counter, lost, 0), None, at(ms))
+                .changed
+            {
+                downs.push((ms, abr.current_bps()));
+            }
+        }
+        assert_eq!(
+            downs,
+            [
+                (0, 12_000_000),
+                (3_000, 10_000_000),
+                (6_000, 8_000_000),
+                (9_000, 6_000_000)
+            ]
+        );
+        // A refused send too.
+        let d = abr.on_send_refused(at(12_000));
+        assert_eq!((d.target_bps, d.changed), (4_000_000, true));
+        // An encoder that takes the bitrate in place keeps the 15 s wait:
+        // 15 s clean from the first clean report.
+        abr.encoder_reopens(false);
+        let ups = clean_reports(&mut abr, at(12_000), &mut counter, 1..17);
+        assert_eq!(ups, [(16, 6_000_000)]);
+    }
+
+    /// A link that carries `capacity` bps: each second, the fragments over
+    /// it are lost. `capacity_at` gives it by second. The steps, by second.
+    fn on_a_link(reopens: bool, seconds: u64, capacity_at: impl Fn(u64) -> u32) -> Vec<(u64, u32)> {
+        let mut abr = AbrController::new(50_000_000, true);
+        abr.encoder_reopens(reopens);
+        let t0 = Instant::now();
+        let (mut received, mut lost) = (0u32, 0u32);
+        let mut steps = Vec::new();
+        for second in 0..seconds {
+            let rate = abr.current_bps();
+            let capacity = capacity_at(second);
+            // A fragment a kilobit: rate in kbit per second.
+            let sent = rate / 1_000;
+            let over = rate.saturating_sub(capacity) / 1_000;
+            received += sent - over;
+            lost += over;
+            let d = abr.on_report(
+                &report(received, lost, 0),
+                None,
+                t0 + Duration::from_secs(second),
+            );
+            if d.changed {
+                steps.push((second, d.target_bps));
+            }
+        }
+        steps
+    }
+
+    #[test]
+    fn a_link_just_below_the_next_rung_probes_less_often_while_the_encoder_reopens() {
+        // 11 Mbps: 10 Mbps holds, every probe to 12 Mbps is lost.
+        let minutes = 30;
+        let steady = on_a_link(false, minutes * 60, |_| 11_000_000);
+        let reopening = on_a_link(true, minutes * 60, |_| 11_000_000);
+        let per_minute = |steps: &[(u64, u32)]| steps.len() as f64 / minutes as f64;
+        eprintln!(
+            "steps a minute at 11 Mbps: {:.2} in place, {:.2} reopening",
+            per_minute(&steady),
+            per_minute(&reopening)
+        );
+        // In place: a probe and its undoing every 15 s plus a few.
+        assert!(per_minute(&steady) >= 6.0, "{steady:?}");
+        // Reopening: about one probe and its undoing every 2 minutes once
+        // the wait reaches its cap.
+        assert!(per_minute(&reopening) <= 1.2, "{reopening:?}");
+        // Both settle on 10 Mbps between probes and never stay above the
+        // link.
+        for steps in [&steady, &reopening] {
+            assert!(steps.iter().all(|&(_, bps)| bps <= 12_000_000), "{steps:?}");
+        }
+        // Capacity that comes back: the reopening encoder still climbs, a
+        // rung per 30 s.
+        let recovered = on_a_link(
+            true,
+            400,
+            |second| if second < 60 { 7_000_000 } else { 60_000_000 },
+        );
+        let after: Vec<_> = recovered
+            .iter()
+            .filter(|(second, _)| *second >= 60)
+            .collect();
+        assert_eq!(
+            after.last().map(|(_, bps)| *bps),
+            Some(50_000_000),
+            "{recovered:?}"
+        );
     }
 }

@@ -34,6 +34,7 @@ pub fn log_system_report() {
 
 extern "C" {
     fn eternal_install_ffmpeg_logger(sink: unsafe extern "C" fn(i32, *const libc::c_char));
+    fn eternal_ffmpeg_verbose(wanted: libc::c_int);
 }
 
 /// Install once, before encoder threads start. The C shim owns the platform's va_list ABI.
@@ -45,6 +46,53 @@ pub fn install_ffmpeg_logging() {
 thread_local! {
     /// Set while this thread opens an encoder that is one of several to try.
     static PROBING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// FFmpeg's lines from this thread while it watches them (see
+    /// [`FfmpegWatch`]), verbose ones included.
+    static WATCHED: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Threads watching FFmpeg's verbose lines. The shim forwards them while
+/// any watches; FFmpeg's own level never changes after it is installed.
+static WATCHERS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+
+/// Keeps FFmpeg's lines from this thread, its verbose ones included, from
+/// [`FfmpegWatch::start`] to [`FfmpegWatch::finish`]. Warnings and errors
+/// are logged as always; verbose lines are only kept, never logged. Lines
+/// from other threads meanwhile are not kept, and their verbose lines are
+/// dropped as before.
+pub struct FfmpegWatch(());
+
+impl FfmpegWatch {
+    pub fn start() -> Self {
+        install_ffmpeg_logging();
+        WATCHED.with(|watched| *watched.borrow_mut() = Some(Vec::new()));
+        let mut watchers = WATCHERS.lock().unwrap_or_else(|e| e.into_inner());
+        *watchers += 1;
+        if *watchers == 1 {
+            unsafe { eternal_ffmpeg_verbose(1) };
+        }
+        Self(())
+    }
+
+    /// The lines this thread logged since the watch started.
+    pub fn finish(self) -> Vec<String> {
+        let lines = WATCHED
+            .with(|watched| watched.borrow_mut().take())
+            .unwrap_or_default();
+        drop(self);
+        lines
+    }
+}
+
+impl Drop for FfmpegWatch {
+    fn drop(&mut self) {
+        WATCHED.with(|watched| watched.borrow_mut().take());
+        let mut watchers = WATCHERS.lock().unwrap_or_else(|e| e.into_inner());
+        *watchers = watchers.saturating_sub(1);
+        if *watchers == 0 {
+            unsafe { eternal_ffmpeg_verbose(0) };
+        }
+    }
 }
 
 /// Runs `open`, an encoder open with another encoder to try if it fails,
@@ -72,6 +120,15 @@ unsafe extern "C" fn ffmpeg_message(level: i32, message: *const libc::c_char) {
         let message = unsafe { CStr::from_ptr(message) }.to_string_lossy();
         let message = message.trim();
         if message.is_empty() {
+            return;
+        }
+        WATCHED.with(|watched| {
+            if let Some(lines) = watched.borrow_mut().as_mut() {
+                lines.push(message.to_string());
+            }
+        });
+        // Only a watching thread wants verbose lines (see `FfmpegWatch`).
+        if level > ffmpeg_next::ffi::AV_LOG_WARNING {
             return;
         }
         // `ffmpeg_level` keeps FFmpeg's own level either way.
