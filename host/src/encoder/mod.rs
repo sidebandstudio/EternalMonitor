@@ -7330,6 +7330,11 @@ mod tests {
     #[ignore = "native: needs an NVIDIA GPU"]
     fn a_bitrate_change_after_a_stalled_nvenc_reopen_clears_is_prompt() {
         use std::time::Duration;
+        // As on an NVIDIA card that cannot change its bitrate live: there an
+        // ABR step reopens NVENC, the reopen this test holds.
+        LiveBitrate::NvencReconfig
+            .refused()
+            .store(true, Ordering::Relaxed);
         let mut stage = NativeStage::start();
         // NVENC streams before the ABR step. A first open slower than the
         // first picture's wait streams libx264 until NVENC's session, opened
