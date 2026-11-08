@@ -270,6 +270,9 @@ pub const NOTICE_NONE: u8 = 0;
 /// The PC is locked or shows a permission prompt, so Windows lets nothing
 /// capture its screen and the picture stops until the user returns.
 pub const NOTICE_PC_LOCKED: u8 = 1;
+/// No display is attached to the PC's desktop (a closed lid, screens off or
+/// unplugged), so there is nothing to capture until one comes back.
+pub const NOTICE_NO_DISPLAY: u8 = 2;
 
 /// Host → client, every heartbeat interval while a session is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1560,7 +1563,7 @@ mod tests {
         // A notice is one byte more. Such a body, cut back to the old length
         // as an older iPad reads it, is the plain heartbeat; an unknown value
         // reaches the iPad as it is, for it to ignore.
-        for notice in [NOTICE_PC_LOCKED, 0xC8] {
+        for notice in [NOTICE_PC_LOCKED, NOTICE_NO_DISPLAY, 0xC8] {
             let datagram = encode_control(7, 1, &heartbeat(notice));
             assert_eq!(datagram.len(), plain.len() + 1);
             assert_eq!(datagram[..plain.len()][8..], plain[8..]);

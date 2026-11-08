@@ -159,6 +159,11 @@ struct Proving {
 /// a secure screen or with the displays off don't count.
 const LOSS_LIMIT: u32 = 8;
 
+/// The output a second screen proves itself on: its adapter's LUID and its
+/// device name. A display back under the same name on another adapter is
+/// another display.
+pub(crate) type ProofOutput = (crate::gpu_preference::AdapterId, String);
+
 /// How often [`State::retry_if_back`] asks Windows whether the desktop is
 /// back.
 const DESKTOP_CHECK: Duration = Duration::from_secs(1);
@@ -176,6 +181,15 @@ pub(crate) struct State {
     /// A start is claimed: its Attach is queued or running.
     attaching: bool,
     proving: Option<Proving>,
+    /// The second screen that captured its first image: the capture
+    /// generation and the output. The stage opening that same output again
+    /// in that generation (a recovery reopen) does not prove it again: a new
+    /// proof hid a display gone dark from the watchdog and then fell back
+    /// to the mirror. Another output, a new attachment or a detach seen in
+    /// between clears it, and the display proves itself again.
+    proven: Option<(u64, ProofOutput)>,
+    /// The output the running proof is for, when the reconciliation named it.
+    proving_output: Option<ProofOutput>,
     /// Why the second screen last failed, for the log and the backend.
     failure: Option<&'static str>,
     /// The failure saved for later app runs.
@@ -794,6 +808,50 @@ pub fn note_attached(shared: &SharedControl, device_name: String) {
     let mut state = shared.second_screen.lock();
     state.switch_pending = true;
     state.proving = None;
+    state.proven = None;
+    state.proving_output = None;
+}
+
+/// The managed display was seen off the desktop: one that comes back, even
+/// under the same name, proves itself again.
+pub fn note_detached(shared: &SharedControl) {
+    shared.second_screen.lock().proven = None;
+}
+
+/// A listing of the outputs (see [`super::listing`]): a second screen whose
+/// output it does not show as it was (absent, or its name under another
+/// adapter) proves itself again when it is back, as after
+/// [`note_detached`].
+pub(crate) fn observe_listing(shared: &SharedControl, outputs: &[super::OutputInfo]) {
+    let shows = |(adapter, name): &ProofOutput| {
+        outputs
+            .iter()
+            .any(|output| output.adapter_id == *adapter && &output.device_name == name)
+    };
+    let mut state = shared.second_screen.lock();
+    if state
+        .proven
+        .as_ref()
+        .is_some_and(|(_, output)| !shows(output))
+    {
+        state.proven = None;
+    }
+    if state
+        .proving_output
+        .as_ref()
+        .is_some_and(|output| !shows(output))
+    {
+        state.proving_output = None;
+    }
+}
+
+/// The driver's outputs, judged as every listing is (see
+/// [`observe_listing`]).
+#[cfg(any(windows, test, debug_assertions))]
+fn listed(shared: &SharedControl, driver: &impl Driver) -> Vec<OutputInfo> {
+    let outputs = driver.outputs();
+    observe_listing(shared, &outputs);
+    outputs
 }
 
 /// [`note_attached`], unless the mode changed or quitting began. The mode
@@ -814,7 +872,31 @@ fn note_attached_if_selected(shared: &SharedControl, device_name: String) -> boo
 /// generation after the switch starts the [`PROVE_TIMEOUT`] deadline; a
 /// later one inherits it, and any capture failure, until an image arrives.
 pub fn start_proving(shared: &SharedControl, generation: u64, now: Instant) {
+    start_proving_on(shared, generation, now, None);
+}
+
+/// [`start_proving`] for the second screen on `output`. The generation that
+/// proved that output is not asked again.
+pub(crate) fn start_proving_on(
+    shared: &SharedControl,
+    generation: u64,
+    now: Instant,
+    output: Option<ProofOutput>,
+) {
     let mut state = shared.second_screen.lock();
+    if state.proving.is_none() {
+        let proven = output.as_ref().is_some_and(|output| {
+            state
+                .proven
+                .as_ref()
+                .is_some_and(|(by, on)| *by == generation && on == output)
+        });
+        if proven {
+            return;
+        }
+        state.proven = None;
+    }
+    state.proving_output = output;
     match state.proving.as_mut() {
         // A call the earlier generation still waits on is not this one's,
         // and its guard can no longer clear the flag.
@@ -872,6 +954,10 @@ pub fn note_image(shared: &SharedControl, generation: u64) {
     let mut state = shared.second_screen.lock();
     if let Some(proving) = state.proving.filter(|p| p.generation == generation) {
         state.proving = None;
+        state.proven = state
+            .proving_output
+            .take()
+            .map(|output| (generation, output));
         tracing::info!(
             after_ms = proving.since.elapsed().as_millis() as u64,
             "Second screen captured its first image — streaming it"
@@ -1467,7 +1553,7 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
     }
     // Still on from before (its release saw this start coming): reuse it,
     // with no change to wait for.
-    let outputs = driver.outputs();
+    let outputs = listed(shared, driver);
     let owned = shared.vdd_output.lock().clone();
     if let Some(name) = owned.filter(|name| {
         outputs
@@ -1493,7 +1579,7 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
         }
         driver.sleep(WAIT_STEP);
     }
-    let outputs = driver.outputs();
+    let outputs = listed(shared, driver);
     driver.prepare(&outputs);
     let before: Vec<String> = outputs
         .into_iter()
@@ -1535,7 +1621,7 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
         wait_for_virtual_output(
             &before,
             timeout,
-            || selected().then(|| driver.outputs()),
+            || selected().then(|| listed(shared, driver)),
             || driver.now(),
             |duration| driver.sleep(duration),
         )
@@ -1753,7 +1839,7 @@ impl WindowsDriver<'_> {
 #[cfg(windows)]
 impl Driver for WindowsDriver<'_> {
     fn outputs(&self) -> Vec<OutputInfo> {
-        super::enumerate_outputs()
+        super::listing::outputs(self.shared)
     }
 
     fn prepare(&self, outputs: &[OutputInfo]) {
@@ -1778,7 +1864,12 @@ impl Driver for WindowsDriver<'_> {
 
     fn settle(&self, chosen: OutputInfo) -> OutputInfo {
         let request = self.request.borrow();
-        let chosen = super::settle_vdd_mode(chosen, request.as_ref().and_then(|r| r.mode), || {});
+        let chosen = super::settle_vdd_mode(
+            self.shared,
+            chosen,
+            request.as_ref().and_then(|r| r.mode),
+            || {},
+        );
         let before = request.as_ref().map_or(&[][..], |r| &r.before[..]);
         let render = crate::vdd_snapshot::render_card_now(before);
         info!(
@@ -1906,6 +1997,7 @@ mod tests {
             top: 0,
             is_primary: primary,
             adapter_name: "Test GPU".to_string(),
+            adapter_id: (0, 1),
         }
     }
 
@@ -2582,6 +2674,293 @@ mod tests {
         assert_eq!(remembered_failure(&shared), Some("duplication_failed"));
     }
 
+    /// Review r2 of #205 (P1): a second screen that showed no new image for
+    /// a while after its duplication came back is opened again by the stage.
+    /// Reconciling it again started a new proof: the watchdog skipped its
+    /// missing-frame check while the display proved itself, and 5 s later
+    /// the proof failed back to the mirror. In the generation that proved
+    /// it, it stays proven, so the watchdog judges a display gone dark.
+    #[test]
+    fn a_recovery_reopen_does_not_prove_a_proven_second_screen_again() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let dir = std::env::temp_dir().join(format!(
+            "eternal-capture-recovery-proven-{}",
+            std::process::id()
+        ));
+        let shared = second_screen_selected();
+        let display = fake::FakeDisplay::new(Some(Duration::ZERO), secs(10.0));
+        display.install(&shared, &dir, std::time::SystemTime::now());
+        assert!(Driver::set_enabled(&display, true));
+        connect_viewer(&shared);
+        note_attached(&shared, "virtual".into());
+        let generation = crate::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
+        let streamed = Some(CaptureTarget::Output("virtual".into()));
+        let reconcile =
+            || reconcile_virtual_display(&CaptureTarget::VirtualExtended, &shared, generation);
+        assert_eq!(reconcile(), streamed);
+        assert!(proving(&shared));
+        note_image(&shared, generation);
+        assert!(!proving(&shared));
+        // The loop ended with a reopen; the stage reconciles again.
+        assert_eq!(reconcile(), streamed);
+        assert!(!proving(&shared), "proven in this generation");
+        // Nothing comes from it: the watchdog restarts the pipeline.
+        let mut machine = crate::supervisor::Machine::new(1);
+        let now_ms = 100_000;
+        shared.hb_capture_loop_ms.store(now_ms, Relaxed);
+        shared.hb_capture_frame_ms.store(now_ms - 5_100, Relaxed);
+        shared.hb_encode_frame_ms.store(now_ms - 5_100, Relaxed);
+        let reason = crate::supervisor::wedge_reason_at(&shared, &mut machine, now_ms);
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with("no captured frame")),
+            "{reason:?}"
+        );
+        // The next generation, after that restart, proves it again; so does
+        // a display attached anew.
+        start_proving(&shared, generation.wrapping_add(1), Instant::now());
+        assert!(proving(&shared));
+        note_attached(&shared, "virtual".into());
+        assert_eq!(reconcile(), streamed);
+        assert!(proving(&shared));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A second screen on the fake display, streamed and proven in the
+    /// current generation. Returns the display, its memory folder and the
+    /// generation.
+    fn proven_fake_second_screen(
+        shared: &SharedControl,
+        label: &str,
+    ) -> (fake::FakeDisplay, std::path::PathBuf, u64) {
+        let dir = std::env::temp_dir().join(format!(
+            "eternal-capture-recovery-{label}-{}",
+            std::process::id()
+        ));
+        let display = fake::FakeDisplay::new(Some(Duration::ZERO), secs(10.0));
+        display.install(shared, &dir, std::time::SystemTime::now());
+        assert!(Driver::set_enabled(&display, true));
+        connect_viewer(shared);
+        note_attached(shared, "virtual".into());
+        let generation = crate::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
+        assert_eq!(
+            reconcile_virtual_display(&CaptureTarget::VirtualExtended, shared, generation),
+            Some(CaptureTarget::Output("virtual".into()))
+        );
+        assert!(proving(shared));
+        note_image(shared, generation);
+        assert!(!proving(shared));
+        (display, dir, generation)
+    }
+
+    /// Review r3 of #205: the virtual display came back under the same name
+    /// on another adapter, and capture reopened it. Reconciling matched it by
+    /// name, and the new display skipped its proof: dark, it would have cost
+    /// a watchdog restart. Another adapter is another display.
+    #[test]
+    fn a_virtual_display_back_on_another_adapter_proves_itself_again() {
+        let shared = second_screen_selected();
+        let (display, dir, generation) = proven_fake_second_screen(&shared, "moved-luid");
+        display.move_virtual_display(true);
+        assert_eq!(
+            reconcile_virtual_display(&CaptureTarget::VirtualExtended, &shared, generation),
+            Some(CaptureTarget::Output("virtual".into()))
+        );
+        assert!(proving(&shared), "same name, another adapter");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review r3 of #205: the virtual display left the desktop and came back
+    /// within one generation, without a new attachment from the worker. Seen
+    /// gone by the reconciliation, or by capture's check of its output, it
+    /// proves itself again when it is back.
+    #[test]
+    fn a_virtual_display_detached_and_back_proves_itself_again() {
+        // The reconciliation sees it gone.
+        let shared = second_screen_selected();
+        let (display, dir, generation) = proven_fake_second_screen(&shared, "detached");
+        assert!(Driver::set_enabled(&display, false));
+        assert_eq!(
+            reconcile_virtual_display(&CaptureTarget::VirtualExtended, &shared, generation),
+            Some(CaptureTarget::PrimaryAuto)
+        );
+        assert!(Driver::set_enabled(&display, true));
+        *shared.vdd_status.lock() = VddStatus::Active;
+        assert_eq!(
+            reconcile_virtual_display(&CaptureTarget::VirtualExtended, &shared, generation),
+            Some(CaptureTarget::Output("virtual".into()))
+        );
+        assert!(proving(&shared), "back after a detach");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Capture's check of the duplicated output sees it off the desktop.
+        let shared = second_screen_selected();
+        let (_display, dir, generation) = proven_fake_second_screen(&shared, "detached-capture");
+        note_detached(&shared);
+        assert_eq!(
+            reconcile_virtual_display(&CaptureTarget::VirtualExtended, &shared, generation),
+            Some(CaptureTarget::Output("virtual".into()))
+        );
+        assert!(proving(&shared), "back after a detach capture saw");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review r4 of #205: capture's own description of the output still said
+    /// attached, a re-creation failed, and the listing that followed found
+    /// the virtual display gone. The proof was kept, so the same display back
+    /// before the next reconciliation inherited it. A listing without the
+    /// output as it was clears the proof; one with it keeps the proof.
+    #[test]
+    fn a_listing_without_the_output_makes_it_prove_itself_again() {
+        let shared = second_screen_selected();
+        let (display, dir, generation) = proven_fake_second_screen(&shared, "listing");
+        let target = CaptureTarget::Output("virtual".into());
+        let streamed = Some(target.clone());
+        let current = super::super::listing::outputs(&shared)
+            .into_iter()
+            .find(|output| output.device_name == "virtual")
+            .unwrap();
+        // The output is still there as it was: no move, and the proof stays.
+        let listed = super::super::listing::outputs(&shared);
+        assert!(!super::super::target_moved(&listed, &target, &current));
+        assert_eq!(
+            reconcile_virtual_display(&CaptureTarget::VirtualExtended, &shared, generation),
+            streamed
+        );
+        assert!(!proving(&shared), "the same output, still attached");
+        // The listing finds it gone; it is back, the same, before the stage
+        // reconciles again.
+        assert!(Driver::set_enabled(&display, false));
+        let listed = super::super::listing::outputs(&shared);
+        assert!(super::super::target_moved(&listed, &target, &current));
+        assert!(Driver::set_enabled(&display, true));
+        assert_eq!(
+            reconcile_virtual_display(&CaptureTarget::VirtualExtended, &shared, generation),
+            streamed
+        );
+        assert!(proving(&shared), "back after the listing saw it gone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review r5 of #205: reconciliation saw the proven display attached, the
+    /// reopen's first listing saw no output at all (no_output_listed), and
+    /// the same display was back before the next reconciliation. Neither
+    /// that path nor the stage's error handling cleared the proof. Every
+    /// listing goes through the judge now: the one capture opens from, the
+    /// no-display wait's, and the driver's.
+    #[test]
+    fn a_reopen_listing_with_no_outputs_makes_it_prove_itself_again() {
+        // What the reopen's DXGI listing hands the judge: nothing attached.
+        let shared = second_screen_selected();
+        let (_display, dir, generation) = proven_fake_second_screen(&shared, "no-outputs");
+        observe_listing(&shared, &[]);
+        assert_eq!(
+            reconcile_virtual_display(&CaptureTarget::VirtualExtended, &shared, generation),
+            Some(CaptureTarget::Output("virtual".into()))
+        );
+        assert!(proving(&shared), "back after a listing with no outputs");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Each listing entry point, with the display gone while it lists.
+        type Look = fn(&SharedControl);
+        let looks: [(&str, Look); 2] = [
+            ("outputs", |shared| {
+                super::super::listing::outputs(shared);
+            }),
+            ("any_attached", |shared| {
+                super::super::listing::any_attached(shared);
+            }),
+        ];
+        for (name, look) in looks {
+            let shared = second_screen_selected();
+            let (display, dir, generation) = proven_fake_second_screen(&shared, name);
+            assert!(Driver::set_enabled(&display, false));
+            look(&shared);
+            assert!(Driver::set_enabled(&display, true));
+            assert_eq!(
+                reconcile_virtual_display(&CaptureTarget::VirtualExtended, &shared, generation),
+                Some(CaptureTarget::Output("virtual".into())),
+                "{name}"
+            );
+            assert!(proving(&shared), "{name}: back before reconciling");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        // The worker's listing through its driver.
+        let shared = second_screen_selected();
+        let (display, dir, generation) = proven_fake_second_screen(&shared, "worker");
+        assert!(Driver::set_enabled(&display, false));
+        listed(&shared, &display);
+        assert!(Driver::set_enabled(&display, true));
+        assert_eq!(
+            reconcile_virtual_display(&CaptureTarget::VirtualExtended, &shared, generation),
+            Some(CaptureTarget::Output("virtual".into()))
+        );
+        assert!(proving(&shared), "worker: back before reconciling");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // A listing that still shows it keeps the proof, whichever lists.
+        let shared = second_screen_selected();
+        let (display, dir, generation) = proven_fake_second_screen(&shared, "kept");
+        super::super::listing::outputs(&shared);
+        super::super::listing::any_attached(&shared);
+        listed(&shared, &display);
+        assert_eq!(
+            reconcile_virtual_display(&CaptureTarget::VirtualExtended, &shared, generation),
+            Some(CaptureTarget::Output("virtual".into()))
+        );
+        assert!(!proving(&shared), "still attached throughout");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review r3 of #205: the same output reopened in the generation that
+    /// proved it keeps its proof, so a display gone dark reaches the
+    /// watchdog (see the test above for the restart itself).
+    #[test]
+    fn a_reopen_of_the_same_output_keeps_its_proof() {
+        let shared = second_screen_selected();
+        let (_display, dir, generation) = proven_fake_second_screen(&shared, "same-output");
+        for _ in 0..3 {
+            assert_eq!(
+                reconcile_virtual_display(&CaptureTarget::VirtualExtended, &shared, generation),
+                Some(CaptureTarget::Output("virtual".into()))
+            );
+            assert!(!proving(&shared));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review r2 of #205 (P2): a display that moved during the first proof
+    /// ends the capture loop with a reopen, and the stage noted it as a
+    /// capture error: the proof failed, and the second screen went back to
+    /// the mirror at once. A reopen keeps the proof, its deadline and the
+    /// interruption.
+    #[test]
+    fn a_reopen_during_the_first_proof_keeps_it_going() {
+        let start = Instant::now();
+        let shared = second_screen_selected();
+        connect_viewer(&shared);
+        note_attached(&shared, "virtual".into());
+        assert_eq!(next_step(&shared, start), Step::Switch);
+        start_proving(&shared, 7, start);
+        let reopen = crate::capture::recovery::Reopen {
+            detail: "the display layout changed".into(),
+        };
+        super::super::note_stage_error(&shared, 7, &reopen);
+        let proving = shared.second_screen.lock().proving.unwrap();
+        assert!(proving.interrupted && !proving.capture_failed);
+        assert_eq!(proving.since, start);
+        assert_eq!(next_step(&shared, start + secs(4.9)), Step::Nothing);
+        // Any other capture error still ends the proof at once.
+        let failed = std::io::Error::other("DuplicateOutput failed");
+        super::super::note_stage_error(&shared, 7, &failed);
+        assert_eq!(
+            next_step(&shared, start + secs(4.9)),
+            Step::Fallback("duplication_failed")
+        );
+    }
+
     #[test]
     fn a_second_screen_that_shows_an_image_stays() {
         let shared = second_screen_selected();
@@ -2770,7 +3149,7 @@ mod tests {
     fn the_watchdog_leaves_a_second_screen_proving_itself_alone() {
         let shared = second_screen_selected();
         connect_viewer(&shared);
-        let machine = crate::supervisor::Machine::new(1);
+        let mut machine = crate::supervisor::Machine::new(1);
         let now_ms = 100_000;
         shared.hb_capture_loop_ms.store(now_ms, Ordering::Relaxed);
         shared
@@ -2782,12 +3161,12 @@ mod tests {
         note_attached(&shared, "virtual".into());
         start_proving(&shared, 7, Instant::now());
         assert_eq!(
-            crate::supervisor::wedge_reason_at(&shared, &machine, now_ms),
+            crate::supervisor::wedge_reason_at(&shared, &mut machine, now_ms),
             None
         );
         // After its first image a stalled second screen is a wedge again.
         note_image(&shared, 7);
-        assert!(crate::supervisor::wedge_reason_at(&shared, &machine, now_ms).is_some());
+        assert!(crate::supervisor::wedge_reason_at(&shared, &mut machine, now_ms).is_some());
     }
 
     /// Review round 2, defect 1: when no tick ended the proof before the

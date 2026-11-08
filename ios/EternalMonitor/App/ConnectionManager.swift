@@ -119,6 +119,9 @@ final class ConnectionManager: ObservableObject {
     /// The PC is locked or shows a permission prompt, so it can't capture and
     /// the picture is held. Its heartbeats say so until capture works again.
     @Published var pcLocked = false
+    /// The PC has no display turned on, so there is nothing to capture and
+    /// the picture is held. Its heartbeats say so until one comes back.
+    @Published var pcNoDisplay = false
     /// Nonzero while an automatic reconnect cycle is running.
     @Published private(set) var reconnectAttempt = 0
 
@@ -450,6 +453,7 @@ final class ConnectionManager: ObservableObject {
         versionMismatch = nil
         signalLost = false
         pcLocked = false
+        pcNoDisplay = false
         degradedSinceUs = nil
         prevCounters = FrameAssembler.Counters()
         diagnostics.removeAll()
@@ -841,6 +845,11 @@ final class ConnectionManager: ObservableObject {
                 if locked != self.pcLocked {
                     self.pcLocked = locked
                     self.record(.info, "ctrl", locked ? "PC locked: holding the picture" : "PC unlocked")
+                }
+                let noDisplay = heartbeat.notice == Heartbeat.noticeNoDisplay
+                if noDisplay != self.pcNoDisplay {
+                    self.pcNoDisplay = noDisplay
+                    self.record(.info, "ctrl", noDisplay ? "PC has no active display: holding the picture" : "PC display back")
                 }
             }
         }
@@ -1508,6 +1517,7 @@ final class ConnectionManager: ObservableObject {
         signalLost = false
         pictureRestoring = false
         pcLocked = false
+        pcNoDisplay = false
         degradedSinceUs = nil
         prevCounters = FrameAssembler.Counters()
         hostInfo = nil

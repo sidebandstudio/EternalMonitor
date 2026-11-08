@@ -44,7 +44,7 @@ use tracing::{info, warn};
 
 use crate::autostart::{first_lan_ipv4, read_startup_registry, set_startup_registry};
 use crate::capture::recovery::CaptureBlock;
-use crate::capture::{enumerate_outputs, OutputInfo};
+use crate::capture::{listing, OutputInfo};
 use crate::control::{CaptureTarget, GuiControl};
 use crate::gpu_preference::{Change, Preference, SwitchRecord};
 use crate::handoff::Handoff;
@@ -366,7 +366,9 @@ pub struct AnalyzerApp {
     update_refused: bool,
     history: History,
     quality: QualityMeter,
-    logo: Option<(f32, egui::TextureHandle)>,
+    /// The logo for a scale and the window renderer's device it was made
+    /// on: textures go with a lost device.
+    logo: Option<(f32, u64, egui::TextureHandle)>,
     /// The saved language choice (see `i18n::resolve`).
     settings_language: Option<String>,
     /// A language whose fonts were just installed; it shows from the next
@@ -444,7 +446,7 @@ impl AnalyzerApp {
                 String::new()
             }
         };
-        let available_outputs = enumerate_outputs();
+        let available_outputs = listing::outputs(&control.shared);
 
         // Same model as encoder_override: push the persisted preference into
         // SharedControl so the encoder honours it without a restart.
@@ -710,7 +712,7 @@ impl AnalyzerApp {
     }
 
     fn refresh_outputs(&mut self) {
-        self.available_outputs = enumerate_outputs();
+        self.available_outputs = listing::outputs(&self.control.shared);
         info!(
             count = self.available_outputs.len(),
             "Re-enumerated display outputs"
@@ -1088,8 +1090,9 @@ impl eframe::App for AnalyzerApp {
         CANVAS.to_normalized_gamma_f32()
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         renderer::frame_started(ui.ctx());
+        renderer::release_render_state(frame);
         crate::startup::simulate_window_failure();
         let ctx = ui.ctx().clone();
         if let Some(language) = self.pending_language.take() {
@@ -1284,14 +1287,19 @@ impl AnalyzerApp {
     fn draw_brand(&mut self, ui: &mut egui::Ui) {
         const LOGO: f32 = 30.0;
         let ppp = ui.ctx().pixels_per_point();
-        if self.logo.as_ref().is_none_or(|(scale, _)| *scale != ppp) {
+        let device = renderer::devices();
+        if self
+            .logo
+            .as_ref()
+            .is_none_or(|(scale, made_on, _)| (*scale, *made_on) != (ppp, device))
+        {
             let pixels = (LOGO * ppp).round().max(1.0) as usize;
-            self.logo = logo_texture(ui.ctx(), pixels).map(|texture| (ppp, texture));
+            self.logo = logo_texture(ui.ctx(), pixels).map(|texture| (ppp, device, texture));
         }
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
             let (rect, _) = ui.allocate_exact_size(vec2(LOGO, LOGO), Sense::hover());
-            if let Some((_, texture)) = &self.logo {
+            if let Some((_, _, texture)) = &self.logo {
                 ui.painter().image(
                     texture.id(),
                     rect,
