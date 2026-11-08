@@ -364,6 +364,10 @@ struct Heartbeat: Equatable {
     /// The same in Second screen mode, after the second screen failed to
     /// start: the main screen it fell back to can't be captured either.
     static let noticeSecondScreenUnsupportedGPU: UInt8 = 4
+    /// The PC is restarting its stream and keeps this session: the picture
+    /// comes back by itself. Sent only to an iPad that sets
+    /// `Hello2.featureStandbyStatus`. (3 and 4 are the graphics card notices.)
+    static let noticeRestarting: UInt8 = 5
     /// The video frames the PC sent this session, from a PC that offered
     /// `HelloAck.hostCapMediaSize`; nil from others. Appended after
     /// `notice`, which is then always written.
