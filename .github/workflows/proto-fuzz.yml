@@ -1,13 +1,15 @@
 name: Proto fuzz
 
-# Builds the cargo-fuzz targets in proto/fuzz and runs each one briefly.
-# Longer runs happen locally; this keeps the targets compiling and catches
-# shallow crashes on every change to proto.
+# Builds the cargo-fuzz targets in proto/fuzz (the v3 protocol and the
+# credential store) and runs each one briefly. Longer runs happen locally;
+# this keeps the targets compiling and catches shallow crashes on every
+# change to either crate.
 
 on:
   pull_request:
     paths:
       - "proto/**"
+      - "credstore/**"
       - ".github/workflows/proto-fuzz.yml"
   workflow_dispatch:
 
@@ -47,7 +49,7 @@ jobs:
         # uploaded. A crash is reported by target name only.
         run: |
           set -uo pipefail
-          targets="v3_handshake v3_parsers v3_record_open v3_replay_window v3_session_sim"
+          targets="credstore_formats credstore_ops v3_handshake v3_parsers v3_record_open v3_replay_window v3_session_sim"
           listed=$(cargo "+$FUZZ_TOOLCHAIN" fuzz list | sort | tr '\n' ' ' | sed 's/ $//')
           if [ "$listed" != "$targets" ]; then
             echo "::error::fuzz targets are '$listed', expected '$targets'"
@@ -57,7 +59,7 @@ jobs:
           for target in $targets; do
             sanitizer=address
             # Safe Rust only; it runs far faster without the sanitizer.
-            if [ "$target" = v3_session_sim ]; then sanitizer=none; fi
+            case "$target" in v3_session_sim | credstore_ops) sanitizer=none ;; esac
             log="$RUNNER_TEMP/fuzz-$target.log"
             if cargo "+$FUZZ_TOOLCHAIN" fuzz run -s "$sanitizer" "$target" -- -max_total_time=30 > "$log" 2>&1; then
               echo "$target: $(grep -E '^Done [0-9]+ runs' "$log" || echo 'finished')"

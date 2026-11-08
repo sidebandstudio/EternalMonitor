@@ -1,0 +1,36 @@
+[package]
+name = "eternal-credstore"
+# The v3 host credential store. Not wired into any shipped build yet.
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[features]
+# In-memory disk and keyring that can crash at any call, for tests and fuzz
+# targets. Never enabled by the host or any shipped build.
+test-hooks = ["eternal-wire/test-hooks"]
+
+[dependencies]
+eternal-wire = { path = "../proto" }
+ring = "0.17"
+zeroize = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = { version = "3", features = ["OSX_10_15"] }
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58"
+features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Registry",
+]
+
+[dev-dependencies]
+eternal-credstore = { path = ".", features = ["test-hooks"] }
+
+[[example]]
+name = "credstore_bench"
+required-features = ["test-hooks"]

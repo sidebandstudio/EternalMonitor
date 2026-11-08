@@ -25,9 +25,9 @@ jobs:
         run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - uses: Swatinem/rust-cache@v2
       - name: Check formatting
-        run: cargo fmt --check -p eternal-wire
+        run: cargo fmt --check -p eternal-wire -p eternal-credstore
       - name: Test pure crates
-        run: cargo test -p eternal-wire --locked
+        run: cargo test -p eternal-wire -p eternal-credstore --locked
 
   rust-windows:
     name: Rust (windows, full host)
