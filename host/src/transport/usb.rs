@@ -17,7 +17,7 @@ use super::apple_usb::{self, AppleUsbState};
 use super::congestion::{is_no_buffer_space, SendCongestion};
 use super::link::{FramedLink, Link, LinkId, PeerId, UdpLink};
 use super::usbmuxd::{self, BoxedTunnel, Client};
-use crate::stats::PIPELINE_STATS;
+use crate::stats::{PipelineStats, PIPELINE_STATS};
 
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static HUB: OnceLock<UsbHub> = OnceLock::new();
@@ -494,7 +494,22 @@ async fn supervise(events: mpsc::Sender<UsbEvent>, force_idr: Arc<AtomicBool>) {
     }
 
     let client = Arc::new(Client::new(usbmuxd::Endpoint::default()));
-    supervise_devices(client, events, force_idr).await;
+    let mut poll = tokio::time::interval(Duration::from_secs(2));
+    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    supervise_devices(client, events, force_idr, &PIPELINE_STATS, poll).await;
+}
+
+/// When the supervisor polls Apple's device list next, and the time it
+/// judges that poll by.
+trait PollClock {
+    fn next(&mut self) -> impl std::future::Future<Output = tokio::time::Instant> + Send;
+}
+
+impl PollClock for tokio::time::Interval {
+    async fn next(&mut self) -> tokio::time::Instant {
+        self.tick().await;
+        tokio::time::Instant::now()
+    }
 }
 
 /// How long Apple's device list may keep failing before the service counts
@@ -546,31 +561,35 @@ impl ListFailures {
     }
 }
 
+/// Polls Apple's device list and runs a worker for each listed device. What
+/// a poll finds goes to `stats`, which the PC window reads.
 async fn supervise_devices(
     client: Arc<Client>,
     events: mpsc::Sender<UsbEvent>,
     force_idr: Arc<AtomicBool>,
+    stats: &Mutex<PipelineStats>,
+    mut poll: impl PollClock,
 ) {
     let mut workers = JoinSet::new();
     let mut handles: HashMap<u32, AbortHandle> = HashMap::new();
-    let mut poll = tokio::time::interval(Duration::from_secs(2));
-    poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut unreachable = AppleUsbState::default();
     let mut failures = ListFailures::default();
     loop {
         tokio::select! {
-            _ = poll.tick() => {
+            now = poll.next() => {
                 let devices = client.list_devices().await;
                 let available = devices.is_ok();
                 let devices = devices.unwrap_or_default();
-                let ids: HashSet<_> = if failures.keep_workers(available, handles.len(), tokio::time::Instant::now()) {
+                let kept = failures.keep_workers(available, handles.len(), now);
+                let ids: HashSet<_> = if kept {
                     handles.keys().copied().collect()
                 } else {
                     devices.iter().map(|device| device.device_id).collect()
                 };
                 // Without the service the cable is invisible to us; ask
                 // Windows whether an iPad is attached so the GUI can say why.
-                let cabled = if available {
+                // A poll that keeps the tunnels shows nothing new: they work.
+                let cabled = if available || kept {
                     AppleUsbState::default()
                 } else {
                     tokio::task::spawn_blocking(apple_usb::probe).await.unwrap_or_default()
@@ -583,8 +602,8 @@ async fn supervise_devices(
                     }
                 }
                 unreachable = cabled;
-                {
-                    let mut stats = PIPELINE_STATS.lock();
+                if !kept {
+                    let mut stats = stats.lock();
                     stats.usb_service_reachable = available;
                     stats.usb_devices = devices.len();
                     stats.usb_cabled_devices = cabled.cabled_devices;
@@ -719,8 +738,6 @@ mod tests {
     /// Connect's stream to the test as that iPad's end of a tunnel.
     struct FlakyService {
         failing: Arc<AtomicBool>,
-        fail_next: Arc<std::sync::atomic::AtomicU32>,
-        listed: Arc<AtomicU64>,
         failed: Arc<AtomicU64>,
         tunnels: mpsc::Receiver<tokio::net::TcpStream>,
         client: Arc<Client>,
@@ -728,25 +745,18 @@ mod tests {
 
     impl FlakyService {
         async fn start() -> Self {
-            use std::sync::atomic::AtomicU32;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let client = Arc::new(Client::new(usbmuxd::Endpoint::Tcp(
                 listener.local_addr().unwrap(),
             )));
             let failing = Arc::new(AtomicBool::new(false));
-            let fail_next = Arc::new(AtomicU32::new(0));
-            let (listed, failed) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+            let failed = Arc::new(AtomicU64::new(0));
             let (tunnel_tx, tunnels) = mpsc::channel(4);
-            let state = (
-                failing.clone(),
-                fail_next.clone(),
-                listed.clone(),
-                failed.clone(),
-            );
+            let state = (failing.clone(), failed.clone());
             tokio::spawn(async move {
                 loop {
                     let (mut stream, _) = listener.accept().await.unwrap();
-                    let (failing, fail_next, listed, failed) = state.clone();
+                    let (failing, failed) = state.clone();
                     let tunnel_tx = tunnel_tx.clone();
                     tokio::spawn(async move {
                         let (tag, request) = usbmuxd::read_message(&mut stream).await.unwrap();
@@ -755,16 +765,10 @@ mod tests {
                             .unwrap()
                             .to_string();
                         let reply = if kind == "ListDevices" {
-                            let once = fail_next
-                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                                    n.checked_sub(1)
-                                })
-                                .is_ok();
-                            if once || failing.load(Ordering::SeqCst) {
+                            if failing.load(Ordering::SeqCst) {
                                 failed.fetch_add(1, Ordering::SeqCst);
                                 return;
                             }
-                            listed.fetch_add(1, Ordering::SeqCst);
                             let device = plist::Dictionary::from_iter([
                                 ("DeviceID".to_string(), plist::Value::from(3u64)),
                                 (
@@ -798,8 +802,6 @@ mod tests {
             });
             Self {
                 failing,
-                fail_next,
-                listed,
                 failed,
                 tunnels,
                 client,
@@ -815,61 +817,121 @@ mod tests {
             super::super::link::read_preamble(&mut ipad).await.unwrap();
             ipad
         }
+    }
 
-        async fn until(&self, what: &str, done: impl Fn(&Self) -> bool) {
-            tokio::time::timeout(Duration::from_secs(30), async {
-                while !done(self) {
-                    tokio::time::sleep(Duration::from_millis(20)).await;
-                }
-            })
-            .await
-            .unwrap_or_else(|_| panic!("{what}"));
+    /// Poll times a test hands the supervisor one at a time. It hears when
+    /// each poll has finished: the supervisor asks for the next one.
+    struct Polls {
+        finished: mpsc::Sender<()>,
+        at: mpsc::Receiver<tokio::time::Instant>,
+    }
+
+    impl PollClock for Polls {
+        async fn next(&mut self) -> tokio::time::Instant {
+            let _ = self.finished.send(()).await;
+            self.at.recv().await.expect("the test's next poll")
+        }
+    }
+
+    /// The test's side of [`Polls`].
+    struct Poller {
+        at: mpsc::Sender<tokio::time::Instant>,
+        polled: mpsc::Receiver<()>,
+        start: tokio::time::Instant,
+    }
+
+    impl Poller {
+        /// Polls `secs` after the start, and returns once that poll has
+        /// finished.
+        async fn poll(&mut self, secs: u64) {
+            let at = self.start + Duration::from_secs(secs);
+            self.at.send(at).await.unwrap();
+            self.polled.recv().await.unwrap();
         }
     }
 
     /// A device list that fails once leaves the live tunnel open; one that
-    /// keeps failing closes it after [`LIST_OUTAGE`], and once the list
-    /// answers again the iPad gets a new tunnel. A single failed list used
-    /// to close the tunnel at once.
+    /// keeps failing closes it once the failures have lasted
+    /// [`LIST_OUTAGE`], and once the list answers again the iPad gets a new
+    /// tunnel. While the tunnel is kept, the PC window goes on showing USB
+    /// as it was, not "Open Apple Devices". A single failed list used to
+    /// close the tunnel at once. Each poll's time is the test's, so how the
+    /// machine schedules the test changes nothing.
     #[tokio::test]
     async fn a_failed_device_list_keeps_the_tunnel_until_the_service_is_down() {
         let mut service = FlakyService::start().await;
+        let stats: &'static Mutex<PipelineStats> =
+            Box::leak(Box::new(Mutex::new(PipelineStats::default())));
+        let (finished, mut polled) = mpsc::channel(1);
+        let (at, polls) = mpsc::channel(1);
         let (events, mut opened) = mpsc::channel(4);
         let supervisor = tokio::spawn(supervise_devices(
             Arc::clone(&service.client),
             events,
             Arc::new(AtomicBool::new(false)),
+            stats,
+            Polls {
+                finished,
+                at: polls,
+            },
         ));
+        polled.recv().await.unwrap();
+        let mut poller = Poller {
+            at,
+            polled,
+            start: tokio::time::Instant::now(),
+        };
+        let shown = || {
+            let stats = stats.lock();
+            (
+                stats.usb_service_reachable,
+                stats.usb_devices,
+                stats.usb_link_state.clone(),
+            )
+        };
+        let streaming = (true, 1, "Waiting for the iPad app".to_string());
+
+        poller.poll(0).await;
         let _ipad = service.tunnel().await;
         let first = opened.recv().await.unwrap();
+        assert_eq!(shown(), streaming);
 
-        service.fail_next.store(1, Ordering::SeqCst);
-        let listed = service.listed.load(Ordering::SeqCst);
-        service
-            .until("a failed list, then a good one", |service| {
-                service.failed.load(Ordering::SeqCst) == 1
-                    && service.listed.load(Ordering::SeqCst) > listed + 1
-            })
-            .await;
+        // One failed list between good ones.
+        service.failing.store(true, Ordering::SeqCst);
+        poller.poll(2).await;
+        assert_eq!(service.failed.load(Ordering::SeqCst), 1);
         assert!(!first.link.is_closed(), "one failed list closed the tunnel");
+        assert_eq!(shown(), streaming, "a kept tunnel shown as unavailable");
+        service.failing.store(false, Ordering::SeqCst);
+        poller.poll(4).await;
+        assert!(!first.link.is_closed());
         assert!(service.tunnels.try_recv().is_err(), "a second tunnel");
 
+        // Failures in a row: kept until they have lasted the outage.
         service.failing.store(true, Ordering::SeqCst);
-        let failing_from = tokio::time::Instant::now();
+        for secs in [6, 8, 10, 12, 14] {
+            poller.poll(secs).await;
+            assert!(!first.link.is_closed(), "closed at {secs} s");
+            assert_eq!(shown(), streaming, "at {secs} s");
+        }
+        poller.poll(16).await;
         let mut closed = first.link.closed_signal();
-        tokio::time::timeout(Duration::from_secs(30), closed.wait_for(|closed| *closed))
+        tokio::time::timeout(Duration::from_secs(20), closed.wait_for(|closed| *closed))
             .await
             .expect("the tunnel closes once the service is down")
             .unwrap();
-        let failing_for = failing_from.elapsed();
-        assert!(failing_for >= LIST_OUTAGE, "{failing_for:?}");
-        assert!(service.failed.load(Ordering::SeqCst) >= 6);
+        assert_eq!(
+            shown(),
+            (false, 0, "Apple device service unavailable".to_string())
+        );
 
         service.failing.store(false, Ordering::SeqCst);
+        poller.poll(18).await;
         let _ipad = service.tunnel().await;
         let second = opened.recv().await.unwrap();
         assert!(second.generation > first.generation);
         assert!(!second.link.is_closed());
+        assert_eq!(shown(), streaming);
         supervisor.abort();
     }
 }
