@@ -8,16 +8,22 @@
 //!
 //! It can't leave the PC worse off than before. Setup deletes every rule
 //! for the exe, then adds its Allow rule; deletions with no add after them
-//! could lose rules that worked. The fix is narrower ([`fix_rules`]):
+//! could lose rules that worked. The fix is narrower ([`fix_rules`]), and
+//! judges every step as the Stream page's verdict does
+//! ([`crate::firewall::judge`]), on the networks in use now:
 //!
-//! 1. It adds the installer's Allow rule, unless one that works is there.
-//!    It does this first, so a failure here changes nothing.
-//! 2. It removes only this exe's own Block rules that reach the stream
-//!    port with no other scope: the rules the Stream page's verdict counts.
-//!    Removing a Block rule never stops anything that worked. Allow rules,
-//!    scoped rules and other programs' rules stay as they are.
-//! 3. It reads the rules again and fails unless the Allow rule is there and
-//!    none of those Block rules is left.
+//! 1. Unless the exe would be allowed on every network in use once its
+//!    blocks are gone, it adds the installer's Allow rule, first, so a
+//!    failure here changes nothing. An Allow rule the user made, however
+//!    narrow, that already covers those networks means no add.
+//! 2. It removes only this exe's own enabled Block rules that reach the
+//!    stream port with no other scope, on a network in use: the blocks the
+//!    verdict counts. Each is renamed to a fresh name, then removed by that
+//!    name, so no other rule can go with it. Removing a Block rule never
+//!    stops anything that worked. Allow rules, scoped rules, blocks for
+//!    networks not in use and other programs' rules stay as they are.
+//! 3. It reads everything again and fails unless the verdict now finds the
+//!    exe allowed, and not blocked by its own rule, on every network in use.
 //!
 //! The exe's path comes from the elevated process itself, and the port is
 //! only ever a number. A user who answers No to the Windows prompt changes
@@ -26,7 +32,7 @@
 
 use std::path::Path;
 
-use crate::firewall::{reach, Reach, Rule, DOMAIN, PRIVATE, PUBLIC};
+use crate::firewall::{judge, reach, Profile, Reach, Rule, Verdict, DOMAIN, PRIVATE, PUBLIC};
 
 /// The argument the elevated copy runs with, before the stream's port.
 pub const FIX_ARG: &str = "--fix-firewall";
@@ -36,22 +42,26 @@ pub const FIX_ARG: &str = "--fix-firewall";
 pub const ALLOW_NAME: &str = "EternalMonitor Host UDP";
 pub const ALLOW_PROFILES: u32 = DOMAIN | PRIVATE | PUBLIC;
 
-/// A firewall rule with its name. `rule` is None for an outbound rule.
+/// A firewall rule as the last read found it. `id` names it for
+/// [`RuleStore::remove`] until the next read. `rule` is None for an
+/// outbound rule.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Named {
-    pub name: String,
+pub struct Found {
+    pub id: usize,
     pub rule: Option<Rule>,
 }
 
 /// The firewall, as the elevated copy changes it. The real one is the
 /// Windows Firewall COM interface; tests fake it.
 pub trait RuleStore {
+    /// The profiles of the networks in use now.
+    fn profiles(&mut self) -> Result<Vec<Profile>, String>;
     /// Every rule, in any direction.
-    fn rules(&mut self) -> Result<Vec<Named>, String>;
+    fn rules(&mut self) -> Result<Vec<Found>, String>;
     /// Adds the installer's Allow rule for `exe`.
     fn add_allow(&mut self, exe: &str) -> Result<(), String>;
-    /// Removes the rule named `name`.
-    fn remove(&mut self, name: &str) -> Result<(), String>;
+    /// Removes the rule the last read found as `id`, and no other.
+    fn remove(&mut self, id: usize) -> Result<(), String>;
 }
 
 /// Why the fix failed, as the elevated copy's exit code.
@@ -59,16 +69,14 @@ pub trait RuleStore {
 pub enum Failure {
     /// The copy got no usable path or port.
     Arguments = 3,
-    /// The rules couldn't be read.
+    /// The rules or the networks in use couldn't be read.
     Read = 10,
     /// The Allow rule couldn't be added. Nothing was changed.
     Add = 11,
     /// A Block rule couldn't be removed.
     Remove = 12,
-    /// A Block rule shares its name with another rule, so removing it by
-    /// name could remove that one too. It was left.
-    SharedName = 13,
-    /// Read again, a Block rule is still there, or the Allow rule isn't.
+    /// Read again, the verdict still finds the exe blocked by its own rule,
+    /// or not allowed, on a network in use.
     StillBlocked = 14,
 }
 
@@ -78,31 +86,50 @@ impl Failure {
     }
 }
 
-fn ours(rule: &Rule, exe: &Path) -> bool {
-    crate::firewall::ours(rule, exe, |name| std::env::var(name).ok())
+fn env(name: &str) -> Option<String> {
+    std::env::var(name).ok()
 }
 
-/// This exe's own Block rules that reach every datagram to `port`: what
-/// the verdict counts as a block, and all the fix removes.
-fn is_block(rule: &Rule, exe: &Path, port: u16) -> bool {
-    !rule.allow && rule.enabled && rule.udp && ours(rule, exe) && reach(rule, port) == Reach::All
+/// The bits of the profiles in use with Windows Firewall on: where the
+/// verdict counts rules.
+fn in_use(profiles: &[Profile]) -> u32 {
+    profiles
+        .iter()
+        .filter(|profile| profile.on)
+        .map(|profile| profile.bit)
+        .sum()
 }
 
-/// An Allow rule that lets every datagram to `port` through on every
-/// profile, as the installer's does.
-fn is_working_allow(rule: &Rule, exe: &Path, port: u16) -> bool {
-    rule.allow
+/// This exe's own Block rules the verdict counts: enabled, reaching every
+/// datagram to `port`, on a network in use. All the fix removes.
+fn is_target(rule: &Rule, exe: &Path, port: u16, in_use: u32) -> bool {
+    !rule.allow
         && rule.enabled
         && rule.udp
-        && rule.profiles & ALLOW_PROFILES == ALLOW_PROFILES
-        && ours(rule, exe)
+        && rule.profiles & in_use != 0
+        && crate::firewall::ours(rule, exe, env)
         && reach(rule, port) == Reach::All
 }
 
-fn inbound(rules: &[Named]) -> impl Iterator<Item = (&str, &Rule)> {
-    rules
+/// Whether the verdict on `rules` finds the exe allowed, and not blocked by
+/// its own rule, on every network in use. A network that blocks all
+/// incoming connections or has the firewall off is the user's switch, not
+/// a rule the fix could change.
+fn allowed_everywhere(profiles: &[Profile], rules: &[&Rule], exe: &Path, port: u16) -> bool {
+    let rules: Vec<Rule> = rules.iter().map(|rule| (*rule).clone()).collect();
+    let report = judge(profiles, &rules, exe, port, true, env);
+    report.profiles.iter().all(|(_, verdict)| {
+        matches!(
+            verdict,
+            Verdict::Allowed | Verdict::BlocksAll | Verdict::Off
+        )
+    })
+}
+
+fn inbound(found: &[Found]) -> impl Iterator<Item = (usize, &Rule)> {
+    found
         .iter()
-        .filter_map(|named| named.rule.as_ref().map(|rule| (named.name.as_str(), rule)))
+        .filter_map(|found| found.rule.as_ref().map(|rule| (found.id, rule)))
 }
 
 /// The fix, on `store`, for this exe at `exe` and the stream's `port`.
@@ -111,31 +138,48 @@ pub fn fix_rules(store: &mut impl RuleStore, exe: &Path, port: u16) -> Result<()
         .to_str()
         .filter(|path| !path.is_empty())
         .ok_or(Failure::Arguments)?;
-    let rules = store.rules().map_err(|_| Failure::Read)?;
-    if !inbound(&rules).any(|(_, rule)| is_working_allow(rule, exe, port)) {
+    let profiles = store.profiles().map_err(|_| Failure::Read)?;
+    let found = store.rules().map_err(|_| Failure::Read)?;
+    let bits = in_use(&profiles);
+    let targets: Vec<usize> = inbound(&found)
+        .filter(|(_, rule)| is_target(rule, exe, port, bits))
+        .map(|(id, _)| id)
+        .collect();
+    let without_targets: Vec<&Rule> = inbound(&found)
+        .filter(|(id, _)| !targets.contains(id))
+        .map(|(_, rule)| rule)
+        .collect();
+    if !allowed_everywhere(&profiles, &without_targets, exe, port) {
         store.add_allow(program).map_err(|_| Failure::Add)?;
     }
-    let mut shared = false;
-    for (name, rule) in inbound(&rules) {
-        if !is_block(rule, exe, port) {
-            continue;
-        }
-        if rules.iter().filter(|other| other.name == name).count() > 1 {
-            shared = true;
-            continue;
-        }
-        store.remove(name).map_err(|_| Failure::Remove)?;
+    for id in targets {
+        store.remove(id).map_err(|_| Failure::Remove)?;
     }
+    let profiles = store.profiles().map_err(|_| Failure::Read)?;
     let after = store.rules().map_err(|_| Failure::Read)?;
-    let blocked = inbound(&after).any(|(_, rule)| is_block(rule, exe, port));
-    let allowed = inbound(&after).any(|(_, rule)| is_working_allow(rule, exe, port));
-    if blocked && shared {
-        Err(Failure::SharedName)
-    } else if blocked || !allowed {
-        Err(Failure::StillBlocked)
-    } else {
+    let after: Vec<&Rule> = inbound(&after).map(|(_, rule)| rule).collect();
+    if allowed_everywhere(&profiles, &after, exe, port) {
         Ok(())
+    } else {
+        Err(Failure::StillBlocked)
     }
+}
+
+/// Runs `fix` on a store opened inside an apartment, and drops the store
+/// before the apartment: COM objects released after `CoUninitialize` may
+/// call into a library Windows has already unloaded.
+#[cfg(any(windows, test))]
+pub(crate) fn in_apartment<A, S, R>(
+    apartment: impl FnOnce() -> Result<A, Failure>,
+    store: impl FnOnce() -> Result<S, Failure>,
+    fix: impl FnOnce(&mut S) -> Result<R, Failure>,
+) -> Result<R, Failure> {
+    let apartment = apartment()?;
+    let mut store = store()?;
+    let result = fix(&mut store);
+    drop(store);
+    drop(apartment);
+    result
 }
 
 /// How starting the elevated copy went.
@@ -145,12 +189,13 @@ pub enum Elevated {
     Exited(u32),
     /// The user answered No to the Windows prompt.
     Declined,
-    /// Windows couldn't start it, or it didn't finish in time.
+    /// Windows couldn't start it.
     Failed(String),
 }
 
-/// Starts this exe again as administrator with `args`, and waits for it.
-/// The real one asks Windows; tests fake it.
+/// Starts this exe again as administrator with `args`, and waits for it to
+/// exit, however long it takes: a second copy never starts meanwhile. The
+/// real one asks Windows; tests fake it.
 pub trait Elevate {
     fn run_elevated(&self, exe: &Path, args: &str) -> Elevated;
 }
@@ -158,8 +203,8 @@ pub trait Elevate {
 /// What the Stream page shows after "Fix it".
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
-    /// The firewall now has the Allow rule and none of the Block rules; it
-    /// was read again, and the notice follows it.
+    /// Read again, the verdict finds the exe allowed on every network in
+    /// use; the Stream page reads it again too, and the notice follows.
     Fixed,
     /// No to the Windows prompt: nothing changed.
     Declined,
@@ -182,9 +227,6 @@ pub fn fix(elevate: &impl Elevate, exe: &Path, port: u16, recheck: impl FnOnce()
         Elevated::Declined => return Outcome::Declined,
         Elevated::Exited(0) => Outcome::Fixed,
         Elevated::Exited(code) if code == Failure::Add.code() => Outcome::Failed(NOT_CHANGED),
-        Elevated::Exited(code) if code == Failure::SharedName.code() => {
-            Outcome::Failed(SHARED_NAME)
-        }
         Elevated::Exited(_) | Elevated::Failed(_) => Outcome::Failed(FAILED),
     };
     recheck();
@@ -195,7 +237,6 @@ pub fn fix(elevate: &impl Elevate, exe: &Path, port: u16, recheck: impl FnOnce()
 pub const FAILED: &str =
     "Windows didn't apply the whole fix. Run the EternalMonitor installer again.";
 pub const NOT_CHANGED: &str = "Windows didn't let EternalMonitor add its firewall rule, so nothing was changed. Run the EternalMonitor installer again.";
-pub const SHARED_NAME: &str = "A firewall rule blocking EternalMonitor shares its name with another rule, so it was left. Remove it in Windows Defender Firewall, or run the EternalMonitor installer again.";
 
 /// Where the Stream page's "Fix it" is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -315,28 +356,41 @@ mod windows_firewall {
     use windows::Win32::NetworkManagement::WindowsFirewall::{
         INetFwPolicy2, INetFwRule, NetFwPolicy2, NetFwRule, NET_FW_ACTION_ALLOW, NET_FW_RULE_DIR_IN,
     };
-    use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
+    use windows::Win32::System::Com::{CoCreateGuid, CoCreateInstance, CLSCTX_INPROC_SERVER};
 
-    use super::{fix_rules, Failure, Named, RuleStore, ALLOW_NAME, ALLOW_PROFILES};
-    use crate::firewall::rule_from;
-    use crate::firewall::windows_policy::{for_each_rule, Apartment};
+    use super::{fix_rules, in_apartment, Failure, Found, RuleStore, ALLOW_NAME, ALLOW_PROFILES};
+    use crate::firewall::windows_policy::{current_profiles, for_each_rule, Apartment};
+    use crate::firewall::{rule_from, Profile};
 
     /// UDP, as `NET_FW_IP_PROTOCOL`.
     const UDP: i32 = 17;
 
-    struct Com(INetFwPolicy2);
+    /// The policy, and the rules its last read found, by id.
+    struct Com {
+        policy: INetFwPolicy2,
+        found: Vec<INetFwRule>,
+    }
 
     impl RuleStore for Com {
-        fn rules(&mut self) -> Result<Vec<Named>, String> {
+        fn profiles(&mut self) -> Result<Vec<Profile>, String> {
+            current_profiles(&self.policy).map_err(|e| e.to_string())
+        }
+
+        fn rules(&mut self) -> Result<Vec<Found>, String> {
+            let mut found = Vec::new();
             let mut rules = Vec::new();
-            for_each_rule(&self.0, |rule| {
-                let name = unsafe { rule.Name()? }.to_string();
-                let rule = rule_from(rule).map_err(|e| windows::core::Error::new(E_FAIL, e))?;
-                rules.push(Named { name, rule });
+            for_each_rule(&self.policy, |rule| {
+                let read = rule_from(rule).map_err(|e| windows::core::Error::new(E_FAIL, e))?;
+                found.push(Found {
+                    id: rules.len(),
+                    rule: read,
+                });
+                rules.push(rule.clone());
                 Ok(())
             })
             .map_err(|e| e.to_string())?;
-            Ok(rules)
+            self.found = rules;
+            Ok(found)
         }
 
         fn add_allow(&mut self, exe: &str) -> Result<(), String> {
@@ -351,32 +405,46 @@ mod windows_firewall {
                     rule.SetAction(NET_FW_ACTION_ALLOW)?;
                     rule.SetProfiles(ALLOW_PROFILES as i32)?;
                     rule.SetEnabled(VARIANT_TRUE)?;
-                    self.0.Rules()?.Add(&rule)
+                    self.policy.Rules()?.Add(&rule)
                 }
             };
             add().map_err(|e| e.to_string())
         }
 
-        fn remove(&mut self, name: &str) -> Result<(), String> {
-            unsafe {
-                self.0
-                    .Rules()
-                    .and_then(|rules| rules.Remove(&BSTR::from(name)))
-            }
-            .map_err(|e| e.to_string())
+        /// Renames the rule to a fresh name first, so removing by name takes
+        /// it alone: not a rule that shares its name, whatever the case, nor
+        /// one added since the read. A failed remove leaves a renamed Block
+        /// rule, no worse than before.
+        fn remove(&mut self, id: usize) -> Result<(), String> {
+            let rule = self.found.get(id).ok_or("no such rule")?;
+            let remove = || -> windows::core::Result<()> {
+                let guid = unsafe { CoCreateGuid()? };
+                let name = BSTR::from(format!("EternalMonitor fix {guid:?}"));
+                unsafe {
+                    rule.SetName(&name)?;
+                    self.policy.Rules()?.Remove(&name)
+                }
+            };
+            remove().map_err(|e| e.to_string())
         }
     }
 
     /// The elevated copy's work: the exit code.
     pub fn fix(exe: &Path, port: u16) -> u32 {
-        let run = || -> Result<(), Failure> {
-            let _apartment = Apartment::new().map_err(|_| Failure::Read)?;
-            let policy: INetFwPolicy2 =
-                unsafe { CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER) }
-                    .map_err(|_| Failure::Read)?;
-            fix_rules(&mut Com(policy), exe, port)
-        };
-        run().map_or_else(Failure::code, |()| 0)
+        in_apartment(
+            || Apartment::new().map_err(|_| Failure::Read),
+            || {
+                let policy: INetFwPolicy2 =
+                    unsafe { CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER) }
+                        .map_err(|_| Failure::Read)?;
+                Ok(Com {
+                    policy,
+                    found: Vec::new(),
+                })
+            },
+            |store| fix_rules(store, exe, port),
+        )
+        .map_or_else(Failure::code, |()| 0)
     }
 }
 
@@ -393,14 +461,17 @@ mod windows_elevate {
     use std::path::Path;
 
     use windows::core::PCWSTR;
-    use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, WAIT_OBJECT_0};
+    use windows::Win32::Foundation::{CloseHandle, ERROR_CANCELLED, WAIT_OBJECT_0, WAIT_TIMEOUT};
+    use windows::Win32::System::Com::{
+        CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
+    };
     use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
     use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
-    use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
+    use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SW_HIDE};
 
     use super::{Elevate, Elevated};
 
-    /// How long the copy may take.
+    /// How long to wait between looks at a copy that hasn't finished.
     const WAIT_MS: u32 = 60_000;
 
     pub struct Shell;
@@ -409,14 +480,31 @@ mod windows_elevate {
         text.encode_wide().chain(Some(0)).collect()
     }
 
+    /// The single-threaded apartment ShellExecuteEx expects, for this call.
+    struct Sta(bool);
+
+    impl Drop for Sta {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe { CoUninitialize() };
+            }
+        }
+    }
+
     impl Elevate for Shell {
         fn run_elevated(&self, exe: &Path, args: &str) -> Elevated {
+            let _sta = Sta(unsafe {
+                CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE).is_ok()
+            });
             let verb = wide("runas".as_ref());
             let file = wide(exe.as_os_str());
             let params = wide(args.as_ref());
             let mut info = SHELLEXECUTEINFOW {
                 cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
                 fMask: SEE_MASK_NOCLOSEPROCESS,
+                // The window just clicked: the Windows prompt belongs to it,
+                // not to whatever is behind.
+                hwnd: unsafe { GetForegroundWindow() },
                 lpVerb: PCWSTR(verb.as_ptr()),
                 lpFile: PCWSTR(file.as_ptr()),
                 lpParameters: PCWSTR(params.as_ptr()),
@@ -433,15 +521,21 @@ mod windows_elevate {
             if info.hProcess.is_invalid() {
                 return Elevated::Failed("no process".into());
             }
-            let elevated = unsafe {
-                if WaitForSingleObject(info.hProcess, WAIT_MS) != WAIT_OBJECT_0 {
-                    Elevated::Failed("did not finish in time".into())
-                } else {
-                    let mut code = 0u32;
-                    match GetExitCodeProcess(info.hProcess, &mut code) {
-                        Ok(()) => Elevated::Exited(code),
-                        Err(error) => Elevated::Failed(error.to_string()),
+            // Until it exits, however long: the page stays on "running", so
+            // Try again can't start a second copy.
+            let elevated = loop {
+                match unsafe { WaitForSingleObject(info.hProcess, WAIT_MS) } {
+                    WAIT_OBJECT_0 => {
+                        let mut code = 0u32;
+                        break match unsafe { GetExitCodeProcess(info.hProcess, &mut code) } {
+                            Ok(()) => Elevated::Exited(code),
+                            Err(error) => Elevated::Failed(error.to_string()),
+                        };
                     }
+                    WAIT_TIMEOUT => {
+                        tracing::warn!("The firewall fix is taking a while; still waiting for it");
+                    }
+                    _ => break Elevated::Failed("lost track of the fix".into()),
                 }
             };
             unsafe {
@@ -464,6 +558,14 @@ mod tests {
         Path::new(EXE)
     }
 
+    fn on(bit: u32) -> Profile {
+        Profile {
+            bit,
+            on: true,
+            block_all_inbound: false,
+        }
+    }
+
     /// What Windows adds when its prompt is dismissed.
     fn prompt_block(profiles: u32) -> Rule {
         Rule::unscoped(&EXE.to_lowercase(), false, profiles)
@@ -473,29 +575,58 @@ mod tests {
         Rule::unscoped(EXE, true, ALLOW_PROFILES)
     }
 
-    fn named(name: &str, rule: Rule) -> Named {
-        Named {
-            name: name.into(),
-            rule: Some(rule),
-        }
-    }
-
-    /// A firewall in memory. Removes go by name, as INetFwRules::Remove does.
-    #[derive(Default)]
+    /// A firewall in memory. Removes take the rule they name and no other.
     struct Fake {
-        rules: Vec<Named>,
+        profiles: Vec<Profile>,
+        rules: Vec<(String, Option<Rule>)>,
         add_fails: bool,
         remove_fails: bool,
         read_fails: bool,
         calls: Vec<String>,
     }
 
+    impl Fake {
+        fn new(profiles: &[Profile], rules: Vec<(&str, Rule)>) -> Self {
+            Self {
+                profiles: profiles.to_vec(),
+                rules: rules
+                    .into_iter()
+                    .map(|(name, rule)| (name.to_string(), Some(rule)))
+                    .chain([("Outbound".to_string(), None)])
+                    .collect(),
+                add_fails: false,
+                remove_fails: false,
+                read_fails: false,
+                calls: Vec::new(),
+            }
+        }
+
+        fn names(&self) -> Vec<&str> {
+            self.rules.iter().map(|(name, _)| name.as_str()).collect()
+        }
+    }
+
     impl RuleStore for Fake {
-        fn rules(&mut self) -> Result<Vec<Named>, String> {
+        fn profiles(&mut self) -> Result<Vec<Profile>, String> {
             if self.read_fails {
                 return Err("read".into());
             }
-            Ok(self.rules.clone())
+            Ok(self.profiles.clone())
+        }
+
+        fn rules(&mut self) -> Result<Vec<Found>, String> {
+            if self.read_fails {
+                return Err("read".into());
+            }
+            Ok(self
+                .rules
+                .iter()
+                .enumerate()
+                .map(|(id, (_, rule))| Found {
+                    id,
+                    rule: rule.clone(),
+                })
+                .collect())
         }
 
         fn add_allow(&mut self, exe: &str) -> Result<(), String> {
@@ -503,57 +634,96 @@ mod tests {
             if self.add_fails {
                 return Err("add".into());
             }
-            self.rules
-                .push(named(ALLOW_NAME, Rule::unscoped(exe, true, ALLOW_PROFILES)));
+            self.rules.push((
+                ALLOW_NAME.into(),
+                Some(Rule::unscoped(exe, true, ALLOW_PROFILES)),
+            ));
             Ok(())
         }
 
-        fn remove(&mut self, name: &str) -> Result<(), String> {
-            self.calls.push(format!("remove {name}"));
+        fn remove(&mut self, id: usize) -> Result<(), String> {
+            self.calls.push(format!("remove {}", self.rules[id].0));
             if self.remove_fails {
                 return Err("remove".into());
             }
-            self.rules.retain(|rule| rule.name != name);
+            self.rules.remove(id);
             Ok(())
         }
     }
 
     const PROMPT_UDP: &str = "UDP Query User{0-1-2-3-4}eternalmonitor-host.exe";
 
-    fn dismissed_prompt() -> Vec<Named> {
+    fn dismissed_prompt() -> Vec<(&'static str, Rule)> {
         vec![
-            named(ALLOW_NAME, installer_allow()),
-            named(PROMPT_UDP, prompt_block(PRIVATE | PUBLIC)),
-            named(
+            (ALLOW_NAME, installer_allow()),
+            (PROMPT_UDP, prompt_block(PRIVATE | PUBLIC)),
+            (
                 "TCP Query User{0-1-2-3-4}eternalmonitor-host.exe",
                 Rule {
                     udp: false,
                     ..prompt_block(PRIVATE)
                 },
             ),
-            named(
+            (
                 "Other",
                 Rule::unscoped(r"C:\Tools\Other.exe", false, PUBLIC),
             ),
-            Named {
-                name: "Outbound".into(),
-                rule: None,
-            },
         ]
     }
 
     /// Windows' Block rule for the exe goes; its Allow rule, the TCP block
-    /// that doesn't reach the stream, and other programs' rules stay.
+    /// that doesn't reach the stream, other programs' rules and outbound
+    /// rules stay.
     #[test]
     fn the_fix_removes_only_this_exes_block_and_keeps_the_rest() {
-        let mut store = Fake {
-            rules: dismissed_prompt(),
-            ..Fake::default()
-        };
+        let mut store = Fake::new(&[on(PUBLIC)], dismissed_prompt());
         assert_eq!(fix_rules(&mut store, exe(), PORT), Ok(()));
-        let mut expected = dismissed_prompt();
-        expected.remove(1);
-        assert_eq!(store.rules, expected);
+        assert_eq!(
+            store.names(),
+            [
+                ALLOW_NAME,
+                "TCP Query User{0-1-2-3-4}eternalmonitor-host.exe",
+                "Other",
+                "Outbound"
+            ]
+        );
+        assert_eq!(store.calls, [format!("remove {PROMPT_UDP}")]);
+    }
+
+    /// The user's own block for a network not in use was never counted,
+    /// and stays.
+    #[test]
+    fn a_block_on_a_network_not_in_use_is_left() {
+        let mut rules = dismissed_prompt();
+        rules.push(("Block EternalMonitor on Public", prompt_block(PUBLIC)));
+        let mut store = Fake::new(&[on(PRIVATE)], rules);
+        assert_eq!(fix_rules(&mut store, exe(), PORT), Ok(()));
+        assert!(store.names().contains(&"Block EternalMonitor on Public"));
+        assert_eq!(store.calls, [format!("remove {PROMPT_UDP}")]);
+    }
+
+    /// A network with Windows Firewall off, or one that blocks all incoming
+    /// connections, is the user's switch: a block there is left, and the
+    /// fix still works on the other networks.
+    #[test]
+    fn the_users_switches_are_left_as_they_are() {
+        let mut rules = dismissed_prompt();
+        rules.push(("Block EternalMonitor on Domain", prompt_block(DOMAIN)));
+        let switches = [
+            Profile {
+                bit: DOMAIN,
+                on: false,
+                block_all_inbound: false,
+            },
+            Profile {
+                bit: PRIVATE,
+                on: true,
+                block_all_inbound: true,
+            },
+        ];
+        let mut store = Fake::new(&[switches[0], switches[1], on(PUBLIC)], rules);
+        assert_eq!(fix_rules(&mut store, exe(), PORT), Ok(()));
+        assert!(store.names().contains(&"Block EternalMonitor on Domain"));
         assert_eq!(store.calls, [format!("remove {PROMPT_UDP}")]);
     }
 
@@ -563,16 +733,32 @@ mod tests {
     fn a_missing_allow_rule_is_added_before_anything_is_removed() {
         let mut rules = dismissed_prompt();
         rules.remove(0);
-        let mut store = Fake {
-            rules,
-            ..Fake::default()
-        };
+        let mut store = Fake::new(&[on(PUBLIC)], rules);
         assert_eq!(fix_rules(&mut store, exe(), PORT), Ok(()));
         assert_eq!(
             store.calls,
             [format!("add {EXE}"), format!("remove {PROMPT_UDP}")]
         );
-        assert!(store.rules.contains(&named(ALLOW_NAME, installer_allow())));
+    }
+
+    /// The user's own Allow rule that already lets the stream in on the
+    /// networks in use, however narrow, means no add: the fix doesn't
+    /// widen what the user chose.
+    #[test]
+    fn the_users_own_allow_rule_means_no_add() {
+        let private_only = Rule::unscoped(EXE, true, PRIVATE);
+        let lan_only = Rule {
+            remote_addresses: Some("LocalSubnet".into()),
+            ..Rule::unscoped(EXE, true, PRIVATE)
+        };
+        for allow in [private_only, lan_only] {
+            let mut store = Fake::new(
+                &[on(PRIVATE)],
+                vec![("Mine", allow.clone()), (PROMPT_UDP, prompt_block(PRIVATE))],
+            );
+            assert_eq!(fix_rules(&mut store, exe(), PORT), Ok(()), "{allow:?}");
+            assert_eq!(store.calls, [format!("remove {PROMPT_UDP}")], "{allow:?}");
+        }
     }
 
     /// The fix's Allow rule is the one the installer's [Run] section adds.
@@ -610,12 +796,9 @@ mod tests {
     fn a_failed_add_leaves_the_rules_exactly_as_they_were() {
         let mut rules = dismissed_prompt();
         rules.remove(0);
-        let before = rules.clone();
-        let mut store = Fake {
-            rules,
-            add_fails: true,
-            ..Fake::default()
-        };
+        let mut store = Fake::new(&[on(PUBLIC)], rules);
+        let before = store.rules.clone();
+        store.add_fails = true;
         assert_eq!(fix_rules(&mut store, exe(), PORT), Err(Failure::Add));
         assert_eq!(store.rules, before);
         assert_eq!(store.calls, [format!("add {EXE}")]);
@@ -625,35 +808,33 @@ mod tests {
     /// nothing that let traffic through went.
     #[test]
     fn a_failed_remove_is_a_failure() {
-        let mut store = Fake {
-            rules: dismissed_prompt(),
-            remove_fails: true,
-            ..Fake::default()
-        };
+        let mut store = Fake::new(&[on(PUBLIC)], dismissed_prompt());
+        let before = store.rules.clone();
+        store.remove_fails = true;
         assert_eq!(fix_rules(&mut store, exe(), PORT), Err(Failure::Remove));
-        assert_eq!(store.rules, dismissed_prompt());
+        assert_eq!(store.rules, before);
     }
 
     /// A remove that reports success but leaves the block, or an add that
-    /// leaves no Allow rule, is caught when the rules are read again.
+    /// leaves no Allow rule, is caught when everything is read again.
     #[test]
     fn a_fix_that_did_not_take_is_a_failure() {
         struct Stubborn(Fake);
         impl RuleStore for Stubborn {
-            fn rules(&mut self) -> Result<Vec<Named>, String> {
+            fn profiles(&mut self) -> Result<Vec<Profile>, String> {
+                self.0.profiles()
+            }
+            fn rules(&mut self) -> Result<Vec<Found>, String> {
                 self.0.rules()
             }
             fn add_allow(&mut self, exe: &str) -> Result<(), String> {
                 self.0.add_allow(exe)
             }
-            fn remove(&mut self, _name: &str) -> Result<(), String> {
+            fn remove(&mut self, _id: usize) -> Result<(), String> {
                 Ok(())
             }
         }
-        let mut store = Stubborn(Fake {
-            rules: dismissed_prompt(),
-            ..Fake::default()
-        });
+        let mut store = Stubborn(Fake::new(&[on(PUBLIC)], dismissed_prompt()));
         assert_eq!(
             fix_rules(&mut store, exe(), PORT),
             Err(Failure::StillBlocked)
@@ -661,44 +842,46 @@ mod tests {
 
         struct NoAdd(Fake);
         impl RuleStore for NoAdd {
-            fn rules(&mut self) -> Result<Vec<Named>, String> {
+            fn profiles(&mut self) -> Result<Vec<Profile>, String> {
+                self.0.profiles()
+            }
+            fn rules(&mut self) -> Result<Vec<Found>, String> {
                 self.0.rules()
             }
             fn add_allow(&mut self, _exe: &str) -> Result<(), String> {
                 Ok(())
             }
-            fn remove(&mut self, name: &str) -> Result<(), String> {
-                self.0.remove(name)
+            fn remove(&mut self, id: usize) -> Result<(), String> {
+                self.0.remove(id)
             }
         }
         let mut rules = dismissed_prompt();
         rules.remove(0);
-        let mut store = NoAdd(Fake {
-            rules,
-            ..Fake::default()
-        });
+        let mut store = NoAdd(Fake::new(&[on(PUBLIC)], rules));
         assert_eq!(
             fix_rules(&mut store, exe(), PORT),
             Err(Failure::StillBlocked)
         );
     }
 
-    /// A block whose name another rule has too is left: removing it by name
-    /// could remove a rule that works.
+    /// A Windows prompt answered for one network type can leave an Allow
+    /// and a Block under one name: only the block goes.
     #[test]
-    fn a_block_sharing_its_name_is_left() {
+    fn a_block_sharing_its_name_goes_alone() {
         let mut rules = dismissed_prompt();
-        rules.push(named(
+        rules.push((
             PROMPT_UDP,
-            Rule::unscoped(r"C:\Tools\Other.exe", true, PUBLIC),
+            Rule::unscoped(&EXE.to_lowercase(), true, PRIVATE),
         ));
-        let before = rules.clone();
-        let mut store = Fake {
-            rules,
-            ..Fake::default()
-        };
-        assert_eq!(fix_rules(&mut store, exe(), PORT), Err(Failure::SharedName));
-        assert_eq!(store.rules, before);
+        let mut store = Fake::new(&[on(PUBLIC)], rules);
+        assert_eq!(fix_rules(&mut store, exe(), PORT), Ok(()));
+        let left: Vec<_> = store
+            .rules
+            .iter()
+            .filter(|(name, _)| name == PROMPT_UDP)
+            .collect();
+        assert_eq!(left.len(), 1);
+        assert!(left[0].1.as_ref().unwrap().allow, "the Allow rule stays");
     }
 
     /// A scoped Block rule, a disabled one, or one for another port is the
@@ -706,22 +889,22 @@ mod tests {
     #[test]
     fn blocks_the_verdict_does_not_count_are_left() {
         let rules = vec![
-            named(ALLOW_NAME, installer_allow()),
-            named(
+            (ALLOW_NAME, installer_allow()),
+            (
                 "Scoped",
                 Rule {
                     remote_addresses: Some("10.0.0.0/8".into()),
                     ..prompt_block(PUBLIC)
                 },
             ),
-            named(
+            (
                 "Off",
                 Rule {
                     enabled: false,
                     ..prompt_block(PUBLIC)
                 },
             ),
-            named(
+            (
                 "Port",
                 Rule {
                     local_ports: Some("80".into()),
@@ -729,27 +912,44 @@ mod tests {
                 },
             ),
         ];
-        let mut store = Fake {
-            rules: rules.clone(),
-            ..Fake::default()
-        };
+        let mut store = Fake::new(&[on(PUBLIC)], rules);
+        let before = store.rules.clone();
         assert_eq!(fix_rules(&mut store, exe(), PORT), Ok(()));
-        assert_eq!(store.rules, rules);
+        assert_eq!(store.rules, before);
         assert!(store.calls.is_empty());
     }
 
     #[test]
     fn rules_that_cant_be_read_are_a_failure() {
-        let mut store = Fake {
-            read_fails: true,
-            ..Fake::default()
-        };
+        let mut store = Fake::new(&[on(PUBLIC)], dismissed_prompt());
+        store.read_fails = true;
         assert_eq!(fix_rules(&mut store, exe(), PORT), Err(Failure::Read));
         assert!(store.calls.is_empty());
         assert_eq!(
-            fix_rules(&mut Fake::default(), Path::new(""), PORT),
+            fix_rules(&mut store, Path::new(""), PORT),
             Err(Failure::Arguments)
         );
+    }
+
+    /// The store goes before the apartment, whatever the fix returns.
+    #[test]
+    fn the_store_is_released_before_the_apartment() {
+        struct Noted(&'static str, std::rc::Rc<RefCell<Vec<&'static str>>>);
+        impl Drop for Noted {
+            fn drop(&mut self) {
+                self.1.borrow_mut().push(self.0);
+            }
+        }
+        for result in [Ok(()), Err(Failure::Remove)] {
+            let order = std::rc::Rc::new(RefCell::new(Vec::new()));
+            let got = in_apartment(
+                || Ok(Noted("apartment", order.clone())),
+                || Ok(Noted("store", order.clone())),
+                |_| result,
+            );
+            assert_eq!(got, result);
+            assert_eq!(*order.borrow(), ["store", "apartment"]);
+        }
     }
 
     /// The elevated copy gets the fixed argument and a port, nothing else.
@@ -821,7 +1021,6 @@ mod tests {
     fn a_fix_that_fails_says_so() {
         for (answer, said) in [
             (Elevated::Exited(Failure::Add.code()), NOT_CHANGED),
-            (Elevated::Exited(Failure::SharedName.code()), SHARED_NAME),
             (Elevated::Exited(Failure::Remove.code()), FAILED),
             (Elevated::Exited(Failure::StillBlocked.code()), FAILED),
             (Elevated::Exited(1), FAILED),

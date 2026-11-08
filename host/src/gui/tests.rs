@@ -45,7 +45,7 @@ fn the_firewall_notice_shows_only_for_a_block_it_is_sure_of() {
     );
     let (title, body) = firewall_notice(Some(&blocked), false).unwrap();
     assert_eq!(title, "Windows Firewall is blocking EternalMonitor");
-    // This exe's own Block rule: Setup's firewall lines remove it.
+    // This exe's own Block rule: "Fix it" removes it.
     assert!(firewall_fix_offered(Some(&blocked)));
     assert!(
         body.contains("Run the EternalMonitor installer again"),

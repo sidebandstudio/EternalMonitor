@@ -1427,8 +1427,8 @@ pub(super) fn usb_cable_notice(
 }
 
 /// "Fix it" on the firewall notice: for this exe's own Block rule, which
-/// Setup's firewall lines remove, not for "Blocks all incoming
-/// connections", which only the user's switch in Windows Security turns off.
+/// the fix removes, not for "Blocks all incoming connections", which only
+/// the user's switch in Windows Security turns off.
 pub(super) fn firewall_fix_offered(report: Option<&crate::firewall::Report>) -> bool {
     matches!(
         report.and_then(crate::firewall::Report::certain_block),

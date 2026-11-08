@@ -15,8 +15,8 @@ use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The Stream page's "Fix it" for a Windows Firewall block starts this
-    // exe as administrator to run Setup's firewall lines, and nothing else:
-    // no settings, log, window or single-instance check.
+    // exe as administrator to change the firewall rules for this exe, and
+    // nothing else: no settings, log, window or single-instance check.
     eternal_host::firewall_fix::run_if_requested();
     // Before anything below creates the settings folder or a file in it: a
     // folder that held nothing means a fresh install, which opens first-run

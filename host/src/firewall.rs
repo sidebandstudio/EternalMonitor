@@ -672,6 +672,15 @@ pub(crate) mod windows_policy {
         let _apartment = Apartment::new()?;
         let policy: INetFwPolicy2 =
             unsafe { CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER)? };
+        let profiles = current_profiles(&policy)?;
+        let rules = inbound_rules(&policy)?;
+        Ok(judge(&profiles, &rules, exe, port, lan, |name| {
+            std::env::var(name).ok()
+        }))
+    }
+
+    /// The profiles of the networks in use now, as the verdict sees them.
+    pub(crate) fn current_profiles(policy: &INetFwPolicy2) -> windows::core::Result<Vec<Profile>> {
         let current = unsafe { policy.CurrentProfileTypes()? } as u32;
         let mut profiles = Vec::new();
         for bit in [DOMAIN, PRIVATE, PUBLIC] {
@@ -685,10 +694,7 @@ pub(crate) mod windows_policy {
                 block_all_inbound: unsafe { policy.get_BlockAllInboundTraffic(profile)? }.as_bool(),
             });
         }
-        let rules = inbound_rules(&policy)?;
-        Ok(judge(&profiles, &rules, exe, port, lan, |name| {
-            std::env::var(name).ok()
-        }))
+        Ok(profiles)
     }
 
     impl RuleSource for INetFwRule {
