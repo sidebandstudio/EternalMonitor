@@ -421,6 +421,26 @@ pub fn profile_name(bit: u32) -> &'static str {
     }
 }
 
+/// What `%name%` in a rule's program path stands for, from the machine's
+/// own settings only: the known folders for Program Files, the Windows
+/// folder and ProgramData, then the system environment in
+/// `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment`.
+/// Never this process's environment, which any user can change for their
+/// own programs: a rule for another program must not look like this exe's,
+/// to the verdict or to the elevated fix. A system value that itself names
+/// a variable, or one only a user has, is unknown, and the path keeps it as
+/// written.
+#[cfg(windows)]
+pub fn machine_env(name: &str) -> Option<String> {
+    windows_policy::machine_env(name)
+}
+
+/// Off Windows no rule has a path to expand.
+#[cfg(not(windows))]
+pub fn machine_env(_name: &str) -> Option<String> {
+    None
+}
+
 /// `%NAME%` replaced with `lookup(NAME)`, as Windows stores a rule made in
 /// its own window (`%ProgramFiles%\...`). An unknown name stays as written.
 pub fn expand(path: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
@@ -674,9 +694,72 @@ pub(crate) mod windows_policy {
             unsafe { CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER)? };
         let profiles = current_profiles(&policy)?;
         let rules = inbound_rules(&policy)?;
-        Ok(judge(&profiles, &rules, exe, port, lan, |name| {
-            std::env::var(name).ok()
-        }))
+        Ok(judge(&profiles, &rules, exe, port, lan, super::machine_env))
+    }
+
+    /// See [`super::machine_env`].
+    pub(crate) fn machine_env(name: &str) -> Option<String> {
+        use windows::Win32::UI::Shell::{
+            FOLDERID_ProgramData, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesCommon,
+            FOLDERID_ProgramFilesCommonX64, FOLDERID_ProgramFilesCommonX86,
+            FOLDERID_ProgramFilesX64, FOLDERID_ProgramFilesX86, FOLDERID_Windows,
+        };
+        let folder = match name.to_ascii_lowercase().as_str() {
+            "programfiles" => FOLDERID_ProgramFiles,
+            "programw6432" => FOLDERID_ProgramFilesX64,
+            "programfiles(x86)" => FOLDERID_ProgramFilesX86,
+            "commonprogramfiles" => FOLDERID_ProgramFilesCommon,
+            "commonprogramw6432" => FOLDERID_ProgramFilesCommonX64,
+            "commonprogramfiles(x86)" => FOLDERID_ProgramFilesCommonX86,
+            "systemroot" | "windir" => FOLDERID_Windows,
+            "programdata" | "allusersprofile" => FOLDERID_ProgramData,
+            "systemdrive" => {
+                return known_folder(&FOLDERID_Windows)
+                    .and_then(|windows| windows.get(..2).map(str::to_string))
+                    .filter(|drive| drive.ends_with(':'))
+            }
+            _ => return system_variable(name),
+        };
+        known_folder(&folder)
+    }
+
+    fn known_folder(id: &windows::core::GUID) -> Option<String> {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Com::CoTaskMemFree;
+        use windows::Win32::UI::Shell::{SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+        let path = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, HANDLE::default()) }.ok()?;
+        let text = unsafe { path.to_string() }.ok();
+        unsafe { CoTaskMemFree(Some(path.0 as *const _)) };
+        text
+    }
+
+    /// A value of the system environment as stored, never expanded: the
+    /// expansion would use this process's environment.
+    fn system_variable(name: &str) -> Option<String> {
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::Foundation::ERROR_SUCCESS;
+        use windows::Win32::System::Registry::{
+            RegGetValueW, HKEY_LOCAL_MACHINE, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
+        };
+        let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        let mut value = [0u16; 1024];
+        let mut bytes = std::mem::size_of_val(&value) as u32;
+        let result = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                w!(r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+                PCWSTR(name.as_ptr()),
+                RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND,
+                None,
+                Some(value.as_mut_ptr().cast()),
+                Some(&mut bytes),
+            )
+        };
+        if result != ERROR_SUCCESS {
+            return None;
+        }
+        let length = value.iter().position(|&c| c == 0).unwrap_or(value.len());
+        Some(String::from_utf16_lossy(&value[..length])).filter(|value| !value.contains('%'))
     }
 
     /// The profiles of the networks in use now, as the verdict sees them.
@@ -813,6 +896,26 @@ mod tests {
 
     const EXE: &str = r"C:\Program Files\EternalMonitor\EternalMonitor-host.exe";
     const PORT: u16 = 9876;
+
+    /// The machine's values come from the machine: a variable only this
+    /// process has, or only a user has, is unknown.
+    #[cfg(windows)]
+    #[test]
+    fn machine_values_never_come_from_this_process() {
+        const OWN: &str = "EM_FIREWALL_MACHINE_TEST";
+        std::env::set_var(OWN, r"C:\Program Files");
+        assert_eq!(machine_env(OWN), None);
+        std::env::remove_var(OWN);
+        for name in ["USERPROFILE", "LOCALAPPDATA", "APPDATA"] {
+            assert_eq!(machine_env(name), None, "{name}");
+        }
+        for name in ["ProgramFiles", "SystemRoot", "windir", "ProgramData"] {
+            let value = machine_env(name).unwrap_or_else(|| panic!("{name}"));
+            assert!(Path::new(&value).is_dir(), "{name}");
+        }
+        let drive = machine_env("SystemDrive").unwrap();
+        assert!(machine_env("SystemRoot").unwrap().starts_with(&drive));
+    }
 
     fn env(name: &str) -> Option<String> {
         match name.to_lowercase().as_str() {

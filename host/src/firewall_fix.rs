@@ -26,7 +26,10 @@
 //!    exe allowed, and not blocked by its own rule, on every network in use.
 //!
 //! The exe's path comes from the elevated process itself, and the port is
-//! only ever a number. A user who answers No to the Windows prompt changes
+//! only ever a number. A rule's path is this exe's only as written, or with
+//! `%name%` read from the machine's own settings
+//! ([`crate::firewall::machine_env`]), never from the environment the
+//! elevated copy inherits from the user who clicked. A user who answers No to the Windows prompt changes
 //! nothing: the notice stays as it was. After the copy ran, the firewall
 //! is read again at once.
 
@@ -86,9 +89,10 @@ impl Failure {
     }
 }
 
-fn env(name: &str) -> Option<String> {
-    std::env::var(name).ok()
-}
+/// What `%name%` in a rule's path stands for: [`crate::firewall::machine_env`]
+/// in the elevated copy, never its environment, which the user who clicked
+/// "Fix it" could have set.
+type Lookup<'a> = &'a dyn Fn(&str) -> Option<String>;
 
 /// The bits of the profiles in use with Windows Firewall on: where the
 /// verdict counts rules.
@@ -102,12 +106,12 @@ fn in_use(profiles: &[Profile]) -> u32 {
 
 /// This exe's own Block rules the verdict counts: enabled, reaching every
 /// datagram to `port`, on a network in use. All the fix removes.
-fn is_target(rule: &Rule, exe: &Path, port: u16, in_use: u32) -> bool {
+fn is_target(rule: &Rule, exe: &Path, port: u16, in_use: u32, lookup: Lookup) -> bool {
     !rule.allow
         && rule.enabled
         && rule.udp
         && rule.profiles & in_use != 0
-        && crate::firewall::ours(rule, exe, env)
+        && crate::firewall::ours(rule, exe, lookup)
         && reach(rule, port) == Reach::All
 }
 
@@ -115,9 +119,15 @@ fn is_target(rule: &Rule, exe: &Path, port: u16, in_use: u32) -> bool {
 /// its own rule, on every network in use. A network that blocks all
 /// incoming connections or has the firewall off is the user's switch, not
 /// a rule the fix could change.
-fn allowed_everywhere(profiles: &[Profile], rules: &[&Rule], exe: &Path, port: u16) -> bool {
+fn allowed_everywhere(
+    profiles: &[Profile],
+    rules: &[&Rule],
+    exe: &Path,
+    port: u16,
+    lookup: Lookup,
+) -> bool {
     let rules: Vec<Rule> = rules.iter().map(|rule| (*rule).clone()).collect();
-    let report = judge(profiles, &rules, exe, port, true, env);
+    let report = judge(profiles, &rules, exe, port, true, lookup);
     report.profiles.iter().all(|(_, verdict)| {
         matches!(
             verdict,
@@ -133,7 +143,12 @@ fn inbound(found: &[Found]) -> impl Iterator<Item = (usize, &Rule)> {
 }
 
 /// The fix, on `store`, for this exe at `exe` and the stream's `port`.
-pub fn fix_rules(store: &mut impl RuleStore, exe: &Path, port: u16) -> Result<(), Failure> {
+pub fn fix_rules(
+    store: &mut impl RuleStore,
+    exe: &Path,
+    port: u16,
+    lookup: Lookup,
+) -> Result<(), Failure> {
     let program = exe
         .to_str()
         .filter(|path| !path.is_empty())
@@ -142,14 +157,14 @@ pub fn fix_rules(store: &mut impl RuleStore, exe: &Path, port: u16) -> Result<()
     let found = store.rules().map_err(|_| Failure::Read)?;
     let bits = in_use(&profiles);
     let targets: Vec<usize> = inbound(&found)
-        .filter(|(_, rule)| is_target(rule, exe, port, bits))
+        .filter(|(_, rule)| is_target(rule, exe, port, bits, lookup))
         .map(|(id, _)| id)
         .collect();
     let without_targets: Vec<&Rule> = inbound(&found)
         .filter(|(id, _)| !targets.contains(id))
         .map(|(_, rule)| rule)
         .collect();
-    if !allowed_everywhere(&profiles, &without_targets, exe, port) {
+    if !allowed_everywhere(&profiles, &without_targets, exe, port, lookup) {
         store.add_allow(program).map_err(|_| Failure::Add)?;
     }
     for id in targets {
@@ -158,11 +173,22 @@ pub fn fix_rules(store: &mut impl RuleStore, exe: &Path, port: u16) -> Result<()
     let profiles = store.profiles().map_err(|_| Failure::Read)?;
     let after = store.rules().map_err(|_| Failure::Read)?;
     let after: Vec<&Rule> = inbound(&after).map(|(_, rule)| rule).collect();
-    if allowed_everywhere(&profiles, &after, exe, port) {
+    if allowed_everywhere(&profiles, &after, exe, port, lookup) {
         Ok(())
     } else {
         Err(Failure::StillBlocked)
     }
+}
+
+/// [`fix_rules`] as the elevated copy runs it, with the machine's own
+/// values for `%name%` in rule paths.
+#[cfg(any(windows, test))]
+pub(crate) fn fix_on_this_machine(
+    store: &mut impl RuleStore,
+    exe: &Path,
+    port: u16,
+) -> Result<(), Failure> {
+    fix_rules(store, exe, port, &crate::firewall::machine_env)
 }
 
 /// Runs `fix` on a store opened inside an apartment, and drops the store
@@ -358,7 +384,9 @@ mod windows_firewall {
     };
     use windows::Win32::System::Com::{CoCreateGuid, CoCreateInstance, CLSCTX_INPROC_SERVER};
 
-    use super::{fix_rules, in_apartment, Failure, Found, RuleStore, ALLOW_NAME, ALLOW_PROFILES};
+    use super::{
+        fix_on_this_machine, in_apartment, Failure, Found, RuleStore, ALLOW_NAME, ALLOW_PROFILES,
+    };
     use crate::firewall::windows_policy::{current_profiles, for_each_rule, Apartment};
     use crate::firewall::{rule_from, Profile};
 
@@ -442,7 +470,7 @@ mod windows_firewall {
                     found: Vec::new(),
                 })
             },
-            |store| fix_rules(store, exe, port),
+            |store| fix_on_this_machine(store, exe, port),
         )
         .map_or_else(Failure::code, |()| 0)
     }
@@ -466,7 +494,9 @@ mod windows_elevate {
         CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE,
     };
     use windows::Win32::System::Threading::{GetExitCodeProcess, WaitForSingleObject};
-    use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+    use windows::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    };
     use windows::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, SW_HIDE};
 
     use super::{Elevate, Elevated};
@@ -501,7 +531,9 @@ mod windows_elevate {
             let params = wide(args.as_ref());
             let mut info = SHELLEXECUTEINFOW {
                 cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
-                fMask: SEE_MASK_NOCLOSEPROCESS,
+                // No message loop here, and the thread blocks below: the
+                // call must finish before it returns.
+                fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
                 // The window just clicked: the Windows prompt belongs to it,
                 // not to whatever is behind.
                 hwnd: unsafe { GetForegroundWindow() },
@@ -573,6 +605,12 @@ mod tests {
 
     fn installer_allow() -> Rule {
         Rule::unscoped(EXE, true, ALLOW_PROFILES)
+    }
+
+    /// The machine's own values.
+    fn machine(name: &str) -> Option<String> {
+        name.eq_ignore_ascii_case("ProgramFiles")
+            .then(|| r"C:\Program Files".to_string())
     }
 
     /// A firewall in memory. Removes take the rule they name and no other.
@@ -677,7 +715,7 @@ mod tests {
     #[test]
     fn the_fix_removes_only_this_exes_block_and_keeps_the_rest() {
         let mut store = Fake::new(&[on(PUBLIC)], dismissed_prompt());
-        assert_eq!(fix_rules(&mut store, exe(), PORT), Ok(()));
+        assert_eq!(fix_rules(&mut store, exe(), PORT, &machine), Ok(()));
         assert_eq!(
             store.names(),
             [
@@ -697,7 +735,7 @@ mod tests {
         let mut rules = dismissed_prompt();
         rules.push(("Block EternalMonitor on Public", prompt_block(PUBLIC)));
         let mut store = Fake::new(&[on(PRIVATE)], rules);
-        assert_eq!(fix_rules(&mut store, exe(), PORT), Ok(()));
+        assert_eq!(fix_rules(&mut store, exe(), PORT, &machine), Ok(()));
         assert!(store.names().contains(&"Block EternalMonitor on Public"));
         assert_eq!(store.calls, [format!("remove {PROMPT_UDP}")]);
     }
@@ -722,7 +760,7 @@ mod tests {
             },
         ];
         let mut store = Fake::new(&[switches[0], switches[1], on(PUBLIC)], rules);
-        assert_eq!(fix_rules(&mut store, exe(), PORT), Ok(()));
+        assert_eq!(fix_rules(&mut store, exe(), PORT, &machine), Ok(()));
         assert!(store.names().contains(&"Block EternalMonitor on Domain"));
         assert_eq!(store.calls, [format!("remove {PROMPT_UDP}")]);
     }
@@ -734,7 +772,7 @@ mod tests {
         let mut rules = dismissed_prompt();
         rules.remove(0);
         let mut store = Fake::new(&[on(PUBLIC)], rules);
-        assert_eq!(fix_rules(&mut store, exe(), PORT), Ok(()));
+        assert_eq!(fix_rules(&mut store, exe(), PORT, &machine), Ok(()));
         assert_eq!(
             store.calls,
             [format!("add {EXE}"), format!("remove {PROMPT_UDP}")]
@@ -756,7 +794,11 @@ mod tests {
                 &[on(PRIVATE)],
                 vec![("Mine", allow.clone()), (PROMPT_UDP, prompt_block(PRIVATE))],
             );
-            assert_eq!(fix_rules(&mut store, exe(), PORT), Ok(()), "{allow:?}");
+            assert_eq!(
+                fix_rules(&mut store, exe(), PORT, &machine),
+                Ok(()),
+                "{allow:?}"
+            );
             assert_eq!(store.calls, [format!("remove {PROMPT_UDP}")], "{allow:?}");
         }
     }
@@ -799,7 +841,10 @@ mod tests {
         let mut store = Fake::new(&[on(PUBLIC)], rules);
         let before = store.rules.clone();
         store.add_fails = true;
-        assert_eq!(fix_rules(&mut store, exe(), PORT), Err(Failure::Add));
+        assert_eq!(
+            fix_rules(&mut store, exe(), PORT, &machine),
+            Err(Failure::Add)
+        );
         assert_eq!(store.rules, before);
         assert_eq!(store.calls, [format!("add {EXE}")]);
     }
@@ -811,7 +856,10 @@ mod tests {
         let mut store = Fake::new(&[on(PUBLIC)], dismissed_prompt());
         let before = store.rules.clone();
         store.remove_fails = true;
-        assert_eq!(fix_rules(&mut store, exe(), PORT), Err(Failure::Remove));
+        assert_eq!(
+            fix_rules(&mut store, exe(), PORT, &machine),
+            Err(Failure::Remove)
+        );
         assert_eq!(store.rules, before);
     }
 
@@ -836,7 +884,7 @@ mod tests {
         }
         let mut store = Stubborn(Fake::new(&[on(PUBLIC)], dismissed_prompt()));
         assert_eq!(
-            fix_rules(&mut store, exe(), PORT),
+            fix_rules(&mut store, exe(), PORT, &machine),
             Err(Failure::StillBlocked)
         );
 
@@ -859,7 +907,7 @@ mod tests {
         rules.remove(0);
         let mut store = NoAdd(Fake::new(&[on(PUBLIC)], rules));
         assert_eq!(
-            fix_rules(&mut store, exe(), PORT),
+            fix_rules(&mut store, exe(), PORT, &machine),
             Err(Failure::StillBlocked)
         );
     }
@@ -874,7 +922,7 @@ mod tests {
             Rule::unscoped(&EXE.to_lowercase(), true, PRIVATE),
         ));
         let mut store = Fake::new(&[on(PUBLIC)], rules);
-        assert_eq!(fix_rules(&mut store, exe(), PORT), Ok(()));
+        assert_eq!(fix_rules(&mut store, exe(), PORT, &machine), Ok(()));
         let left: Vec<_> = store
             .rules
             .iter()
@@ -914,19 +962,87 @@ mod tests {
         ];
         let mut store = Fake::new(&[on(PUBLIC)], rules);
         let before = store.rules.clone();
-        assert_eq!(fix_rules(&mut store, exe(), PORT), Ok(()));
+        assert_eq!(fix_rules(&mut store, exe(), PORT, &machine), Ok(()));
         assert_eq!(store.rules, before);
         assert!(store.calls.is_empty());
+    }
+
+    /// A rule's `%name%` means what the machine says, not what this
+    /// process's environment says: a user can set their own value, and the
+    /// elevated copy inherits it. Another program's rule never goes because
+    /// of it.
+    #[test]
+    fn only_the_machines_values_make_a_rule_this_exes() {
+        const USERS_OWN: &str = "EM_FIREWALL_FIX_TEST_ROOT";
+        // A value only this process has, set as a user would.
+        std::env::set_var(USERS_OWN, r"C:\Program Files");
+        let installed = r"D:\Apps\EternalMonitor\EternalMonitor-host.exe";
+        let rules = vec![
+            (ALLOW_NAME, Rule::unscoped(installed, true, ALLOW_PROFILES)),
+            (
+                "Program Files copy",
+                Rule::unscoped(
+                    r"%ProgramFiles%\EternalMonitor\EternalMonitor-host.exe",
+                    false,
+                    PUBLIC,
+                ),
+            ),
+            (
+                "Users own",
+                Rule::unscoped(
+                    &format!(r"%{USERS_OWN}%\EternalMonitor\EternalMonitor-host.exe"),
+                    false,
+                    PUBLIC,
+                ),
+            ),
+        ];
+        // The process would say D:\Apps for ProgramFiles; the machine says
+        // C:\Program Files.
+        let mut store = Fake::new(&[on(PUBLIC)], rules.clone());
+        assert_eq!(
+            fix_rules(&mut store, Path::new(installed), PORT, &machine),
+            Ok(())
+        );
+        assert!(store.calls.is_empty(), "{:?}", store.calls);
+
+        // The same rules, for the copy the machine's value names: its
+        // block goes, and it gets its own Allow rule.
+        let mut store = Fake::new(&[on(PUBLIC)], rules);
+        assert_eq!(fix_rules(&mut store, exe(), PORT, &machine), Ok(()));
+        assert_eq!(
+            store.calls,
+            [format!("add {EXE}"), "remove Program Files copy".into()]
+        );
+
+        // And as the elevated copy runs it.
+        let rules = vec![
+            (ALLOW_NAME, installer_allow()),
+            (
+                "Users own",
+                Rule::unscoped(
+                    &format!(r"%{USERS_OWN}%\EternalMonitor\EternalMonitor-host.exe"),
+                    false,
+                    PUBLIC,
+                ),
+            ),
+        ];
+        let mut store = Fake::new(&[on(PUBLIC)], rules);
+        assert_eq!(fix_on_this_machine(&mut store, exe(), PORT), Ok(()));
+        assert!(store.calls.is_empty(), "{:?}", store.calls);
+        std::env::remove_var(USERS_OWN);
     }
 
     #[test]
     fn rules_that_cant_be_read_are_a_failure() {
         let mut store = Fake::new(&[on(PUBLIC)], dismissed_prompt());
         store.read_fails = true;
-        assert_eq!(fix_rules(&mut store, exe(), PORT), Err(Failure::Read));
+        assert_eq!(
+            fix_rules(&mut store, exe(), PORT, &machine),
+            Err(Failure::Read)
+        );
         assert!(store.calls.is_empty());
         assert_eq!(
-            fix_rules(&mut store, Path::new(""), PORT),
+            fix_rules(&mut store, Path::new(""), PORT, &machine),
             Err(Failure::Arguments)
         );
     }
