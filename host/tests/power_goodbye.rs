@@ -9,7 +9,7 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use eternal_host::control::SharedControl;
-use eternal_host::power::{self, Message, END_SESSION_WAIT, SLEEP_WAIT};
+use eternal_host::power::{self, Message, SLEEP_WAIT, SUMMARY_WAIT};
 use eternal_host::transport;
 use eternal_wire::v2::control::{
     encode_control, parse_control, ByeReason, ControlMessage, Hello2, HelloStatus, CAP_DECODE_H264,
@@ -248,6 +248,7 @@ fn shutting_down_or_signing_out_says_so_and_saves_the_summary() {
             Message::EndSession {
                 ending: true,
                 logoff: false,
+                close_app: false,
             },
         ),
         (
@@ -255,6 +256,7 @@ fn shutting_down_or_signing_out_says_so_and_saves_the_summary() {
             Message::EndSession {
                 ending: true,
                 logoff: true,
+                close_app: false,
             },
         ),
         (13, Message::SessionLogoff),
@@ -266,7 +268,8 @@ fn shutting_down_or_signing_out_says_so_and_saves_the_summary() {
         assert_eq!(
             rig.tell(Message::EndSession {
                 ending: false,
-                logoff: false
+                logoff: false,
+                close_app: false,
             })
             .0,
             0
@@ -280,23 +283,66 @@ fn shutting_down_or_signing_out_says_so_and_saves_the_summary() {
 
         let (answer, took) = rig.tell(message);
         assert_eq!(answer, 0, "{message:?}");
-        assert!(
-            took < END_SESSION_WAIT + Duration::from_millis(100),
-            "{took:?}"
-        );
-        let log = session_log();
+        assert!(took < SUMMARY_WAIT + Duration::from_millis(100), "{took:?}");
+        // A sign-out's session change follows its end of session: the
+        // repeat ends nothing, tells nothing and writes nothing again.
+        let (_, repeat_took) = rig.tell(Message::SessionLogoff);
+        assert!(repeat_took < Duration::from_millis(100), "{repeat_took:?}");
         let summary = format!(" nonce={nonce:016x} ");
-        assert!(
-            log.lines()
-                .any(|line| line.contains("session_summary v=1 role=pc")
+        let summaries = session_log()
+            .lines()
+            .filter(|line| {
+                line.contains("session_summary v=1 role=pc")
                     && line.contains(&summary)
-                    && line.contains(" end=shutdown ")),
-            "{message:?}: no summary in the log"
-        );
+                    && line.contains(" end=shutdown ")
+            })
+            .count();
+        assert_eq!(summaries, 1, "{message:?}: one summary in the log");
         assert_eq!(
             rig.goodbyes(Duration::from_millis(500)),
             [ByeReason::HostPoweringOff; 3],
             "{message:?}"
+        );
+    }
+}
+
+/// Restart Manager closes the app for an installer, as Setup does on an
+/// update, while the PC stays up: the stream ends as on a quit, with the
+/// goodbye every iPad reads, not as the PC powering off. An update that
+/// hands over to its new copy says connect again.
+#[test]
+fn an_installer_closing_the_app_ends_the_stream_as_a_quit() {
+    let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for (nonce, handoff, bye) in [
+        (21, false, ByeReason::UserDisconnect),
+        (22, true, ByeReason::Error),
+    ] {
+        let mut rig = Rig::start(FEATURE_POWER_BYE);
+        assert_eq!(rig.connect(nonce), Some(HelloStatus::Ok));
+        if handoff {
+            rig.shared
+                .handoff
+                .claim(eternal_host::handoff::Handoff::Update)
+                .unwrap();
+        }
+        let (answer, took) = rig.tell(Message::EndSession {
+            ending: true,
+            logoff: false,
+            close_app: true,
+        });
+        assert_eq!(answer, 0);
+        assert!(took < SUMMARY_WAIT + Duration::from_millis(100), "{took:?}");
+        assert_eq!(rig.goodbyes(Duration::from_millis(500)), [bye; 3]);
+        assert!(
+            !rig.shared.running.load(Ordering::SeqCst),
+            "the stream stopped"
+        );
+        let summary = format!(" nonce={nonce:016x} ");
+        assert!(
+            session_log()
+                .lines()
+                .any(|line| line.contains("session_summary v=1 role=pc") && line.contains(&summary)),
+            "no summary in the log"
         );
     }
 }

@@ -245,6 +245,28 @@ impl PowerEvent {
     }
 }
 
+/// What [`Session::power_down`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PowerDown {
+    /// The session ended; its summary is the caller's to write.
+    Ended(SessionEnd),
+    /// Nobody was streaming.
+    NoSession,
+    /// The PC was already going down: Windows sends some of this news twice
+    /// (the end of the session, then the session change, for a sign-out;
+    /// the broadcast and the registration, for sleep). Nothing changed.
+    Repeat,
+}
+
+impl PowerDown {
+    pub fn ended(self) -> Option<SessionEnd> {
+        match self {
+            Self::Ended(end) => Some(end),
+            Self::NoSession | Self::Repeat => None,
+        }
+    }
+}
+
 /// How far a session got and how it ended, for its support summary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEnd {
@@ -730,18 +752,35 @@ impl Session {
     /// [`Self::power_up`] or [`POWER_DOWN_HOLD`], HELLO2s go unanswered, as
     /// they would a moment later from a PC that is down. The stream keeps
     /// running, so the PC streams again when it wakes.
-    pub fn power_down(&mut self, now: Instant, event: PowerEvent) -> Option<SessionEnd> {
+    pub fn power_down(&mut self, now: Instant, event: PowerEvent) -> PowerDown {
+        if self.going_down(now) {
+            return PowerDown::Repeat;
+        }
         self.powering_down = Some((event, now));
-        let understands =
-            self.active.as_ref()?.accepted_hello.feature_caps & FEATURE_POWER_BYE != 0;
-        if understands {
+        let Some(session) = self.active.as_ref() else {
+            return PowerDown::NoSession;
+        };
+        let end = if session.accepted_hello.feature_caps & FEATURE_POWER_BYE != 0 {
             let end = self.end_saying(event.bye(), EndReason::Shutdown, now);
             self.power_bye = true;
             end
         } else {
             self.lost_unsaid = true;
             self.end(EndReason::Shutdown, now)
-        }
+        };
+        end.map_or(PowerDown::NoSession, PowerDown::Ended)
+    }
+
+    /// Windows said the PC is going down, and hasn't said since that it is
+    /// back, within [`POWER_DOWN_HOLD`].
+    fn going_down(&self, now: Instant) -> bool {
+        self.powering_down
+            .is_some_and(|(_, since)| now.saturating_duration_since(since) < POWER_DOWN_HOLD)
+    }
+
+    /// A goodbye waits for the transport.
+    pub fn goodbye_pending(&self) -> bool {
+        self.goodbye.is_some()
     }
 
     /// A goodbye [`Self::power_down`] left waits for the transport.
@@ -765,10 +804,7 @@ impl Session {
     /// quits). The first and last are turned away with Busy before anything
     /// else is looked at; a retry once the stream runs again works.
     fn closed_to_clients(&self, now: Instant) -> Option<Closed> {
-        if self
-            .powering_down
-            .is_some_and(|(_, since)| now.saturating_duration_since(since) < POWER_DOWN_HOLD)
-        {
+        if self.going_down(now) {
             Some(Closed::Silent("Client unanswered while the PC goes down"))
         } else if self.updating {
             Some(Closed::Busy("Client turned away while an update starts"))
@@ -4246,7 +4282,6 @@ mod tests {
         );
     }
 
-    /// The goodbye's destination, session id and reason.
     fn power_hello(nonce: u32, feature_caps: u16) -> ControlMessage {
         let ControlMessage::Hello2(mut hello) = hello(nonce, 50000) else {
             unreachable!()
@@ -4271,7 +4306,10 @@ mod tests {
             let mut session = Session::new(500);
             session.handle_control(peer, 0, power_hello(1, FEATURE_POWER_BYE), &TestConfig, now);
             let id = session.session_id().unwrap();
-            let end = session.power_down(now, event).expect("the session ended");
+            let end = session
+                .power_down(now, event)
+                .ended()
+                .expect("the session ended");
             assert_eq!((end.client_nonce, end.reason), (1, EndReason::Shutdown));
             assert!(!session.is_active());
             assert!(session.power_goodbye_pending());
@@ -4298,7 +4336,7 @@ mod tests {
             &TestConfig,
             now,
         );
-        let end = session.power_down(now, PowerEvent::Sleep).unwrap();
+        let end = session.power_down(now, PowerEvent::Sleep).ended().unwrap();
         assert_eq!(end.reason, EndReason::Shutdown);
         assert!(!session.power_goodbye_pending());
         let next = session.tick(&TestConfig, false, now);
@@ -4318,7 +4356,7 @@ mod tests {
         let mut session = Session::new(500);
         assert_eq!(
             session.power_down(now, PowerEvent::Sleep),
-            None,
+            PowerDown::NoSession,
             "nobody streamed"
         );
         let unanswered =
@@ -4343,6 +4381,50 @@ mod tests {
         assert_eq!(admitted.new_target, Some(peer), "the hold ran out");
     }
 
+    /// Windows tells some of it twice: the end of the session, then the
+    /// session change, for a sign-out. The repeat changes nothing: the hold
+    /// keeps its start, and nothing is ended or told again.
+    #[test]
+    fn news_of_the_pc_going_down_counts_once() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut session = Session::new(500);
+        session.handle_control(peer, 0, power_hello(1, FEATURE_POWER_BYE), &TestConfig, now);
+        assert!(session
+            .power_down(now, PowerEvent::Logoff)
+            .ended()
+            .is_some());
+        let again = now + Duration::from_secs(20);
+        assert_eq!(
+            session.power_down(again, PowerEvent::Logoff),
+            PowerDown::Repeat
+        );
+        assert_eq!(
+            session.power_down(again, PowerEvent::Sleep),
+            PowerDown::Repeat
+        );
+        assert!(session.take_goodbye().is_some(), "told once");
+        assert_eq!(session.take_goodbye(), None);
+        // The hold still runs from the first news.
+        let admitted = session.handle_control(
+            peer,
+            0,
+            power_hello(2, FEATURE_POWER_BYE),
+            &TestConfig,
+            now + POWER_DOWN_HOLD,
+        );
+        assert_eq!(admitted.new_target, Some(peer));
+        // After waking, the next news counts again.
+        session.power_up();
+        assert_eq!(
+            session
+                .power_down(now + POWER_DOWN_HOLD, PowerEvent::Sleep)
+                .ended()
+                .map(|end| end.client_nonce),
+            Some(2)
+        );
+    }
+
     /// A goodbye no transport sent before the PC slept is for a session
     /// that is over by the time it wakes: dropped. Any other goodbye stays.
     #[test]
@@ -4351,7 +4433,7 @@ mod tests {
         let peer = addr([10, 0, 0, 5], 50000);
         let mut session = Session::new(500);
         session.handle_control(peer, 0, power_hello(1, FEATURE_POWER_BYE), &TestConfig, now);
-        session.power_down(now, PowerEvent::Sleep).unwrap();
+        session.power_down(now, PowerEvent::Sleep).ended().unwrap();
         session.power_up();
         assert_eq!(session.take_goodbye(), None);
 
@@ -4374,7 +4456,7 @@ mod tests {
         for caps in [FEATURE_POWER_BYE, 0] {
             let mut session = Session::new(500);
             session.handle_control(peer, 0, power_hello(1, caps), &TestConfig, now);
-            session.power_down(now, PowerEvent::Sleep).unwrap();
+            session.power_down(now, PowerEvent::Sleep).ended().unwrap();
             session.tick(&TestConfig, false, now);
             let woke = now + Duration::from_secs(3 * 3600);
             session.power_up();
@@ -4387,6 +4469,7 @@ mod tests {
         }
     }
 
+    /// The goodbye's destination, session id and reason.
     fn goodbye_of(actions: &Actions) -> (PeerId, u32, ByeReason) {
         let (to, bytes) = actions.goodbye.clone().expect("a goodbye");
         let (header, message) = eternal_wire::v2::control::parse_control(&bytes).unwrap();

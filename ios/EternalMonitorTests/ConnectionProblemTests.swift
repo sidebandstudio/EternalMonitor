@@ -301,7 +301,7 @@ final class ConnectionProblemTests: XCTestCase {
             .hostShuttingDown: (.pcUpdating(.reconnecting),
                                 "This iPad reconnects when it's back. If it doesn't, check that EternalMonitor opened again on the PC, then try again."),
             .hostSleeping: (.pcAsleep, "Wake the PC, then tap Try again."),
-            .hostPoweringOff: (.pcPoweringOff, "Tap Try again once the PC is back on and EternalMonitor is open on it."),
+            .hostPoweringOff: (.pcPoweringOff, "Tap Try again once the PC is on, someone has signed in, and EternalMonitor is open."),
         ]
         for reason in reasons {
             let problem = ConnectionProblem.pcGoodbye(reason)

@@ -192,7 +192,7 @@ enum ConnectionProblem: Equatable {
         case .pcAsleep:
             return "Wake the PC, then tap Try again."
         case .pcPoweringOff:
-            return "Tap Try again once the PC is back on and EternalMonitor is open on it."
+            return "Tap Try again once the PC is on, someone has signed in, and EternalMonitor is open."
         case .pcUpdating(.reconnecting):
             return "This iPad reconnects when it's back. If it doesn't, check that EternalMonitor opened again on the PC, then try again."
         case .pcUpdating(.manual):

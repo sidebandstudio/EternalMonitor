@@ -350,29 +350,36 @@ pub fn log_session_end(end: &SessionEnd, shared: &SharedControl) {
 /// told the PC ended the session, or, when a restart or an update hands over
 /// to a new copy, to connect again.
 pub fn log_session_end_at_quit(shared: &SharedControl) {
-    let why = if shared.handoff.holder().is_some() {
+    stop_session(shared, quit_stop(shared));
+}
+
+/// Why the app quits: for good, or for a restart or an update that hands
+/// over to a new copy.
+pub fn quit_stop(shared: &SharedControl) -> StreamStop {
+    if shared.handoff.holder().is_some() {
         StreamStop::Handoff
     } else {
         StreamStop::Quit
-    };
-    stop_session(shared, why);
+    }
 }
 
 /// The stream stops for good: ends the session, which the transport tells
-/// why on its way out, stops the stream, and logs the summary. The goodbye
-/// and `running` change under one session lock, so a transport starting
-/// meanwhile never takes the goodbye for a stale one
-/// (`Session::transport_resumed`).
+/// why on its way out, stops the stream, and logs the summary.
 pub fn stop_session(shared: &SharedControl, why: StreamStop) {
-    let end = {
-        let mut session = shared.session.lock();
-        let end = session.shut_down(std::time::Instant::now(), why);
-        shared.stop();
-        end
-    };
-    if let Some(end) = end {
+    if let Some(end) = end_stream(shared, why) {
         log_session_end(&end, shared);
     }
+}
+
+/// [`stop_session`] without the summary, which the caller writes. The
+/// goodbye and `running` change under one session lock, so a transport
+/// starting meanwhile never takes the goodbye for a stale one
+/// (`Session::transport_resumed`).
+pub fn end_stream(shared: &SharedControl, why: StreamStop) -> Option<SessionEnd> {
+    let mut session = shared.session.lock();
+    let end = session.shut_down(std::time::Instant::now(), why);
+    shared.stop();
+    end
 }
 
 /// [`log_session_end`] for a PC about to go down: the line goes straight to

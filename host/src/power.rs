@@ -16,10 +16,10 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use tracing::info;
+use tracing::{debug, info, warn};
 
 use crate::control::SharedControl;
-use crate::transport::session::PowerEvent;
+use crate::transport::session::{PowerDown, PowerEvent, SessionEnd};
 
 /// Longest a suspend message waits for the goodbye to leave.
 pub const SLEEP_WAIT: Duration = Duration::from_millis(500);
@@ -62,10 +62,23 @@ pub enum Message {
     /// yes, and nothing happens yet: another app can still call it off.
     QueryEndSession,
     /// WM_ENDSESSION: `ending` false when the shutdown was called off.
-    EndSession { ending: bool, logoff: bool },
+    /// `close_app` (ENDSESSION_CLOSEAPP) without `logoff`: the PC stays up,
+    /// and Restart Manager closes the app because an installer needs its
+    /// files, as Setup does on every update.
+    EndSession {
+        ending: bool,
+        logoff: bool,
+        close_app: bool,
+    },
     /// WM_WTSSESSION_CHANGE WTS_SESSION_LOGOFF.
     SessionLogoff,
 }
+
+/// Longest the end-of-session message waits for the session summary to
+/// reach the disk, counted from when the message came. Windows lists the
+/// app as holding up shutdown after about five seconds; the goodbye's own
+/// wait runs at the same time.
+pub const SUMMARY_WAIT: Duration = Duration::from_secs(3);
 
 /// Acts on `message` and returns what the window answers Windows: 1 (TRUE)
 /// for WM_POWERBROADCAST and WM_QUERYENDSESSION, 0 otherwise.
@@ -82,7 +95,16 @@ pub fn handle(shared: &SharedControl, message: Message) -> isize {
         Message::QueryEndSession => 1,
         Message::EndSession {
             ending: true,
+            logoff: false,
+            close_app: true,
+        } => {
+            closing_app(shared);
+            0
+        }
+        Message::EndSession {
+            ending: true,
             logoff,
+            ..
         } => {
             let event = if logoff {
                 PowerEvent::Logoff
@@ -108,22 +130,27 @@ pub fn handle(shared: &SharedControl, message: Message) -> isize {
 fn going_down(shared: &SharedControl, event: PowerEvent, wait: Duration) {
     let started = Instant::now();
     let before = shared.power.count();
-    let (end, told) = {
+    let (down, told) = {
         let mut session = shared.session.lock();
-        let end = session.power_down(started, event);
-        (end, session.power_goodbye_pending())
+        let down = session.power_down(started, event);
+        (down, session.power_goodbye_pending())
     };
-    // Only a running transport can send it.
-    let sending = told && shared.transport_beat.read().is_some();
-    if sending {
-        shared.power.wake.notify_one();
-    }
-    let Some(end) = end else {
-        info!(
-            power = event.name(),
-            "Windows is taking the PC down; no iPad was streaming"
-        );
-        return;
+    let end = match down {
+        PowerDown::Repeat => {
+            debug!(
+                power = event.name(),
+                "Windows repeated that the PC is going down"
+            );
+            return;
+        }
+        PowerDown::NoSession => {
+            info!(
+                power = event.name(),
+                "Windows is taking the PC down; no iPad was streaming"
+            );
+            return;
+        }
+        PowerDown::Ended(end) => end,
     };
     info!(
         power = event.name(),
@@ -131,25 +158,115 @@ fn going_down(shared: &SharedControl, event: PowerEvent, wait: Duration) {
     );
     // A PC that sleeps comes back with this process and its log writers;
     // one that shuts down or signs out may end it any moment now.
-    match event {
-        PowerEvent::Sleep => crate::diagnostics::log_session_end(&end, shared),
-        PowerEvent::Shutdown | PowerEvent::Logoff => {
-            crate::diagnostics::log_session_end_now(&end, shared)
+    let write = match event {
+        PowerEvent::Sleep => Write::Log,
+        PowerEvent::Shutdown | PowerEvent::Logoff => Write::Disk,
+    };
+    finish(
+        shared,
+        end,
+        write,
+        told,
+        before,
+        started,
+        wait,
+        event.name(),
+    );
+}
+
+/// Restart Manager closes the app for an installer while the PC stays up:
+/// the stream ends as on a quit, with the goodbye every iPad reads (connect
+/// again, when an update hands over to its new copy), and the summary on
+/// disk, since the process ends right after.
+fn closing_app(shared: &SharedControl) {
+    let started = Instant::now();
+    let before = shared.power.count();
+    let end = crate::diagnostics::end_stream(shared, crate::diagnostics::quit_stop(shared));
+    let told = shared.session.lock().goodbye_pending();
+    let Some(end) = end else {
+        info!("Windows is closing the app for an installer; no iPad was streaming");
+        return;
+    };
+    info!(
+        told,
+        "Windows is closing the app for an installer — ended the iPad's session"
+    );
+    finish(
+        shared,
+        end,
+        Write::Disk,
+        told,
+        before,
+        started,
+        END_SESSION_WAIT,
+        "close_app",
+    );
+}
+
+/// Where an ended session's summary goes.
+enum Write {
+    /// Through the log, which outlives a sleep.
+    Log,
+    /// Straight to disk, on a thread of its own, waited for until
+    /// [`SUMMARY_WAIT`] after the message came.
+    Disk,
+}
+
+/// Writes `end`'s summary and waits for the goodbye the transport was told
+/// to send, each within its bound from `started`.
+#[allow(clippy::too_many_arguments)]
+fn finish(
+    shared: &SharedControl,
+    end: SessionEnd,
+    write: Write,
+    told: bool,
+    before: u64,
+    started: Instant,
+    wait: Duration,
+    why: &'static str,
+) {
+    // Only a running transport can send it.
+    let sending = told && shared.transport_beat.read().is_some();
+    if sending {
+        shared.power.wake.notify_one();
+    }
+    let written = match write {
+        Write::Log => {
+            crate::diagnostics::log_session_end(&end, shared);
+            None
+        }
+        Write::Disk => {
+            let (done, written) = std::sync::mpsc::channel();
+            let writer = shared.clone();
+            let spawned = std::thread::Builder::new()
+                .name("summary-now".into())
+                .spawn(move || {
+                    crate::diagnostics::log_session_end_now(&end, &writer);
+                    let _ = done.send(());
+                });
+            spawned.ok().map(|_| written)
+        }
+    };
+    if sending {
+        while shared.power.count() == before && started.elapsed() < wait {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        info!(
+            power = why,
+            sent = shared.power.count() != before,
+            waited_ms = started.elapsed().as_millis() as u64,
+            "Goodbye before the PC goes down"
+        );
+    }
+    if let Some(written) = written {
+        let left = SUMMARY_WAIT.saturating_sub(started.elapsed());
+        if written.recv_timeout(left).is_err() {
+            warn!(
+                power = why,
+                "The session summary did not reach the disk in time"
+            );
         }
     }
-    if !sending {
-        return;
-    }
-    while shared.power.count() == before && started.elapsed() < wait {
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    let sent = shared.power.count() != before;
-    info!(
-        power = event.name(),
-        sent,
-        waited_ms = started.elapsed().as_millis() as u64,
-        "Goodbye before the PC goes down"
-    );
 }
 
 fn back_up(shared: &SharedControl, why: &'static str) {
@@ -185,7 +302,7 @@ mod windows_impl {
     };
     use windows::Win32::UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW,
-        TranslateMessage, DEVICE_NOTIFY_WINDOW_HANDLE, ENDSESSION_LOGOFF, MSG,
+        TranslateMessage, DEVICE_NOTIFY_WINDOW_HANDLE, ENDSESSION_CLOSEAPP, ENDSESSION_LOGOFF, MSG,
         PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, WINDOW_EX_STYLE,
         WINDOW_STYLE, WM_ENDSESSION, WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_WTSSESSION_CHANGE,
         WNDCLASSW, WTS_SESSION_LOGOFF,
@@ -276,6 +393,7 @@ mod windows_impl {
             WM_ENDSESSION => Message::EndSession {
                 ending: wparam != 0,
                 logoff: lparam as u32 & ENDSESSION_LOGOFF != 0,
+                close_app: lparam as u32 & ENDSESSION_CLOSEAPP != 0,
             },
             WM_WTSSESSION_CHANGE if wparam as u32 == WTS_SESSION_LOGOFF => Message::SessionLogoff,
             _ => return None,
@@ -329,6 +447,18 @@ mod windows_impl {
                     Some(Message::EndSession {
                         ending: true,
                         logoff: false,
+                        close_app: false,
+                    }),
+                ),
+                // Restart Manager closing the app for an installer.
+                (
+                    WM_ENDSESSION,
+                    1,
+                    ENDSESSION_CLOSEAPP as isize,
+                    Some(Message::EndSession {
+                        ending: true,
+                        logoff: false,
+                        close_app: true,
                     }),
                 ),
                 (
@@ -338,6 +468,7 @@ mod windows_impl {
                     Some(Message::EndSession {
                         ending: true,
                         logoff: true,
+                        close_app: false,
                     }),
                 ),
                 (
@@ -347,6 +478,7 @@ mod windows_impl {
                     Some(Message::EndSession {
                         ending: false,
                         logoff: false,
+                        close_app: false,
                     }),
                 ),
                 (
