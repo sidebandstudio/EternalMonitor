@@ -23,6 +23,8 @@ snow = { version = "0.10", default-features = false, features = [
     "risky-raw-split",
 ] }
 ring = "0.17"
+# Constant-time comparison of the cookie MAC (already in the tree via snow).
+subtle = "2.6"
 zeroize = "1"
 
 [[example]]

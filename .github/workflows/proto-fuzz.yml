@@ -50,7 +50,7 @@ jobs:
         # uploaded. A crash is reported by target name only.
         run: |
           set -uo pipefail
-          targets="credstore_formats credstore_ops v3_handshake v3_pairing v3_parsers v3_record_open v3_replay_window v3_session_sim"
+          targets="credstore_formats credstore_ops v3_cookie v3_handshake v3_pairing v3_parsers v3_record_open v3_replay_window v3_session_sim"
           listed=$(cargo "+$FUZZ_TOOLCHAIN" fuzz list | sort | tr '\n' ' ' | sed 's/ $//')
           if [ "$listed" != "$targets" ]; then
             echo "::error::fuzz targets are '$listed', expected '$targets'"

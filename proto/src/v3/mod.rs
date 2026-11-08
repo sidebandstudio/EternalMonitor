@@ -57,6 +57,7 @@
 //! Integers are little-endian throughout, like v2.
 
 pub mod client;
+pub mod cookie;
 pub mod handshake;
 pub mod host;
 pub mod pairing;

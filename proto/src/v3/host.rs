@@ -38,6 +38,7 @@ use std::hash::Hash;
 use std::net::{IpAddr, SocketAddr};
 use std::time::Duration;
 
+use super::cookie::{self, CookieJar, CookieMode, LoadMeter};
 use super::handshake::Responder;
 use super::record::{Opener, RecordHeader, Sealer};
 use super::wire::{
@@ -104,6 +105,12 @@ pub struct HostConfig {
     pub liveness_timeout: Duration,
     /// A session's maximum age.
     pub max_age: Duration,
+    /// When message 1 must carry a valid cookie for its source.
+    pub cookies: CookieMode,
+    /// Under load while this many message 1s arrived this second or the one
+    /// before, whatever they carry, or half the host-wide Diffie-Hellman
+    /// budget is used this second.
+    pub cookie_load_msg1_per_second: u32,
 }
 
 impl HostConfig {
@@ -128,6 +135,8 @@ impl HostConfig {
             max_pending: 16,
             liveness_timeout: Duration::from_secs(3),
             max_age: SESSION_MAX_AGE,
+            cookies: CookieMode::UnderLoad,
+            cookie_load_msg1_per_second: 400,
         }
     }
 }
@@ -140,6 +149,9 @@ impl HostConfig {
 pub trait PeerAddr: Clone + Eq + Hash {
     type Bucket: Clone + Eq + Hash;
     fn rate_bucket(&self) -> Self::Bucket;
+    /// What a return-routability cookie binds: the exact source, IP and
+    /// port, so a cookie proves the iPad receives at that address.
+    fn cookie_input(&self) -> Vec<u8>;
 }
 
 impl PeerAddr for SocketAddr {
@@ -157,6 +169,17 @@ impl PeerAddr for SocketAddr {
             v4 => v4,
         }
     }
+
+    /// The IP as [`rate_bucket`](Self::rate_bucket) normalizes it (4 or 16
+    /// bytes), then the port, little-endian.
+    fn cookie_input(&self) -> Vec<u8> {
+        let mut out = match self.rate_bucket() {
+            IpAddr::V4(v4) => v4.octets().to_vec(),
+            IpAddr::V6(v6) => v6.octets().to_vec(),
+        };
+        out.extend_from_slice(&self.port().to_le_bytes());
+        out
+    }
 }
 
 #[cfg(any(test, feature = "test-hooks"))]
@@ -164,6 +187,9 @@ impl PeerAddr for u32 {
     type Bucket = u32;
     fn rate_bucket(&self) -> u32 {
         *self
+    }
+    fn cookie_input(&self) -> Vec<u8> {
+        self.to_le_bytes().to_vec()
     }
 }
 
@@ -624,6 +650,11 @@ pub struct HostSessions<A: PeerAddr> {
     wall_clock: (Duration, u64),
     msg1_reads: u64,
     dh_performed: u64,
+    /// The cookie secrets and the reply budget.
+    cookies: CookieJar,
+    /// Message 1 arrivals, for the load test.
+    arrivals: LoadMeter,
+    cookie_replies: u64,
 }
 
 impl<A: PeerAddr> HostSessions<A> {
@@ -635,7 +666,12 @@ impl<A: PeerAddr> HostSessions<A> {
         now: Duration,
         wall_us: u64,
     ) -> Self {
+        let mut rng = rng;
+        let cookies = CookieJar::new(now, rng.as_mut());
         Self {
+            cookies,
+            arrivals: LoadMeter::new(now),
+            cookie_replies: 0,
             answered_capacity: answered_capacity(&config),
             msg1_rate: SourceLimiter::new(config.msg1_per_second),
             stale_replay_rate: SourceLimiter::new(config.stale_replays_per_second),
@@ -684,6 +720,27 @@ impl<A: PeerAddr> HostSessions<A> {
     /// Message 1s read (authenticated or not) so far.
     pub fn msg1_reads(&self) -> u64 {
         self.msg1_reads
+    }
+
+    /// Cookie replies sent so far.
+    pub fn cookie_replies(&self) -> u64 {
+        self.cookie_replies
+    }
+
+    /// Whether message 1 needs a cookie now: always or never as configured,
+    /// otherwise while many message 1s are arriving, or half the host-wide
+    /// Diffie-Hellman budget is used this second.
+    pub fn under_load(&self, now: Duration) -> bool {
+        match self.config.cookies {
+            CookieMode::Always => true,
+            CookieMode::Off => false,
+            CookieMode::UnderLoad => {
+                self.arrivals
+                    .busy(now, self.config.cookie_load_msg1_per_second)
+                    || (now.saturating_sub(self.dh_budget.start) < Duration::from_secs(1)
+                        && self.dh_budget.count.saturating_mul(2) >= self.config.dh_per_second)
+            }
+        }
     }
 
     /// Diffie-Hellman operations performed so far: one per message 2
@@ -768,9 +825,11 @@ impl<A: PeerAddr> HostSessions<A> {
         creds: &dyn HostCredentials,
         out: &mut Vec<HostOutput<A>>,
     ) {
-        let Ok(msg1) = wire::parse_msg1(datagram) else {
+        let (canon, mac) = cookie::split(datagram);
+        let Ok(msg1) = wire::parse_msg1(&canon) else {
             return;
         };
+        self.arrivals.record(now);
         let bucket = from.rate_bucket();
         let key = msg1_key(&msg1);
         if self
@@ -779,6 +838,36 @@ impl<A: PeerAddr> HostSessions<A> {
             .is_some_and(|&until| now < until)
         {
             return;
+        }
+        // Under load, nothing answers or reads a message 1 without a valid
+        // cookie for its exact source: only a cookie reply goes back, and
+        // only for a known dev_id. That covers new message 1s, cached
+        // answers and the live address alike.
+        if self.under_load(now) {
+            let address = from.cookie_input();
+            let verified = mac.is_some_and(|mac| {
+                self.cookies
+                    .verify(now, &address, &canon, &mac, self.rng.as_mut())
+            });
+            if !verified {
+                if let Some(k_dev) = creds.key(&msg1.dev_id) {
+                    let key = cookie::session_key(&k_dev, &msg1.dev_id);
+                    let reply = self.cookies.reply(
+                        now,
+                        &address,
+                        &key,
+                        super::EXT_SESSION,
+                        &canon,
+                        self.rng.as_mut(),
+                    );
+                    self.cookie_replies += 1;
+                    out.push(HostOutput::Send {
+                        to: from.clone(),
+                        datagram: reply,
+                    });
+                }
+                return;
+            }
         }
         let dev_id = msg1.dev_id;
         let resend_interval = self.config.msg2_resend_interval;
@@ -1668,15 +1757,18 @@ mod tests {
     }
 
     fn setup() -> (HostSessions<u32>, Creds) {
+        setup_with(CookieMode::UnderLoad)
+    }
+
+    /// With cookies `Off`, for the budgets beneath the cookie: what a flood
+    /// from real addresses (which can answer a cookie) reaches.
+    fn setup_with(cookies: CookieMode) -> (HostSessions<u32>, Creds) {
         let mut creds = Creds::default();
         creds.keys.insert(DEV, K);
+        let mut config = HostConfig::new(HOST);
+        config.cookies = cookies;
         (
-            HostSessions::new(
-                HostConfig::new(HOST),
-                Box::new(SeededRandom::new(1)),
-                T0,
-                WALL,
-            ),
+            HostSessions::new(config, Box::new(SeededRandom::new(1)), T0, WALL),
             creds,
         )
     }
@@ -2418,7 +2510,7 @@ mod tests {
 
     #[test]
     fn unknown_dev_ids_are_never_charged() {
-        let (mut host, creds) = setup();
+        let (mut host, creds) = setup_with(CookieMode::Off);
         for source in 0..2000u32 {
             let junk = Initiator::start(&K, &[0xEE; 16], &HOST, 1, &hello(1)).unwrap();
             host.handle_datagram(T0, &(10_000 + source), junk.msg1(), &creds);
@@ -2438,6 +2530,7 @@ mod tests {
         // Only the per-source table decides here.
         let mut config = HostConfig::new(HOST);
         config.dh_per_second = u32::MAX;
+        config.cookies = CookieMode::Off;
         let mut host: HostSessions<u32> =
             HostSessions::new(config, Box::new(SeededRandom::new(5)), T0, WALL);
         let forged = |i: u64| Initiator::start(&[7; 32], &DEV, &HOST, 1, &hello(i)).unwrap();
@@ -2458,7 +2551,7 @@ mod tests {
 
     #[test]
     fn the_live_sessions_own_address_has_a_reserved_budget() {
-        let (mut host, creds) = setup();
+        let (mut host, creds) = setup_with(CookieMode::Off);
         live(&mut host, &creds, 10, T0);
         // Flood: forged message 1s for this dev_id from 2,000 sources use up
         // the shared budgets.
@@ -2521,7 +2614,7 @@ mod tests {
 
     #[test]
     fn forged_message_1s_never_use_the_host_wide_handshake_budget() {
-        let (mut host, creds) = setup();
+        let (mut host, creds) = setup_with(CookieMode::Off);
         // Forged message 1s for a known dev_id from 100 sources at their
         // full per-source rate, for 10 s.
         let forged: Vec<Vec<u8>> = (0..2000u64)
@@ -2575,6 +2668,7 @@ mod tests {
         }
         let mut config = HostConfig::new(HOST);
         config.max_pending = 1000;
+        config.cookies = CookieMode::Off;
         let mut host2: HostSessions<u32> =
             HostSessions::new(config, Box::new(SeededRandom::new(9)), T0, WALL);
         for (i, id) in ids.iter().enumerate() {
@@ -2587,7 +2681,7 @@ mod tests {
 
     #[test]
     fn spoofing_the_live_address_below_its_cap_never_drains_its_reserved_budget() {
-        let (mut host, creds) = setup();
+        let (mut host, creds) = setup_with(CookieMode::Off);
         live(&mut host, &creds, 10, T0);
         // Forged message 1s for this dev_id from the live address itself.
         for i in 0..1500u64 {
@@ -2683,6 +2777,7 @@ mod tests {
     fn the_remembered_table_fits_every_credential_at_full_rate() {
         let mut config = HostConfig::new(HOST);
         config.max_credentials = 4;
+        config.cookies = CookieMode::Off;
         let mut host = HostSessions::new(config, Box::new(SeededRandom::new(1)), T0, WALL);
         let mut creds = Creds::default();
         *creds.timestamp.borrow_mut() = u64::from(u32::MAX);
@@ -2772,5 +2867,274 @@ mod tests {
             sends(&host.handle_datagram(T0 + ms(120), &ADDR, ipad.msg1(), &creds)).len(),
             1
         );
+    }
+
+    /// Message 1 with the cookie the host's reply to it carries, from the
+    /// iPad's side: what [`crate::v3::client::Client`] does.
+    fn with_cookie(reply: &[u8], msg1: &[u8]) -> Vec<u8> {
+        let parsed = cookie::CookieReply::parse(reply).expect("a cookie reply");
+        let key = cookie::session_key(&K, &DEV);
+        let value = cookie::open(&key, &parsed, &cookie::msg1_digest(msg1)).expect("opens");
+        cookie::attach(msg1, &value)
+    }
+
+    fn only_cookie_reply(out: &[HostOutput<u32>], to: u32, msg1: &[u8]) -> Vec<u8> {
+        match out {
+            [HostOutput::Send { to: at, datagram }] => {
+                assert_eq!(*at, to);
+                assert!(cookie::is_reply(datagram), "a cookie reply");
+                assert!(datagram.len() < msg1.len(), "smaller than message 1");
+                datagram.clone()
+            }
+            other => panic!("expected one cookie reply, got {} outputs", other.len()),
+        }
+    }
+
+    #[test]
+    fn under_load_a_message_1_without_a_cookie_gets_only_a_cookie_reply() {
+        let (mut host, creds) = setup_with(CookieMode::Always);
+        let ipad = Initiator::start(&K, &DEV, &HOST, 1, &hello(10)).unwrap();
+        let out = host.handle_datagram(T0, &ADDR, ipad.msg1(), &creds);
+        let reply = only_cookie_reply(&out, ADDR, ipad.msg1());
+        assert_eq!(host.msg1_reads(), 0, "no Noise read");
+        assert_eq!(host.handshakes_performed(), 0, "no Diffie-Hellman");
+        assert_eq!(host.pending_count(), 0);
+        assert_eq!(host.cookie_replies(), 1);
+        // With the cookie: an ordinary handshake.
+        let msg1 = with_cookie(&reply, ipad.msg1());
+        let out = sends(&host.handle_datagram(T0 + ms(1), &ADDR, &msg1, &creds));
+        assert_eq!(out.len(), 1);
+        assert_eq!(wire::classify(&out[0]), V3Kind::Handshake2);
+        assert_eq!(host.msg1_reads(), 1);
+        assert!(host.pending_session(&DEV).is_some());
+    }
+
+    #[test]
+    fn unknown_dev_ids_get_no_cookie_reply() {
+        let (mut host, creds) = setup_with(CookieMode::Always);
+        let stranger = Initiator::start(&K, &[0xEE; 16], &HOST, 1, &hello(10)).unwrap();
+        assert!(host
+            .handle_datagram(T0, &ADDR, stranger.msg1(), &creds)
+            .is_empty());
+        assert_eq!(host.cookie_replies(), 0);
+    }
+
+    #[test]
+    fn a_cookie_is_good_only_from_the_address_it_was_sent_to() {
+        let (mut host, creds) = setup_with(CookieMode::Always);
+        let ipad = Initiator::start(&K, &DEV, &HOST, 1, &hello(10)).unwrap();
+        let reply = only_cookie_reply(
+            &host.handle_datagram(T0, &ADDR, ipad.msg1(), &creds),
+            ADDR,
+            ipad.msg1(),
+        );
+        let msg1 = with_cookie(&reply, ipad.msg1());
+        // The same bytes from anywhere else: a new cookie reply, nothing more.
+        only_cookie_reply(&host.handle_datagram(T0, &2, &msg1, &creds), 2, ipad.msg1());
+        assert_eq!(host.msg1_reads(), 0);
+        // A forged MAC from the right address is no better.
+        let mut forged = msg1.clone();
+        let last = forged.len() - 1;
+        forged[last] ^= 1;
+        only_cookie_reply(
+            &host.handle_datagram(T0, &ADDR, &forged, &creds),
+            ADDR,
+            ipad.msg1(),
+        );
+        assert_eq!(host.msg1_reads(), 0);
+    }
+
+    /// Under load the cookie comes before everything that answers: cached
+    /// Stale answers, message 2 resends and the live address's reserve.
+    #[test]
+    fn under_load_cached_answers_and_resends_need_a_cookie_too() {
+        let (mut host, creds) = setup_with(CookieMode::Always);
+        let round_trip = |host: &mut HostSessions<u32>, from: u32, msg1: &[u8]| {
+            let out = host.handle_datagram(T0, &from, msg1, &creds);
+            let reply = only_cookie_reply(&out, from, msg1);
+            sends(&host.handle_datagram(T0, &from, &with_cookie(&reply, msg1), &creds))
+        };
+        // A pending attempt: its message 1 again, without a cookie.
+        let ipad = Initiator::start(&K, &DEV, &HOST, 1, &hello(10)).unwrap();
+        assert_eq!(round_trip(&mut host, ADDR, ipad.msg1()).len(), 1);
+        let out = host.handle_datagram(T0 + ms(200), &ADDR, ipad.msg1(), &creds);
+        only_cookie_reply(&out, ADDR, ipad.msg1());
+        // A cached Stale answer, replayed from elsewhere without a cookie.
+        *creds.timestamp.borrow_mut() = 1000;
+        let stale = Initiator::start(&K, &DEV, &HOST, 2, &hello(900)).unwrap();
+        assert_eq!(round_trip(&mut host, 5, stale.msg1()).len(), 1, "Stale");
+        let out = host.handle_datagram(T0 + ms(300), &6, stale.msg1(), &creds);
+        only_cookie_reply(&out, 6, stale.msg1());
+        // The live address, spoofed: only cookie replies, to the iPad.
+        let (mut host, creds) = setup_with(CookieMode::Off);
+        live(&mut host, &creds, 10, T0);
+        host.config.cookies = CookieMode::Always;
+        let before = host.msg1_reads();
+        for i in 0..50u64 {
+            let forged = Initiator::start(&[7; 32], &DEV, &HOST, 1, &hello(100 + i)).unwrap();
+            let out = host.handle_datagram(T0 + ms(5), &ADDR, forged.msg1(), &creds);
+            only_cookie_reply(&out, ADDR, forged.msg1());
+        }
+        assert_eq!(host.msg1_reads(), before);
+    }
+
+    /// Phase-1 iPads send no cookie: they connect whenever the host isn't
+    /// under load, get only cookie replies (which they drop) while it is,
+    /// and connect again once the load has passed.
+    #[test]
+    fn a_client_without_cookies_connects_whenever_the_host_is_not_under_load() {
+        let (mut host, creds) = setup();
+        let plain = |host: &mut HostSessions<u32>, at: Duration, ts: u64| {
+            let ipad = Initiator::start(&K, &DEV, &HOST, ts as u32, &hello(ts)).unwrap();
+            let out = sends(&host.handle_datagram(at, &ADDR, ipad.msg1(), &creds));
+            out.len() == 1 && wire::classify(&out[0]) == V3Kind::Handshake2
+        };
+        assert!(!host.under_load(T0));
+        assert!(plain(&mut host, T0, 10));
+        // A flood: message 1s for an unknown dev_id from many sources. They
+        // cost nothing, but they're arrivals.
+        let junk = Initiator::start(&K, &[0xEE; 16], &HOST, 1, &hello(1)).unwrap();
+        let start = T0 + Duration::from_secs(1);
+        for i in 0..400u32 {
+            host.handle_datagram(start, &(10_000 + i), junk.msg1(), &creds);
+        }
+        assert!(host.under_load(start));
+        assert!(!plain(&mut host, start + ms(10), 20), "only a cookie reply");
+        // The second after still counts: the load doesn't flap at the edge.
+        let next = start + ms(1500);
+        assert!(host.under_load(next));
+        // Two quiet seconds later it's over.
+        let after = start + Duration::from_secs(2);
+        assert!(!host.under_load(after));
+        assert!(plain(&mut host, after, 30));
+    }
+
+    #[test]
+    fn half_the_handshake_budget_in_a_second_is_load() {
+        let mut creds = Creds::default();
+        let ids: Vec<Id16> = (0..100u16)
+            .map(|i| {
+                let mut id = [0u8; 16];
+                id[..2].copy_from_slice(&i.to_le_bytes());
+                id
+            })
+            .collect();
+        for id in &ids {
+            creds.keys.insert(*id, K);
+        }
+        let mut config = HostConfig::new(HOST);
+        config.max_pending = 1000;
+        let mut host: HostSessions<u32> =
+            HostSessions::new(config, Box::new(SeededRandom::new(9)), T0, WALL);
+        for (i, id) in ids.iter().enumerate() {
+            assert!(!host.under_load(T0), "{i} handshakes");
+            let ipad = Initiator::start(&K, id, &HOST, 1, &hello(10)).unwrap();
+            host.handle_datagram(T0, &(i as u32), ipad.msg1(), &creds);
+        }
+        assert_eq!(host.handshakes_performed(), 100);
+        assert!(host.under_load(T0));
+        assert!(!host.under_load(T0 + Duration::from_secs(1)));
+    }
+
+    /// 10,000 spoofed message 1s a second for the iPad's own dev_id, from
+    /// 1,000,000 sources, for 5 s, half of them replays of its genuine old
+    /// message 1s. Once the load is on, none is read, nothing reaches
+    /// Diffie-Hellman, each gets at most one smaller reply, and the iPad
+    /// reconnects through the cookie in the middle of it.
+    #[test]
+    fn a_spoofed_flood_never_reaches_the_crypto_and_never_starves_the_ipad() {
+        let (mut host, creds) = setup();
+        *creds.timestamp.borrow_mut() = 1000;
+        let old: Vec<Vec<u8>> = (0..20u64)
+            .map(|i| {
+                let ipad = Initiator::start(&K, &DEV, &HOST, i as u32, &hello(500 + i)).unwrap();
+                ipad.msg1().to_vec()
+            })
+            .collect();
+        let forged: Vec<Vec<u8>> = (0..20u64)
+            .map(|i| {
+                let ipad = Initiator::start(&[7; 32], &DEV, &HOST, 1, &hello(2000 + i)).unwrap();
+                ipad.msg1().to_vec()
+            })
+            .collect();
+        let mut rng = SeededRandom::new(77);
+        let mut reads_once_loaded = None;
+        let mut reconnected = false;
+        let mut replies = 0u64;
+        for tick in 0..500u64 {
+            let at = T0 + ms(tick * 10);
+            for i in 0..100usize {
+                let mut source = [0u8; 4];
+                rng.fill(&mut source);
+                let source = 10_000 + u32::from_le_bytes(source) % 1_000_000;
+                let msg1 = if i % 2 == 0 {
+                    &old[i / 2 % 20]
+                } else {
+                    &forged[i / 2 % 20]
+                };
+                let out = host.handle_datagram(at, &source, msg1, &creds);
+                assert!(out.len() <= 1);
+                for o in &out {
+                    let HostOutput::Send { datagram, .. } = o else {
+                        panic!("only sends")
+                    };
+                    assert!(datagram.len() < msg1.len());
+                    if reads_once_loaded.is_some() {
+                        assert!(cookie::is_reply(datagram), "only cookie replies");
+                    }
+                    replies += 1;
+                }
+            }
+            if reads_once_loaded.is_none() && host.under_load(at) {
+                reads_once_loaded = Some((host.msg1_reads(), host.handshakes_performed()));
+            }
+            if tick == 300 {
+                let ipad = Initiator::start(&K, &DEV, &HOST, 9, &hello(5000)).unwrap();
+                let out = host.handle_datagram(at, &ADDR, ipad.msg1(), &creds);
+                let reply = only_cookie_reply(&out, ADDR, ipad.msg1());
+                let msg1 = with_cookie(&reply, ipad.msg1());
+                let out = sends(&host.handle_datagram(at, &ADDR, &msg1, &creds));
+                reconnected = out.len() == 1 && wire::classify(&out[0]) == V3Kind::Handshake2;
+            }
+        }
+        // Before it, the phase-1 budgets: reads up to the load threshold, and
+        // Stale answers within the dev_id's 5 a second.
+        let (reads, handshakes) = reads_once_loaded.expect("the flood is load");
+        assert!(reads <= 400, "{reads} reads before the load was on");
+        assert!(handshakes <= 5);
+        assert_eq!(host.msg1_reads(), reads + 1, "only the iPad's, after");
+        assert_eq!(
+            host.handshakes_performed(),
+            handshakes + 1,
+            "only the iPad's"
+        );
+        assert!(reconnected);
+        assert!(replies <= 50_000);
+        assert!(host.pending_session(&DEV).is_some());
+    }
+
+    /// A real address that got a cookie and floods with it is still held to
+    /// its per-source limit.
+    #[test]
+    fn a_valid_cookie_never_lifts_the_per_source_limit() {
+        let (mut host, creds) = setup_with(CookieMode::Always);
+        let mut reads = Vec::new();
+        for i in 0..100u64 {
+            let forged = Initiator::start(&[7; 32], &DEV, &HOST, 1, &hello(100 + i)).unwrap();
+            let out = host.handle_datagram(T0, &9, forged.msg1(), &creds);
+            let reply = only_cookie_reply(&out, 9, forged.msg1());
+            // The attacker can't open a reply sealed under K, but say it
+            // could: the cookie only proves the address.
+            let parsed = cookie::CookieReply::parse(&reply).unwrap();
+            let value = cookie::open(
+                &cookie::session_key(&K, &DEV),
+                &parsed,
+                &cookie::msg1_digest(forged.msg1()),
+            )
+            .unwrap();
+            host.handle_datagram(T0, &9, &cookie::attach(forged.msg1(), &value), &creds);
+            reads.push(host.msg1_reads());
+        }
+        assert_eq!(*reads.last().unwrap(), 20, "the per-source limit");
     }
 }

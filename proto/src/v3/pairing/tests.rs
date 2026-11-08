@@ -37,8 +37,16 @@ impl PairCredentials for Creds {
 }
 
 fn host() -> PairingHost<u32> {
+    host_with(CookieMode::UnderLoad)
+}
+
+/// With cookies `Off`, for the budgets beneath the cookie.
+fn host_with(cookies: CookieMode) -> PairingHost<u32> {
     PairingHost::new(
-        PairingConfig::default(),
+        PairingConfig {
+            cookies,
+            ..PairingConfig::default()
+        },
         HOST,
         "0.4.0",
         "Test PC",
@@ -643,27 +651,55 @@ fn hex(bytes: &[u8]) -> String {
     out
 }
 
+/// What answers the iPad's message 1 once any cookie round trip is done: a
+/// message 2, or nothing.
+fn pair_msg2(
+    host: &mut PairingHost<u32>,
+    at: Duration,
+    ipad: &mut PairingClient,
+    creds: &Creds,
+) -> Option<Vec<u8>> {
+    let mut out = sends(&host.handle_datagram(at, &ADDR, ipad.msg1(), creds));
+    if let [reply] = &out[..] {
+        if let Some(msg1) = ipad.handle_cookie(reply) {
+            out = sends(&host.handle_datagram(at, &ADDR, &msg1, creds));
+        }
+    }
+    out.into_iter()
+        .find(|d| wire::classify(d) == V3Kind::Handshake2)
+}
+
 #[test]
 fn one_sender_flooding_junk_never_blocks_a_pairing_from_another() {
+    for cookies in [CookieMode::Off, CookieMode::UnderLoad] {
+        one_sender_flooding(cookies);
+    }
+}
+
+fn one_sender_flooding(cookies: CookieMode) {
     let creds = Creds::default();
-    let mut host = host();
+    let mut host = host_with(cookies);
     let qr = host.open(T0, addr());
     let mut forged = qr.clone();
     forged.secret = Zeroizing::new([0x03; 32]);
     let junk = client(&forged, 40).msg1().to_vec();
     // A thousand a second from one LAN address, with no QR, for two seconds.
     let mut answered = 0;
-    let ipad = client(&qr, 41);
+    let mut ipad = client(&qr, 41);
     for step in 0..2_000u64 {
         let at = T0 + Duration::from_millis(step);
         host.handle_datagram(at, &2, &junk, &creds);
         // The real iPad retries every 250 ms, well into each second's
         // flood.
         if step % 250 == 125 {
-            answered += sends(&host.handle_datagram(at, &ADDR, ipad.msg1(), &creds)).len();
+            answered += usize::from(pair_msg2(&mut host, at, &mut ipad, &creds).is_some());
         }
     }
-    assert!(answered >= 1, "the genuine iPad got its message 2");
+    assert!(
+        answered >= 1,
+        "the genuine iPad got its message 2: {cookies:?}"
+    );
+    assert_eq!(host.cookie_replies() > 0, cookies != CookieMode::Off);
 }
 
 /// Many senders, each inside its own limit, burst junk right before each of
@@ -671,13 +707,19 @@ fn one_sender_flooding_junk_never_blocks_a_pairing_from_another() {
 /// limit before authentication can be used up.)
 #[test]
 fn a_genuine_pairing_gets_message_2_behind_many_senders() {
+    for cookies in [CookieMode::Off, CookieMode::UnderLoad] {
+        behind_many_senders(cookies);
+    }
+}
+
+fn behind_many_senders(cookies: CookieMode) {
     let creds = Creds::default();
-    let mut host = host();
+    let mut host = host_with(cookies);
     let qr = host.open(T0, addr());
     let mut forged = qr.clone();
     forged.secret = Zeroizing::new([0x04; 32]);
     let junk = client(&forged, 42).msg1().to_vec();
-    let ipad = client(&qr, 43);
+    let mut ipad = client(&qr, 43);
     let mut answered = 0;
     for retry in 0..8u64 {
         let at = T0 + Duration::from_millis(250 * retry);
@@ -686,7 +728,88 @@ fn a_genuine_pairing_gets_message_2_behind_many_senders() {
                 host.handle_datagram(at, &(100 + source), &junk, &creds);
             }
         }
-        answered += sends(&host.handle_datagram(at, &ADDR, ipad.msg1(), &creds)).len();
+        answered += usize::from(pair_msg2(&mut host, at, &mut ipad, &creds).is_some());
     }
-    assert!(answered >= 1, "message 2 on {answered} of 8 retries");
+    assert!(
+        answered >= 1,
+        "message 2 on {answered} of 8 retries: {cookies:?}"
+    );
+    assert_eq!(host.cookie_replies() > 0, cookies != CookieMode::Off);
+}
+
+#[test]
+fn under_load_a_pairing_message_1_gets_only_a_cookie_reply_and_pairs_through_it() {
+    let creds = Creds::default();
+    let mut host = host_with(CookieMode::Always);
+    let qr = host.open(T0, addr());
+    let mut ipad = client(&qr, 50);
+    let out = sends(&host.handle_datagram(T0, &ADDR, ipad.msg1(), &creds));
+    let [reply] = &out[..] else {
+        panic!("one reply")
+    };
+    assert!(cookie::is_reply(reply));
+    assert!(reply.len() < ipad.msg1().len());
+    assert!(!host.in_flight(T0), "no pairing started");
+    // It reads nothing and remembers nothing: the same message 1 gets the
+    // same treatment, and with the cookie it pairs.
+    let msg1 = ipad.handle_cookie(reply).expect("the iPad opens it");
+    assert_eq!(ipad.msg1(), &msg1[..], "retries carry the cookie");
+    let msg2 = sends(&host.handle_datagram(T0 + ms(1), &ADDR, &msg1, &creds));
+    assert_eq!(msg2.len(), 1);
+    ipad.read_msg2(&msg2[0]).unwrap();
+    let confirm = ipad.confirm(None).unwrap();
+    let pending = store_of(host.handle_datagram(T0 + ms(2), &ADDR, &confirm, &creds));
+    assert!(pending.is_some(), "stored after the confirm");
+    // A retry of message 1 without the cookie, from anywhere: a cookie
+    // reply, never message 2 again.
+    let plain = client(&qr, 50);
+    let out = sends(&host.handle_datagram(T0 + ms(300), &9, plain.msg1(), &creds));
+    assert!(out.len() == 1 && cookie::is_reply(&out[0]));
+    assert_eq!(host.cookie_replies(), 2);
+}
+
+#[test]
+fn only_the_qr_holder_can_open_a_pairing_cookie_reply() {
+    let creds = Creds::default();
+    let mut host = host_with(CookieMode::Always);
+    let qr = host.open(T0, addr());
+    let mut forged = qr.clone();
+    forged.secret = Zeroizing::new([0x05; 32]);
+    let mut guess = client(&forged, 51);
+    let out = sends(&host.handle_datagram(T0, &ADDR, guess.msg1(), &creds));
+    assert_eq!(out.len(), 1, "a reply: the host can't tell before the PSK");
+    assert!(guess.handle_cookie(&out[0]).is_none());
+    // Nor can another iPad that scanned the same QR (its own nonce_i).
+    let mut ipad = client(&qr, 52);
+    let mine = sends(&host.handle_datagram(T0, &ADDR, ipad.msg1(), &creds));
+    let mut other = client(&qr, 53);
+    assert!(other.handle_cookie(&mine[0]).is_none());
+    assert!(ipad.handle_cookie(&out[0]).is_none(), "not its message 1");
+    assert!(ipad.handle_cookie(&mine[0]).is_some());
+    // And nothing pairs without a window.
+    host.close();
+    assert!(host
+        .handle_datagram(T0, &ADDR, ipad.msg1(), &creds)
+        .is_empty());
+}
+
+#[test]
+fn pairing_load_turns_on_with_arrivals_and_off_after_them() {
+    let creds = Creds::default();
+    let mut host = host();
+    let qr = host.open(T0, addr());
+    let mut forged = qr.clone();
+    forged.secret = Zeroizing::new([0x06; 32]);
+    let junk = client(&forged, 54).msg1().to_vec();
+    assert!(!host.under_load(T0));
+    for i in 0..400u32 {
+        host.handle_datagram(T0, &(1000 + i), &junk, &creds);
+    }
+    assert!(host.under_load(T0));
+    assert!(host.under_load(T0 + ms(1500)));
+    assert!(!host.under_load(T0 + Duration::from_secs(2)));
+    // A phase-1 style iPad that ignores cookies pairs once it's over.
+    let ipad = client(&qr, 55);
+    let out = sends(&host.handle_datagram(T0 + Duration::from_secs(2), &ADDR, ipad.msg1(), &creds));
+    assert_eq!(wire::classify(&out[0]), V3Kind::Handshake2);
 }

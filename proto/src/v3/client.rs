@@ -30,6 +30,7 @@
 
 use std::time::Duration;
 
+use super::cookie::{self, CookieReply, HeldCookie};
 use super::handshake::Initiator;
 use super::record::{Opener, RecordHeader, Sealer};
 use super::wire::{self, Accept, HelloPayload, Msg2Payload, SessionMessage, SlotStatus, V3Kind};
@@ -286,6 +287,8 @@ pub struct Client {
     /// them. Their live session, and an abandoned attempt the host may have
     /// committed (the commit that reached the ceiling), stay usable.
     no_new_attempts: Vec<Id16>,
+    /// The host's last cookie: attached to every message 1 while fresh.
+    cookie: Option<HeldCookie>,
 }
 
 /// A confirming attempt the iPad stopped retrying. Nothing is sealed under
@@ -316,6 +319,15 @@ impl Client {
             intent: None,
             clock_limit: None,
             no_new_attempts: Vec::new(),
+            cookie: None,
+        }
+    }
+
+    /// Message 1 as sent now: with the host's cookie while it's fresh.
+    fn msg1_datagram(cookie: Option<HeldCookie>, now: Duration, initiator: &Initiator) -> Vec<u8> {
+        match cookie.filter(|c| c.fresh(now)) {
+            Some(held) => cookie::attach(initiator.msg1(), &held.cookie),
+            None => initiator.msg1().to_vec(),
         }
     }
 
@@ -482,7 +494,11 @@ impl Client {
             &hello,
         )
         .expect("message 1 always fits");
-        out.push(ClientOutput::Send(initiator.msg1().to_vec()));
+        out.push(ClientOutput::Send(Self::msg1_datagram(
+            self.cookie,
+            now,
+            &initiator,
+        )));
         self.attempt = Attempt::Connecting {
             initiator: Box::new(initiator),
             key,
@@ -499,12 +515,48 @@ impl Client {
         clock_us: u64,
     ) -> Vec<ClientOutput> {
         let mut out = Vec::new();
+        if cookie::is_reply(datagram) {
+            self.handle_cookie(now, datagram, &mut out);
+            return out;
+        }
         match wire::classify(datagram) {
             V3Kind::Handshake2 => self.handle_msg2(now, datagram, clock_us, &mut out),
             V3Kind::Sealed => self.handle_record(now, datagram, &mut out),
             V3Kind::Handshake1 | V3Kind::Other => {}
         }
         out
+    }
+
+    /// A cookie reply for the message 1 being sent: keep the cookie and
+    /// send message 1 again with it at once. Anything else is dropped: a
+    /// reply opens only under this attempt's key and its exact message 1.
+    fn handle_cookie(&mut self, now: Duration, datagram: &[u8], out: &mut Vec<ClientOutput>) {
+        let Attempt::Connecting {
+            initiator,
+            key,
+            last_sent,
+            ..
+        } = &mut self.attempt
+        else {
+            return;
+        };
+        let Ok(reply) = CookieReply::parse(datagram) else {
+            return;
+        };
+        if reply.tag != super::EXT_SESSION {
+            return;
+        }
+        let k = cookie::session_key(&key.k_dev, &key.dev_id);
+        let Some(value) = cookie::open(&k, &reply, &cookie::msg1_digest(initiator.msg1())) else {
+            return;
+        };
+        let held = HeldCookie {
+            cookie: value,
+            received: now,
+        };
+        self.cookie = Some(held);
+        *last_sent = now;
+        out.push(ClientOutput::Send(cookie::attach(initiator.msg1(), &value)));
     }
 
     fn handle_msg2(
@@ -882,7 +934,11 @@ impl Client {
                     self.fail_attempt(dev_id, &mut out);
                 } else if now.saturating_sub(*last_sent) >= self.config.msg1_retry_interval {
                     *last_sent = now;
-                    out.push(ClientOutput::Send(initiator.msg1().to_vec()));
+                    out.push(ClientOutput::Send(Self::msg1_datagram(
+                        self.cookie,
+                        now,
+                        initiator,
+                    )));
                 }
             }
             Attempt::Confirming {
@@ -1275,5 +1331,95 @@ mod tests {
         let text = format!("{output:?}");
         assert!(text.contains("body_len: 11"), "{text}");
         assert!(!text.contains("102, 114"), "{text}");
+    }
+
+    /// The host's cookie reply to `msg1` from the iPad's address.
+    fn cookie_reply(msg1: &[u8], value: &[u8; 16]) -> Vec<u8> {
+        let k = cookie::session_key(&key().k_dev, &key().dev_id);
+        cookie::seal(
+            &k,
+            super::super::EXT_SESSION,
+            [1; 12],
+            value,
+            &cookie::msg1_digest(msg1),
+        )
+        .encode()
+    }
+
+    #[test]
+    fn a_cookie_reply_resends_message_1_with_the_cookie_at_once() {
+        let mut ipad = client();
+        let msg1 = sent(&ipad.connect(T0, key(), 1_000)).remove(0);
+        let value = [0x77; 16];
+        let out = sent(&ipad.handle_datagram(
+            T0 + Duration::from_millis(3),
+            &cookie_reply(&msg1, &value),
+            1_000,
+        ));
+        assert_eq!(
+            out,
+            vec![cookie::attach(&msg1, &value)],
+            "at once, with the cookie"
+        );
+        // Retries carry it too, on the usual schedule from the resend.
+        let at = T0 + Duration::from_millis(3) + ClientConfig::new(HOST).msg1_retry_interval;
+        assert_eq!(
+            sent(&ipad.poll(at, 1_000)),
+            vec![cookie::attach(&msg1, &value)]
+        );
+        // The host reads it as the same message 1.
+        let (canon, mac) = cookie::split(&out[0]);
+        assert_eq!(&*canon, &msg1[..]);
+        assert_eq!(mac, Some(cookie::mac2(&value, &msg1)));
+    }
+
+    #[test]
+    fn a_cookie_reply_that_isnt_for_this_attempt_is_dropped() {
+        let mut ipad = client();
+        let msg1 = sent(&ipad.connect(T0, key(), 1_000)).remove(0);
+        let value = [0x77; 16];
+        // For another message 1, under another key, or flipped.
+        let mut other = msg1.clone();
+        other[20] ^= 1;
+        let wrong_key = cookie::seal(
+            &[9; 32],
+            super::super::EXT_SESSION,
+            [1; 12],
+            &value,
+            &cookie::msg1_digest(&msg1),
+        )
+        .encode();
+        let mut flipped = cookie_reply(&msg1, &value);
+        flipped[40] ^= 1;
+        let mut pairing = cookie_reply(&msg1, &value);
+        pairing[16] = 2;
+        for reply in [cookie_reply(&other, &value), wrong_key, flipped, pairing] {
+            assert!(ipad.handle_datagram(T0, &reply, 1_000).is_empty());
+        }
+        // Nothing was kept: the next retry has no cookie.
+        let at = T0 + ClientConfig::new(HOST).msg1_retry_interval;
+        assert_eq!(sent(&ipad.poll(at, 1_000)), vec![msg1.clone()]);
+        // And with no attempt, a genuine reply is dropped too.
+        let (mut live, _) = live_client();
+        assert!(live
+            .handle_datagram(T0, &cookie_reply(&msg1, &value), 1_000)
+            .is_empty());
+    }
+
+    #[test]
+    fn a_held_cookie_goes_on_later_attempts_until_it_gets_old() {
+        let mut ipad = client();
+        let msg1 = sent(&ipad.connect(T0, key(), 1_000)).remove(0);
+        let value = [0x78; 16];
+        ipad.handle_datagram(T0, &cookie_reply(&msg1, &value), 1_000);
+        // A new attempt within the cookie's lifetime starts with it.
+        let at = T0 + Duration::from_secs(10);
+        let next = sent(&ipad.connect(at, key(), 2_000)).remove(0);
+        let (canon, mac) = cookie::split(&next);
+        assert_eq!(mac, Some(cookie::mac2(&value, &canon)));
+        // Past it, without.
+        let late = T0 + cookie::CLIENT_COOKIE_LIFETIME;
+        let last = sent(&ipad.connect(late, key(), 3_000)).remove(0);
+        assert_eq!(cookie::split(&last).1, None);
     }
 }

@@ -44,6 +44,9 @@ impl PeerAddr for SimAddr {
     fn rate_bucket(&self) -> u16 {
         self.ip
     }
+    fn cookie_input(&self) -> Vec<u8> {
+        [self.ip.to_le_bytes(), self.port.to_le_bytes()].concat()
+    }
 }
 
 pub const IPAD: SimAddr = SimAddr {

@@ -2,6 +2,7 @@
 //! re-encodes to something that parses back to the same value.
 #![no_main]
 
+use eternal_wire::v3::cookie::{self, CookieReply};
 use eternal_wire::v3::pairing::QrPayload;
 use eternal_wire::v3::record::RecordHeader;
 use eternal_wire::v3::wire::{
@@ -12,6 +13,30 @@ use libfuzzer_sys::fuzz_target;
 fuzz_target!(|data: &[u8]| {
     let _ = wire::classify(data);
     let _ = RecordHeader::parse(data);
+
+    if let Ok(reply) = CookieReply::parse(data) {
+        assert_eq!(
+            reply.encode(),
+            data,
+            "a cookie reply has exactly one encoding"
+        );
+        assert!(cookie::is_reply(data));
+        assert_eq!(wire::classify(data), wire::V3Kind::Other);
+    }
+    match cookie::split(data) {
+        (canon, Some(mac)) => {
+            // Exactly one cookie after the handshake extension, stripped,
+            // with only payload_len rewritten.
+            let end = canon.len();
+            assert_eq!(data.len(), end + 20);
+            assert_eq!(canon[..6], data[..6]);
+            assert_eq!(canon[8..], data[8..end]);
+            assert_eq!(data[end..end + 4], [0xFF, 0x00, 16, 0]);
+            assert_eq!(data[end + 4..], mac);
+            assert_eq!(cookie::split(&canon).1, None);
+        }
+        (canon, None) => assert_eq!(&*canon, data),
+    }
 
     if let Ok(msg1) = wire::parse_msg1(data) {
         let port = u16::from_le_bytes([data[22], data[23]]);

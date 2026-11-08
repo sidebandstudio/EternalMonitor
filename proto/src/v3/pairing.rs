@@ -33,6 +33,7 @@ use std::time::Duration;
 use snow::HandshakeState;
 
 use super::client::ClientKey;
+use super::cookie::{self, CookieJar, CookieMode, CookieReply, LoadMeter};
 use super::handshake::{builder, map_snow, split};
 use super::host::{PeerAddr, SourceLimiter};
 use super::record::{Opener, RecordHeader, Sealer};
@@ -213,7 +214,7 @@ pub fn qr_psk(secret: &Key32, ctx: &[u8]) -> Zeroizing<Key32> {
 }
 
 /// HKDF-SHA-256 (RFC 5869) with a 32-byte output.
-fn hkdf32(salt: &[u8], ikm: &[u8], info: &[u8]) -> Zeroizing<Key32> {
+pub(super) fn hkdf32(salt: &[u8], ikm: &[u8], info: &[u8]) -> Zeroizing<Key32> {
     struct Len;
     impl ring::hkdf::KeyType for Len {
         fn len(&self) -> usize {
@@ -335,6 +336,12 @@ pub struct PairingConfig {
     /// 10 µs), so the most the table admits, (1,024 + 1) × 20 a second, is
     /// about a fifth of one core.
     pub msg1_per_source_per_second: u32,
+    /// When message 1 must carry a valid cookie for its source, as on the
+    /// session path ([`super::host::HostConfig::cookies`]).
+    pub cookies: CookieMode,
+    /// Under load while this many pairing message 1s arrived during an open
+    /// window this second or the one before, whatever they carry.
+    pub cookie_load_msg1_per_second: u32,
 }
 
 impl Default for PairingConfig {
@@ -344,6 +351,8 @@ impl Default for PairingConfig {
             answered_lifetime: Duration::from_secs(30),
             reanswer_interval: Duration::from_millis(50),
             msg1_per_source_per_second: 20,
+            cookies: CookieMode::UnderLoad,
+            cookie_load_msg1_per_second: 400,
         }
     }
 }
@@ -422,6 +431,10 @@ pub struct PairingHost<A: PeerAddr> {
     attempt: Option<Attempt<A>>,
     /// Message 1 reads per source.
     per_source: SourceLimiter<A::Bucket>,
+    cookies: CookieJar,
+    /// Message 1 arrivals, for the load test.
+    arrivals: LoadMeter,
+    cookie_replies: u64,
 }
 
 impl<A: PeerAddr> PairingHost<A> {
@@ -433,7 +446,11 @@ impl<A: PeerAddr> PairingHost<A> {
         rng: Box<dyn Random + Send>,
     ) -> Self {
         assert!(wire::valid_version(host_version));
+        let mut rng = rng;
         Self {
+            cookies: CookieJar::new(Duration::ZERO, rng.as_mut()),
+            arrivals: LoadMeter::new(Duration::ZERO),
+            cookie_replies: 0,
             per_source: SourceLimiter::new(config.msg1_per_source_per_second),
             config,
             host_id,
@@ -512,6 +529,23 @@ impl<A: PeerAddr> PairingHost<A> {
         self.attempt.as_ref().map(|a| a.session_id)
     }
 
+    /// Cookie replies sent so far.
+    pub fn cookie_replies(&self) -> u64 {
+        self.cookie_replies
+    }
+
+    /// Whether message 1 needs a cookie now: always or never as configured,
+    /// otherwise while many message 1s are arriving.
+    pub fn under_load(&self, now: Duration) -> bool {
+        match self.config.cookies {
+            CookieMode::Always => true,
+            CookieMode::Off => false,
+            CookieMode::UnderLoad => self
+                .arrivals
+                .busy(now, self.config.cookie_load_msg1_per_second),
+        }
+    }
+
     /// Handles a pairing message 1, or a record of the pairing in flight.
     /// Anything else is ignored.
     pub fn handle_datagram(
@@ -542,9 +576,42 @@ impl<A: PeerAddr> PairingHost<A> {
         let Some(window) = self.window.as_ref().filter(|w| now < w.expires) else {
             return;
         };
-        let Ok(pair1) = wire::parse_pair1(datagram) else {
+        let (canon, mac) = cookie::split(datagram);
+        let Ok(pair1) = wire::parse_pair1(&canon) else {
             return;
         };
+        self.arrivals.record(now);
+        // Under load, nothing answers or reads a message 1 without a valid
+        // cookie for its exact source, retries of the pairing in flight
+        // included: only a cookie reply goes back, sealed under a key only
+        // the QR's holder can derive.
+        if self.under_load(now) {
+            let address = from.cookie_input();
+            let verified = mac.is_some_and(|mac| {
+                self.cookies
+                    .verify(now, &address, &canon, &mac, self.rng.as_mut())
+            });
+            if !verified {
+                let ctx = pairing_ctx(
+                    pair1.ipad_version,
+                    &self.host_version,
+                    &pair1.slot_id,
+                    &self.host_id,
+                    &pair1.nonce_i,
+                    &window.nonce_r,
+                );
+                let key = cookie::pairing_key(&qr_psk(&window.secret, &ctx));
+                let reply =
+                    self.cookies
+                        .reply(now, &address, &key, EXT_PAIR_QR, &canon, self.rng.as_mut());
+                self.cookie_replies += 1;
+                out.push(PairOutput::Send {
+                    to: from.clone(),
+                    datagram: reply,
+                });
+                return;
+            }
+        }
         if let Some(attempt) = self
             .attempt
             .as_mut()
@@ -816,7 +883,12 @@ impl<A: PeerAddr> PairingHost<A> {
 /// counterpart in tests.
 pub struct PairingClient {
     state: Option<HandshakeState>,
+    /// Message 1 without a cookie.
     msg1: Vec<u8>,
+    /// What a cookie reply to it is sealed under.
+    cookie_key: Zeroizing<Key32>,
+    /// Message 1 with the host's newest cookie, once one came.
+    with_cookie: Option<Vec<u8>>,
     session: Option<(Sealer, Opener, [u8; 32])>,
     accept: Option<PairAccept>,
 }
@@ -880,14 +952,32 @@ impl PairingClient {
         Ok(Self {
             state: Some(state),
             msg1,
+            cookie_key: cookie::pairing_key(&psk),
+            with_cookie: None,
             session: None,
             accept: None,
         })
     }
 
-    /// Message 1; retries resend these bytes.
+    /// Message 1 as sent now: retries resend these bytes, with the host's
+    /// cookie once one came.
     pub fn msg1(&self) -> &[u8] {
-        &self.msg1
+        self.with_cookie.as_deref().unwrap_or(&self.msg1)
+    }
+
+    /// A cookie reply to this message 1, before message 2: keeps the cookie
+    /// and gives back message 1 to send again at once. Anything else is
+    /// `None` and changes nothing.
+    pub fn handle_cookie(&mut self, datagram: &[u8]) -> Option<Vec<u8>> {
+        self.state.as_ref()?;
+        let reply = CookieReply::parse(datagram).ok()?;
+        if reply.tag != EXT_PAIR_QR {
+            return None;
+        }
+        let value = cookie::open(&self.cookie_key, &reply, &cookie::msg1_digest(&self.msg1))?;
+        let msg1 = cookie::attach(&self.msg1, &value);
+        self.with_cookie = Some(msg1.clone());
+        Some(msg1)
     }
 
     /// Reads message 2. On failure nothing changes. On success the iPad

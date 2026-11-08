@@ -103,16 +103,21 @@ impl Rig {
     }
 
     fn with(store: Store, live: Live) -> Self {
+        Self::with_cookies(store, live, CookieMode::UnderLoad)
+    }
+
+    fn with_cookies(store: Store, live: Live, cookies: CookieMode) -> Self {
         let start = Instant::now();
         let mut session = Session::new(100);
         session.require_v3();
-        let host = V3Host::new(
+        let host = V3Host::with_cookies(
             HOST_ID,
             Some(store.snapshot()),
             Pairings::Ready,
             Box::new(SeededRandom::new(9)),
             start,
             WALL_S * 1_000_000,
+            cookies,
         );
         Self {
             host,
@@ -318,6 +323,19 @@ fn to_pad(rig: &mut Rig, pad: &mut Pad, sends: Vec<(PeerId, Vec<u8>)>) {
         outputs.extend(pad.client.handle_datagram(rig.now, &datagram, clock));
     }
     settle(rig, pad, outputs);
+}
+
+/// Sends a pairing message 1 and gives back what answers it, after the
+/// cookie round trip if the host asks for one.
+fn pair_msg1(rig: &mut Rig, from: SocketAddr, ipad: &mut PairingClient) -> Vec<(PeerId, Vec<u8>)> {
+    let first = rig.receive(from, ipad.msg1());
+    match first.as_slice() {
+        [(_, reply)] => match ipad.handle_cookie(reply) {
+            Some(msg1) => rig.receive(from, &msg1),
+            None => first,
+        },
+        _ => first,
+    }
 }
 
 /// Moves time on in steps, ticking both sides like the real loops do.
@@ -1071,6 +1089,7 @@ fn liveness_ends_the_v3_session_with_a_sealed_goodbye() {
 ///
 /// With `in_commit` the crash points are those of the commit itself;
 /// otherwise the session commits first and `job` is killed.
+/// Each crash point runs with and without message 1's cookie round trip.
 fn crash_each_step(
     records: &[(u8, u8, Option<u8>, bool, u64)],
     dev: u8,
@@ -1078,10 +1097,23 @@ fn crash_each_step(
     job: fn(&mut Rig, &mut Pad),
     check: fn(&Store, bool),
 ) {
+    for cookies in [CookieMode::UnderLoad, CookieMode::Always] {
+        crash_each_step_with(records, dev, in_commit, job, check, cookies);
+    }
+}
+
+fn crash_each_step_with(
+    records: &[(u8, u8, Option<u8>, bool, u64)],
+    dev: u8,
+    in_commit: bool,
+    job: fn(&mut Rig, &mut Pad),
+    check: fn(&Store, bool),
+    cookies: CookieMode,
+) {
     let world = world(records);
     for k in 0.. {
         let (store, _, live) = world.open();
-        let mut rig = Rig::with(store, live);
+        let mut rig = Rig::with_cookies(store, live, cookies);
         let mut pad = Pad::new(50_000);
         if !in_commit {
             connect(&mut rig, &mut pad, dev);
@@ -1094,6 +1126,11 @@ fn crash_each_step(
         job(&mut rig, &mut pad);
         let crashed = rig.live.steps.count.get() > base + k;
         rig.live.steps.crash_at.set(None);
+        assert_eq!(
+            rig.host.table().cookie_replies() > 0,
+            cookies == CookieMode::Always,
+            "the cookie path ran only when required"
+        );
         check_invariants(rig.store());
         check(rig.store(), crashed);
         assert_eq!(rig.host.held_invalid(), 0, "every job released its holds");
@@ -1617,7 +1654,7 @@ fn pair(
         &mut SeededRandom::new(u64::from(slot) + 40),
     )
     .unwrap();
-    let msg2 = rig.receive(from, ipad.msg1());
+    let msg2 = pair_msg1(rig, from, &mut ipad);
     assert_eq!(msg2.len(), 1, "message 2");
     let accept = ipad.read_msg2(&msg2[0].1).unwrap();
     let key = ClientKey {
@@ -1770,10 +1807,16 @@ fn pairings_that_are_unavailable_open_no_window() {
 /// went out only if it is, and the iPad's next confirm finishes the job.
 #[test]
 fn a_crash_in_the_pairing_write_never_answers_what_isnt_stored() {
+    for cookies in [CookieMode::UnderLoad, CookieMode::Always] {
+        crash_in_the_pairing_write(cookies);
+    }
+}
+
+fn crash_in_the_pairing_write(cookies: CookieMode) {
     for k in 0.. {
         let world = world(&[]);
         let (store, _, live) = world.open();
-        let mut rig = Rig::with(store, live);
+        let mut rig = Rig::with_cookies(store, live, cookies);
         let pad = Pad::new(50_000);
         let at = rig.at();
         let qr = rig.host.open_pairing(at, host_addr(), "PC").unwrap();
@@ -1786,9 +1829,13 @@ fn a_crash_in_the_pairing_write_never_answers_what_isnt_stored() {
             &mut SeededRandom::new(3),
         )
         .unwrap();
-        let msg2 = rig.receive(pad.addr, ipad.msg1());
+        let msg2 = pair_msg1(&mut rig, pad.addr, &mut ipad);
         let accept = ipad.read_msg2(&msg2[0].1).unwrap();
         let dev_id = accept.dev_id;
+        assert_eq!(
+            rig.host.pairing.cookie_replies() > 0,
+            cookies == CookieMode::Always
+        );
         let base = rig.live.steps.count.get();
         rig.live.steps.crash_at.set(Some(base + k));
         let confirm = ipad.confirm(None).unwrap();
