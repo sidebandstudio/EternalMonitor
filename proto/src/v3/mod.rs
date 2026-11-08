@@ -67,6 +67,10 @@ pub mod wire;
 #[cfg(test)]
 mod golden;
 #[cfg(test)]
+mod golden_client;
+#[cfg(test)]
+mod golden_differential;
+#[cfg(test)]
 mod vectors;
 
 use std::time::Duration;

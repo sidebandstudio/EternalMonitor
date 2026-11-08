@@ -28,3 +28,7 @@ zeroize = "1"
 [[example]]
 name = "v3_record_bench"
 required-features = ["test-hooks"]
+
+[[example]]
+name = "v3_interop_host"
+required-features = ["test-hooks"]
