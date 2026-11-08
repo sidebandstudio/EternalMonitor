@@ -241,13 +241,26 @@ def assets(release, name):
     return [a for a in (release or {}).get("assets", []) if a["name"] == name]
 
 
-def verify(github, url, size, sha256=None, tries=6, wait=10, sleep=time.sleep):
+def transient(status):
+    """An HTTP status GitHub's download servers give while briefly unwell, which says
+    nothing about the file."""
+    return status == 429 or 500 <= status <= 599
+
+
+def verify(github, url, size, sha256=None, tries=6, wait=10, transient_tries=12, sleep=time.sleep):
     """url serves size bytes (with sha256, those exact bytes) to an anonymous visitor.
-    A new or renamed asset can take a few seconds to show, so it retries."""
-    for attempt in range(tries):
+
+    A new or renamed asset can take a few seconds to show, so a missing or different
+    file is checked again: tries times, wait seconds apart. A server error (HTTP 429 or
+    5xx) or a dropped connection says nothing about the file, so those have a longer
+    window of their own: transient_tries, each wait 5 s longer up to 30 s (about four
+    minutes). Either way the size and SHA-256 must match exactly."""
+    misses = errors = 0
+    while True:
         try:
             status, length = github.head(url)
             seen = f"HTTP {status}, {length} bytes"
+            flaky = transient(status)
             if status == 200 and length == size:
                 if sha256 is None:
                     return
@@ -255,9 +268,21 @@ def verify(github, url, size, sha256=None, tries=6, wait=10, sleep=time.sleep):
                 if got == sha256:
                     return
                 seen = f"SHA-256 {got}"
+        except urllib.error.HTTPError as error:
+            seen = f"HTTP {error.code}"
+            flaky = transient(error.code)
         except OSError as error:
             seen = str(error)
-        if attempt + 1 < tries:
+            flaky = True
+        if flaky:
+            errors += 1
+            if errors >= transient_tries:
+                break
+            sleep(min(5 * errors, 30))
+        else:
+            misses += 1
+            if misses >= tries:
+                break
             sleep(wait)
     raise PublishError(f"{url}: {seen}; expected {size} bytes" + (f", SHA-256 {sha256}" if sha256 else ""))
 
