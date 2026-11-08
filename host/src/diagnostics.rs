@@ -343,44 +343,65 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FallbackWatch {
 /// Logs the summary of a session, or of a HELLO2 the host turned down. The
 /// upload sends it as category `summary` (`crate::telemetry`).
 pub fn log_session_end(end: &SessionEnd, shared: &SharedControl) {
+    info!("{}", summary_line(end, shared));
+}
+
+/// The summary of `end`, with what the PC knows at the end, for
+/// [`log_session_end`] and [`log_session_end_now`] alike.
+fn summary_line(end: &SessionEnd, shared: &SharedControl) -> String {
     let second_screen = *shared.capture_target.lock() == CaptureTarget::VirtualExtended;
     // `mode=` is the mode at the end; the fallback was counted in Second
     // screen mode, perhaps before a switch to Mirror.
     let fallback = end.session_id.and_then(take_fallback);
     let refused = *shared.capture_block.lock()
         == Some(crate::capture::recovery::CaptureBlock::UnsupportedOnThisGpu);
-    info!(
-        "{}",
-        session_summary(end, second_screen, fallback, refused, host_facts())
-    );
+    session_summary(end, second_screen, fallback, refused, host_facts())
 }
 
 /// The app is quitting: the summary of the stream it stops. Its iPad is
 /// told the PC ended the session, or, when a restart or an update hands over
 /// to a new copy, to connect again.
 pub fn log_session_end_at_quit(shared: &SharedControl) {
-    let why = if shared.handoff.holder().is_some() {
+    stop_session(shared, quit_stop(shared));
+}
+
+/// Why the app quits: for good, or for a restart or an update that hands
+/// over to a new copy.
+pub fn quit_stop(shared: &SharedControl) -> StreamStop {
+    if shared.handoff.holder().is_some() {
         StreamStop::Handoff
     } else {
         StreamStop::Quit
-    };
-    stop_session(shared, why);
+    }
 }
 
 /// The stream stops for good: ends the session, which the transport tells
-/// why on its way out, stops the stream, and logs the summary. The goodbye
-/// and `running` change under one session lock, so a transport starting
-/// meanwhile never takes the goodbye for a stale one
-/// (`Session::transport_resumed`).
+/// why on its way out, stops the stream, and logs the summary.
 pub fn stop_session(shared: &SharedControl, why: StreamStop) {
-    let end = {
-        let mut session = shared.session.lock();
-        let end = session.shut_down(std::time::Instant::now(), why);
-        shared.stop();
-        end
-    };
-    if let Some(end) = end {
+    if let Some(end) = end_stream(shared, why) {
         log_session_end(&end, shared);
+    }
+}
+
+/// [`stop_session`] without the summary, which the caller writes. The
+/// goodbye and `running` change under one session lock, so a transport
+/// starting meanwhile never takes the goodbye for a stale one
+/// (`Session::transport_resumed`).
+pub fn end_stream(shared: &SharedControl, why: StreamStop) -> Option<SessionEnd> {
+    let mut session = shared.session.lock();
+    let end = session.shut_down(std::time::Instant::now(), why);
+    shared.stop();
+    end
+}
+
+/// [`log_session_end`] for a PC about to go down: the line goes straight to
+/// the session log and the upload outbox on disk, so it survives the
+/// process ending a moment later, and the next launch uploads it.
+pub fn log_session_end_now(end: &SessionEnd, shared: &SharedControl) {
+    let line = crate::startup::info_line(&summary_line(end, shared));
+    let written = crate::logging::append_now(&line).and(crate::telemetry::queue_now(&line, "info"));
+    if let Err(error) = written {
+        tracing::warn!(%error, "Could not save the session summary before the PC went down");
     }
 }
 

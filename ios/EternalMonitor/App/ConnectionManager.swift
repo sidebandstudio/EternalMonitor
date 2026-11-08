@@ -96,12 +96,13 @@ final class ConnectionManager: ObservableObject {
 
     /// HELLO2 feature bits. Every build says it checks for its own updates,
     /// so the PC tells only older iPad apps to update, and that it
-    /// understands why a PC isn't streaming. It draws the PC's pointer
-    /// itself, so pointer motion needs no video frame.
+    /// understands why a PC isn't streaming and why it went down. It draws
+    /// the PC's pointer itself, so pointer motion needs no video frame.
     nonisolated static func featureCaps(wantsInput: Bool, wantsAudio: Bool, isUSB: Bool) -> UInt16 {
         (wantsInput ? Hello2.featureWantsInput : 0) | (wantsAudio ? Hello2.featureWantsAudio : 0)
             | (isUSB ? 0 : Hello2.featureSupportsNack | Hello2.featureMediaSize) | Hello2.featureChecksUpdates
-            | Hello2.featureStandbyStatus | (E2E.drawsPointer ? Hello2.featureDrawsPointer : 0)
+            | Hello2.featureStandbyStatus | Hello2.featurePowerBye
+            | (E2E.drawsPointer ? Hello2.featureDrawsPointer : 0)
     }
     private var awaitingPairing = false
     /// The PC answered that it isn't streaming; the attempt waits for it.
@@ -1029,9 +1030,10 @@ final class ConnectionManager: ObservableObject {
                     } else {
                         self.beginReconnect(.pcStoppedResponding, failure: failure, end: .pcGoodbye)
                     }
-                case .userDisconnect, .superseded:
-                    // Disconnected from the PC, or another device took over:
-                    // stay away until the user connects again.
+                case .userDisconnect, .superseded, .hostSleeping, .hostPoweringOff:
+                    // Disconnected from the PC, another device took over, or
+                    // the PC is going down and won't answer: stay away until
+                    // the user connects again.
                     self.endReconnectCycle()
                     self.disconnect(.pcGoodbye)
                     self.problem = failure

@@ -35,7 +35,7 @@ final class WireProtocolGoldenTests: XCTestCase {
 
     func testGoldenFileIsBundledAndComplete() throws {
         XCTAssertEqual(
-            Self.vectors.count, 47,
+            Self.vectors.count, 49,
             "golden vector count drifted — update both test suites together"
         )
     }
@@ -546,6 +546,23 @@ final class WireProtocolGoldenTests: XCTestCase {
         let data = try vector("bye_background")
         let (_, message) = try XCTUnwrap(Wire.parseControl(data))
         XCTAssertEqual(message, .bye(.appBackground))
+    }
+
+    /// The goodbyes a PC sends as it goes to sleep or powers off, only to an
+    /// iPad that sets `featurePowerBye`. An app without them drops the whole
+    /// message, as 0.3.4 does.
+    func testPowerGoodbyeVectors() throws {
+        for (name, reason) in [("bye_host_sleeping", ByeReason.hostSleeping),
+                               ("bye_host_powering_off", .hostPoweringOff)] {
+            let data = try vector(name)
+            let (header, message) = try XCTUnwrap(Wire.parseControl(data))
+            XCTAssertEqual(message, .bye(reason))
+            XCTAssertEqual(Wire.encodeControl(sessionId: header.sessionId, msgSeq: header.msgSeq, message: message), data)
+        }
+        var unknown = try vector("bye_host_powering_off")
+        unknown[unknown.count - 1] = 7
+        XCTAssertNil(Wire.parseControl(unknown))
+        XCTAssertEqual(Hello2.featurePowerBye, 1 << 7)
     }
 
     func testKeyframeRequestVector() throws {

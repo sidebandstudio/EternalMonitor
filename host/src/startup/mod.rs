@@ -408,9 +408,9 @@ fn log_line(summary: &str, detail: &str) -> String {
     timestamped("ERROR", &format!("{summary}: {detail}"))
 }
 
-/// A line the reporter adds to the session log about its own work.
-#[cfg(windows)]
-fn info_line(text: &str) -> String {
+/// An INFO line shaped like the tracing ones, for the session log written
+/// directly: the reporter's own work, or a summary before the PC goes down.
+pub(crate) fn info_line(text: &str) -> String {
     timestamped(" INFO", text)
 }
 
