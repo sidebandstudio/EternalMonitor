@@ -122,6 +122,9 @@ final class ConnectionManager: ObservableObject {
     /// The PC has no display turned on, so there is nothing to capture and
     /// the picture is held. Its heartbeats say so until one comes back.
     @Published var pcNoDisplay = false
+    /// The PC's heartbeats say Windows won't let it capture from its
+    /// graphics card, and which screen.
+    @Published var pcGraphicsCard: PCGraphicsCard?
     /// Nonzero while an automatic reconnect cycle is running.
     @Published private(set) var reconnectAttempt = 0
 
@@ -552,6 +555,7 @@ final class ConnectionManager: ObservableObject {
         signalLost = false
         pcLocked = false
         pcNoDisplay = false
+        pcGraphicsCard = nil
         degradedSinceUs = nil
         prevCounters = FrameAssembler.Counters()
         diagnostics.removeAll()
@@ -966,6 +970,12 @@ final class ConnectionManager: ObservableObject {
                 if noDisplay != self.pcNoDisplay {
                     self.pcNoDisplay = noDisplay
                     self.record(.info, "ctrl", noDisplay ? "PC has no active display: holding the picture" : "PC display back")
+                }
+                let card = PCGraphicsCard(notice: heartbeat.notice)
+                if card != self.pcGraphicsCard {
+                    self.pcGraphicsCard = card
+                    self.record(.info, "ctrl", card.map { "PC can't capture from its graphics card screen=\($0)" }
+                        ?? "PC captures from its graphics card again")
                 }
             }
         }
@@ -1462,7 +1472,11 @@ final class ConnectionManager: ObservableObject {
                 if handshakeDone { self.noPictureStreak.endedWithoutPicture() }
                 // A PC that said it isn't streaming and then went quiet (it
                 // closed, or slept) didn't answer: its answers were no picture.
-                let problem: ConnectionProblem = self.waitingForStream ? .noReply(usb: isUSB) : self.noPictureStreak.shown(.timeout(
+                // A PC that said why (its graphics card, which only the PC
+                // can switch) gets that card instead of "no picture".
+                let card = handshakeDone ? self.pcGraphicsCard : nil
+                let problem: ConnectionProblem = self.waitingForStream ? .noReply(usb: isUSB)
+                    : card.map { .pcGraphicsCard($0) } ?? self.noPictureStreak.shown(.timeout(
                     listenerReady: debug.listenerReadyPort != nil, helloAttempts: debug.helloAttempts,
                     handshakeDone: handshakeDone, datagramsReceived: debug.datagramsReceived,
                     isUSB: isUSB, host: debug.host), at: isUSB ? nil : "\(debug.host):\(debug.port)")
@@ -1724,6 +1738,7 @@ final class ConnectionManager: ObservableObject {
         pictureRestoring = false
         pcLocked = false
         pcNoDisplay = false
+        pcGraphicsCard = nil
         degradedSinceUs = nil
         prevCounters = FrameAssembler.Counters()
         hostInfo = nil
@@ -1749,7 +1764,8 @@ final class ConnectionManager: ObservableObject {
         return SessionSummary(
             end: end, isUSB: mediaLink?.isUSB ?? (transportMode == "USB"), sessionId: hostInfo?.sessionId,
             nonce: controlChannel?.helloNonce ?? 0, awaitingPairing: awaitingPairing,
-            datagramsReceived: debugState.datagramsReceived, firstFrame: firstFrameAt.map { $0 - summaryStartedAt },
+            datagramsReceived: debugState.datagramsReceived, captureRefused: pcGraphicsCard != nil,
+            firstFrame: firstFrameAt.map { $0 - summaryStartedAt },
             duration: now - summaryStartedAt)
     }
 
