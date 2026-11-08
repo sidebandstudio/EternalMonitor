@@ -27,6 +27,7 @@ use eternal_wire::reassembly::{AddOutcome, Reassembler, MAX_STALL_ALLOWANCE};
 use eternal_wire::v2::control::{
     encode_control, parse_control, ByeReason, ControlMessage, Hello2, HelloAck, HelloStatus,
     KeyframeReason, KeyframeRequest, Ping, ReceiverReport, CAP_DECODE_H264,
+    HOSTCAP_KEYFRAME_PER_LOSS,
 };
 use eternal_wire::v2::media::MediaHeader;
 use eternal_wire::v2::{classify, Classified};
@@ -796,9 +797,21 @@ fn slow_usb_link_measurement() {
 /// The host's fault injection drops first transmissions only, so this
 /// receiver also loses that share of the repairs and of its own requests,
 /// as WiFi does. `ETERNAL_TEST_ENCODER` picks the encoder (default libx264),
-/// `ETERNAL_TEST_SECONDS` the length (default 30). Timing on a busy machine
-/// changes the numbers, so this only reports them; `wifi_repair_sim.rs`
-/// holds the assertions.
+/// `ETERNAL_TEST_SECONDS` the length (default 30), `ETERNAL_TEST_FPS` the
+/// capture rate (default 60; the encoder's own IDR comes every 30 frames, so
+/// a slower desktop waits longer for it). `ETERNAL_TEST_BURST_MS`
+/// adds a total outage each way of that length every
+/// `ETERNAL_TEST_BURST_EVERY_MS` (default 4000), after a 2 s start.
+///
+/// It also reports each recovery: from the first sign of a broken picture
+/// (a dropped frame, an undecodable one, or a burst's start) to the next
+/// decodable frame, with the requests sent and the keyframes that began
+/// meanwhile, and the size and send spread of keyframes and delta frames.
+/// `ETERNAL_TEST_TRACE=1` prints each of those events with its time.
+/// `ETERNAL_TEST_OLD_CLIENT=1` makes the receiver ask as iPads before 0.3.5
+/// did, without the request for a new loss after a keyframe.
+/// Timing on a busy machine changes the numbers, so this only reports them;
+/// `wifi_repair_sim.rs` holds the assertions.
 #[test]
 #[ignore = "measurement; run with --ignored --nocapture"]
 fn lossy_wifi_recovery_measurement() {
@@ -809,6 +822,12 @@ fn lossy_wifi_recovery_measurement() {
     let loss: f64 = env("ETERNAL_TEST_LOSS").map_or(0.10, |v| v.parse().unwrap());
     let seconds: u64 = env("ETERNAL_TEST_SECONDS").map_or(30, |v| v.parse().unwrap());
     let encoder = env("ETERNAL_TEST_ENCODER").unwrap_or_else(|| "libx264".into());
+    let fps: u32 = env("ETERNAL_TEST_FPS").map_or(60, |v| v.parse().unwrap());
+    let burst =
+        Duration::from_millis(env("ETERNAL_TEST_BURST_MS").map_or(0, |v| v.parse().unwrap()));
+    let burst_every = Duration::from_millis(
+        env("ETERNAL_TEST_BURST_EVERY_MS").map_or(4000, |v| v.parse().unwrap()),
+    );
     if env("ETERNAL_SYNTH_SIZE").is_none() {
         std::env::set_var("ETERNAL_SYNTH_SIZE", "1920x1080");
     }
@@ -824,6 +843,9 @@ fn lossy_wifi_recovery_measurement() {
     let shared = SharedControl::new(port, pipeline::DEFAULT_BITRATE_BPS);
     shared.pairing.lock().required = false;
     *shared.encoder_override.lock() = Some(encoder.clone());
+    shared
+        .target_fps
+        .store(fps, std::sync::atomic::Ordering::SeqCst);
     let (tx, rx) = mpsc::channel();
     let pipeline_shared = shared.clone();
     let pipeline_tx = tx.clone();
@@ -845,11 +867,7 @@ fn lossy_wifi_recovery_measurement() {
         .set_read_timeout(Some(Duration::from_millis(1)))
         .unwrap();
     let mut assembler = Reassembler::new();
-    assembler.configure_repair(
-        true,
-        Duration::from_micros(16_667),
-        Duration::from_millis(5),
-    );
+    assembler.configure_repair(true, Duration::from_secs(1) / fps, Duration::from_millis(5));
     // The iPad's clock, as in `lossy_stream_recovers_and_adapts`: a pass
     // counts at most MAX_PASS, so a descheduled test thread expires nothing.
     const MAX_PASS: Duration = Duration::from_millis(20);
@@ -862,10 +880,20 @@ fn lossy_wifi_recovery_measurement() {
         rng ^= rng << 17;
         ((rng >> 11) as f64 / (1u64 << 53) as f64) < loss
     };
-    // The app's request spacing: the control channel sends one keyframe
-    // request per 500 ms, and a held picture asks again every 600 ms.
+    // The app's requests: the assembler asks when it drops a frame, then
+    // the decoder when a frame cannot be decoded, and again while it waits
+    // for a keyframe, at most every 600 ms (`VideoDecoder`); only the
+    // assembler's name the last frame. The control channel sends one
+    // request per 500 ms and drops the others, but to a host with
+    // `HOSTCAP_KEYFRAME_PER_LOSS` the first GapLoss after a keyframe goes at
+    // once without moving that spacing (`ControlChannel.sendKeyframeRequest`).
+    let old_client = env("ETERNAL_TEST_OLD_CLIENT").is_some();
     let mut last_request: Option<Instant> = None;
-    let mut wants_keyframe = false;
+    let mut keyframe_since_request = false;
+    let mut early_requests = 0u64;
+    let mut decoder_waiting: Option<Instant> = None;
+    let mut decoder_asked: Option<Instant> = None;
+    let mut requests_dropped = 0u64;
     let mut keyframes_seen = std::collections::HashSet::new();
     let mut keyframes_complete = 0u64;
     let mut previous: Option<(u32, u32, bool)> = None;
@@ -876,16 +904,74 @@ fn lossy_wifi_recovery_measurement() {
     let mut requests = 0u64;
     let mut bitrate = 0;
     let mut bytes = [0; 2048];
+    // A broken picture until the next decodable frame.
+    #[derive(Debug)]
+    struct Episode {
+        since: Instant,
+        requests: u32,
+        delivered_requests: u32,
+        /// Requests sent while a newer keyframe was already arriving.
+        behind_keyframe: u32,
+        keyframes_begun: u32,
+    }
+    let begin = |since| Episode {
+        since,
+        requests: 0,
+        delivered_requests: 0,
+        behind_keyframe: 0,
+        keyframes_begun: 0,
+    };
+    let mut episode: Option<Episode> = None;
+    let mut episodes: Vec<(Duration, Episode)> = Vec::new();
+    // The newest keyframe whose fragments began to arrive, until it is delivered.
+    let mut arriving_keyframe: Option<(u32, u32)> = None;
+    // First and last first-transmission arrival per frame, and keyframe flag.
+    let mut spread: HashMap<(u32, u32), (Instant, Instant, bool)> = HashMap::new();
+    let mut keyframe_bytes = Vec::new();
+    let mut delta_bytes = Vec::new();
+    let mut was_in_burst = false;
+    // From a delivered request to the first fragment of the next keyframe.
+    let mut asked_at: Option<Instant> = None;
+    let mut answer_us = Vec::new();
     let started = Instant::now();
+    let tracing = env("ETERNAL_TEST_TRACE").is_some();
+    let trace = |what: std::fmt::Arguments| {
+        if tracing {
+            eprintln!("LOSSY_TRACE {:>6} {what}", started.elapsed().as_millis());
+        }
+    };
     while started.elapsed() < Duration::from_secs(seconds) {
         let woke = Instant::now();
         ipad_now += (woke - pass_started).min(MAX_PASS);
         pass_started = woke;
+        let in_burst = !burst.is_zero()
+            && started.elapsed() >= Duration::from_secs(2)
+            && ((started.elapsed() - Duration::from_secs(2)).as_millis() % burst_every.as_millis())
+                < burst.as_millis();
+        if in_burst && !was_in_burst && episode.is_none() {
+            trace(format_args!("begin burst"));
+            episode = Some(begin(ipad_now));
+        }
+        was_in_burst = in_burst;
         if let Ok((len, _)) = receiver.socket.recv_from(&mut bytes) {
-            if let Ok((header, payload)) = MediaHeader::decode(&bytes[..len]) {
+            if in_burst {
+                // Everything is lost each way during a burst.
+            } else if let Ok((header, payload)) = MediaHeader::decode(&bytes[..len]) {
                 if header.session_id == receiver.session_id && !(header.is_retransmit && lost()) {
-                    if header.is_keyframe {
-                        keyframes_seen.insert((header.stream_epoch, header.frame_seq));
+                    let id = (header.stream_epoch, header.frame_seq);
+                    if header.is_keyframe && keyframes_seen.insert(id) {
+                        if let Some(episode) = episode.as_mut() {
+                            episode.keyframes_begun += 1;
+                        }
+                        trace(format_args!("keyframe {id:?} first fragment"));
+                        arriving_keyframe = Some(id);
+                        if let Some(at) = asked_at.take() {
+                            answer_us.push((woke - at).as_micros());
+                        }
+                    }
+                    if !header.is_retransmit {
+                        let entry = spread.entry(id).or_insert((woke, woke, header.is_keyframe));
+                        entry.1 = woke;
                     }
                     assembler.add_media(header, payload, ipad_now);
                 }
@@ -895,45 +981,114 @@ fn lossy_wifi_recovery_measurement() {
         }
         assembler.tick(ipad_now);
         for nack in assembler.take_nacks() {
-            if !lost() {
+            if !lost() && !in_burst {
                 receiver.send(&ControlMessage::Nack(nack));
             }
         }
-        wants_keyframe |= assembler.take_keyframe_request().is_some();
-        let held = last_decodable.is_some_and(|at| ipad_now - at >= Duration::from_millis(600));
-        let spacing = if wants_keyframe { 500 } else { 600 };
-        if (wants_keyframe || held)
-            && last_request.is_none_or(|at| ipad_now - at >= Duration::from_millis(spacing))
-        {
-            wants_keyframe = false;
-            last_request = Some(ipad_now);
-            requests += 1;
-            let c = assembler.counters();
-            if !lost() {
-                receiver.send(&ControlMessage::KeyframeRequest(KeyframeRequest {
-                    stream_epoch: c.stream_epoch,
-                    last_complete_seq: assembler.latest_completed_seq(),
-                    reason: KeyframeReason::GapLoss,
-                    max_media_dgram: 0,
-                }));
+        let mut asks = Vec::new();
+        if assembler.take_keyframe_request().is_some() {
+            asks.push(KeyframeReason::GapLoss);
+            if episode.is_none() {
+                trace(format_args!("begin dropped frame"));
             }
+            episode.get_or_insert(begin(ipad_now));
         }
         for frame in assembler.take_ready() {
             delivered += 1;
             keyframes_complete += u64::from(frame.is_keyframe);
             let epoch = assembler.counters().stream_epoch;
+            if frame.is_keyframe {
+                keyframe_since_request = true;
+                keyframe_bytes.push(frame.payload.len());
+                if arriving_keyframe.is_some_and(|(e, seq)| e == epoch && seq <= frame.seq) {
+                    arriving_keyframe = None;
+                }
+            } else {
+                delta_bytes.push(frame.payload.len());
+            }
             // The host numbers sent frames contiguously per epoch, so a
             // delta decodes only right after the frame before it decoded.
             let decodes = frame.is_keyframe
                 || previous.is_some_and(|(e, seq, ok)| ok && e == epoch && seq + 1 == frame.seq);
             previous = Some((epoch, frame.seq, decodes));
+            if episode.is_some() || frame.is_keyframe {
+                trace(format_args!(
+                    "deliver {} key={} decodes={decodes}",
+                    frame.seq, frame.is_keyframe
+                ));
+            }
             if decodes {
+                decoder_waiting = None;
                 decodable += 1;
                 if let Some(at) = last_decodable {
                     freezes.push(ipad_now - at);
                 }
                 last_decodable = Some(ipad_now);
+                if let Some(episode) = episode.take() {
+                    trace(format_args!("end {:?}", ipad_now - episode.since));
+                    episodes.push((ipad_now - episode.since, episode));
+                }
+            } else if last_decodable.is_some() {
+                if episode.is_none() {
+                    trace(format_args!("begin undecodable frame"));
+                }
+                episode.get_or_insert(begin(ipad_now));
+                if decoder_waiting.is_none() {
+                    decoder_waiting = Some(ipad_now);
+                }
             }
+        }
+        if let Some(since) = decoder_waiting {
+            if decoder_asked.is_none_or(|at| ipad_now - at >= Duration::from_millis(600)) {
+                decoder_asked = Some(ipad_now);
+                asks.push(if ipad_now - since >= Duration::from_secs(2) {
+                    KeyframeReason::Resume
+                } else {
+                    KeyframeReason::DecodeError
+                });
+            }
+        }
+        for reason in asks {
+            let spaced = last_request.is_none_or(|at| ipad_now - at >= Duration::from_millis(500));
+            let new_loss = !old_client
+                && receiver.host_caps & HOSTCAP_KEYFRAME_PER_LOSS != 0
+                && reason == KeyframeReason::GapLoss
+                && keyframe_since_request;
+            if !spaced && !new_loss {
+                requests_dropped += 1;
+            } else {
+                trace(format_args!("request {reason:?} early={}", !spaced));
+                if spaced {
+                    last_request = Some(ipad_now);
+                }
+                keyframe_since_request = false;
+                early_requests += u64::from(!spaced);
+                requests += 1;
+                let c = assembler.counters();
+                let delivered_request = !lost() && !in_burst;
+                if let Some(episode) = episode.as_mut() {
+                    episode.requests += 1;
+                    episode.delivered_requests += u32::from(delivered_request);
+                    episode.behind_keyframe += u32::from(arriving_keyframe.is_some());
+                }
+                if delivered_request {
+                    asked_at.get_or_insert(woke);
+                    let gap = reason == KeyframeReason::GapLoss;
+                    receiver.send(&ControlMessage::KeyframeRequest(KeyframeRequest {
+                        stream_epoch: if gap { c.stream_epoch } else { 0 },
+                        last_complete_seq: if gap {
+                            assembler.latest_completed_seq()
+                        } else {
+                            0
+                        },
+                        reason,
+                        max_media_dgram: 0,
+                    }));
+                }
+            }
+        }
+        if in_burst {
+            continue;
         }
         if receiver.last_report.elapsed() >= Duration::from_millis(500) {
             receiver.last_report = Instant::now();
@@ -973,14 +1128,65 @@ fn lossy_wifi_recovery_measurement() {
             .count()
     };
     let longest = freezes.last().copied().unwrap_or_default();
+    let percentile = |values: &mut Vec<u128>, p: usize| {
+        values.sort_unstable();
+        values
+            .get((values.len() * p / 100).min(values.len().saturating_sub(1)))
+            .copied()
+            .unwrap_or(0)
+    };
+    let mut recovery_ms: Vec<u128> = episodes.iter().map(|(d, _)| d.as_millis()).collect();
+    let storms = episodes
+        .iter()
+        .filter(|(_, e)| e.delivered_requests > 1)
+        .count();
+    let extra_keyframes: u32 = episodes
+        .iter()
+        .map(|(_, e)| e.keyframes_begun.saturating_sub(1))
+        .sum();
+    let behind_keyframe: u32 = episodes.iter().map(|(_, e)| e.behind_keyframe).sum();
+    let episode_requests: u32 = episodes.iter().map(|(_, e)| e.delivered_requests).sum();
+    let mut key_sizes: Vec<u128> = keyframe_bytes.iter().map(|b| *b as u128).collect();
+    let mut delta_sizes: Vec<u128> = delta_bytes.iter().map(|b| *b as u128).collect();
+    let key_p50 = percentile(&mut key_sizes, 50);
+    let delta_p50 = percentile(&mut delta_sizes, 50);
+    let mut key_spread_us: Vec<u128> = spread
+        .values()
+        .filter(|(_, _, key)| *key)
+        .map(|(first, last, _)| (*last - *first).as_micros())
+        .collect();
+    let mut delta_spread_us: Vec<u128> = spread
+        .values()
+        .filter(|(_, _, key)| !*key)
+        .map(|(first, last, _)| (*last - *first).as_micros())
+        .collect();
     eprintln!(
-        "LOSSY_E2E encoder={encoder} loss={loss} seconds={seconds} keyframes={keyframes_complete}/{} \
+        "LOSSY_E2E encoder={encoder} fps={fps} loss={loss} burst_ms={} seconds={seconds} keyframes={keyframes_complete}/{} \
          decodable={decodable}/{delivered} sent={sent} retransmits={retransmits} requests={requests} \
-         longest_freeze_ms={} freezes_over_250ms={} freezes_over_1s={} end_bitrate={bitrate} counters={:?}",
+         requests_dropped={requests_dropped} early_requests={early_requests} old_client={old_client} \
+         longest_freeze_ms={} freezes_over_250ms={} freezes_over_1s={} end_bitrate={bitrate} \
+         episodes={} recovery_p50_ms={} recovery_p90_ms={} recovery_max_ms={} \
+         episode_requests={episode_requests} storm_episodes={storms} requests_behind_keyframe={behind_keyframe} \
+         extra_keyframes={extra_keyframes} keyframe_p50_bytes={key_p50} keyframe_max_bytes={} \
+         delta_p50_bytes={delta_p50} keyframe_spread_p50_us={} keyframe_spread_max_us={} \
+         delta_spread_p50_us={} answers={} answer_p50_us={} answer_p90_us={} answer_max_us={} counters={:?}",
+        burst.as_millis(),
         keyframes_seen.len(),
         longest.as_millis(),
         over(250),
         over(1000),
+        episodes.len(),
+        percentile(&mut recovery_ms, 50),
+        percentile(&mut recovery_ms, 90),
+        recovery_ms.last().copied().unwrap_or(0),
+        key_sizes.last().copied().unwrap_or(0),
+        percentile(&mut key_spread_us, 50),
+        key_spread_us.last().copied().unwrap_or(0),
+        percentile(&mut delta_spread_us, 50),
+        answer_us.len(),
+        percentile(&mut answer_us, 50),
+        percentile(&mut answer_us, 90),
+        answer_us.last().copied().unwrap_or(0),
         assembler.counters()
     );
     assert!(delivered > 0, "the stream must deliver frames");
@@ -1694,6 +1900,107 @@ fn an_ipad_gets_the_smaller_media_datagrams_it_asks_for() {
             FakeReceiver::connect_full(listen_port, CAP_DECODE_H264, FEATURE_MEDIA_SIZE);
         let (largest, _, _) = media_seen(&mut receiver, Duration::from_secs(2));
         assert!(largest > 1000, "{largest}");
+        receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
+    }));
+    let _ = supervisor_tx.send(SupervisorCommand::Shutdown);
+    supervisor.join().unwrap();
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+/// The first keyframe `receiver` gets after frame `after`, arriving before
+/// `until`: its stream epoch and frame number.
+fn keyframe_after(receiver: &mut FakeReceiver, after: u32, until: Instant) -> Option<(u32, u32)> {
+    let mut buffer = [0; 2048];
+    while Instant::now() < until {
+        receiver.maybe_report(0, 0);
+        let Ok((len, _)) = receiver.socket.recv_from(&mut buffer) else {
+            continue;
+        };
+        if let Ok((header, _)) = MediaHeader::decode(&buffer[..len]) {
+            if header.is_keyframe && !header.is_retransmit && header.frame_seq > after {
+                return Some((header.stream_epoch, header.frame_seq));
+            }
+        }
+    }
+    None
+}
+
+/// Under Wi-Fi loss the next frame is often lost soon after a recovery IDR
+/// lands. The iPad then asks again at once, naming a frame from that
+/// keyframe on, and the PC sends that loss its own IDR inside its 500 ms
+/// request window rather than after it. Each round asks for a keyframe,
+/// waits for it, and asks again naming it; the second IDR must arrive less
+/// than 500 ms after the first request, which no IDR granted on the window
+/// can. At 10 fps the encoder's own IDR comes 3 s after the last one, so
+/// none falls in a round.
+#[test]
+fn a_loss_soon_after_a_recovery_gets_its_own_keyframe() {
+    let _env = test_env();
+    init_test_tracing();
+    ffmpeg_next::init().unwrap();
+    std::env::set_var("ETERNAL_CAPTURE", "synthetic");
+    std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
+    for name in ["ETERNAL_DROP", "ETERNAL_REORDER", "ETERNAL_JITTER_MS"] {
+        std::env::remove_var(name);
+    }
+    let listen_port = free_udp_port();
+    let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
+    shared.pairing.lock().required = false;
+    *shared.encoder_override.lock() = Some("libx264".into());
+    shared
+        .target_fps
+        .store(10, std::sync::atomic::Ordering::SeqCst);
+    let (supervisor_tx, supervisor_rx) = mpsc::channel();
+    let supervisor_shared = shared.clone();
+    let supervisor_sender = supervisor_tx.clone();
+    let supervisor = std::thread::spawn(move || {
+        eternal_host::supervisor::run(
+            listen_port,
+            supervisor_shared,
+            GpuInfo::software_fallback(),
+            supervisor_sender,
+            supervisor_rx,
+        )
+    });
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut receiver = FakeReceiver::connect(listen_port);
+        let gap_loss = |stream_epoch, last_complete_seq| {
+            ControlMessage::KeyframeRequest(KeyframeRequest {
+                stream_epoch,
+                last_complete_seq,
+                reason: KeyframeReason::GapLoss,
+                max_media_dgram: 0,
+            })
+        };
+        let (epoch, mut last) =
+            keyframe_after(&mut receiver, 0, Instant::now() + Duration::from_secs(10))
+                .expect("the opening keyframe");
+        let mut in_window = Vec::new();
+        for _ in 0..6 {
+            // Past the window of the round before.
+            let _ = keyframe_after(
+                &mut receiver,
+                u32::MAX,
+                Instant::now() + Duration::from_millis(700),
+            );
+            let asked = Instant::now();
+            receiver.send(&gap_loss(epoch, last));
+            let (_, recovery) = keyframe_after(&mut receiver, last, asked + Duration::from_secs(2))
+                .expect("the first loss gets an IDR");
+            receiver.send(&gap_loss(epoch, recovery));
+            let answer =
+                keyframe_after(&mut receiver, recovery, asked + Duration::from_millis(500));
+            in_window.push(answer.is_some());
+            last = answer.map_or(recovery, |(_, seq)| seq);
+        }
+        let answered = in_window.iter().filter(|answered| **answered).count();
+        assert!(
+            answered >= 4,
+            "a new loss is answered inside the window: {in_window:?}"
+        );
         receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
     }));
     let _ = supervisor_tx.send(SupervisorCommand::Shutdown);

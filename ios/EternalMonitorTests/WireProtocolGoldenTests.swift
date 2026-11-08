@@ -501,6 +501,7 @@ final class WireProtocolGoldenTests: XCTestCase {
     /// earlier versions read, so those read them as before.
     func testMediaSizeVectors() throws {
         XCTAssertEqual(HelloAck.hostCapMediaSize, 0x0080)
+        XCTAssertEqual(HelloAck.hostCapKeyframePerLoss, 0x0100)
         XCTAssertEqual(Hello2.featureMediaSize, 0x0040)
         XCTAssertEqual(KeyframeRequest.minMediaDgram, 576)
 

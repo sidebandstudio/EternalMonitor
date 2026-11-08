@@ -918,6 +918,7 @@ fn media_size_vectors_round_trip_and_extend_the_old_bodies() {
         HOSTCAP_NACK | HOSTCAP_CONTIGUOUS_FRAME_SEQ | HOSTCAP_MEDIA_SIZE
     );
     assert_eq!(HOSTCAP_MEDIA_SIZE, 0x0080);
+    assert_eq!(HOSTCAP_KEYFRAME_PER_LOSS, 0x0100);
     assert_eq!(FEATURE_MEDIA_SIZE, 0x0040);
     assert_eq!(MIN_MEDIA_DGRAM, 576);
 

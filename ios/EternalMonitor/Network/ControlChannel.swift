@@ -85,12 +85,15 @@ final class ControlChannel {
     private static let pingIntervalMs = 2000
     private static let pingBurstCount = 5
     private static let pingBurstSpacingMs = 200
-    /// The host grants one keyframe per 500 ms and ignores the rest. A WiFi
+    /// The host grants one keyframe per 500 ms, besides one for each loss
+    /// after a recovery (`sendKeyframeRequest`), and ignores the rest. A WiFi
     /// stall can damage many frames at once; ask once for all of them.
     static let keyframeRequestSpacingUs: UInt64 = 500_000
 
     private let nowUs: () -> UInt64
     private var lastKeyframeRequestUs: UInt64?
+    /// A keyframe was assembled since the last keyframe request went out.
+    private var keyframeSinceRequest = false
 
     init(queue: DispatchQueue, nowUs: @escaping () -> UInt64 = ControlChannel.clientNowUs,
          send: @escaping (Data) -> Void) {
@@ -335,6 +338,11 @@ final class ControlChannel {
         timer.resume()
     }
 
+    /// A keyframe arrived whole: the next frame lost is a new loss.
+    func noteKeyframeAssembled() {
+        queue.async { [self] in keyframeSinceRequest = true }
+    }
+
     /// `maxMediaDgram` asks the PC for media datagrams no larger, for the
     /// rest of the session; only a PC with `HelloAck.hostCapMediaSize` gets it.
     func sendKeyframeRequest(streamEpoch: UInt32, lastCompleteSeq: UInt32, reason: KeyframeReason,
@@ -345,9 +353,20 @@ final class ControlChannel {
             // Startup comes at most every 2 s, while no frame completes. The
             // dropped frames' own requests then keep the spacing busy, and
             // would always hide it from the PC's log.
-            if reason != .startup, let last = lastKeyframeRequestUs, now &- last < Self.keyframeRequestSpacingUs { return }
+            let spaced = reason == .startup
+                || lastKeyframeRequestUs.map { now &- $0 >= Self.keyframeRequestSpacingUs } ?? true
+            // A frame lost after a keyframe arrived is a new loss, which a PC
+            // with `hostCapKeyframePerLoss` answers at once when the request
+            // names a frame from that keyframe on; only GapLoss names one. It
+            // goes once per keyframe and leaves the spacing as it was. An
+            // older PC moves its 500 ms window for any grant, so it isn't
+            // asked early.
+            let newLoss = reason == .gapLoss && keyframeSinceRequest
+                && hostCaps & HelloAck.hostCapKeyframePerLoss != 0
+            guard spaced || newLoss else { return }
             let maxMediaDgram = hostCaps & HelloAck.hostCapMediaSize != 0 ? maxMediaDgram : 0
-            lastKeyframeRequestUs = now
+            if spaced { lastKeyframeRequestUs = now }
+            keyframeSinceRequest = false
             onDiagnostic?("Requesting keyframe (\(reason))" + (maxMediaDgram == 0 ? "" : " with media datagrams up to \(maxMediaDgram) bytes"))
             sendMessage(.keyframeRequest(KeyframeRequest(
                 streamEpoch: streamEpoch,

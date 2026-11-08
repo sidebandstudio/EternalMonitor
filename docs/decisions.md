@@ -255,6 +255,34 @@ remaining drop in the simulation, but raised the p50 latency at 10% loss from
 6.6 to 10.7 ms. It would also undo the repair-window rules above, which were
 tuned on a physical iPad, so it waits for a device run.
 
+### Answer a loss after a recovery at once
+
+With keyframes repaired, the first run on real encoders under loss (NVENC and
+AMF, headless hosts with synthetic capture and the fake iPad, 1-10% loss and
+300 ms outages) put the longest recoveries somewhere else. The PC's IDR began
+to arrive 15-130 ms after a request (medians), AMF's reopen included. But at
+10% loss the next frame was often lost within half a second of a recovery
+landing. The iPad sends one keyframe request per 500 ms and the PC grants one
+per 500 ms, so that loss waited for the decoder's next try 600 ms later. Most
+recoveries over half a second began that way. Keyframe size was not the cause:
+a P-frame was 20-30 KB, an IDR 30-100 KB, sent within one frame interval.
+
+A loss after a recovery now gets its own IDR at once. When a keyframe has
+arrived since the iPad's last request, its next GapLoss request goes inside
+the 500 ms spacing, once per keyframe, without moving that spacing. The PC
+grants it inside its own window when the frame the request names is at or
+past the first keyframe the PC sent since its last grant, because then the
+iPad already had that recovery. That grant doesn't move the window either. A
+request that names an older frame, or none, as the decoder's requests do,
+waits as before, so one loss still gets one IDR. A PC that does this sets
+`HOSTCAP_KEYFRAME_PER_LOSS`, and the iPad asks early only such a PC. An older
+PC moves its window for any grant, so an early request it granted could push
+the iPad's next one out of its window.
+
+AMF still reopens for each forced keyframe, at most once per 500 ms, so on
+AMF the IDR for such a loss can still wait for that limit. The 300 ms outage
+rows, which end with one request after the outage, are unchanged.
+
 ### Use Apple's usbmuxd tunnel for USB
 
 Apple's installed device service handles the cable/trust relationship. EMLINK

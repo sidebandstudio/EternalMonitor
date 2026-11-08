@@ -693,6 +693,9 @@ pub async fn start_sender(
                 }
                 let frag_count = frag_count_usize as u16;
                 let capture_ts_us = crate::clock::instant_to_us(nal.timestamp);
+                if nal.is_keyframe {
+                    shared.session.lock().note_keyframe_sent(session_id, stream_epoch, frame_seq);
+                }
 
                 let mut send_failed = false;
                 let keep_for_repair = shared.session.lock().client_supports_nack();

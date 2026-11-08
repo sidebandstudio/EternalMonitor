@@ -332,6 +332,9 @@ struct HelloAck: Equatable {
     /// session, and its heartbeats carry `framesSent`. Only an iPad that
     /// sets `Hello2.featureMediaSize` hears it.
     static let hostCapMediaSize: UInt16 = 1 << 7
+    /// The PC answers a GapLoss request at once when it names a frame from
+    /// the PC's last recovery keyframe on (`ControlChannel.sendKeyframeRequest`).
+    static let hostCapKeyframePerLoss: UInt16 = 1 << 8
     var status: HelloStatus
     var acceptedVersion: UInt8
     var clientNonce: UInt32
