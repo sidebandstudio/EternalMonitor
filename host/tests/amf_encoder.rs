@@ -111,8 +111,8 @@ struct StageRun {
     codec_name: String,
     /// Pictures the stage gave the encoder again (`keyframe_resubmits`).
     resubmits: u64,
-    /// The longest time between two published frames.
-    longest_gap: Duration,
+    /// When each frame was published, by frame number.
+    published: Vec<Instant>,
 }
 
 /// Feeds `FRAME_COUNT` frames through a fresh encode stage at
@@ -148,8 +148,7 @@ fn run_stage(
         packets
     });
 
-    let mut last_publish: Option<Instant> = None;
-    let mut longest_gap = Duration::ZERO;
+    let mut published = Vec::new();
     for number in 0..FRAME_COUNT {
         if keyframe_at == Some(number) {
             shared.force_next_idr.store(true, Ordering::SeqCst);
@@ -157,15 +156,14 @@ fn run_stage(
         let (width, height) = size_of(number);
         let mut data = frame_buffer((width * height * 4) as usize);
         render_synthetic_frame(&mut data, width, height, number);
-        if let Some(last) = last_publish.replace(Instant::now()) {
-            longest_gap = longest_gap.max(last.elapsed());
-        }
+        published.push(Instant::now());
         producer.publish(RawFrame {
             frame_number: number,
             timestamp: Instant::now(),
             data: Arc::new(data),
             width,
             height,
+            cached: false,
         });
         std::thread::sleep(FRAME_INTERVAL);
     }
@@ -184,40 +182,57 @@ fn run_stage(
         software_fallback: stats.using_software_fallback,
         codec_name: stats.codec_name.clone(),
         resubmits: stats.keyframe_resubmits - resubmits_before,
-        longest_gap,
+        published,
     }
 }
 
 /// A stream whose frames come every `FRAME_INTERVAL` is never still, so no
-/// picture may be given to the encoder again and none encoded twice. Only if
-/// the producer itself stalled for a frame and a half (the encode loop's wait,
-/// see `keyframe_flush_wait`) may a picture repeat, and then only one the
-/// stage reports giving again.
+/// picture may be given to the encoder again and none encoded twice. A
+/// picture may repeat only where the feeder itself stalled right after it,
+/// for a frame and a half (the encode loop's wait, see `keyframe_flush_wait`),
+/// at most once per 20 ms of that stall, and no more often in all than the
+/// stage reports giving pictures again. Everywhere else counters advance.
 fn assert_no_duplicate_encodes(run: &StageRun, pictures: &[(u32, u32, u64)]) {
     let counters: Vec<u64> = pictures.iter().map(|picture| picture.2).collect();
     assert!(
         counters.windows(2).all(|pair| pair[0] <= pair[1]),
         "frame counters go back: {counters:?}"
     );
-    let repeats = counters
-        .windows(2)
-        .filter(|pair| pair[0] == pair[1])
-        .count() as u64;
-    if run.longest_gap < FRAME_INTERVAL * 3 / 2 {
-        assert_eq!(
-            (repeats, run.resubmits),
-            (0, 0),
-            "pictures encoded twice, and given again, while frames came every \
-             {FRAME_INTERVAL:?} at most {:?} apart: {counters:?}",
-            run.longest_gap
-        );
-    } else {
+    let mut repeats = std::collections::BTreeMap::<u64, u32>::new();
+    for pair in counters.windows(2).filter(|pair| pair[0] == pair[1]) {
+        *repeats.entry(pair[0]).or_default() += 1;
+    }
+    for (&counter, &times) in &repeats {
+        let stall = run
+            .published
+            .get(counter as usize + 1)
+            .zip(run.published.get(counter as usize))
+            .map(|(next, this)| next.saturating_duration_since(*this));
+        let allowed = stall
+            .filter(|stall| *stall >= FRAME_INTERVAL * 3 / 2)
+            .map_or(0, |stall| (stall.as_millis() / 20) as u32);
         assert!(
-            repeats <= run.resubmits,
-            "{repeats} pictures encoded twice but {} given again: {counters:?}",
-            run.resubmits
+            times <= allowed,
+            "frame {counter} encoded {} times, though the next frame came {stall:?} \
+             after it: {counters:?}",
+            times + 1
         );
     }
+    let stalled = run
+        .published
+        .windows(2)
+        .any(|pair| pair[1].saturating_duration_since(pair[0]) >= FRAME_INTERVAL * 3 / 2);
+    assert!(
+        stalled || run.resubmits == 0,
+        "{} pictures given again though no frame came later than {FRAME_INTERVAL:?}",
+        run.resubmits
+    );
+    let total: u64 = repeats.values().map(|&times| u64::from(times)).sum();
+    assert!(
+        total <= run.resubmits,
+        "{total} pictures encoded again but {} given again: {counters:?}",
+        run.resubmits
+    );
 }
 
 /// Decodes `packets` with a fresh, strict software decoder and returns each
@@ -361,6 +376,54 @@ fn assert_follows_mode_changes(run: &StageRun, codec: Id) {
             );
         }
     }
+}
+
+#[test]
+fn a_repeat_is_excused_only_by_the_stall_right_after_it() {
+    // Frames every 20 ms, except a 60 ms stall after frame 10.
+    let start = Instant::now();
+    let published: Vec<Instant> = (0..60u32)
+        .map(|n| {
+            start
+                + FRAME_INTERVAL * n
+                + if n > 10 {
+                    FRAME_INTERVAL * 2
+                } else {
+                    Duration::ZERO
+                }
+        })
+        .collect();
+    let run = |resubmits| StageRun {
+        packets: Vec::new(),
+        software_fallback: false,
+        codec_name: String::new(),
+        resubmits,
+        published: published.clone(),
+    };
+    let pictures = |repeated: u64| -> Vec<(u32, u32, u64)> {
+        (0..60u64)
+            .flat_map(|n| std::iter::repeat_n((0, 0, n), if n == repeated { 2 } else { 1 }))
+            .collect()
+    };
+    assert_no_duplicate_encodes(&run(1), &pictures(10));
+    for (resubmits, repeated, what) in [
+        (1, 50, "a repeat far from the stall"),
+        (0, 10, "a repeat the stage did not give again"),
+        (1, 9, "a repeat just before the stall"),
+    ] {
+        let failed = std::panic::catch_unwind(|| {
+            assert_no_duplicate_encodes(&run(resubmits), &pictures(repeated))
+        })
+        .is_err();
+        assert!(failed, "{what} was accepted");
+    }
+    // Pictures given again with no stall at all.
+    let steady = StageRun {
+        published: (0..60u32).map(|n| start + FRAME_INTERVAL * n).collect(),
+        ..run(1)
+    };
+    let counters: Vec<(u32, u32, u64)> = (0..60u64).map(|n| (0, 0, n)).collect();
+    assert!(std::panic::catch_unwind(|| assert_no_duplicate_encodes(&steady, &counters)).is_err());
 }
 
 #[test]
@@ -585,6 +648,8 @@ fn keyframe_on_a_still_desktop(encoder: &str) -> StillRun {
             data: Arc::new(data),
             width,
             height,
+            // The warm-up's frames are new; the resent one is the cache.
+            cached: number == RESENT,
         });
     };
 

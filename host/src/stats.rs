@@ -43,7 +43,7 @@ pub struct PipelineStats {
     /// stuck on slow software encoding.
     pub using_software_fallback: bool,
     /// Pictures given to an encoder again to bring out a keyframe it held
-    /// (see `encoder::holds_last_frame`).
+    /// (see `encoder::holds_last_frame`), for the connected viewer.
     pub keyframe_resubmits: u64,
     /// NVENC refused to open because the NVIDIA driver is older than the
     /// linked FFmpeg's NVENC needs. The fallback notice then says to update
@@ -179,6 +179,7 @@ impl PipelineStats {
         self.transport_retransmits = 0;
         self.pointer_states_sent = 0;
         self.pointer_shapes_sent = 0;
+        self.keyframe_resubmits = 0;
         self.transport_timestamps.clear();
         self.bandwidth_samples.clear();
         self.bandwidth_bps = 0.0;
@@ -312,6 +313,16 @@ impl PipelineStats {
 #[cfg(test)]
 mod tests {
     use super::PipelineStats;
+
+    #[test]
+    fn a_new_viewer_starts_counting_pictures_given_again_from_zero() {
+        let mut stats = PipelineStats {
+            keyframe_resubmits: 3,
+            ..PipelineStats::default()
+        };
+        stats.reset_connection_stats();
+        assert_eq!(stats.keyframe_resubmits, 0);
+    }
 
     #[test]
     fn reset_for_restart_preserves_runtime_configuration() {

@@ -113,7 +113,10 @@ pub fn run_capture_loop(
 
         heartbeat(&shared.hb_capture_loop_ms);
 
+        // A still picture sent again, as DXGI capture marks its resends.
+        let mut cached = false;
         let data = if let Some(scene) = pointer.as_mut() {
+            cached = shared.client_draws_pointer();
             scene.tick(&shared, &mut buffers, frame_start, frame_number)
         } else {
             let data = match still.as_ref() {
@@ -125,6 +128,7 @@ pub fn run_capture_loop(
                             true,
                         ) =>
                 {
+                    cached = true;
                     Arc::clone(picture)
                 }
                 Some(_) => {
@@ -151,6 +155,7 @@ pub fn run_capture_loop(
                 data,
                 width,
                 height,
+                cached,
             });
             #[cfg(debug_assertions)]
             if std::mem::take(&mut proving) {
