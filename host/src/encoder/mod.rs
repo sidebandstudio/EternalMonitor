@@ -319,7 +319,6 @@ fn run_encode_loop(
         if encoder_state.is_none() {
             let picture_by =
                 *first_picture_by.get_or_insert_with(|| Instant::now() + FIRST_PICTURE_WAIT);
-            let wait = || picture_by.saturating_duration_since(Instant::now());
             match open_session(
                 &LAUNCH_FAILURES,
                 &desired_encoder,
@@ -328,7 +327,7 @@ fn run_encode_loop(
                 desired_bitrate,
                 target_fps,
                 &mut input_mode,
-                first_open(&desired_encoder, wait()),
+                first_open(&desired_encoder, picture_by),
                 &mut opening,
             ) {
                 Ok(state) => {
@@ -405,7 +404,7 @@ fn run_encode_loop(
                                 desired_bitrate,
                                 target_fps,
                                 &mut input_mode,
-                                first_open(name, wait()),
+                                first_open(name, picture_by),
                                 &mut opening,
                             );
                             if let Err(error) = &opened {
@@ -1307,9 +1306,11 @@ enum Opening {
     /// first open but libx264's. FFmpeg's errors while it opens are logged
     /// as warnings (see [`crate::diagnostics::while_probing`]). One in the
     /// lane is waited for only until the pipeline's first picture is due,
-    /// the time given (see [`FIRST_PICTURE_WAIT`]): then it goes on opening
-    /// in the background while libx264 streams.
-    Probe(Duration),
+    /// at the instant given (see [`FIRST_PICTURE_WAIT`]): then it goes on
+    /// opening in the background while libx264 streams. The instant holds
+    /// whatever came before the open: a fallback's earlier tries, a BGRA
+    /// open retried at YUV420, a call's thread that was slow to start.
+    Probe(Instant),
     /// The live session, which goes on if the reopen is given up on. The
     /// picture freezes until then, so the limit is shorter.
     Reopen,
@@ -1395,15 +1396,13 @@ fn wait_or_park<T, N: Fn() -> Instant>(
     opening: Opening,
     progress: &mut impl FnMut(),
 ) -> Result<Result<T, crate::stall::Stall>, crate::stall::Pending<T, N>> {
-    let wait = match opening {
-        Opening::Probe(wait) => wait,
-        Opening::Behind => Duration::ZERO,
-        Opening::First | Opening::Reopen => Duration::MAX,
+    let waited = match opening {
+        Opening::Probe(by) => pending.wait_until(by, progress),
+        Opening::Behind => None,
+        Opening::First | Opening::Reopen => pending.wait_up_to(Duration::MAX, progress),
     };
-    if !wait.is_zero() {
-        if let Some(result) = pending.wait_up_to(wait, progress) {
-            return Ok(result);
-        }
+    if let Some(result) = waited {
+        return Ok(result);
     }
     match pending.park() {
         Some(result) => Ok(result),
@@ -1411,13 +1410,13 @@ fn wait_or_park<T, N: Fn() -> Instant>(
     }
 }
 
-/// A pipeline's first open of `encoder_name`, `wait` before its first
-/// picture is due: anything but libx264 has another encoder after it.
-fn first_open(encoder_name: &str, wait: Duration) -> Opening {
+/// A pipeline's first open of `encoder_name`, whose first picture is due
+/// `by`: anything but libx264 has another encoder after it.
+fn first_open(encoder_name: &str, by: Instant) -> Opening {
     if encoder_name == "libx264" {
         Opening::First
     } else {
-        Opening::Probe(wait)
+        Opening::Probe(by)
     }
 }
 
@@ -3747,7 +3746,7 @@ mod tests {
 
     #[test]
     fn ffmpeg_errors_are_warnings_only_while_an_encoder_is_one_of_several() {
-        let probed = failing_open(Opening::Probe(FIRST_PICTURE_WAIT));
+        let probed = failing_open(Opening::Probe(Instant::now() + FIRST_PICTURE_WAIT));
         assert!(!probed.is_empty());
         assert!(
             probed
@@ -3770,15 +3769,15 @@ mod tests {
             );
         }
         // The pipeline's first open probes, except the last resort.
-        let wait = FIRST_PICTURE_WAIT;
-        assert_eq!(first_open("h264_nvenc", wait), Opening::Probe(wait));
-        assert_eq!(first_open("hevc_amf", wait), Opening::Probe(wait));
-        assert_eq!(first_open("libx265", wait), Opening::Probe(wait));
-        assert_eq!(first_open("h264_videotoolbox", wait), Opening::Probe(wait));
-        assert_eq!(first_open("libx264", wait), Opening::First);
+        let by = Instant::now() + FIRST_PICTURE_WAIT;
+        assert_eq!(first_open("h264_nvenc", by), Opening::Probe(by));
+        assert_eq!(first_open("hevc_amf", by), Opening::Probe(by));
+        assert_eq!(first_open("libx265", by), Opening::Probe(by));
+        assert_eq!(first_open("h264_videotoolbox", by), Opening::Probe(by));
+        assert_eq!(first_open("libx264", by), Opening::First);
         // A probe has the first open's limits.
         assert_eq!(
-            open_limits("h264_qsv", Opening::Probe(FIRST_PICTURE_WAIT)),
+            open_limits("h264_qsv", Opening::Probe(Instant::now())),
             open_limits("h264_qsv", Opening::First)
         );
     }
@@ -5132,16 +5131,48 @@ mod tests {
         (release, pending)
     }
 
-    /// Waits for the pipeline's first open of `name` as the encode loop
-    /// does, each 1 ms heartbeat moving the paused clock 100 ms on.
+    /// Waits for the pipeline's first open as the encode loop does, as
+    /// `opening` says, each 1 ms heartbeat moving the paused clock 100 ms on.
     fn first_open_of<N: Fn() -> Instant>(
         pending: crate::stall::Pending<&'static str, N>,
+        opening: Opening,
         ms: &std::sync::atomic::AtomicU64,
     ) -> Result<Result<&'static str, crate::stall::Stall>, crate::stall::Pending<&'static str, N>>
     {
-        wait_or_park(pending, Opening::Probe(FIRST_PICTURE_WAIT), &mut || {
+        wait_or_park(pending, opening, &mut || {
             ms.fetch_add(100, Ordering::SeqCst);
         })
+    }
+
+    #[test]
+    fn time_before_the_open_starts_counts_against_the_first_pictures_wait() {
+        let lanes: &'static crate::stall::Lanes = Box::leak(Box::new(crate::stall::Lanes::new()));
+        let (ms, clock) = paused_clock();
+        let opening = Opening::Probe(clock() + FIRST_PICTURE_WAIT);
+        // 2.2 s go by before the open's thread is running, as Windows once
+        // took to start one on a loaded PC.
+        ms.store(2_200, Ordering::SeqCst);
+        let (release, pending) = hung_open(lanes, "h264_nvenc", opening, clock.clone());
+        let Err(parked) = first_open_of(pending, opening, &ms) else {
+            panic!("the hung open returned")
+        };
+        // Parked when the picture was due, 3 s after it was asked for, not
+        // 3 s after the thread began.
+        assert_eq!(ms.load(Ordering::SeqCst), 3_000);
+        assert_eq!(parked.running_for(), Duration::from_millis(800));
+        release.send(()).unwrap();
+        drop(parked);
+        wait_for_clear_lane(lanes);
+        // Due before the open even starts: parked at once.
+        ms.store(4_000, Ordering::SeqCst);
+        let (release, pending) = hung_open(lanes, "h264_amf", opening, clock);
+        let Err(parked) = wait_or_park(pending, opening, &mut || panic!("it waited")) else {
+            panic!("returned")
+        };
+        assert_eq!(parked.running_for(), Duration::ZERO);
+        release.send(()).unwrap();
+        drop(parked);
+        wait_for_clear_lane(lanes);
     }
 
     #[test]
@@ -5149,9 +5180,9 @@ mod tests {
         let lanes: &'static crate::stall::Lanes = Box::leak(Box::new(crate::stall::Lanes::new()));
         let (ms, clock) = paused_clock();
         let ((parked, opened_late), lines) = logged(|| {
-            let opening = Opening::Probe(FIRST_PICTURE_WAIT);
+            let opening = Opening::Probe(clock() + FIRST_PICTURE_WAIT);
             let (release, pending) = hung_open(lanes, "h264_qsv", opening, clock.clone());
-            let Err(mut parked) = first_open_of(pending, &ms) else {
+            let Err(mut parked) = first_open_of(pending, opening, &ms) else {
                 panic!("the hung open returned")
             };
             // Given up waiting for when the first picture was due, 7 s
@@ -5204,7 +5235,7 @@ mod tests {
     fn an_open_that_returns_before_the_first_picture_is_due_is_not_parked() {
         let lanes: &'static crate::stall::Lanes = Box::leak(Box::new(crate::stall::Lanes::new()));
         let (ms, clock) = paused_clock();
-        let opening = Opening::Probe(FIRST_PICTURE_WAIT);
+        let opening = Opening::Probe(clock() + FIRST_PICTURE_WAIT);
         let (release, pending) = hung_open(lanes, "h264_nvenc", opening, clock);
         // NVENC's slowest open in the field: 2.6 s. The clock stops there,
         // however long the hand-over takes on a loaded machine.
@@ -5223,8 +5254,13 @@ mod tests {
         assert!(beats >= 26, "{beats}");
         // A deadline already past (an earlier encoder of the fallback used
         // the wait up) parks at once; so does a background reopen.
-        for opening in [Opening::Probe(Duration::ZERO), Opening::Behind] {
+        for behind in [false, true] {
             let (_ms, clock) = paused_clock();
+            let opening = if behind {
+                Opening::Behind
+            } else {
+                Opening::Probe(clock())
+            };
             let (release, pending) = hung_open(lanes, "h264_amf", opening, clock);
             let Err(parked) = wait_or_park(pending, opening, &mut || panic!("it waited")) else {
                 panic!("returned")
@@ -5255,9 +5291,9 @@ mod tests {
         let t0 = Instant::now();
         let at = |ms: u64| t0 + Duration::from_millis(ms);
         let mut recovery = StallRecovery::default();
-        let opening = Opening::Probe(FIRST_PICTURE_WAIT);
+        let opening = Opening::Probe(clock() + FIRST_PICTURE_WAIT);
         let (release, pending) = hung_open(lanes, "h264_nvenc", opening, clock.clone());
-        let Err(mut parked) = first_open_of(pending, &ms) else {
+        let Err(mut parked) = first_open_of(pending, opening, &ms) else {
             panic!("the hung open returned")
         };
         recovery.outwaited("h264_nvenc", "libx264", at(3_000));

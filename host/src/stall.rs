@@ -517,6 +517,20 @@ impl<T, N: Fn() -> Instant> Pending<T, N> {
         }
     }
 
+    /// [`Self::wait_up_to`] until `by` on the caller's clock, however long
+    /// the call took to start. None at once if `by` has passed.
+    pub(crate) fn wait_until(
+        &mut self,
+        by: Instant,
+        progress: &mut impl FnMut(),
+    ) -> Option<Result<T, Stall>> {
+        let up_to = by.saturating_duration_since(self.started);
+        if (self.now)() >= by {
+            return None;
+        }
+        self.wait_up_to(up_to, progress)
+    }
+
     /// How long the call has run, by its caller's clock.
     pub(crate) fn running_for(&self) -> Duration {
         (self.now)().saturating_duration_since(self.started)
