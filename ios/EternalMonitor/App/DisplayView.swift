@@ -55,6 +55,10 @@ struct DisplayView: View {
                 pcLockedPill
                     .transition(.opacity)
                     .allowsHitTesting(false)
+            } else if connectionManager.pcNoDisplay {
+                noDisplayPill
+                    .transition(.opacity)
+                    .allowsHitTesting(false)
             } else if connectionManager.pictureRestoring {
                 restoringPill
                     .transition(.opacity)
@@ -118,6 +122,7 @@ struct DisplayView: View {
         .animation(.easeInOut(duration: 0.25), value: connectionManager.signalLost)
         .animation(.easeInOut(duration: 0.25), value: connectionManager.pictureRestoring)
         .animation(.easeInOut(duration: 0.25), value: connectionManager.pcLocked)
+        .animation(.easeInOut(duration: 0.25), value: connectionManager.pcNoDisplay)
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.35), value: appeared)
         .onAppear {
             appeared = true
@@ -433,6 +438,26 @@ struct DisplayView: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(L("Your PC is locked. Unlock it to continue."))
         .accessibilityIdentifier("display.pcLocked")
+    }
+
+    /// Over the held picture while the PC has no display turned on, until
+    /// one comes back.
+    private var noDisplayPill: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "display")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Theme.text)
+                .accessibilityHidden(true)
+            Text(L("Your PC has no active display. Turn on a screen to continue."))
+                .font(.app(15, .semibold, relativeTo: .subheadline))
+                .foregroundStyle(Theme.text)
+        }
+        .padding(.horizontal, 18)
+        .frame(minHeight: 44)
+        .background(glass(Capsule()))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(L("Your PC has no active display. Turn on a screen to continue."))
+        .accessibilityIdentifier("display.pcNoDisplay")
     }
 
     /// The PC is still connected but a lost frame left the picture waiting

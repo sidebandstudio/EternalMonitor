@@ -40,6 +40,9 @@ pub enum Call {
     /// Reading the graphics cards and the screens' wiring for the second
     /// screen's decisions (`capture::second_screen::facts`).
     GpuFacts,
+    /// After a lost duplication: asking the duplicated output whether it is
+    /// still on the desktop, and listing the outputs when it is not.
+    ListOutputs,
     /// The graphics calls before the window's first paint: finding the
     /// graphics cards (`gpu::GpuInfo::detect`), listing the screens and the
     /// window renderer's adapter list. They share one lane: they wait on the
@@ -52,7 +55,7 @@ pub enum Call {
     GpuProbe,
 }
 
-const CALLS: usize = 8;
+const CALLS: usize = 9;
 
 /// When a call is slow enough to log, and when it is given up on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,6 +83,7 @@ impl Call {
             Self::VddEnable => "vdd_enable",
             Self::VddDisable => "vdd_disable",
             Self::GpuFacts => "gpu_facts",
+            Self::ListOutputs => "list_outputs",
             Self::GpuDetect => "gpu_detect",
             Self::GpuProbe => "gpu_probe",
         }
@@ -111,6 +115,10 @@ impl Call {
             // adapters, as device creation begins, then asks DXCore and reads
             // the display configuration; it keeps device creation's limits.
             Self::GpuFacts => Limits::ms(1_000, 4_000),
+            // Not timed in the field. Listing creates a DXGI factory and asks
+            // every adapter for its outputs, which is how device creation
+            // begins; it keeps device creation's limits.
+            Self::ListOutputs => Limits::ms(1_000, 4_000),
             // 34 startups on 3 PCs (two test PCs, one field PC's uploads):
             // median 10 ms, slowest 44 ms, from "Support system information"
             // to "Selected encoder". It makes the same DXGI calls as
@@ -994,6 +1002,7 @@ mod tests {
             Call::VddEnable,
             Call::VddDisable,
             Call::GpuFacts,
+            Call::ListOutputs,
             Call::GpuDetect,
             Call::GpuProbe,
         ]
@@ -1013,6 +1022,7 @@ mod tests {
             Call::EncoderOpen,
             Call::VddEnable,
             Call::GpuFacts,
+            Call::ListOutputs,
             Call::GpuDetect,
             Call::GpuProbe,
         ] {

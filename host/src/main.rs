@@ -133,15 +133,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // authoritative per-run source (including a persisted/fallback selection) is logged
     // inside the capture loop when the stream starts. Time-boxed with GPU
     // detection: it would wait on the same driver.
-    let capture_summary = {
-        let outputs = capture::enumerate_outputs_at_startup();
-        outputs
-            .iter()
-            .find(|o| o.is_primary)
-            .or_else(|| outputs.first())
-            .map(|o| format!("{} ({}x{})", o.device_name, o.width, o.height))
-            .unwrap_or_else(|| "unknown".to_string())
-    };
+    let capture_summary = capture::listing::startup_display_label();
 
     // Load persisted settings BEFORE the first pipeline spawns, so generation
     // 0 already streams with the user's bitrate/fps/encoder/display/codec.

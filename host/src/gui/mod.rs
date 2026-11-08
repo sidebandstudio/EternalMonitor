@@ -45,7 +45,7 @@ use tracing::{info, warn};
 
 use crate::autostart::{first_lan_ipv4, read_startup_registry, set_startup_registry};
 use crate::capture::recovery::CaptureBlock;
-use crate::capture::{enumerate_outputs, enumerate_outputs_at_startup, OutputInfo};
+use crate::capture::{listing, OutputInfo};
 use crate::control::{CaptureTarget, GuiControl};
 use crate::gpu_preference::{Change, Preference, SwitchRecord};
 use crate::handoff::Handoff;
@@ -451,7 +451,7 @@ impl AnalyzerApp {
             }
         };
         // Before the first paint, so a stuck driver must not hold it.
-        let available_outputs = enumerate_outputs_at_startup();
+        let available_outputs = listing::outputs_at_startup(&control.shared);
 
         // Same model as encoder_override: push the persisted preference into
         // SharedControl so the encoder honours it without a restart.
@@ -717,7 +717,7 @@ impl AnalyzerApp {
     }
 
     fn refresh_outputs(&mut self) {
-        self.available_outputs = enumerate_outputs();
+        self.available_outputs = listing::outputs(&self.control.shared);
         info!(
             count = self.available_outputs.len(),
             "Re-enumerated display outputs"
