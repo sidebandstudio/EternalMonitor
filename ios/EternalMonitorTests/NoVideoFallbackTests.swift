@@ -263,7 +263,9 @@ final class NoVideoFallbackTests: XCTestCase {
     func testARememberedAddressThatFailsAfterItsProofIsRetired() async throws {
         for failure in ["no_reply", "no_picture", "other_pc"] {
             let first = FakeUDPHost(), other = FakeUDPHost()
-            let (manager, _) = try manager(pairedAt: first, connectTimeout: 3)
+            // Well past HELLO2's 2 s of retries, so an unanswered HELLO2 always
+            // gives up before the connect timeout, even on a slow runner.
+            let (manager, _) = try manager(pairedAt: first, connectTimeout: 6)
             defer { manager.cancel() }
             let (logged, sink) = lines(manager)
             defer { sink.cancel() }
