@@ -260,11 +260,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // An iPad looking for PCs starts waking the encoder's graphics card, which
+    // a laptop powers off when idle (see `gpu_wake`).
+    let wake_card = (gpu_info.encoder_name != "libx264").then_some(gpu_info.adapter_index);
+    let wake_shared = shared.clone();
+    let mut wake_gate = eternal_host::gpu_wake::WakeGate::default();
+    let on_browse = move || {
+        if let Some(adapter_index) = wake_card {
+            let sessions = wake_shared.session.lock().sessions_started();
+            if wake_gate.browse(
+                std::time::Instant::now(),
+                wake_shared.client_connected(),
+                sessions,
+            ) {
+                eternal_host::gpu_wake::wake(adapter_index);
+            }
+        }
+    };
+
     let supervisor_thread = std::thread::spawn(move || {
         eternal_host::supervisor::run(listen_port, shared, gpu_info, supervisor_tx, supervisor_rx);
     });
 
-    let mdns = discovery::advertise_service(listen_port);
+    let mdns = discovery::advertise_service(listen_port, on_browse);
 
     // The quit path, once: after the window closes (or the headless loop
     // ends), or from the first-paint watcher when the user quits while the

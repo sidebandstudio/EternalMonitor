@@ -14,6 +14,7 @@ pub mod encoder;
 pub mod feedback;
 pub mod firewall;
 pub mod gpu_preference;
+pub mod gpu_wake;
 pub mod gui;
 pub mod handoff;
 pub mod i18n;
