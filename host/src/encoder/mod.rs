@@ -352,7 +352,7 @@ fn run_encode_loop(
                     {
                         PIPELINE_STATS.lock().set_software_fallback(false);
                     }
-                    note_encoder_opened(&shared, &desired_encoder);
+                    note_encoder_opened(&shared, &desired_encoder, &gpu);
                 }
                 // No picture yet, and the iPad would give up waiting for
                 // it: libx264 streams while the open goes on.
@@ -382,7 +382,7 @@ fn run_encode_loop(
                     PIPELINE_STATS
                         .lock()
                         .set_software_fallback(encoder_name != "libx264");
-                    note_encoder_opened(&shared, "libx264");
+                    note_encoder_opened(&shared, "libx264", &gpu);
                 }
                 Err(e) if is_hevc_encoder(&desired_encoder) => {
                     warn!(
@@ -455,7 +455,7 @@ fn run_encode_loop(
                     PIPELINE_STATS
                         .lock()
                         .set_software_fallback(name == "libx264");
-                    note_encoder_opened(&shared, name);
+                    note_encoder_opened(&shared, name, &gpu);
                 }
                 Err(e) => return Err(e),
             }
@@ -609,7 +609,7 @@ fn run_encode_loop(
                     {
                         PIPELINE_STATS.lock().set_software_fallback(false);
                     }
-                    note_encoder_opened(&shared, &reopen.encoder);
+                    note_encoder_opened(&shared, &reopen.encoder, &gpu);
                 }
                 // The old session cannot take a frame of the new size. A
                 // pipeline restart opens a fresh encoder, with the software
@@ -2604,7 +2604,8 @@ fn codec_display_name_for(encoder_name: &str) -> &str {
 
 /// After every successful encoder open: report the live codec on the wire
 /// (HELLO_ACK/heartbeat `StreamConfig.codec`) and in the GUI.
-fn note_encoder_opened(shared: &SharedControl, encoder_name: &str) {
+fn note_encoder_opened(shared: &SharedControl, encoder_name: &str, gpu: &GpuInfo) {
+    *shared.wake_adapter.lock() = crate::gpu_wake::wake_adapter_for(encoder_name, gpu);
     let codec = if is_hevc_encoder(encoder_name) {
         eternal_wire::v2::control::CODEC_HEVC
     } else {
@@ -6104,6 +6105,26 @@ mod tests {
     /// Automatic's BGRA open failing on NVENC opens YUV420P at once and keeps
     /// it for later opens; a picked input, a stall, or a YUV420P open that
     /// fails is not tried again.
+    /// NVENC failing over to Quick Sync streams from the Intel card: the
+    /// NVIDIA card detection chose is unused and is not woken for iPads.
+    #[test]
+    fn an_encoder_open_publishes_the_card_to_wake() {
+        let shared = SharedControl::new(0, 8_000_000);
+        let gpu = GpuInfo {
+            encoder_name: "h264_nvenc".to_string(),
+            adapter_index: 1,
+            ..GpuInfo::software_fallback()
+        };
+        note_encoder_opened(&shared, "h264_nvenc", &gpu);
+        assert_eq!(*shared.wake_adapter.lock(), Some(1));
+        note_encoder_opened(&shared, "h264_qsv", &gpu);
+        assert_eq!(*shared.wake_adapter.lock(), None, "a cross-vendor fallback");
+        note_encoder_opened(&shared, "libx264", &gpu);
+        assert_eq!(*shared.wake_adapter.lock(), None, "the CPU");
+        note_encoder_opened(&shared, "hevc_nvenc", &gpu);
+        assert_eq!(*shared.wake_adapter.lock(), Some(1), "back on the card");
+    }
+
     #[test]
     fn a_failed_automatic_bgra_open_falls_back_to_yuv420_and_stays_there() {
         use ffmpeg_next::format::Pixel;

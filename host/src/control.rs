@@ -30,6 +30,11 @@ pub struct SharedControl {
     /// Encoder name override from the Settings tab, applied on next pipeline restart.
     /// `None` means use auto-detected encoder from GpuInfo.
     pub encoder_override: Arc<Mutex<Option<String>>>,
+    /// The DXGI adapter of the encoder that streams, for waking it when an
+    /// iPad looks for PCs (see `gpu_wake`): set at each encoder open and
+    /// when a late detection is adopted, None for a CPU encoder or one on
+    /// a card detection didn't choose.
+    pub wake_adapter: Arc<Mutex<Option<u32>>>,
     /// Which display output the capture loop should duplicate, applied on next pipeline
     /// restart. `PrimaryAuto` mirrors the primary monitor (today's behavior).
     pub capture_target: Arc<Mutex<CaptureTarget>>,
@@ -199,6 +204,7 @@ impl SharedControl {
             ))))),
             force_next_idr: Arc::new(AtomicBool::new(false)),
             encoder_override: Arc::new(Mutex::new(None)),
+            wake_adapter: Arc::new(Mutex::new(None)),
             capture_target: Arc::new(Mutex::new(CaptureTarget::PrimaryAuto)),
             vdd_status: Arc::new(Mutex::new(VddStatus::Inactive)),
             vdd_problem: Arc::new(Mutex::new(None)),

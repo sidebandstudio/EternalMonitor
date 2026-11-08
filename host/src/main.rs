@@ -262,21 +262,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // An iPad looking for PCs starts waking the encoder's graphics card, which
     // a laptop powers off when idle (see `gpu_wake`).
-    let (wake_adapter, detected_encoder) = (gpu_info.adapter_index, gpu_info.encoder_name.clone());
     let wake_shared = shared.clone();
     let mut wake_gate = eternal_host::gpu_wake::WakeGate::default();
     let on_browse = move || {
-        // The encoder that will stream: the override, unless the pipeline
-        // fell back to the CPU.
-        let encoder_override = wake_shared.encoder_override.lock().clone();
-        let software_fallback = stats::PIPELINE_STATS.lock().using_software_fallback;
-        if !eternal_host::gpu_wake::wakes_card(
-            encoder_override.as_deref(),
-            &detected_encoder,
-            software_fallback,
-        ) {
+        // The card of the encoder that streams, as its last open published.
+        let Some(adapter_index) = *wake_shared.wake_adapter.lock() else {
             return;
-        }
+        };
         let sessions = wake_shared.session.lock().sessions_started();
         if wake_gate.browse(
             std::time::Instant::now(),
@@ -285,7 +277,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ) {
             // A HELLO between here and the wake's device takes priority.
             let shared = wake_shared.clone();
-            eternal_host::gpu_wake::wake(wake_adapter, move || {
+            eternal_host::gpu_wake::wake(adapter_index, move || {
                 !shared.client_connected() && shared.session.lock().sessions_started() == sessions
             });
         }

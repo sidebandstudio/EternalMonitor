@@ -70,18 +70,20 @@ impl WakeGate {
     }
 }
 
-/// Whether the encoder that will stream runs on the card detection chose
-/// (`detected`): the override in Settings (`encoder_override`) if any, and
-/// not a software fallback. Only that card is woken; a CPU encoder, or one
-/// on another card, needs none.
-pub fn wakes_card(encoder_override: Option<&str>, detected: &str, software_fallback: bool) -> bool {
+/// The adapter to wake for `opened`, the encoder that opened in a pipeline
+/// using `gpu`: the card detection chose, when `opened` is a hardware encoder
+/// of its family (its HEVC sibling too). None for a CPU encoder, or for a
+/// fallback to another card's encoder (NVENC or AMF failing over to Quick
+/// Sync): the card detection chose is then unused, and waking it costs power
+/// for nothing.
+pub fn wake_adapter_for(opened: &str, gpu: &crate::gpu::GpuInfo) -> Option<u32> {
     let family = |name: &str| {
         name.strip_prefix("h264_")
             .or_else(|| name.strip_prefix("hevc_"))
             .map(str::to_owned)
     };
-    let effective = encoder_override.unwrap_or(detected);
-    !software_fallback && family(effective).is_some() && family(effective) == family(detected)
+    (family(opened).is_some() && family(opened) == family(&gpu.encoder_name))
+        .then_some(gpu.adapter_index)
 }
 
 /// Runs `touch` unless `still_wanted`, checked just before, says a session
@@ -188,27 +190,31 @@ mod tests {
         assert!(gate.browse(at(start, 75), false, 9));
     }
 
+    fn gpu(encoder: &str, adapter_index: u32) -> crate::gpu::GpuInfo {
+        crate::gpu::GpuInfo {
+            encoder_name: encoder.to_string(),
+            adapter_index,
+            ..crate::gpu::GpuInfo::software_fallback()
+        }
+    }
+
     #[test]
-    fn only_the_encoder_that_will_stream_on_the_detected_card_wakes_it() {
-        assert!(wakes_card(None, "h264_amf", false));
-        assert!(
-            wakes_card(Some("hevc_amf"), "h264_amf", false),
+    fn only_the_encoder_that_streams_on_the_detected_card_wakes_it() {
+        let nvenc = gpu("h264_nvenc", 1);
+        assert_eq!(wake_adapter_for("h264_nvenc", &nvenc), Some(1));
+        assert_eq!(
+            wake_adapter_for("hevc_nvenc", &nvenc),
+            Some(1),
             "its HEVC sibling"
         );
-        assert!(
-            !wakes_card(Some("libx264"), "h264_amf", false),
-            "a CPU override"
+        assert_eq!(
+            wake_adapter_for("h264_qsv", &nvenc),
+            None,
+            "a Quick Sync fallback"
         );
-        assert!(!wakes_card(None, "h264_amf", true), "a software fallback");
-        assert!(!wakes_card(None, "libx264", false));
-        assert!(
-            !wakes_card(Some("h264_qsv"), "h264_amf", false),
-            "another card"
-        );
-        assert!(
-            !wakes_card(Some("h264_nvenc"), "h264_amf", false),
-            "another card"
-        );
+        assert_eq!(wake_adapter_for("h264_amf", &nvenc), None, "another card");
+        assert_eq!(wake_adapter_for("libx264", &nvenc), None, "the CPU");
+        assert_eq!(wake_adapter_for("libx264", &gpu("libx264", 0)), None);
     }
 
     #[test]

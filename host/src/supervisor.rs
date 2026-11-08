@@ -471,7 +471,7 @@ pub fn run(
                 machine.note_started(generation);
                 settle(&machine, &shared, &mut standby, listen_port);
                 healthy_since = Instant::now();
-                if take_late_detection(&mut gpu_info, crate::gpu::take_late_detection) {
+                if adopt_late_detection(&mut gpu_info, &shared, crate::gpu::take_late_detection) {
                     let mut stats = PIPELINE_STATS.lock();
                     stats.set_gpu_name(gpu_info.name.clone());
                     stats.set_codec_name(gpu_info.codec_display_name.clone());
@@ -523,6 +523,21 @@ fn take_late_detection(gpu: &mut GpuInfo, late: impl FnOnce() -> Option<GpuInfo>
         "GPU detection returned after startup went on without it; this pipeline uses its graphics card"
     );
     *gpu = found;
+    true
+}
+
+/// [`take_late_detection`], and the card it found becomes the one to wake
+/// for an iPad that looks for PCs, until the new pipeline's encoder opens
+/// and says which it uses.
+fn adopt_late_detection(
+    gpu: &mut GpuInfo,
+    shared: &SharedControl,
+    late: impl FnOnce() -> Option<GpuInfo>,
+) -> bool {
+    if !take_late_detection(gpu, late) {
+        return false;
+    }
+    *shared.wake_adapter.lock() = crate::gpu_wake::wake_adapter_for(&gpu.encoder_name, gpu);
     true
 }
 
@@ -839,6 +854,27 @@ mod tests {
         assert!(!take_late_detection(&mut gpu, late));
         assert_eq!(gpu.name, "Software");
     }
+    #[test]
+    fn an_adopted_late_detection_becomes_the_card_to_wake() {
+        let shared = SharedControl::new(0, 8_000_000);
+        // Startup gave up and encodes on the CPU: nothing to wake.
+        let mut gpu = GpuInfo {
+            detection_stalled: true,
+            ..GpuInfo::software_fallback()
+        };
+        assert!(!adopt_late_detection(&mut gpu, &shared, || None));
+        assert_eq!(*shared.wake_adapter.lock(), None);
+        let late = || {
+            Some(GpuInfo {
+                encoder_name: "h264_amf".to_string(),
+                adapter_index: 1,
+                ..GpuInfo::software_fallback()
+            })
+        };
+        assert!(adopt_late_detection(&mut gpu, &shared, late));
+        assert_eq!(*shared.wake_adapter.lock(), Some(1));
+    }
+
     #[test]
     fn audio_failures_never_restart_or_exhaust_the_video_failure_budget() {
         let mut machine = Machine::new(7);
