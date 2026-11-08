@@ -494,18 +494,80 @@ async fn supervise(events: mpsc::Sender<UsbEvent>, force_idr: Arc<AtomicBool>) {
     }
 
     let client = Arc::new(Client::new(usbmuxd::Endpoint::default()));
+    supervise_devices(client, events, force_idr).await;
+}
+
+/// How long Apple's device list may keep failing before the service counts
+/// as down and the devices' workers stop, closing their tunnels. A single
+/// failed poll used to close every live tunnel, though the service and the
+/// tunnels through it were fine.
+const LIST_OUTAGE: Duration = Duration::from_secs(10);
+
+/// Device-list polls that failed in a row, and when the first one did.
+#[derive(Debug, Default)]
+struct ListFailures {
+    count: u32,
+    since: Option<tokio::time::Instant>,
+}
+
+impl ListFailures {
+    /// Whether a poll keeps the running workers, whatever it listed: its
+    /// list failed, but the failures have not lasted [`LIST_OUTAGE`] yet.
+    /// Only a list that answers can show a device gone.
+    fn keep_workers(&mut self, listed: bool, workers: usize, now: tokio::time::Instant) -> bool {
+        if listed {
+            if self.count > 0 {
+                info!(
+                    failed_polls = self.count,
+                    "Apple's device list answers again"
+                );
+            }
+            *self = Self::default();
+            return false;
+        }
+        self.count = self.count.saturating_add(1);
+        let since = *self.since.get_or_insert(now);
+        if workers == 0 {
+            return false;
+        }
+        if now.saturating_duration_since(since) < LIST_OUTAGE {
+            info!(
+                failed_polls = self.count,
+                "Apple's device list failed — keeping the USB tunnels"
+            );
+            return true;
+        }
+        info!(
+            failed_polls = self.count,
+            failing_ms = now.saturating_duration_since(since).as_millis() as u64,
+            "Apple's device list keeps failing — closing the USB tunnels"
+        );
+        false
+    }
+}
+
+async fn supervise_devices(
+    client: Arc<Client>,
+    events: mpsc::Sender<UsbEvent>,
+    force_idr: Arc<AtomicBool>,
+) {
     let mut workers = JoinSet::new();
     let mut handles: HashMap<u32, AbortHandle> = HashMap::new();
     let mut poll = tokio::time::interval(Duration::from_secs(2));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut unreachable = AppleUsbState::default();
+    let mut failures = ListFailures::default();
     loop {
         tokio::select! {
             _ = poll.tick() => {
                 let devices = client.list_devices().await;
                 let available = devices.is_ok();
                 let devices = devices.unwrap_or_default();
-                let ids: HashSet<_> = devices.iter().map(|device| device.device_id).collect();
+                let ids: HashSet<_> = if failures.keep_workers(available, handles.len(), tokio::time::Instant::now()) {
+                    handles.keys().copied().collect()
+                } else {
+                    devices.iter().map(|device| device.device_id).collect()
+                };
                 // Without the service the cable is invisible to us; ask
                 // Windows whether an iPad is attached so the GUI can say why.
                 let cabled = if available {
@@ -576,5 +638,238 @@ mod tests {
         std::env::set_var("ETERNAL_USB_DIRECT", "127.0.0.1:9");
         assert_eq!(direct_endpoint(), None);
         std::env::remove_var("ETERNAL_USB_DIRECT");
+    }
+
+    /// A failed device list keeps the workers that run, until the failures
+    /// last [`LIST_OUTAGE`]: then the service counts as down and they stop,
+    /// as every failed poll used to stop them. Each step is logged with the
+    /// count of failed polls.
+    #[test]
+    fn failed_device_lists_keep_the_workers_for_a_while() {
+        use tracing_subscriber::prelude::*;
+        #[derive(Clone, Default)]
+        struct Lines(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Lines {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let lines = Lines::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .without_time()
+                .with_target(false)
+                .with_writer(move || writer.clone()),
+        );
+        let start = tokio::time::Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let mut failures = ListFailures::default();
+        crate::logging::prepare_log_capture();
+        tracing::subscriber::with_default(subscriber, || {
+            // One failed poll between good ones.
+            assert!(!failures.keep_workers(true, 1, at(0)));
+            assert!(failures.keep_workers(false, 1, at(2)));
+            assert!(!failures.keep_workers(true, 1, at(4)));
+            // Failures in a row, until they have lasted the outage.
+            for secs in [6, 8, 10, 12, 14] {
+                assert!(failures.keep_workers(false, 1, at(secs)), "{secs} s");
+            }
+            assert!(!failures.keep_workers(false, 1, at(16)));
+            // Nothing left to keep, nothing more to say.
+            assert!(!failures.keep_workers(false, 0, at(18)));
+            assert!(!failures.keep_workers(true, 0, at(20)));
+            // Without workers a failure keeps nothing, but still counts.
+            assert!(!failures.keep_workers(false, 0, at(22)));
+            assert!(!failures.keep_workers(false, 1, at(32)));
+        });
+        let text = String::from_utf8(lines.0.lock().clone()).unwrap();
+        let lines: Vec<&str> = text.lines().map(str::trim).collect();
+        let keeping = |n: u32| {
+            format!("INFO Apple's device list failed — keeping the USB tunnels failed_polls={n}")
+        };
+        assert_eq!(
+            lines,
+            [
+                keeping(1),
+                "INFO Apple's device list answers again failed_polls=1".into(),
+                keeping(1),
+                keeping(2),
+                keeping(3),
+                keeping(4),
+                keeping(5),
+                "INFO Apple's device list keeps failing — closing the USB tunnels \
+                 failed_polls=6 failing_ms=10000"
+                    .into(),
+                "INFO Apple's device list answers again failed_polls=7".into(),
+                "INFO Apple's device list keeps failing — closing the USB tunnels \
+                 failed_polls=2 failing_ms=10000"
+                    .into(),
+            ]
+        );
+    }
+
+    /// Apple's device service whose list fails on demand: it drops the
+    /// request unanswered. It lists one USB iPad otherwise, and hands every
+    /// Connect's stream to the test as that iPad's end of a tunnel.
+    struct FlakyService {
+        failing: Arc<AtomicBool>,
+        fail_next: Arc<std::sync::atomic::AtomicU32>,
+        listed: Arc<AtomicU64>,
+        failed: Arc<AtomicU64>,
+        tunnels: mpsc::Receiver<tokio::net::TcpStream>,
+        client: Arc<Client>,
+    }
+
+    impl FlakyService {
+        async fn start() -> Self {
+            use std::sync::atomic::AtomicU32;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = Arc::new(Client::new(usbmuxd::Endpoint::Tcp(
+                listener.local_addr().unwrap(),
+            )));
+            let failing = Arc::new(AtomicBool::new(false));
+            let fail_next = Arc::new(AtomicU32::new(0));
+            let (listed, failed) = (Arc::new(AtomicU64::new(0)), Arc::new(AtomicU64::new(0)));
+            let (tunnel_tx, tunnels) = mpsc::channel(4);
+            let state = (
+                failing.clone(),
+                fail_next.clone(),
+                listed.clone(),
+                failed.clone(),
+            );
+            tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let (failing, fail_next, listed, failed) = state.clone();
+                    let tunnel_tx = tunnel_tx.clone();
+                    tokio::spawn(async move {
+                        let (tag, request) = usbmuxd::read_message(&mut stream).await.unwrap();
+                        let kind = request.as_dictionary().unwrap()["MessageType"]
+                            .as_string()
+                            .unwrap()
+                            .to_string();
+                        let reply = if kind == "ListDevices" {
+                            let once = fail_next
+                                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
+                                    n.checked_sub(1)
+                                })
+                                .is_ok();
+                            if once || failing.load(Ordering::SeqCst) {
+                                failed.fetch_add(1, Ordering::SeqCst);
+                                return;
+                            }
+                            listed.fetch_add(1, Ordering::SeqCst);
+                            let device = plist::Dictionary::from_iter([
+                                ("DeviceID".to_string(), plist::Value::from(3u64)),
+                                (
+                                    "Properties".to_string(),
+                                    plist::Value::Dictionary(plist::Dictionary::from_iter([(
+                                        "ConnectionType".to_string(),
+                                        plist::Value::from("USB"),
+                                    )])),
+                                ),
+                            ]);
+                            plist::Dictionary::from_iter([(
+                                "DeviceList".to_string(),
+                                plist::Value::Array(vec![plist::Value::Dictionary(device)]),
+                            )])
+                        } else {
+                            plist::Dictionary::from_iter([
+                                ("MessageType".to_string(), plist::Value::from("Result")),
+                                ("Number".to_string(), plist::Value::from(0u64)),
+                            ])
+                        };
+                        let bytes =
+                            usbmuxd::encode_message(tag, &plist::Value::Dictionary(reply)).unwrap();
+                        tokio::io::AsyncWriteExt::write_all(&mut stream, &bytes)
+                            .await
+                            .unwrap();
+                        if kind == "Connect" {
+                            let _ = tunnel_tx.send(stream).await;
+                        }
+                    });
+                }
+            });
+            Self {
+                failing,
+                fail_next,
+                listed,
+                failed,
+                tunnels,
+                client,
+            }
+        }
+
+        /// The iPad's end of the next tunnel, past its preamble.
+        async fn tunnel(&mut self) -> tokio::net::TcpStream {
+            let mut ipad = tokio::time::timeout(Duration::from_secs(20), self.tunnels.recv())
+                .await
+                .expect("a tunnel")
+                .unwrap();
+            super::super::link::read_preamble(&mut ipad).await.unwrap();
+            ipad
+        }
+
+        async fn until(&self, what: &str, done: impl Fn(&Self) -> bool) {
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while !done(self) {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("{what}"));
+        }
+    }
+
+    /// A device list that fails once leaves the live tunnel open; one that
+    /// keeps failing closes it after [`LIST_OUTAGE`], and once the list
+    /// answers again the iPad gets a new tunnel. A single failed list used
+    /// to close the tunnel at once.
+    #[tokio::test]
+    async fn a_failed_device_list_keeps_the_tunnel_until_the_service_is_down() {
+        let mut service = FlakyService::start().await;
+        let (events, mut opened) = mpsc::channel(4);
+        let supervisor = tokio::spawn(supervise_devices(
+            Arc::clone(&service.client),
+            events,
+            Arc::new(AtomicBool::new(false)),
+        ));
+        let _ipad = service.tunnel().await;
+        let first = opened.recv().await.unwrap();
+
+        service.fail_next.store(1, Ordering::SeqCst);
+        let listed = service.listed.load(Ordering::SeqCst);
+        service
+            .until("a failed list, then a good one", |service| {
+                service.failed.load(Ordering::SeqCst) == 1
+                    && service.listed.load(Ordering::SeqCst) > listed + 1
+            })
+            .await;
+        assert!(!first.link.is_closed(), "one failed list closed the tunnel");
+        assert!(service.tunnels.try_recv().is_err(), "a second tunnel");
+
+        service.failing.store(true, Ordering::SeqCst);
+        let failing_from = tokio::time::Instant::now();
+        let mut closed = first.link.closed_signal();
+        tokio::time::timeout(Duration::from_secs(30), closed.wait_for(|closed| *closed))
+            .await
+            .expect("the tunnel closes once the service is down")
+            .unwrap();
+        let failing_for = failing_from.elapsed();
+        assert!(failing_for >= LIST_OUTAGE, "{failing_for:?}");
+        assert!(service.failed.load(Ordering::SeqCst) >= 6);
+
+        service.failing.store(false, Ordering::SeqCst);
+        let _ipad = service.tunnel().await;
+        let second = opened.recv().await.unwrap();
+        assert!(second.generation > first.generation);
+        assert!(!second.link.is_closed());
+        supervisor.abort();
     }
 }
