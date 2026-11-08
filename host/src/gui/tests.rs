@@ -141,6 +141,25 @@ fn audio_row_reports_rate_and_keeps_failure_separate_from_video() {
 }
 
 #[test]
+fn audio_row_says_why_while_another_app_has_the_output() {
+    let mut audio = crate::audio::AudioStats::started("Speakers");
+    audio.stopped(crate::audio::DEVICE_IN_USE_STATUS);
+    let (text, color) = audio_summary(&audio, true);
+    assert_eq!(
+        text,
+        "Another app is using your speakers on its own. PC audio comes back when it lets go."
+    );
+    assert_eq!(color, WARNING);
+
+    // Gone once audio is back.
+    let mut audio = crate::audio::AudioStats::started("Speakers");
+    audio.kbps = 128.0;
+    let (text, color) = audio_summary(&audio, true);
+    assert!(text.starts_with("Streaming Speakers"), "{text}");
+    assert_eq!(color, ACCENT);
+}
+
+#[test]
 fn usb_row_shows_install_hint_only_when_the_service_is_unavailable() {
     let missing = usb_summary(false, 2, "Connected", 0, false);
     assert!(!missing.available);
