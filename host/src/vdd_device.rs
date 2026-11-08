@@ -137,6 +137,26 @@ pub fn from_task_stderr(stderr: &str) -> Option<DeviceState> {
     DeviceState::from_task_result(digits.parse().ok()?)
 }
 
+/// As [`query`], but `None` when Windows lists the present root devices,
+/// reads each of them, and none is the driver's: there is no device to turn
+/// off, as on Windows 10, where Setup installs none. [`query`] reads that as
+/// `Missing`, as it does a list it couldn't get.
+#[cfg(windows)]
+pub fn query_present() -> Option<DeviceState> {
+    match root_devnodes() {
+        Some(devnodes) if confirmed_absent(&devnodes) => None,
+        _ => Some(query()),
+    }
+}
+
+/// Whether every present root device was read and none is the driver's.
+#[cfg(any(windows, test))]
+fn confirmed_absent(devnodes: &[Devnode]) -> bool {
+    devnodes
+        .iter()
+        .all(|devnode| matches!(devnode, Devnode::Other))
+}
+
 /// Read the driver's device from Configuration Manager.
 #[cfg(windows)]
 pub fn query() -> DeviceState {
@@ -446,6 +466,24 @@ pub fn query() -> DeviceState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only a list where every root device was read, and none is the
+    /// driver's, says there is no device to turn off.
+    #[test]
+    fn only_a_fully_read_list_without_the_driver_is_an_absent_device() {
+        let driver = Devnode::Driver {
+            devinst: 7,
+            status: Some((0, 22)),
+        };
+        assert!(confirmed_absent(&[]));
+        assert!(confirmed_absent(&[Devnode::Other, Devnode::Other]));
+        assert!(!confirmed_absent(&[Devnode::Other, driver]));
+        assert!(!confirmed_absent(&[Devnode::Other, Devnode::Unread]));
+        assert!(!confirmed_absent(&[Devnode::Driver {
+            devinst: 7,
+            status: None
+        }]));
+    }
 
     /// Review r6: a root device whose location or hardware IDs couldn't be
     /// read may be the driver's, so the driver's state is unreadable, not
