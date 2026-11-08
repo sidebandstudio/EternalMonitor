@@ -141,6 +141,25 @@ fn audio_row_reports_rate_and_keeps_failure_separate_from_video() {
 }
 
 #[test]
+fn audio_row_says_why_while_another_app_has_the_output() {
+    let mut audio = crate::audio::AudioStats::started("Speakers");
+    audio.stopped(crate::audio::DEVICE_IN_USE_STATUS);
+    let (text, color) = audio_summary(&audio, true);
+    assert_eq!(
+        text,
+        "Another app is using your speakers on its own. PC audio comes back when it lets go."
+    );
+    assert_eq!(color, WARNING);
+
+    // Gone once audio is back.
+    let mut audio = crate::audio::AudioStats::started("Speakers");
+    audio.kbps = 128.0;
+    let (text, color) = audio_summary(&audio, true);
+    assert!(text.starts_with("Streaming Speakers"), "{text}");
+    assert_eq!(color, ACCENT);
+}
+
+#[test]
 fn usb_row_shows_install_hint_only_when_the_service_is_unavailable() {
     let missing = usb_summary(false, 2, "Connected", 0, false);
     assert!(!missing.available);
@@ -424,7 +443,7 @@ fn display_choices_use_the_names_shared_with_the_ipad() {
 
 #[test]
 fn an_outdated_nvidia_driver_is_named_with_the_version_to_install() {
-    let body = software_fallback_body(false, true);
+    let body = software_fallback_body(false, true, &[]);
     assert!(
         body.contains("NVIDIA driver to version 570 or newer"),
         "{body}"
@@ -441,10 +460,64 @@ fn an_outdated_nvidia_driver_is_named_with_the_version_to_install() {
     }
     // Custom settings are still the first thing to undo.
     assert_eq!(
-        software_fallback_body(true, true),
-        software_fallback_body(true, false)
+        software_fallback_body(true, true, &[]),
+        software_fallback_body(true, false, &[])
     );
-    assert!(!software_fallback_body(false, false).contains("570"));
+    assert!(!software_fallback_body(false, false, &[]).contains("570"));
+}
+
+#[test]
+fn an_amd_or_intel_card_that_could_not_encode_is_named_for_its_driver_update() {
+    use crate::gpu::GpuVendor::{Amd, Intel, Nvidia};
+    let amd = software_fallback_body(false, false, &[Amd]);
+    assert!(
+        amd.contains("The AMD graphics driver on this PC could not start video encoding"),
+        "{amd}"
+    );
+    assert!(
+        amd.contains("Update the AMD graphics driver, then click Restart"),
+        "{amd}"
+    );
+    let intel = software_fallback_body(false, false, &[Intel]);
+    assert!(
+        intel.contains("Update the Intel graphics driver, then click Restart"),
+        "{intel}"
+    );
+    assert!(!intel.contains("AMD"), "{intel}");
+    let both = software_fallback_body(false, false, &[Intel, Amd]);
+    assert!(
+        both.contains("Update the AMD and Intel graphics drivers, then click Restart"),
+        "{both}"
+    );
+    for body in [&amd, &intel, &both] {
+        for jargon in [
+            "AMF",
+            "Quick Sync",
+            "QSV",
+            "MFX",
+            "libx264",
+            "encoder",
+            "http",
+        ] {
+            assert!(!body.contains(jargon), "{body}");
+        }
+    }
+    // An outdated NVIDIA driver names the version to install, and custom
+    // settings are still the first thing to undo.
+    assert_eq!(
+        software_fallback_body(false, true, &[Amd]),
+        software_fallback_body(false, true, &[])
+    );
+    assert_eq!(
+        software_fallback_body(true, false, &[Amd]),
+        software_fallback_body(true, false, &[])
+    );
+    // No vendor named: the general advice, as before.
+    assert_eq!(
+        software_fallback_body(false, false, &[Nvidia]),
+        software_fallback_body(false, false, &[])
+    );
+    assert!(software_fallback_body(false, false, &[]).contains("NVIDIA, AMD or Intel"));
 }
 
 #[test]

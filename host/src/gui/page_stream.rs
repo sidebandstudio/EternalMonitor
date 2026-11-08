@@ -85,7 +85,11 @@ impl AnalyzerApp {
                 WARNING,
                 Icon::Warning,
                 SOFTWARE_FALLBACK_TITLE,
-                &software_fallback_body(customized, snap.nvidia_driver_outdated),
+                &software_fallback_body(
+                    customized,
+                    snap.nvidia_driver_outdated,
+                    &snap.driver_update_vendors,
+                ),
                 if customized { 230.0 } else { 110.0 },
                 |ui| {
                     if customized {
@@ -831,15 +835,30 @@ pub(super) const SOFTWARE_FALLBACK_TITLE: &str =
     "Video is using the processor instead of the graphics card";
 
 /// What the CPU fallback notice says: undo custom settings first, say the
-/// NVIDIA driver is too old when that is what the graphics card refused, or
-/// suggest a driver update.
-pub(super) fn software_fallback_body(customized: bool, nvidia_driver_outdated: bool) -> String {
+/// NVIDIA driver is too old when that is what the graphics card refused,
+/// name the AMD or Intel driver whose card could not start encoding
+/// (`driver_vendors`), or suggest a driver update.
+pub(super) fn software_fallback_body(
+    customized: bool,
+    nvidia_driver_outdated: bool,
+    driver_vendors: &[crate::gpu::GpuVendor],
+) -> String {
+    use crate::gpu::GpuVendor::{Amd, Intel};
+    let amd = driver_vendors.contains(&Amd);
+    let intel = driver_vendors.contains(&Intel);
     if customized {
         "The graphics card could not encode video with the options chosen in Settings, so the picture may lag and the PC may run hot. Go back to the recommended options first.".to_string()
     } else if nvidia_driver_outdated {
         format!(
             "The NVIDIA graphics driver on this PC is too old for the graphics card to encode video, so the picture may lag and the PC may run hot. Update the NVIDIA driver to version {} or newer, if your graphics card supports it, then click Restart. Older cards keep using the processor.",
             crate::encoder::NVENC_MIN_DRIVER
+        )
+    } else if amd && intel {
+        "The AMD and Intel graphics drivers on this PC could not start video encoding on the graphics cards, so the picture may lag and the PC may run hot. Update the AMD and Intel graphics drivers, then click Restart.".to_string()
+    } else if amd || intel {
+        let vendor = if amd { "AMD" } else { "Intel" };
+        format!(
+            "The {vendor} graphics driver on this PC could not start video encoding on the graphics card, so the picture may lag and the PC may run hot. Update the {vendor} graphics driver, then click Restart."
         )
     } else {
         "The picture may lag and the PC may run hot. Update your graphics driver from NVIDIA, AMD or Intel, then click Restart.".to_string()
@@ -1494,6 +1513,13 @@ pub(super) fn audio_summary(
                 audio.kbps, audio.packets_per_sec
             ),
             ACCENT,
+        );
+    }
+    if audio.status == crate::audio::DEVICE_IN_USE_STATUS {
+        return (
+            "Another app is using your speakers on its own. PC audio comes back when it lets go."
+                .into(),
+            WARNING,
         );
     }
     // The audio stage's idle status names the protocol, not the device.
