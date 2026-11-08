@@ -728,6 +728,12 @@ fn run_encode_loop(
         let qsv_change = encoder
             .bitrate_change
             .is_some_and(|change| change.live == LiveBitrate::QsvReset);
+        // NVENC reconfigures for a new bitrate while it takes this frame,
+        // and says so only in its verbose lines.
+        let nvenc_watch = encoder
+            .bitrate_change
+            .is_some_and(|change| change.live == LiveBitrate::NvencReconfig)
+            .then(crate::diagnostics::FfmpegWatch::start);
         let mut reset_refused: Option<String> = None;
         if let Err(error) = encoder.send_frame(pts, raw_frame.timestamp, raw_frame.frame_number) {
             if !qsv_change {
@@ -735,9 +741,6 @@ fn run_encode_loop(
             }
             reset_refused = Some(error.to_string());
         }
-        encoder.bitrate_change = encoder
-            .bitrate_change
-            .and_then(|change| change.sent(pts, force_idr));
 
         let mut keyframe_out = false;
         while reset_refused.is_none() {
@@ -785,16 +788,6 @@ fn run_encode_loop(
                         (nal_data, is_keyframe)
                     };
                     keyframe_out |= is_keyframe;
-                    if let Some(change) = encoder.bitrate_change {
-                        match change.packet(encoder.packet.pts(), is_keyframe) {
-                            Some(true) => encoder.bitrate_change = None,
-                            Some(false) => {
-                                reset_refused =
-                                    Some("no IDR came out after the reconfigure".to_string())
-                            }
-                            None => {}
-                        }
-                    }
                     if !opened_is_hevc {
                         encoder.observe_amf_diagnostics(
                             &nal_data,
@@ -859,6 +852,13 @@ fn run_encode_loop(
                 Err(e) if is_eagain(&e) => break,
                 Err(e) if qsv_change => reset_refused = Some(e.to_string()),
                 Err(e) => return Err(e.into()),
+            }
+        }
+        if let Some(watch) = nvenc_watch {
+            if nvenc_reconfigured(&watch.finish()) {
+                encoder.bitrate_change = None;
+            } else if reset_refused.is_none() {
+                reset_refused = Some("NVENC did not reconfigure the session's bitrate".to_string());
             }
         }
         if let Some(error) = reset_refused {
@@ -936,12 +936,12 @@ struct EncoderState {
 /// before each frame in three of its encoders:
 /// - libx264 applies bitrate and VBV changes through x264_encoder_reconfig.
 /// - Quick Sync resets the session's rate control to it (qsvenc.c,
-///   `update_bitrate` and `MFXVideoENCODE_Reset`), with no new sequence. A
-///   Quick Sync open takes 630 ms at the median in the field.
+///   `update_bitrate` and `MFXVideoENCODE_Reset`), with no new sequence,
+///   instead of its slow open.
 /// - NVENC reconfigures the session (nvenc.c, `reconfig_encoder` and
 ///   `nvEncReconfigureEncoder`) with an IDR, if the card can change its
-///   bitrate live (NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE). Its open takes
-///   144 ms at the median in the field.
+///   bitrate live (NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE), instead of a
+///   new session.
 ///
 /// AMF sets its bitrate only when it opens (amfenc_h264.c and
 /// amfenc_hevc.c), and libx265 has no reconfigure, so both reopen, and ABR
@@ -990,48 +990,29 @@ fn refused_this_launch(live: LiveBitrate) -> bool {
     live.refused().load(Ordering::Relaxed)
 }
 
-/// A hardware bitrate change made in place, until the session shows it
-/// took it. Quick Sync applies it with the next frame, so an error there
-/// means it refused it. NVENC logs a failed reconfigure without returning
-/// an error, and skips it on a card that cannot change its bitrate live,
-/// so the change is confirmed by the IDR its reconfigure forces on that
-/// frame. (A GOP's own IDR landing on that frame confirms a change that
-/// may not have taken; the next change is checked again.)
+/// A hardware bitrate change made in place, settled by the end of the frame
+/// it goes in with: then the session took it, or it is replaced by one
+/// opened at the new bitrate, so the session's bitrate never outlives an
+/// unconfirmed change. Quick Sync applies it with that frame, and an error
+/// there is its refusal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Unconfirmed {
     live: LiveBitrate,
-    /// The PTS of the frame the change goes in with; None before it is sent.
-    pts: Option<i64>,
 }
 
-impl Unconfirmed {
-    /// The frame with `pts` went in. For NVENC, a frame that forces an IDR
-    /// anyway cannot show whether the reconfigure took: the change is
-    /// taken as made, and the next one is checked.
-    fn sent(mut self, pts: i64, forced_idr: bool) -> Option<Self> {
-        if self.pts.is_some() {
-            return Some(self);
-        }
-        if self.live == LiveBitrate::NvencReconfig && forced_idr {
-            return None;
-        }
-        self.pts = Some(pts);
-        Some(self)
-    }
-
-    /// A packet came out. Some(true): the change took; Some(false): the
-    /// session refused it; None: not known yet.
-    fn packet(self, packet_pts: Option<i64>, is_keyframe: bool) -> Option<bool> {
-        let pts = self.pts?;
-        match self.live {
-            // Errors decide for Quick Sync; one packet is enough.
-            LiveBitrate::QsvReset | LiveBitrate::X264 => Some(true),
-            LiveBitrate::NvencReconfig => match packet_pts {
-                Some(out) if out >= pts => Some(is_keyframe),
-                _ => None,
-            },
-        }
-    }
+/// Whether NVENC reconfigured its session for a new bitrate, from FFmpeg's
+/// lines while it took the change's frame. FFmpeg 7.1.1's nvenc.c
+/// (`reconfig_encoder`) logs "avg bitrate change" at verbose level when it
+/// calls nvEncReconfigureEncoder for one, and "failed to reconfigure nvenc"
+/// when that fails; it returns no error either way, and skips the change
+/// with no line on a card that cannot change its bitrate live. An IDR says
+/// nothing: one the frame forced, or the GOP's own, comes out either way.
+/// Anything but a reconfigure that ran and did not fail is a refusal.
+fn nvenc_reconfigured(lines: &[String]) -> bool {
+    lines.iter().any(|line| line.contains("avg bitrate change"))
+        && !lines
+            .iter()
+            .any(|line| line.contains("failed to reconfigure nvenc"))
 }
 
 impl EncoderState {
@@ -1078,7 +1059,7 @@ impl EncoderState {
             }
             // Quick Sync opened in VBR with no maximum rate or buffer size,
             // so only the target changes.
-            self.bitrate_change = Some(Unconfirmed { live, pts: None });
+            self.bitrate_change = Some(Unconfirmed { live });
             info!(
                 from = self.opened_bitrate,
                 to = bitrate_bps,
@@ -4289,6 +4270,12 @@ mod tests {
         qsv_refused: bool,
         /// An NVENC session did: a card that cannot change its bitrate live.
         nvenc_refused: bool,
+        /// Whether FFmpeg reconfigures an NVENC session for a change made
+        /// in place (see `nvenc_reconfigured`).
+        nvenc_reconfigures: bool,
+        /// The session was dropped after a refused change; the next frame
+        /// opens one, as the encode loop's first open does.
+        dropped: bool,
         /// The user's preference.
         hevc_wanted: bool,
         bitrate: u32,
@@ -4319,6 +4306,8 @@ mod tests {
                 // As on a card that cannot change its bitrate live: these
                 // tests reopen NVENC sessions with bitrate changes.
                 nvenc_refused: true,
+                nvenc_reconfigures: true,
+                dropped: false,
                 hevc_wanted: is_hevc_encoder(opened),
                 bitrate: 15_000_000,
                 fps: 60,
@@ -4353,7 +4342,14 @@ mod tests {
                 self.session.is_some() && !client_hevc && is_hevc_encoder(&self.opened.0);
             self.undecodable_retry
                 .frame(undecodable, &mut self.failed_reopen, self.now);
-            // As `update_bitrate_without_reopening`.
+            if std::mem::take(&mut self.dropped) {
+                self.opened = (desired.clone(), self.bitrate, self.fps);
+                self.pacer.opened(self.now);
+                self.failed_reopen = None;
+                return Some(desired);
+            }
+            // As `update_bitrate_without_reopening`, settled at the end of
+            // the frame: a refused NVENC change drops the session.
             if takes_bitrate_in_place(&self.opened.0, |live| match live {
                 LiveBitrate::QsvReset => self.qsv_refused,
                 LiveBitrate::NvencReconfig => self.nvenc_refused,
@@ -4361,6 +4357,13 @@ mod tests {
             }) && (self.opened.0.as_str(), self.opened.2) == (desired.as_str(), self.fps)
                 && self.opened.1 != self.bitrate
             {
+                if LiveBitrate::of(&self.opened.0) == Some(LiveBitrate::NvencReconfig)
+                    && !self.nvenc_reconfigures
+                {
+                    self.nvenc_refused = true;
+                    self.dropped = true;
+                    return None;
+                }
                 self.opened.1 = self.bitrate;
                 self.failed_reopen = None;
                 self.in_place += 1;
@@ -6163,39 +6166,129 @@ mod tests {
     }
 
     #[test]
-    fn an_nvenc_change_is_taken_only_once_its_frame_comes_out_as_an_idr() {
-        let nvenc = |pts| Unconfirmed {
-            live: LiveBitrate::NvencReconfig,
-            pts,
+    fn an_nvenc_change_is_settled_by_its_reconfigure_and_never_by_an_idr() {
+        let lines = |lines: &[&str]| {
+            lines
+                .iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
         };
-        // Sent with frame 100: an earlier frame's packet says nothing.
-        let sent = nvenc(None).sent(100, false).unwrap();
-        assert_eq!(sent, nvenc(Some(100)));
-        assert_eq!(sent.packet(Some(99), false), None);
-        assert_eq!(sent.packet(None, true), None);
-        // Its own frame decides: an IDR took it, a P-frame did not.
-        assert_eq!(sent.packet(Some(100), true), Some(true));
-        assert_eq!(sent.packet(Some(100), false), Some(false));
-        assert_eq!(sent.packet(Some(101), false), Some(false));
-        // Once sent, a later frame does not move it.
-        assert_eq!(sent.sent(200, false), Some(sent));
-        // A frame that forces an IDR anyway cannot tell: taken as made.
-        assert_eq!(nvenc(None).sent(100, true), None);
-        // Quick Sync's errors decide: its first packet confirms it.
-        let qsv = Unconfirmed {
-            live: LiveBitrate::QsvReset,
-            pts: None,
+        // What FFmpeg 7.1.1's nvenc.c prints while it takes the change's
+        // frame. A reconfigure that ran:
+        assert!(nvenc_reconfigured(&lines(&[
+            "[h264_nvenc @ 0x1] avg bitrate change: 8000000 -> 6000000",
+            "[h264_nvenc @ 0x1] vbv buffer size change: 16000000 -> 12000000",
+        ])));
+        // One that failed: FFmpeg returns no error, so the line decides.
+        assert!(!nvenc_reconfigured(&lines(&[
+            "[h264_nvenc @ 0x1] avg bitrate change: 8000000 -> 6000000",
+            "[h264_nvenc @ 0x1] failed to reconfigure nvenc: invalid param (8): ",
+        ])));
+        // A card that cannot change its bitrate live: FFmpeg skips it and
+        // prints nothing, though the frame may come out as an IDR anyway,
+        // forced or the GOP's own. Before, that IDR confirmed it.
+        assert!(!nvenc_reconfigured(&[]));
+        assert!(!nvenc_reconfigured(&lines(&[
+            "[h264_nvenc @ 0x1] aspect ratio change (DAR): 16:9 -> 16:9"
+        ])));
+    }
+
+    #[test]
+    fn ffmpeg_verbose_lines_reach_only_the_watching_thread_and_are_not_logged() {
+        ffmpeg_next::init().unwrap();
+        crate::diagnostics::install_ffmpeg_logging();
+        let say = |level: i32, text: &str| {
+            let message = std::ffi::CString::new(format!("{text}\n")).unwrap();
+            unsafe { ffmpeg_next::ffi::av_log(std::ptr::null_mut(), level, message.as_ptr()) };
         };
-        let sent = qsv.sent(7, true).unwrap();
-        assert_eq!(sent.packet(Some(3), false), Some(true));
-        assert_eq!(qsv.packet(Some(7), false), None);
+        let (kept, logged_lines) = logged(|| {
+            let watch = crate::diagnostics::FfmpegWatch::start();
+            say(
+                ffmpeg_next::ffi::AV_LOG_VERBOSE,
+                "avg bitrate change: 1 -> 2",
+            );
+            say(ffmpeg_next::ffi::AV_LOG_WARNING, "a warning while watching");
+            // Another thread's verbose line meanwhile is not kept here.
+            let other = std::thread::spawn(move || {
+                say(
+                    ffmpeg_next::ffi::AV_LOG_VERBOSE,
+                    "another thread's verbose line",
+                );
+            });
+            other.join().unwrap();
+            let kept = watch.finish();
+            // After the watch, verbose lines are dropped again.
+            say(ffmpeg_next::ffi::AV_LOG_VERBOSE, "verbose after the watch");
+            kept
+        });
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert!(kept[0].contains("avg bitrate change: 1 -> 2"), "{kept:?}");
+        assert!(kept[1].contains("a warning while watching"), "{kept:?}");
+        // The warning is logged as always; no verbose line ever is.
+        assert!(
+            logged_lines
+                .iter()
+                .any(|line| line.contains("a warning while watching")),
+            "{logged_lines:?}"
+        );
+        assert!(
+            !logged_lines
+                .iter()
+                .any(|line| line.contains("verbose") || line.contains("avg bitrate change")),
+            "{logged_lines:?}"
+        );
+        assert_eq!(
+            unsafe { ffmpeg_next::ffi::av_log_get_level() },
+            ffmpeg_next::ffi::AV_LOG_WARNING
+        );
+    }
+
+    #[test]
+    fn a_refused_nvenc_change_reopens_at_the_new_bitrate_even_with_abr_off() {
+        // ETERNAL_ABR=0: the target is the user's Max bitrate, and nothing
+        // changes it again for as long as the user leaves it. A change NVENC
+        // did not take must not leave the session on the old bitrate.
+        let mut abr = crate::transport::abr::AbrController::new(8_000_000, false);
+        let mut p = Pipeline::new("h264_nvenc", "h264_nvenc", Instant::now());
+        p.nvenc_refused = false;
+        p.nvenc_reconfigures = false;
+        p.opened.1 = abr.current_bps();
+        p.bitrate = abr.current_bps();
+        let raised = abr.set_ceiling(20_000_000);
+        assert!(raised.changed);
+        p.bitrate = raised.target_bps;
+        // The frame it went in with: refused, the session is dropped.
+        assert_eq!(p.frame(Reopen::Opens), None);
+        assert!(p.nvenc_refused && p.dropped);
+        // The next frame opens one at the new bitrate.
+        p.later(16);
+        assert_eq!(p.frame(Reopen::Opens).as_deref(), Some("h264_nvenc"));
+        assert_eq!(p.opened.1, 20_000_000);
+        assert_eq!(p.in_place, 0);
+        // From then on its changes reopen, as after a Quick Sync refusal.
+        let lowered = abr.set_ceiling(10_000_000);
+        p.later(2_000);
+        p.bitrate = lowered.target_bps;
+        assert_eq!(p.frame(Reopen::Opens).as_deref(), Some("h264_nvenc"));
+        assert_eq!(p.opened.1, 10_000_000);
+        // A card that reconfigures takes the same changes in place.
+        let mut p = Pipeline::new("h264_nvenc", "h264_nvenc", Instant::now());
+        p.nvenc_refused = false;
+        for bitrate in [20_000_000, 10_000_000] {
+            p.bitrate = bitrate;
+            assert_eq!(p.frame(Reopen::Opens), None);
+            assert_eq!(p.opened.1, bitrate);
+        }
+        assert_eq!(p.in_place, 2);
     }
 
     /// Native, where NVENC opens: a bitrate change on the open session takes
-    /// effect with no new session, at once as an IDR, and the stream decodes
-    /// throughout. Skips elsewhere.
+    /// effect with no new session, FFmpeg's reconfigure confirms each one,
+    /// including on a GOP's own IDR (frames 120 and 240) and on a frame that
+    /// forces an IDR (250), and the stream decodes throughout. Skips
+    /// elsewhere.
     #[test]
-    fn nvenc_changes_its_bitrate_on_the_open_session_with_an_idr() {
+    fn nvenc_changes_its_bitrate_on_the_open_session() {
         ffmpeg_next::init().unwrap();
         let Ok(mut state) = EncoderState::new(
             "h264_nvenc",
@@ -6221,12 +6314,22 @@ mod tests {
         let mut sizes = [0usize; 3];
         let mut keyframes = Vec::new();
         let mut random = 1u32;
-        let mut changes = Vec::new();
+        let mut confirmed = Vec::new();
         for number in 0..360u64 {
-            if number == 120 || number == 240 {
-                let bitrate = if number == 120 { 1_000_000 } else { 8_000_000 };
+            let change = match number {
+                120 => Some(1_000_000),
+                240 => Some(8_000_000),
+                250 => Some(6_000_000),
+                _ => None,
+            };
+            if let Some(bitrate) = change {
                 assert!(state.update_bitrate_without_reopening("h264_nvenc", bitrate, 60));
-                changes.push(state.bitrate_change.take().unwrap());
+                assert_eq!(
+                    state.bitrate_change.take(),
+                    Some(Unconfirmed {
+                        live: LiveBitrate::NvencReconfig
+                    })
+                );
             }
             for value in state.frame.data_mut(0) {
                 random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
@@ -6234,29 +6337,20 @@ mod tests {
             }
             state.frame.data_mut(1).fill(128);
             state.frame.data_mut(2).fill(128);
-            let pts = number as i64 * 1_000_000 / 60;
-            state.frame.set_pts(Some(pts));
+            state.frame.set_pts(Some(number as i64 * 1_000_000 / 60));
+            state.frame.set_kind(if number == 250 {
+                ffmpeg_next::picture::Type::I
+            } else {
+                ffmpeg_next::picture::Type::None
+            });
+            let watch = change.map(|_| crate::diagnostics::FfmpegWatch::start());
             state.encoder.send_frame(&state.frame).unwrap();
-            if let Some(change) = changes.last_mut() {
-                if change.pts.is_none() {
-                    *change = change.sent(pts, false).unwrap();
-                }
-            }
             loop {
                 match state.encoder.receive_packet(&mut state.packet) {
                     Ok(()) => {
                         let out = state.packet.pts().unwrap();
                         if state.packet.is_key() {
                             keyframes.push(out * 60 / 1_000_000);
-                        }
-                        for change in &changes {
-                            if change.pts == Some(out) {
-                                assert_eq!(
-                                    change.packet(Some(out), state.packet.is_key()),
-                                    Some(true),
-                                    "frame {number}: the reconfigure was not taken"
-                                );
-                            }
                         }
                         if number % 120 >= 60 {
                             sizes[(number / 120) as usize] += state.packet.size();
@@ -6274,15 +6368,16 @@ mod tests {
                     Err(error) => panic!("encode failed: {error}"),
                 }
             }
+            if let Some(watch) = watch {
+                let lines = watch.finish();
+                assert!(nvenc_reconfigured(&lines), "frame {number}: {lines:?}");
+                confirmed.push(number);
+            }
         }
-        eprintln!("NVENC sizes {sizes:?}, keyframes at {keyframes:?}");
+        eprintln!("NVENC sizes {sizes:?}, keyframes at {keyframes:?}, confirmed {confirmed:?}");
+        assert_eq!(confirmed, [120, 240, 250]);
         assert_eq!(decoded_frames, 360);
         assert_eq!(unsafe { state.encoder.as_ptr() }, context);
-        // An IDR on each change's frame, besides the GOP's.
-        assert!(
-            keyframes.contains(&120) && keyframes.contains(&240),
-            "{keyframes:?}"
-        );
         assert!(
             sizes[1] * 2 < sizes[0],
             "lower bitrate was not applied: {sizes:?}"
@@ -6387,8 +6482,7 @@ mod tests {
         assert_eq!(
             state.bitrate_change,
             Some(Unconfirmed {
-                live: LiveBitrate::NvencReconfig,
-                pts: None
+                live: LiveBitrate::NvencReconfig
             })
         );
         state.bitrate_change = None;
@@ -6400,8 +6494,7 @@ mod tests {
         assert_eq!(
             state.bitrate_change,
             Some(Unconfirmed {
-                live: LiveBitrate::QsvReset,
-                pts: None
+                live: LiveBitrate::QsvReset
             })
         );
         assert!(!state.update_bitrate_without_reopening("h264_qsv", 4_000_000, 60));
@@ -7070,8 +7163,8 @@ mod tests {
     /// Native, for measurements: the real encode stage on
     /// `ETERNAL_MEASURE_ENCODER` (h264_nvenc unless set), steered by the real
     /// ABR controller for `ETERNAL_MEASURE_MINUTES` (4) on a link that loses
-    /// whatever the encoder sends above 11 Mbps, as on a PC whose link holds
-    /// 10 Mbps and loses each probe to 12. One receiver report a second.
+    /// whatever the encoder sends above 11 Mbps: 10 Mbps holds, and each
+    /// probe to 12 is lost. One receiver report a second.
     /// Prints a MEASURE line: steps, reopens and in-place changes a minute,
     /// and for each change the longest gap between packets in the next 2 s
     /// (the hitch) and the time to the next keyframe.

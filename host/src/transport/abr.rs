@@ -18,12 +18,10 @@ const DOWN_COOLDOWN: Duration = Duration::from_secs(3);
 const UP_COOLDOWN: Duration = Duration::from_secs(15);
 /// The wait after any change before a step up, while the encoder takes a
 /// new bitrate only by reopening (AMF, libx265): each step there costs a
-/// stutter and an IDR. In 24 h of field logs from 59 Windows PCs, 75-80% of
-/// hardware encoder opens followed an ABR step, and of 1,504 steps up, 919
-/// were undone by a step down: half of those within 4 s and 788 within
-/// 30 s, so each probe that failed reopened twice. One PC opened AMF 897
-/// times in 7 h. A probe undone within [`PROBE_HOLDS`] doubles the wait, up
-/// to [`REOPEN_UP_COOLDOWN_MAX`]; one that holds that long resets it.
+/// stutter and an IDR. On a link just below the next rung, a step up is
+/// undone by a step down within seconds, so a probe that fails reopens the
+/// encoder twice. A probe undone within [`PROBE_HOLDS`] doubles the wait,
+/// up to [`REOPEN_UP_COOLDOWN_MAX`]; one that holds that long resets it.
 const REOPEN_UP_COOLDOWN: Duration = Duration::from_secs(30);
 const REOPEN_UP_COOLDOWN_MAX: Duration = Duration::from_secs(120);
 /// A step up held this long, with no step down, worked.
@@ -796,7 +794,7 @@ mod tests {
         let at = |s: u64| t0 + Duration::from_secs(s);
         let mut counter = 0;
         // Steps down at 0 s, then probes up once the wait is over, and each
-        // probe is lost 4 s later, as half the failed probes in the field.
+        // probe is lost 4 s later, on a link that cannot carry it.
         assert!(abr.on_report(&report(980, 30, 0), None, at(0)).changed);
         let mut downs = vec![0u64];
         let mut ups = Vec::new();
@@ -911,8 +909,7 @@ mod tests {
 
     #[test]
     fn a_link_just_below_the_next_rung_probes_less_often_while_the_encoder_reopens() {
-        // 11 Mbps: 10 Mbps holds, every probe to 12 Mbps is lost, as on the
-        // field PC that opened AMF 897 times in 7 h.
+        // 11 Mbps: 10 Mbps holds, every probe to 12 Mbps is lost.
         let minutes = 30;
         let steady = on_a_link(false, minutes * 60, |_| 11_000_000);
         let reopening = on_a_link(true, minutes * 60, |_| 11_000_000);
