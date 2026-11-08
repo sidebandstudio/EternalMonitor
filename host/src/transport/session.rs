@@ -109,6 +109,10 @@ struct RefusalMinute {
 }
 /// Honor at most one keyframe request per this window (PLI storm guard).
 pub const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(500);
+/// Smaller media sizes per session whose keyframe skips that window: the
+/// iPad asks for two (1,200 then 576 bytes). Any later one is an ordinary,
+/// rate-limited keyframe request.
+const MEDIA_SIZE_IDRS: u8 = 2;
 
 /// Media bytes, headers included, a Wi-Fi client's address gets before
 /// anything of its session comes back from it: room for the first picture,
@@ -286,8 +290,10 @@ struct ActiveSession {
     /// Video frames let through to this session ([`Session::may_send_media`]).
     frames_sent: u32,
     /// The largest media datagram the client asked for in this session
-    /// ([`KeyframeRequest::max_media_dgram`]).
+    /// ([`KeyframeRequest::max_media_dgram`]), and how many times it went
+    /// down.
     max_media_dgram: Option<u16>,
+    media_size_lowered: u8,
     /// A Wi-Fi goodbye while the cable takes over.
     bye: Option<ByeReason>,
     /// The msg_seq of input packets taken in this session.
@@ -1121,6 +1127,7 @@ impl Session {
             frags_received: false,
             frames_sent: 0,
             max_media_dgram: None,
+            media_size_lowered: 0,
             bye: None,
             input_seqs: SeqWindow::default(),
             answered,
@@ -1191,21 +1198,24 @@ impl Session {
         actions.force_idr = session.heard(Heard::Keyframe, now);
         info!(reason = ?request.reason, "Keyframe request received");
         // Only a client that was told the host takes it asks; anything else
-        // is ignored, as before. Each smaller size restarts the picture at
-        // once: the frames sent so far gave the client no picture.
+        // is ignored, as before. The first smaller sizes restart the picture
+        // at once: the frames sent so far gave the client no picture.
         let asked = request.max_media_dgram;
         if asked != 0 && session.info.feature_caps & FEATURE_MEDIA_SIZE != 0 {
             let size = asked.clamp(MIN_MEDIA_DGRAM, eternal_wire::v2::MAX_DGRAM_SIZE as u16);
             if session.max_media_dgram.is_none_or(|current| size < current) {
                 session.max_media_dgram = Some(size);
-                session.last_keyframe_grant = Some(now);
+                session.media_size_lowered = session.media_size_lowered.saturating_add(1);
                 info!(
                     max_dgram = size,
                     frames_sent = session.frames_sent,
                     "Media packet size lowered for this session"
                 );
-                actions.force_idr = true;
-                return actions;
+                if session.media_size_lowered <= MEDIA_SIZE_IDRS {
+                    session.last_keyframe_grant = Some(now);
+                    actions.force_idr = true;
+                    return actions;
+                }
             }
         }
 
@@ -2944,6 +2954,37 @@ mod tests {
             assert!(actions.replies.is_empty() && actions.new_target.is_none());
         }
         assert_eq!(session.max_media_dgram(id.wrapping_add(1)), None);
+
+        // A client that keeps asking for less, a byte at a time, gets two
+        // keyframes past the rate limit, then no more than any other client.
+        session.handle_control(
+            peer,
+            0,
+            media_size_hello(3, FEATURE_MEDIA_SIZE),
+            &TestConfig,
+            at(1_000),
+        );
+        let id = session.session_id().unwrap();
+        let mut forced = Vec::new();
+        for step in 0..825u64 {
+            let actions = session.handle_control_authed(
+                peer,
+                sized_request(1400 - step as u16),
+                &TestConfig,
+                at(1_000 + step * 10),
+            );
+            if actions.force_idr {
+                forced.push(step * 10);
+            }
+        }
+        assert_eq!(session.max_media_dgram(id), Some(MIN_MEDIA_DGRAM));
+        // Two at once, then one per rate-limit window from the second.
+        assert_eq!(forced[..2], [0, 10]);
+        assert!(forced[2..]
+            .windows(2)
+            .all(|pair| pair[1] - pair[0] >= KEYFRAME_REQUEST_MIN_INTERVAL.as_millis() as u64));
+        assert_eq!(forced[2], 510);
+        assert!(forced.len() <= 2 + 8240 / 500, "{forced:?}");
 
         session.handle_control(
             peer,

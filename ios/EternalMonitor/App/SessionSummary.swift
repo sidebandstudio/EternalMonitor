@@ -116,7 +116,7 @@ struct SessionSummary: Equatable {
         switch end {
         case .connectTimeout where sessionId == nil, .pcMoved: return "no_reply"
         case .connectTimeout: return datagramsReceived == 0 ? "no_video" : "no_frame"
-        case .noVideoPath: return "no_video"
+        case .noVideoPath: return datagramsReceived == 0 ? "no_video" : "no_frame"
         case .pcStoppedResponding: return "signal_lost"
         case .cableUnplugged, .usbLinkFailed, .closedBeforePicture: return "usb_lost"
         case .noNetwork: return "no_network"

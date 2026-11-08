@@ -85,14 +85,10 @@ enum MovedPC {
             guard text.split(separator: ".").count == 4, let bytes = IPv4Address(text)?.rawValue, bytes.count == 4 else { return nil }
             return bytes.reduce(0) { $0 << 8 | UInt32($1) }
         }
-        guard isDirect(route), let address = ipv4(route.address), let mask = ipv4(route.netmask), let candidate = ipv4(host),
+        guard route.direct, !tunnels.contains(where: route.interface.hasPrefix),
+              let address = ipv4(route.address), let mask = ipv4(route.netmask), let candidate = ipv4(host),
               mask != 0, mask != .max else { return false }
         return address & mask == candidate & mask
-    }
-
-    /// Whether `route` is a direct Wi-Fi or Ethernet path, not a tunnel.
-    static func isDirect(_ route: Route) -> Bool {
-        route.direct && !tunnels.contains(where: route.interface.hasPrefix)
     }
 
     /// The other home network addresses `identity` signed, in the PC's

@@ -168,24 +168,95 @@ final class NoVideoFallbackTests: XCTestCase {
         XCTAssertEqual(try pairings.token(address: PairingStore.address(host: "127.0.0.1", port: first.port)), Self.token)
         XCTAssertEqual(UserDefaults.standard.integer(forKey: "lastPort"), Int(other.port))
 
-        // Connecting to the first address later goes to the other first.
+        // Connecting to the first address later goes to the other first,
+        // once the PC there shows again that it holds the pairing.
         manager.cancel()
         manager.connect(host: "127.0.0.1", port: first.port)
-        XCTAssertTrue(manager.diagnostics.contains { $0.message == "no_video_fallback step=remembered result=tried" })
         async let atFirst = Task.detached { first.received(within: 1) }.value
-        let answered = await Task.detached { other.acceptSession(authToken: Self.token) }.value
+        let answered = await Task.detached {
+            other.answerIdentify(token: Self.token) && other.acceptSession(authToken: Self.token)
+        }.value
         XCTAssertTrue(answered, "the address that showed video goes first")
+        XCTAssertFalse(other.helloBeforeIdentify, "nothing with the token before the proof")
         let firstTypes = await atFirst
         XCTAssertFalse(firstTypes.contains(.hello2), "\(firstTypes)")
+        XCTAssertTrue(logged().contains("no_video_fallback step=remembered result=tried"), logged().joined(separator: "\n"))
 
-        // Where the other address doesn't answer, the attempt goes back to
-        // the first.
+        // Where nothing at the other address shows the proof, the attempt
+        // goes to the first, and the other is forgotten.
         manager.cancel()
         manager.connect(host: "127.0.0.1", port: first.port)
         let backAtFirst = await Task.detached { first.helloAttempts(within: 8) }.value
         XCTAssertGreaterThan(backAtFirst, 0)
-        XCTAssertTrue(logged().contains("no_video_fallback step=remembered result=no_reply"),
+        XCTAssertTrue(logged().contains("no_video_fallback step=remembered result=not_confirmed"),
                       logged().joined(separator: "\n"))
+        XCTAssertNil(NoVideoPaths.better(than: "127.0.0.1", port: first.port, pairing: Self.token))
+    }
+
+    /// The remembered address belongs to another PC now: one with pairing
+    /// on, which can't make this pairing's proof, or one with pairing off,
+    /// which would take any HELLO2 and doesn't answer the identity check.
+    /// The token never goes there, the pairing stays, and the attempt goes
+    /// to the address tapped.
+    func testARememberedAddressThatIsNowAnotherPCNeverGetsTheToken() async throws {
+        for pairingOn in [true, false] {
+            let first = FakeUDPHost(), other = FakeUDPHost()
+            let (manager, pairings) = try manager(pairedAt: first)
+            defer { manager.cancel() }
+            let (logged, sink) = lines(manager)
+            defer { sink.cancel() }
+            NoVideoPaths.remember(from: .init(host: "127.0.0.1", port: first.port),
+                                  to: .init(host: "127.0.0.1", port: other.port), pairing: Self.token)
+            manager.connect(host: "127.0.0.1", port: first.port)
+            async let atOther = Task.detached { () -> [Wire.PacketType] in
+                if pairingOn, !other.answerIdentify(token: Data(2...17)) { return [] }
+                return other.received(within: 4)
+            }.value
+            let accepted = await Task.detached { first.acceptSession() }.value
+            XCTAssertTrue(accepted, "\(pairingOn): the tapped address got no HELLO2")
+            XCTAssertEqual(first.lastAuthToken, Self.token, "\(pairingOn)")
+            let types = await atOther
+            XCTAssertFalse(types.contains(.hello2), "\(pairingOn): \(types)")
+            XCTAssertFalse(other.helloBeforeIdentify, "\(pairingOn)")
+            if !pairingOn { XCTAssertEqual(Set(types), [.identify]) }
+            try await until("handshake at the tapped address") { manager.hostInfo != nil }
+            XCTAssertEqual(manager.debugState.port, first.port)
+            XCTAssertEqual(try pairings.token(address: PairingStore.address(host: "127.0.0.1", port: first.port)), Self.token)
+            XCTAssertNil(NoVideoPaths.better(than: "127.0.0.1", port: first.port, pairing: Self.token))
+            XCTAssertTrue(logged().contains("no_video_fallback step=remembered result=not_confirmed"), "\(pairingOn)")
+        }
+        // An entry kept for another pairing is never used for this one.
+        NoVideoPaths.remember(from: .init(host: "127.0.0.1", port: 1), to: .init(host: "127.0.0.1", port: 2),
+                              pairing: Data(2...17))
+        XCTAssertNil(NoVideoPaths.better(than: "127.0.0.1", port: 1, pairing: Self.token))
+        XCTAssertEqual(NoVideoPaths.better(than: "127.0.0.1", port: 1, pairing: Data(2...17))?.port, 2)
+    }
+
+    /// The other address the PC signs is outside this iPad's own network:
+    /// it is never asked, as for a PC Bonjour moved there.
+    func testAnOtherAddressOffThisNetworkIsNeverAsked() async throws {
+        let first = FakeUDPHost(), other = FakeUDPHost()
+        let (manager, _) = try manager(pairedAt: first, other: other, connectTimeout: 8)
+        defer { manager.cancel() }
+        manager.localRoute = { _, _ in MovedPC.Route(interface: "en0", direct: true, address: "10.0.0.5", netmask: "255.255.255.0") }
+        let (logged, sink) = lines(manager)
+        defer { sink.cancel() }
+        let ended = OSAllocatedUnfairLock(initialState: false)
+        manager.connect(host: "127.0.0.1", port: first.port)
+        let frame = try FakeUDPHost.keyframe()
+        let served = Task.detached {
+            first.servePath(limit: 0, frame: frame, hostCaps: HelloAck.hostCapMediaSize,
+                            addresses: Self.bothAddresses) { ended.withLock { $0 } }
+        }
+        try await until("asked the PC for its addresses", seconds: 20) {
+            logged().contains("no_video_fallback step=other_address result=none")
+        }
+        let types = await Task.detached { other.received(within: 1) }.value
+        XCTAssertEqual(types, [])
+        try await until("timed out", seconds: 20) { manager.state == .disconnected }
+        ended.withLock { $0 = true }
+        let run = await served.value
+        XCTAssertGreaterThan(run.identifyAnswers, 0)
     }
 
     /// The other address the PC signs answers without the pairing's proof,

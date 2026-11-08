@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 /// A PC accepted the session and sends video, and no picture comes of it:
@@ -54,8 +55,9 @@ struct NoVideoFallback: Equatable {
 }
 
 /// Where a PC's video didn't arrive, and the address of the same PC where it
-/// did, so the next connect to the first goes to the second. Kept in
-/// UserDefaults as "host:port" pairs.
+/// did, so the next connect to the first goes to the second once the PC
+/// there proves it holds the pairing. Each entry is bound to that pairing by
+/// a digest of its token. Kept in UserDefaults.
 enum NoVideoPaths {
     private static let key = "noVideoPaths"
     private static let kept = 16
@@ -68,17 +70,29 @@ enum NoVideoPaths {
     private struct Entry: Codable {
         var from: Address
         var to: Address
+        /// SHA-256 of the pairing token, in hex.
+        var pairing: String
     }
 
-    /// The address where the PC at `host:port` showed video instead.
-    static func better(than host: String, port: UInt16) -> Address? {
-        load().last { $0.from == Address(host: host, port: port) }?.to
+    /// The address where the PC paired with `pairing` at `host:port` showed
+    /// video instead.
+    static func better(than host: String, port: UInt16, pairing: Data) -> Address? {
+        let digest = digest(pairing)
+        return load().last { $0.from == Address(host: host, port: port) && $0.pairing == digest }?.to
     }
 
-    static func remember(from: Address, to: Address) {
+    static func remember(from: Address, to: Address, pairing: Data) {
         var entries = load().filter { $0.from != from && $0.from != to }
-        entries.append(Entry(from: from, to: to))
+        entries.append(Entry(from: from, to: to, pairing: digest(pairing)))
         save(Array(entries.suffix(kept)))
+    }
+
+    static func forget(from: Address) {
+        save(load().filter { $0.from != from })
+    }
+
+    private static func digest(_ token: Data) -> String {
+        SHA256.hash(data: token).map { String(format: "%02x", $0) }.joined()
     }
 
     static func forgetAll() {

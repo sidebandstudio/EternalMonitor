@@ -280,6 +280,9 @@ final class ConnectionManager: ObservableObject {
     /// asked for (kept here) if the PC doesn't answer there.
     private var pendingRedirect: (host: String, port: UInt16)?
     private var attemptRedirect: (host: String, port: UInt16)?
+    /// The proof the PC at a remembered address is checked for, before any
+    /// attempt starts (see `connectViaRemembered`).
+    private var redirectCheck: UUID?
     /// The current session's no-video steps, with a PC that takes them, and
     /// the step whose result isn't known yet, as its log line names it.
     private var noVideoFallback: NoVideoFallback?
@@ -378,24 +381,59 @@ final class ConnectionManager: ObservableObject {
         if let token {
             do { try pairingStore.save(token: token, hostName: "", address: PairingStore.address(host: host, port: port)) }
             catch { record(.warning, "pairing", "Could not save the scanned pairing on this iPad.") }
-        } else if let better = betterAddress(host: host, port: port) {
-            pendingRedirect = (host.trimmingCharacters(in: .whitespacesAndNewlines), port)
-            connect(target: .udp(host: better.host, port: better.port))
-            pendingRedirect = nil
+        } else if let remembered = rememberedAddress(host: host, port: port) {
+            connectViaRemembered(from: (host.trimmingCharacters(in: .whitespacesAndNewlines), port), remembered)
             return
         }
         connect(target: .udp(host: host, port: port))
     }
 
-    /// Where the same PC showed video after none arrived at `host:port`: an
-    /// address this iPad holds the same pairing for.
-    private func betterAddress(host: String, port: UInt16) -> NoVideoPaths.Address? {
+    /// Where the PC paired at `host:port` showed video after none arrived
+    /// there, kept for this pairing, with the pairing and the PC's name.
+    private func rememberedAddress(host: String, port: UInt16) -> (to: NoVideoPaths.Address, token: Data, name: String)? {
         let host = host.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let better = NoVideoPaths.better(than: host, port: port),
-              let token = (try? pairingStore.token(address: PairingStore.address(host: host, port: port))) ?? nil,
-              let there = (try? pairingStore.token(address: PairingStore.address(host: better.host, port: better.port))) ?? nil,
-              token == there else { return nil }
-        return better
+        let address = PairingStore.address(host: host, port: port)
+        guard let token = (try? pairingStore.token(address: address)) ?? nil,
+              let to = NoVideoPaths.better(than: host, port: port, pairing: token),
+              let name = pairingStore.pcName(address: address) ?? RecentConnectionStore.shared.entry(host: host, port: port)?.name
+        else { return nil }
+        return (to, token, name)
+    }
+
+    /// Connecting to `from`, where the PC's video didn't arrive before, goes
+    /// to the address where it did, once the PC there shows it holds this
+    /// pairing and receives there: the address may belong to another device
+    /// now. Only then does a HELLO2 with the token go there, as a move, with
+    /// the same-PC checks of one. Without the proof the entry is forgotten
+    /// and the attempt goes to `from`.
+    private func connectViaRemembered(from: (host: String, port: UInt16),
+                                      _ remembered: (to: NoVideoPaths.Address, token: Data, name: String)) {
+        endReconnectCycle()
+        let check = UUID()
+        redirectCheck = check
+        connectionError = nil
+        problem = nil
+        state = .connecting
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let to = remembered.to
+            let same = await MovedPC.confirm(host: to.host, port: to.port, token: remembered.token,
+                                             link: self.makeUDPLink(to.port))
+            guard self.redirectCheck == check else { return }
+            self.redirectCheck = nil
+            self.state = .disconnected
+            guard same else {
+                NoVideoPaths.forget(from: .init(host: from.host, port: from.port))
+                self.startAttempt(.udp(host: from.host, port: from.port))
+                self.record(.info, "connection", "no_video_fallback step=remembered result=not_confirmed")
+                return
+            }
+            self.pendingMove = Move(from: from, name: remembered.name, token: remembered.token, noVideo: true)
+            self.pendingRedirect = from
+            self.explicitPairingToken = remembered.token
+            self.startAttempt(.udp(host: to.host, port: to.port))
+            self.pendingRedirect = nil
+        }
     }
 
     func submitPairing() {
@@ -1264,7 +1302,7 @@ final class ConnectionManager: ObservableObject {
             // The PC still answers at the old address: its pairing stays,
             // and connecting there goes here first.
             NoVideoPaths.remember(from: .init(host: move.from.host, port: move.from.port),
-                                  to: .init(host: new.host, port: new.port))
+                                  to: .init(host: new.host, port: new.port), pairing: move.token)
         } else if homeAddress(move.from.host) {
             try? pairingStore.remove(address: PairingStore.address(host: move.from.host, port: move.from.port))
         }
@@ -1302,9 +1340,9 @@ final class ConnectionManager: ObservableObject {
 
     /// No picture came of the PC's video at this address, even in small
     /// datagrams. Asked here, the PC signs its home network addresses with
-    /// this iPad's pairing; the first other one this iPad reaches over
-    /// Wi-Fi or Ethernet, where the PC shows again that it holds the pairing
-    /// and receives there, gets a new attempt. A forwarded or spoofed
+    /// this iPad's pairing; the first other one on this iPad's own network,
+    /// where the PC shows again that it holds the pairing and receives
+    /// there, gets a new attempt. A forwarded or spoofed
     /// address can't make either answer.
     private func tryOtherAddress() {
         let host = debugState.host, port = debugState.port
@@ -1328,7 +1366,9 @@ final class ConnectionManager: ObservableObject {
                 let target = self.dialAddress(other, identity.port)
                 let route = await self.localRoute(target.host, target.port)
                 guard current() else { return }
-                guard let route, MovedPC.isDirect(route) else { continue }
+                // As for a PC Bonjour moved: only an address on this iPad's
+                // own network, so nothing relays the stream elsewhere.
+                guard let route, MovedPC.isLocal(target.host, over: route) else { continue }
                 let same = await MovedPC.confirm(host: target.host, port: target.port, token: token,
                                                  link: self.makeUDPLink(target.port))
                 guard current() else { return }
@@ -1589,6 +1629,12 @@ final class ConnectionManager: ObservableObject {
     /// Ends the attempt. `end` says why; only the user's own action is
     /// `.userDisconnect`.
     func disconnect(_ end: AttemptEnd = .userDisconnect) {
+        // Still checking the remembered address: nothing went out yet.
+        if redirectCheck != nil {
+            redirectCheck = nil
+            state = .disconnected
+            return
+        }
         if state != .disconnected {
             endNoVideoStep("no_video")
             recordStreamSummary(reason: "disconnect=\(end.name)")
