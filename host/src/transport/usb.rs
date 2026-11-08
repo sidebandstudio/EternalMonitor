@@ -267,6 +267,12 @@ impl TransportLinks {
         links
     }
 
+    /// Tests: a link over a stream they hold, as if its cable connected.
+    #[cfg(test)]
+    pub(crate) fn adopt_for_test(&mut self, link: Arc<FramedLink>) {
+        self.adopt(0, link);
+    }
+
     fn adopt(&mut self, generation: u64, link: Arc<FramedLink>) {
         // Drops already counted by an earlier generation are not new.
         let reported_drops = link.stats().frames_dropped.load(Ordering::Relaxed);

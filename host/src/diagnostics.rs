@@ -126,6 +126,7 @@ fn log_stream_summary(shared: &SharedControl) {
         target_fps = shared.effective_fps(), max_dgram = shared.max_dgram.load(Relaxed),
         input = ?*shared.encoder_input.lock(), hevc = shared.hevc_enabled.load(Relaxed),
         retransmits = sample.transport_retransmits, usb_drops = sample.usb_frames_dropped,
+        pointer_sent = sample.pointer_states_sent, pointer_shapes = sample.pointer_shapes_sent,
         usb_state = %sample.usb_link_state, usb_devices = sample.usb_devices,
         capture_heartbeat_age_ms = now_ms.saturating_sub(shared.hb_capture_frame_ms.load(Relaxed)),
         encode_heartbeat_age_ms = now_ms.saturating_sub(shared.hb_encode_frame_ms.load(Relaxed)),

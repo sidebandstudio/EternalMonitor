@@ -247,6 +247,7 @@ fn connect_app(
             nacks_sent: 10,
             audio_packets_lost: 0,
             audio_buffer_ms: 60,
+            pointer_shape_id: 0,
         }),
         &Fixture,
         now,

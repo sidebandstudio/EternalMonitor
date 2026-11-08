@@ -94,6 +94,7 @@ features = [
     "Win32_System_ProcessStatus",
     "Win32_Storage_FileSystem",
     "Win32_Devices_FunctionDiscovery",
+    "Win32_Devices_Properties",
     "Win32_UI_Shell_PropertiesSystem",
     "Win32_Graphics_DXCore",
     "Win32_Graphics_Dxgi",

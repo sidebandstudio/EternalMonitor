@@ -75,6 +75,7 @@ Rust and Swift share golden vectors and stable packet-type registry tests.
 | KEYFRAME_REQUEST | Recovery after repair expiry or decoder error |
 | PING / PONG | Min-RTT clock estimate for end-to-end latency |
 | INPUT_EVENT | Normalized mouse/touch events, HID keys and UTF-16 text |
+| POINTER_SHAPE / POINTER_STATE | The Mirror's pointer image (chunked premultiplied BGRA and an invert mask) and its position, at most once a frame budget, for an iPad that draws the pointer itself (feature bit 5, host capability bit 6); the video then leaves the pointer out. The Second screen does the same when the running virtual display driver started with a hardware cursor (as the host's settings file sets it), which the host knows from its record of that start (boot and device arrival); a pointer image larger than that cursor's caps stays in the video. When the host can't tell, it does as 0.3.4: no pointer messages, and the pointer in the video. |
 | Audio | Sequenced Opus packets with discontinuity and capture timing |
 | BYE | User, background or shutdown teardown; the host ending a silent session |
 

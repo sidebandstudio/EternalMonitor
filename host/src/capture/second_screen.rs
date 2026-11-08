@@ -1803,6 +1803,40 @@ struct WindowsDriver<'a> {
 }
 
 #[cfg(windows)]
+impl WindowsDriver<'_> {
+    /// After an Enable that succeeded: a driver seen off before it and
+    /// running after it started in it, with the file `prepare` wrote, so
+    /// keep what that file gives the pointer
+    /// (`vdd_settings::record_after_enable`). One already running, or one
+    /// that couldn't be read, keeps the record of its own start.
+    fn note_start(&self) {
+        let request = self.request.borrow();
+        let Some(request) = request.as_ref() else {
+            return;
+        };
+        let after = crate::vdd_device::run_state();
+        let record = crate::vdd_settings::record_after_enable(
+            request.instance,
+            after,
+            request.settings.as_deref(),
+            request.cursor,
+        );
+        info!(
+            started = record.is_some(),
+            before = ?request.instance,
+            ?after,
+            "The virtual display's driver after the Enable"
+        );
+        let (Some(record), Some(path)) = (record, super::cursor_record_path()) else {
+            return;
+        };
+        if let Err(error) = crate::vdd_settings::save_record(&path, &record) {
+            warn!(%error, "Could not keep the virtual display's pointer record");
+        }
+    }
+}
+
+#[cfg(windows)]
 impl Driver for WindowsDriver<'_> {
     fn outputs(&self) -> Vec<OutputInfo> {
         super::listing::outputs(self.shared)
@@ -1813,11 +1847,19 @@ impl Driver for WindowsDriver<'_> {
     }
 
     fn set_enabled(&self, enabled: bool) -> bool {
-        crate::vdd::set_enabled(enabled, || {})
+        let done = crate::vdd::set_enabled(enabled, || {});
+        if enabled && done {
+            self.note_start();
+        }
+        done
     }
 
     fn enable(&self) -> Result<(), EnableReport> {
-        crate::vdd::enable(|| {})
+        let result = crate::vdd::enable(|| {});
+        if result.is_ok() {
+            self.note_start();
+        }
+        result
     }
 
     fn settle(&self, chosen: OutputInfo) -> OutputInfo {
