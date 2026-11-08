@@ -84,7 +84,6 @@ public struct KeyRing {
     /// Adds a key from a pairing, before its `PairConfirm` goes out (store
     /// first, section 4.1 step 3). It joins the group no status has listed.
     /// Anything but `.added` changes nothing.
-    @discardableResult
     public mutating func add(_ key: ClientKey) -> AddOutcome {
         if tombstoned.contains(key.devId) { return .tombstoned }
         if keys.contains(where: { $0.key.devId == key.devId }) { return .alreadyHeld }

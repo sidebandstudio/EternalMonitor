@@ -528,12 +528,16 @@ public enum SessionMessage: Equatable, Sendable {
     case confirmAck(SlotStatus)
     /// Host → iPad: this key's record conflicted and is retired.
     case refused(SlotStatus)
+    /// Host → iPad: another iPad is streaming; this session wasn't committed
+    /// and nothing changed. Empty body.
+    case busy
     /// Either way: the session is over. One byte, the v2 `ByeReason`.
     case bye(UInt8)
 
     public static let innerConfirm: UInt8 = 0x50
     public static let innerConfirmAck: UInt8 = 0x51
     public static let innerRefused: UInt8 = 0x52
+    public static let innerBusy: UInt8 = 0x53
     public static let innerBye: UInt8 = V2.byeType
 
     public var innerType: UInt8 {
@@ -541,6 +545,7 @@ public enum SessionMessage: Equatable, Sendable {
         case .confirm: return Self.innerConfirm
         case .confirmAck: return Self.innerConfirmAck
         case .refused: return Self.innerRefused
+        case .busy: return Self.innerBusy
         case .bye: return Self.innerBye
         }
     }
@@ -548,7 +553,7 @@ public enum SessionMessage: Equatable, Sendable {
     public func encodeBody() -> [UInt8] {
         var out: [UInt8] = []
         switch self {
-        case .confirm: break
+        case .confirm, .busy: break
         case .confirmAck(let status), .refused(let status): status.encode(into: &out)
         case .bye(let reason): out.append(reason)
         }
@@ -563,6 +568,7 @@ public enum SessionMessage: Equatable, Sendable {
         case innerConfirm: return .confirm
         case innerConfirmAck: return .confirmAck(try SlotStatus.read(&r))
         case innerRefused: return .refused(try SlotStatus.read(&r))
+        case innerBusy: return .busy
         case innerBye: return .bye(try r.u8())
         default: return nil
         }

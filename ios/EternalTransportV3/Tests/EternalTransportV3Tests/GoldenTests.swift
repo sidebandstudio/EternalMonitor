@@ -358,7 +358,8 @@ final class GoldenTests: XCTestCase {
         let refused = SessionMessage.refused(Self.fullStatus())
         for (name, message) in [("accept_max.record.refused", (refused.innerType, refused.encodeBody())),
                                 ("accept_max.record.bye", (V2.byeType, [UInt8(2)])),
-                                ("accept_max.record.heartbeat", (V2.heartbeatType, heartbeat))] {
+                                ("accept_max.record.heartbeat", (V2.heartbeatType, heartbeat)),
+                                ("accept_max.record.busy", (SessionMessage.innerBusy, [UInt8]()))] {
             XCTAssertEqual(hex(try hostSend.seal(innerType: message.0, body: message.1)), hex(v[name]), name)
             let opened = try ipadRecv.open(v[name])
             XCTAssertEqual(try SessionMessage.parse(innerType: opened.innerType, body: opened.body),

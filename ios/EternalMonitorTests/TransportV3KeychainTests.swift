@@ -61,9 +61,9 @@ final class TransportV3KeychainTests: XCTestCase {
     func testTheItemsProtection() throws {
         let store = KeychainKeyStore(service: service)
         var ring = KeyRing(hostId: hostId, slotId: Id16([UInt8](repeating: 0x5C, count: 16))!)
-        ring.add(key(3))
+        XCTAssertEqual(ring.add(key(3)), .added)
         try store.save(ring)
-        ring.add(key(4))
+        XCTAssertEqual(ring.add(key(4)), .added)
         try store.save(ring)
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,

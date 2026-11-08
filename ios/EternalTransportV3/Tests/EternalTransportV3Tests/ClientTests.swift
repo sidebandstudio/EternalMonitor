@@ -177,18 +177,50 @@ final class ClientTests: XCTestCase {
         XCTAssertNil(client.liveSession)
     }
 
+    /// The reference client's `busy_ends_the_attempt_and_keeps_everything_else`.
+    func testBusyEndsTheAttemptAndKeepsEverythingElse() throws {
+        let (hostSealer, _) = try goLive(77)
+        let msg1 = try XCTUnwrap(client.connect(now: t0 + .seconds(1), key: keyA, clockUs: 2_000).sent.first)
+        let (msg2, sealer, _) = try answer(msg1, accept(78))
+        _ = handle(msg2, at: t0 + .seconds(1))
+        XCTAssertTrue(client.isConfirming)
+        XCTAssertEqual(handle(sealed(sealer!, .busy), at: t0 + .seconds(1)), [.busy(devId: keyA.devId)])
+        XCTAssertFalse(client.isConfirming || client.isConnecting)
+        XCTAssertEqual(client.liveSession, 77, "the live session is untouched")
+        XCTAssertEqual(client.abandonedCount, 0)
+        XCTAssertEqual(client.poll(now: t0 + ms(2500), clockUs: 5_000).sent, [], "no retry of its own")
+        // A Busy on the live session is no answer to anything: nothing
+        // changes, and it still shows the host holds the keys.
+        XCTAssertEqual(handle(sealed(hostSealer, .busy), at: t0 + ms(2900)), [])
+        XCTAssertEqual(client.poll(now: t0 + ms(3500), clockUs: 5_000), [])
+        XCTAssertEqual(client.liveSession, 77)
+    }
+
+    func testBusyUnderAnAbandonedAttemptDropsOnlyThatAttempt() throws {
+        let msg1 = try XCTUnwrap(client.connect(now: t0, key: keyA, clockUs: 1_000).sent.first)
+        let (msg2, sealer, _) = try answer(msg1, accept(77))
+        _ = handle(msg2, at: t0)
+        _ = client.poll(now: t0 + ms(2000), clockUs: 2_000)
+        XCTAssertEqual(client.abandonedCount, 1)
+        XCTAssertTrue(client.isConnecting)
+        XCTAssertEqual(handle(sealed(sealer!, .busy), at: t0 + ms(2100)), [.busy(devId: keyA.devId)])
+        XCTAssertEqual(client.abandonedCount, 0)
+        XCTAssertTrue(client.isConnecting, "the current attempt goes on")
+        XCTAssertEqual(handle(sealed(sealer!, .confirmAck(SlotStatus())), at: t0 + ms(2200)), [], "its keys are gone")
+    }
+
     /// The reference client's `only_application_types_count_as_proof_of_a_commit`,
     /// plus the drain and the liveness refresh.
     func testOnlyApplicationTypesCountAsProofOfACommit() throws {
         XCTAssertTrue(V3.isApplication(0x3F))
         XCTAssertFalse(V3.isApplication(0x40))
 
-        // Confirming: an unknown protocol type changes nothing. 0x53 is a
-        // newer host's busy answer, unknown to this client.
+        // Confirming: an unknown protocol type changes nothing. 0x57 is a
+        // pairing message, which the session client doesn't know.
         var msg1 = try XCTUnwrap(client.connect(now: t0, key: keyA, clockUs: 1_000).sent.first)
         var (msg2, sealer, _) = try answer(msg1, accept(81))
         _ = handle(msg2, at: t0)
-        for unknown: UInt8 in [0x40, 0x53, 0x5F, 0xFF] {
+        for unknown: UInt8 in [0x40, 0x57, 0x5F, 0xFF] {
             XCTAssertEqual(handle(try sealer!.seal(innerType: unknown, body: [1, 2, 3]), at: t0), [], "type \(unknown)")
             XCTAssertTrue(client.isConfirming)
             XCTAssertNil(client.liveSession)

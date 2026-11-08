@@ -103,8 +103,8 @@ final class LiveInteropTests: XCTestCase {
         XCTAssertEqual(refusal.tombstones, [setup.b.devId])
         XCTAssertNil(refused.client.liveSession)
         var ring = KeyRing(hostId: setup.hostId, slotId: id16(0x5C))
-        ring.add(setup.a)
-        ring.add(setup.b)
+        XCTAssertEqual(ring.add(setup.a), .added)
+        XCTAssertEqual(ring.add(setup.b), .added)
         XCTAssertEqual(ring.apply(refusal), [setup.b.devId], "the key rule deletes the refused key")
         XCTAssertEqual(ring.connectOrder().map(\.devId), [setup.a.devId])
 

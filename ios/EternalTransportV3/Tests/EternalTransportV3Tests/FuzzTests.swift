@@ -156,8 +156,8 @@ final class FuzzTests: XCTestCase {
 
     func testDamagedStoredRingsAreRejectedOrDecodeToAValidRing() throws {
         var ring = KeyRing(hostId: id16(1), slotId: id16(2))
-        ring.add(clientKey(3, 3))
-        ring.add(clientKey(4, 4))
+        XCTAssertEqual(ring.add(clientKey(3, 3)), .added)
+        XCTAssertEqual(ring.add(clientKey(4, 4)), .added)
         ring.apply(SlotStatus(held: [(id16(3), .active)], tombstones: [id16(9)]))
         let good = bytes(ring.encoded())
         var rng = XorShift(state: 77)

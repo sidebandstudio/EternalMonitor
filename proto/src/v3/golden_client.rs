@@ -217,6 +217,7 @@ fn client_transcript() -> Vec<(&'static str, Vec<u8>)> {
     let refused = SessionMessage::Refused(full_status());
     let bye = SessionMessage::Bye(2);
     let heartbeat_body = 0x1122_3344_5566_7788u64.to_le_bytes();
+    let busy = SessionMessage::Busy;
     let confirm = SessionMessage::Confirm;
     let sealed = [
         (
@@ -235,6 +236,12 @@ fn client_transcript() -> Vec<(&'static str, Vec<u8>)> {
             "accept_max.record.heartbeat",
             host_send
                 .seal(PacketType::Heartbeat as u8, &heartbeat_body)
+                .unwrap(),
+        ),
+        (
+            "accept_max.record.busy",
+            host_send
+                .seal(busy.inner_type(), &busy.encode_body())
                 .unwrap(),
         ),
     ];

@@ -106,6 +106,9 @@ public enum ClientOutput: Equatable, CustomStringConvertible {
     /// This key can never connect again: pair again. Nothing more is
     /// attempted under it.
     case pairAgain(devId: Id16)
+    /// Another iPad is streaming from the host: this attempt is over and
+    /// nothing changed. Show it; no attempt starts on its own.
+    case busy(devId: Id16)
     /// No usable answer within the attempt's window. Try the next key.
     case attemptFailed(devId: Id16)
     case deliver(sessionId: UInt32, counter: UInt64, innerType: UInt8, body: [UInt8], draining: Bool)
@@ -119,6 +122,7 @@ public enum ClientOutput: Equatable, CustomStringConvertible {
         case .status(let devId, let status): return "status(\(devId), \(status.held.count) held, \(status.tombstones.count) tombstones)"
         case .refused(let devId, _): return "refused(\(devId))"
         case .pairAgain(let devId): return "pairAgain(\(devId))"
+        case .busy(let devId): return "busy(\(devId))"
         case .attemptFailed(let devId): return "attemptFailed(\(devId))"
         case let .deliver(sessionId, counter, innerType, body, draining):
             return "deliver(session: \(sessionId), counter: \(counter), innerType: \(innerType), bodyLength: \(body.count), draining: \(draining))"
@@ -434,6 +438,10 @@ public final class Client {
             case .session(.refused(let status)):
                 retireKey(devId)
                 out.append(.refused(devId: devId, status: status))
+            case .session(.busy):
+                // The host dropped this session: nothing to keep.
+                attempt = .idle
+                out.append(.busy(devId: devId))
             case .application:
                 promote(now: now, &out)
                 attempt = .acking(sessionId: sessionId, started: started, lastSent: lastSent)
@@ -455,6 +463,9 @@ public final class Client {
             case .session(.refused(let status)):
                 retireKey(devId)
                 out.append(.refused(devId: devId, status: status))
+            case .session(.busy):
+                abandoned.remove(at: index)
+                out.append(.busy(devId: devId))
             case .application:
                 guard promoteAbandoned(now: now, index: index, &out) else { return }
                 deliver(opened, draining: false)
