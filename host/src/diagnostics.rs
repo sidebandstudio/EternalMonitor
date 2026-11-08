@@ -343,16 +343,19 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FallbackWatch {
 /// Logs the summary of a session, or of a HELLO2 the host turned down. The
 /// upload sends it as category `summary` (`crate::telemetry`).
 pub fn log_session_end(end: &SessionEnd, shared: &SharedControl) {
+    info!("{}", summary_line(end, shared));
+}
+
+/// The summary of `end`, with what the PC knows at the end, for
+/// [`log_session_end`] and [`log_session_end_now`] alike.
+fn summary_line(end: &SessionEnd, shared: &SharedControl) -> String {
     let second_screen = *shared.capture_target.lock() == CaptureTarget::VirtualExtended;
     // `mode=` is the mode at the end; the fallback was counted in Second
     // screen mode, perhaps before a switch to Mirror.
     let fallback = end.session_id.and_then(take_fallback);
     let refused = *shared.capture_block.lock()
         == Some(crate::capture::recovery::CaptureBlock::UnsupportedOnThisGpu);
-    info!(
-        "{}",
-        session_summary(end, second_screen, fallback, refused, host_facts())
-    );
+    session_summary(end, second_screen, fallback, refused, host_facts())
 }
 
 /// The app is quitting: the summary of the stream it stops. Its iPad is
@@ -395,10 +398,7 @@ pub fn end_stream(shared: &SharedControl, why: StreamStop) -> Option<SessionEnd>
 /// the session log and the upload outbox on disk, so it survives the
 /// process ending a moment later, and the next launch uploads it.
 pub fn log_session_end_now(end: &SessionEnd, shared: &SharedControl) {
-    let second_screen = *shared.capture_target.lock() == CaptureTarget::VirtualExtended;
-    let fallback = end.session_id.and_then(take_fallback);
-    let line =
-        crate::startup::info_line(&session_summary(end, second_screen, fallback, host_facts()));
+    let line = crate::startup::info_line(&summary_line(end, shared));
     let written = crate::logging::append_now(&line).and(crate::telemetry::queue_now(&line, "info"));
     if let Err(error) = written {
         tracing::warn!(%error, "Could not save the session summary before the PC went down");
