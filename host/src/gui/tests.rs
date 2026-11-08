@@ -443,7 +443,7 @@ fn display_choices_use_the_names_shared_with_the_ipad() {
 
 #[test]
 fn an_outdated_nvidia_driver_is_named_with_the_version_to_install() {
-    let body = software_fallback_body(false, true, &[]);
+    let body = software_fallback_body(false, true, false, &[]);
     assert!(
         body.contains("NVIDIA driver to version 570 or newer"),
         "{body}"
@@ -460,16 +460,16 @@ fn an_outdated_nvidia_driver_is_named_with_the_version_to_install() {
     }
     // Custom settings are still the first thing to undo.
     assert_eq!(
-        software_fallback_body(true, true, &[]),
-        software_fallback_body(true, false, &[])
+        software_fallback_body(true, true, false, &[]),
+        software_fallback_body(true, false, false, &[])
     );
-    assert!(!software_fallback_body(false, false, &[]).contains("570"));
+    assert!(!software_fallback_body(false, false, false, &[]).contains("570"));
 }
 
 #[test]
 fn an_amd_or_intel_card_that_could_not_encode_is_named_for_its_driver_update() {
     use crate::gpu::GpuVendor::{Amd, Intel, Nvidia};
-    let amd = software_fallback_body(false, false, &[Amd]);
+    let amd = software_fallback_body(false, false, false, &[Amd]);
     assert!(
         amd.contains("The AMD graphics driver on this PC could not start video encoding"),
         "{amd}"
@@ -478,13 +478,13 @@ fn an_amd_or_intel_card_that_could_not_encode_is_named_for_its_driver_update() {
         amd.contains("Update the AMD graphics driver, then click Restart"),
         "{amd}"
     );
-    let intel = software_fallback_body(false, false, &[Intel]);
+    let intel = software_fallback_body(false, false, false, &[Intel]);
     assert!(
         intel.contains("Update the Intel graphics driver, then click Restart"),
         "{intel}"
     );
     assert!(!intel.contains("AMD"), "{intel}");
-    let both = software_fallback_body(false, false, &[Intel, Amd]);
+    let both = software_fallback_body(false, false, false, &[Intel, Amd]);
     assert!(
         both.contains("Update the AMD and Intel graphics drivers, then click Restart"),
         "{both}"
@@ -505,19 +505,37 @@ fn an_amd_or_intel_card_that_could_not_encode_is_named_for_its_driver_update() {
     // An outdated NVIDIA driver names the version to install, and custom
     // settings are still the first thing to undo.
     assert_eq!(
-        software_fallback_body(false, true, &[Amd]),
-        software_fallback_body(false, true, &[])
+        software_fallback_body(false, true, false, &[Amd]),
+        software_fallback_body(false, true, false, &[])
     );
     assert_eq!(
-        software_fallback_body(true, false, &[Amd]),
-        software_fallback_body(true, false, &[])
+        software_fallback_body(true, false, false, &[Amd]),
+        software_fallback_body(true, false, false, &[])
     );
     // No vendor named: the general advice, as before.
     assert_eq!(
-        software_fallback_body(false, false, &[Nvidia]),
-        software_fallback_body(false, false, &[])
+        software_fallback_body(false, false, false, &[Nvidia]),
+        software_fallback_body(false, false, false, &[])
     );
-    assert!(software_fallback_body(false, false, &[]).contains("NVIDIA, AMD or Intel"));
+    assert!(software_fallback_body(false, false, false, &[]).contains("NVIDIA, AMD or Intel"));
+}
+
+#[test]
+fn a_driver_that_did_not_answer_at_startup_is_named_with_a_restart() {
+    let body = software_fallback_body(false, false, true, &[]);
+    assert!(
+        body.contains("graphics driver did not respond when EternalMonitor started"),
+        "{body}"
+    );
+    assert!(body.contains("Click Restart"), "{body}");
+    for jargon in ["DXGI", "libx264", "encoder", "timed out"] {
+        assert!(!body.contains(jargon), "{body}");
+    }
+    // It is the reason, whatever else is true.
+    assert_eq!(
+        body,
+        software_fallback_body(true, true, true, &[crate::gpu::GpuVendor::Amd])
+    );
 }
 
 #[test]
