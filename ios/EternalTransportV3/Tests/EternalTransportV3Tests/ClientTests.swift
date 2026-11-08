@@ -413,6 +413,55 @@ final class ClientTests: XCTestCase {
         XCTAssertEqual(client.liveSession, 77)
     }
 
+    /// Round 4 (Rust fuzz find): an abandoned attempt is promoted only for
+    /// the key the app currently wants.
+    func testALateAckIsNotPromotedOnceTheIntentMovedToAnotherKey() throws {
+        let (hostSealer, _) = try goLive(77)
+        let msg1 = try XCTUnwrap(client.connect(now: t0, key: keyA, clockUs: 2_000).sent.first)
+        let (msg2, sealer78, _) = try answer(msg1, accept(78))
+        _ = handle(msg2, at: t0)
+        _ = handle(heartbeat(hostSealer), at: t0 + ms(1900))
+        _ = client.poll(now: t0 + ms(2000), clockUs: 3_000)
+        _ = client.connect(now: t0 + ms(2100), key: keyB, clockUs: 4_000)
+        XCTAssertEqual(client.abandonedCount, 1, "kept: it's under the live key")
+        XCTAssertTrue(client.isConnecting, "B's attempt is running, so the intent is B")
+        XCTAssertEqual(handle(sealed(sealer78!, .confirmAck(SlotStatus())), at: t0 + ms(2200)), [])
+        XCTAssertEqual(client.liveSession, 77, "A's late ack doesn't cut over while the app wants B")
+        XCTAssertNil(client.drainingSession)
+    }
+
+    /// Round 5 (Rust fuzz find): PairAgain stops new attempts under a key
+    /// but keeps its abandoned attempts, which the host may have committed.
+    func testPairAgainKeepsAnAbandonedAttemptTheHostMayHaveCommitted() throws {
+        let msg1 = try XCTUnwrap(client.connect(now: t0, key: keyA, clockUs: 1_000).sent.first)
+        let (msg2, sealer, _) = try answer(msg1, accept(77))
+        _ = handle(msg2, at: t0)
+        let retry = try XCTUnwrap(client.poll(now: t0 + ms(2000), clockUs: 2_000).sent.first)
+        XCTAssertEqual(client.abandonedCount, 1)
+        XCTAssertEqual(handle(try answer(retry, .pairAgain).0, at: t0 + ms(2100)), [.pairAgain(devId: keyA.devId)])
+        XCTAssertEqual(client.abandonedCount, 1, "PairAgain retires nothing")
+        let out = handle(sealed(sealer!, .confirmAck(SlotStatus())), at: t0 + ms(3000))
+        XCTAssertTrue(out.contains(.releaseAllInput))
+        XCTAssertEqual(client.liveSession, 77)
+    }
+
+    /// Round 6 (Rust fuzz find): a failed attempt falls the intent back to
+    /// the live session's key only while a session is live; a key remembered
+    /// from an ended session never overrides the one the app connects with.
+    func testAKeyFromAnEndedSessionNeverTakesTheIntentBack() throws {
+        let (hostSealer, _) = try goLive(77)
+        XCTAssertEqual(handle(sealed(hostSealer, .bye(2)), at: t0 + ms(10)), [.closed(sessionId: 77, reason: .hostBye(2))])
+        let msg1 = try XCTUnwrap(client.connect(now: t0 + ms(100), key: keyB, clockUs: 2_000).sent.first)
+        let (msg2, sealerB, _) = try answer(msg1, accept(78), key: keyB)
+        _ = handle(msg2, at: t0 + ms(100))
+        _ = client.poll(now: t0 + ms(2100), clockUs: 3_000)
+        XCTAssertEqual(client.abandonedCount, 1)
+        XCTAssertEqual(client.poll(now: t0 + ms(4100), clockUs: 4_000), [.attemptFailed(devId: keyB.devId)])
+        let out = handle(sealed(sealerB!, .confirmAck(SlotStatus())), at: t0 + ms(4200))
+        XCTAssertTrue(out.contains(.releaseAllInput), "the intent stayed B")
+        XCTAssertEqual(client.liveSession, 78)
+    }
+
     func testConnectUnderAnotherKeyDropsAbandonedAttemptsOfOtherKeys() throws {
         let msg1 = try XCTUnwrap(client.connect(now: t0, key: keyA, clockUs: 1_000).sent.first)
         let (msg2, sealer, _) = try answer(msg1, accept(77))

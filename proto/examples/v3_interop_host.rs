@@ -7,7 +7,7 @@
 //!
 //! It makes a fresh `host_id` and two credentials, prints one JSON line with
 //! the port and the test keys, and serves until it's told to quit, nothing
-//! arrives for 30 s, or 5 minutes pass:
+//! arrives for 120 s, or 10 minutes pass:
 //!
 //! - key `a` commits like any valid record;
 //! - key `b`'s Finalize always conflicts: its confirm gets `SessionRefused`
@@ -181,7 +181,7 @@ fn main() -> std::io::Result<()> {
 
     while !quit {
         let now = start.elapsed();
-        if now > Duration::from_secs(300) || now - last_rx > Duration::from_secs(30) {
+        if now > Duration::from_secs(600) || now - last_rx > Duration::from_secs(120) {
             eprintln!("v3_interop_host: idle or overtime, exiting");
             break;
         }

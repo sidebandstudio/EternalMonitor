@@ -40,11 +40,11 @@ final class TransportV3KeychainTests: XCTestCase {
         let store = KeychainKeyStore(service: service)
         XCTAssertNil(try store.load(hostId: hostId))
         var ring = KeyRing(hostId: hostId, slotId: Id16([UInt8](repeating: 0x5C, count: 16))!)
-        XCTAssertTrue(ring.add(key(1)))
+        XCTAssertEqual(ring.add(key(1)), .added)
         try store.save(ring)
         assertSame(try store.load(hostId: hostId), ring)
 
-        XCTAssertTrue(ring.add(key(2)))
+        XCTAssertEqual(ring.add(key(2)), .added)
         ring.apply(SlotStatus(held: [(key(2).devId, .pending)], tombstones: [key(1).devId]))
         ring.lastTimestamp = 1_762_500_000_123_456
         try store.save(ring)

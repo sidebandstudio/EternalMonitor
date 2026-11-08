@@ -13,7 +13,14 @@ import Foundation
 /// - A tombstoned key is never used again: it leaves `keys` at once, and its
 ///   `dev_id` is remembered (the last 32), so a later `add` of it is
 ///   refused. That holds in memory even if saving fails; the next save that
-///   succeeds makes it durable.
+///   succeeds makes it durable, since every save writes the whole ring.
+///   If the app restarts before any save succeeds, the stored ring still
+///   holds the key. That is accepted, not blocked: the host decides, a
+///   retired `dev_id` is never valid again, so the key's handshakes go
+///   unanswered, and the next status tombstones it again (while it is
+///   among the slot's last 8). The cost is time spent on that key, never
+///   access. Blocking connects until a save succeeds would turn a failing
+///   Keychain into no reconnects at all.
 /// - Connect order (`connectOrder`): keys the most recent status listed as
 ///   pending, then the one it listed as active, then keys it didn't list,
 ///   newest first within each group. A stale status only changes the order.
@@ -62,18 +69,28 @@ public struct KeyRing {
         return KeyRing(hostId: hostId, slotId: Id16(slot)!)
     }
 
+    public enum AddOutcome: Equatable, Sendable {
+        case added
+        case alreadyHeld
+        /// A status tombstoned this `dev_id`: it is never used again.
+        case tombstoned
+        /// The ring holds `maxKeys` keys. Nothing is evicted: a key no
+        /// status lists may be a pairing whose `PairDone` was lost, which
+        /// section 4.3 keeps until "Forget this PC". The pairing sends
+        /// `PairAbort`, and the iPad offers Forget, then pairing again.
+        case full
+    }
+
     /// Adds a key from a pairing, before its `PairConfirm` goes out (store
     /// first, section 4.1 step 3). It joins the group no status has listed.
-    /// Returns false, changing nothing, for a `dev_id` already held or
-    /// tombstoned, or when the ring is full.
+    /// Anything but `.added` changes nothing.
     @discardableResult
-    public mutating func add(_ key: ClientKey) -> Bool {
-        guard keys.count < Self.maxKeys,
-              !tombstoned.contains(key.devId),
-              !keys.contains(where: { $0.key.devId == key.devId })
-        else { return false }
+    public mutating func add(_ key: ClientKey) -> AddOutcome {
+        if tombstoned.contains(key.devId) { return .tombstoned }
+        if keys.contains(where: { $0.key.devId == key.devId }) { return .alreadyHeld }
+        if keys.count >= Self.maxKeys { return .full }
         keys.append(HeldKey(key: key, listed: nil))
-        return true
+        return .added
     }
 
     /// Applies an authenticated slot status: every held key it tombstones is
@@ -183,7 +200,7 @@ extension KeyRing {
     private static let notListed: UInt8 = 0xFF
 
     /// The stored form, in wiped-on-release storage.
-    public func encoded() -> SecretBytes {
+    func encoded() -> SecretBytes {
         let count = 4 + 1 + 16 + 16 + 8 + 1 + keys.count * 49 + 1 + tombstoned.count * 16
         return SecretBytes(count: count) { out in
             var at = 0
@@ -212,7 +229,7 @@ extension KeyRing {
         }
     }
 
-    public static func decode(_ bytes: UnsafeRawBufferPointer) throws -> KeyRing {
+    static func decode(_ bytes: UnsafeRawBufferPointer) throws -> KeyRing {
         var at = 0
         func take(_ count: Int) throws -> UnsafeRawBufferPointer {
             guard count <= bytes.count - at else { throw KeyStoreError.corrupt }

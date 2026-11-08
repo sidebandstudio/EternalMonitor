@@ -92,37 +92,3 @@ public final class KeychainKeyStore: KeyStore {
         }
     }
 }
-
-/// An in-memory `KeyStore` for tests: it keeps each ring in its stored form,
-/// so every save and load goes through the same encoding as the Keychain,
-/// and it can be told to fail.
-public final class InMemoryKeyStore: KeyStore {
-    private var items: [Id16: SecretBytes] = [:]
-    /// While set, `save` and `delete` throw this and change nothing.
-    public var failure: KeyStoreError?
-
-    public init() {}
-
-    public func load(hostId: Id16) throws -> KeyRing? {
-        try items[hostId]?.withUnsafeBytes { try KeyRing.decode($0) }
-    }
-
-    public func save(_ ring: KeyRing) throws {
-        if let failure { throw failure }
-        items[ring.hostId] = ring.encoded()
-    }
-
-    public func delete(hostId: Id16) throws {
-        if let failure { throw failure }
-        items[hostId] = nil
-    }
-
-    /// The stored bytes, for tests that damage them.
-    public func storedBytes(hostId: Id16) -> [UInt8]? {
-        items[hostId]?.withUnsafeBytes { Array($0) }
-    }
-
-    public func setStoredBytes(_ bytes: [UInt8], hostId: Id16) {
-        items[hostId] = SecretBytes(copying: bytes)
-    }
-}

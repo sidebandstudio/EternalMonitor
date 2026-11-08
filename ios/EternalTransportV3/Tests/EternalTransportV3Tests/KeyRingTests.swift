@@ -9,7 +9,7 @@ final class KeyRingTests: XCTestCase {
     func makeRing(_ keys: [ClientKey]) -> KeyRing {
         var ring = KeyRing(hostId: hostId, slotId: id16(0x5C))
         for key in keys {
-            XCTAssertTrue(ring.add(key))
+            XCTAssertEqual(ring.add(key), .added)
         }
         return ring
     }
@@ -28,8 +28,8 @@ final class KeyRingTests: XCTestCase {
         XCTAssertEqual(ring.apply(SlotStatus(held: [(a.devId, .active)], tombstones: [b.devId, id16(0xEE)])), [b.devId])
         XCTAssertFalse(ring.holds(b.devId))
         XCTAssertEqual(ring.tombstoned, [b.devId])
-        XCTAssertFalse(ring.add(b), "a tombstoned key is never used again")
-        XCTAssertFalse(ring.add(a), "already held")
+        XCTAssertEqual(ring.add(b), .tombstoned, "a tombstoned key is never used again")
+        XCTAssertEqual(ring.add(a), .alreadyHeld)
         XCTAssertFalse(ring.connectOrder().contains { $0.devId == b.devId })
         // A late copy of an older status changes the order, never what's kept.
         XCTAssertEqual(ring.apply(SlotStatus(held: [(b.devId, .pending), (c.devId, .active)])), [])
@@ -57,9 +57,11 @@ final class KeyRingTests: XCTestCase {
     func testTheRingIsBounded() {
         var ring = makeRing([])
         for byte in 0..<UInt8(KeyRing.maxKeys) {
-            XCTAssertTrue(ring.add(clientKey(byte, byte)))
+            XCTAssertEqual(ring.add(clientKey(byte, byte)), .added)
         }
-        XCTAssertFalse(ring.add(clientKey(0xFF, 0xFF)))
+        XCTAssertEqual(ring.add(clientKey(0xFF, 0xFF)), .full, "nothing is evicted")
+        XCTAssertEqual(ring.keys.count, KeyRing.maxKeys)
+        XCTAssertFalse(ring.holds(id16(0xFF)))
         var tombstones = (0..<UInt8(KeyRing.maxKeys)).map(id16)
         while !tombstones.isEmpty {
             ring.apply(SlotStatus(tombstones: Array(tombstones.prefix(8))))
@@ -68,14 +70,14 @@ final class KeyRingTests: XCTestCase {
         XCTAssertEqual(ring.keys.count, 0)
         XCTAssertEqual(ring.tombstoned.count, 16)
         for byte in 0x40..<UInt8(0x40 + KeyRing.maxKeys) {
-            XCTAssertTrue(ring.add(clientKey(byte, byte)))
+            XCTAssertEqual(ring.add(clientKey(byte, byte)), .added)
         }
         ring.apply(SlotStatus(tombstones: (0x40..<UInt8(0x48)).map(id16)))
         ring.apply(SlotStatus(tombstones: (0x48..<UInt8(0x50)).map(id16)))
         XCTAssertEqual(ring.tombstoned.count, KeyRing.maxRemembered)
         ring.apply(SlotStatus())
-        XCTAssertTrue(ring.add(clientKey(0x60, 1)))
-        XCTAssertTrue(ring.add(clientKey(0x61, 1)))
+        XCTAssertEqual(ring.add(clientKey(0x60, 1)), .added)
+        XCTAssertEqual(ring.add(clientKey(0x61, 1)), .added)
         ring.apply(SlotStatus(tombstones: [id16(0x60)]))
         XCTAssertEqual(ring.tombstoned.count, KeyRing.maxRemembered, "the oldest is dropped")
         XCTAssertEqual(ring.tombstoned.first, id16(1))

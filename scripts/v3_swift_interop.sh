@@ -9,8 +9,10 @@
 #   scripts/v3_swift_interop.sh                    # swift test, on macOS
 #   scripts/v3_swift_interop.sh --simulator UDID   # xcodebuild test, on an iOS simulator
 #
-# The host uses a random free port, never 9876 or 19873-19878. It exits once
-# the test sends its final query; this script fails if it doesn't.
+# The tests are built before the host starts. The host uses a random free
+# port, never 9876 or 19873-19878. It exits once the test sends its final
+# query (or after 120 s with nothing received); this script fails if the
+# test never sent that query.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -24,12 +26,23 @@ cargo build --quiet --manifest-path "$ROOT/proto/Cargo.toml" --features test-hoo
 HOST_BIN="${CARGO_TARGET_DIR:-$ROOT/target}/debug/examples/v3_interop_host"
 
 WORK="$(mktemp -d -t v3-interop)"
+DERIVED="${EM_DERIVED_DATA:-$WORK/derived}"
 HOST_PID=""
 cleanup() {
   if [[ -n "$HOST_PID" ]]; then kill "$HOST_PID" 2>/dev/null || true; fi
   rm -rf "$WORK"
 }
 trap cleanup EXIT
+
+# Build the tests before the host starts, so a slow build never outlasts the
+# host's idle limit.
+if [[ -n "$SIMULATOR" ]]; then
+  DESTINATION="platform=iOS Simulator,id=$SIMULATOR"
+  (cd "$PACKAGE" && xcodebuild build-for-testing -scheme EternalTransportV3 \
+    -destination "$DESTINATION" -derivedDataPath "$DERIVED" -quiet)
+else
+  swift build --build-tests --package-path "$PACKAGE"
+fi
 
 "$HOST_BIN" >"$WORK/host.json" 2>"$WORK/host.log" &
 HOST_PID=$!
@@ -56,11 +69,10 @@ if [[ -n "$SIMULATOR" ]]; then
     var="EM_V3_INTEROP_$name"
     export "TEST_RUNNER_$var=${!var}"
   done
-  (cd "$PACKAGE" && xcodebuild test -scheme EternalTransportV3 \
-    -destination "platform=iOS Simulator,id=$SIMULATOR" \
-    -derivedDataPath "${EM_DERIVED_DATA:-$WORK/derived}" -quiet)
+  (cd "$PACKAGE" && xcodebuild test-without-building -scheme EternalTransportV3 \
+    -destination "$DESTINATION" -derivedDataPath "$DERIVED" -quiet)
 else
-  swift test --package-path "$PACKAGE"
+  swift test --skip-build --package-path "$PACKAGE"
 fi
 
 for _ in $(seq 1 50); do
