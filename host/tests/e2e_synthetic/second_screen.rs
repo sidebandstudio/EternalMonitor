@@ -71,8 +71,11 @@ impl Host {
         }
     }
 
+    /// Unanswered until its first report: an answer runs the second screen's
+    /// next step at once, and with an instant attach these tests would see
+    /// no mirror before the switch.
     fn connect(&self, nonce: u32) -> FakeReceiver {
-        FakeReceiver::connect_as(self.port, CAP_DECODE_H264, 0, 0, nonce)
+        FakeReceiver::handshake(self.port, CAP_DECODE_H264, 0, 0, nonce)
     }
 
     fn status(&self) -> VddStatus {

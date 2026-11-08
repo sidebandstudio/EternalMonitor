@@ -11,20 +11,23 @@ struct DiscoveredHost: Identifiable, Equatable {
     let port: UInt16
     /// Still resolving. False once resolution gave up without IPv4.
     var finding = false
+    /// The `version` this service's own TXT record announced.
+    var version: String?
 
-    init(name: String, address: String?, port: UInt16, finding: Bool = false) {
+    init(name: String, address: String?, port: UInt16, finding: Bool = false, version: String? = nil) {
         self.name = name
         self.address = address
         self.port = port
         self.finding = finding
+        self.version = version
     }
 
     /// The service as far as it has resolved: its first IPv4 address, or a
     /// PC still being found when only IPv6 (or nothing usable) came back.
-    static func resolved(name: String, port: Int, addresses: [Data]) -> DiscoveredHost {
+    static func resolved(name: String, port: Int, addresses: [Data], version: String? = nil) -> DiscoveredHost {
         let port = port > 0 ? UInt16(clamping: port) : 9876
         let ipv4 = addresses.lazy.compactMap { NetworkScanner.ipAddress(from: $0, family: AF_INET) }.first
-        return DiscoveredHost(name: name, address: ipv4, port: port, finding: ipv4 == nil)
+        return DiscoveredHost(name: name, address: ipv4, port: port, finding: ipv4 == nil, version: version)
     }
 }
 
@@ -232,11 +235,13 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
         Task { @MainActor in
             let key = Self.serviceKey(sender)
             guard isCurrent(sender), sender.addresses?.isEmpty == false else { return }
-            let host = DiscoveredHost.resolved(name: sender.name, port: sender.port, addresses: sender.addresses ?? [])
+            let version = PCVersions.version(fromTXT: sender.txtRecordData())
+            let host = DiscoveredHost.resolved(name: sender.name, port: sender.port, addresses: sender.addresses ?? [],
+                                               version: version)
             // discovery diagnostic — surface every resolved host so we
             // can tell whether mDNS is finding the right machine.
             print("[mDNS] Found: \(host.name) at \(host.address ?? "no IPv4 yet"):\(host.port)")
-            if let version = PCVersions.version(fromTXT: sender.txtRecordData()) {
+            if let version {
                 PCVersions.record(version, name: host.name, address: host.address)
             }
             merge(host)
@@ -277,7 +282,7 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
                 guard self.ipv4Lookups[service.name] == lookup else { return }
                 self.ipv4Lookups.removeValue(forKey: service.name)
                 if let address {
-                    self.merge(DiscoveredHost(name: service.name, address: address, port: service.port))
+                    self.merge(DiscoveredHost(name: service.name, address: address, port: service.port, version: service.version))
                 } else if !self.isScanning, let index = self.hosts.firstIndex(where: { $0.name == service.name && $0.address == nil }) {
                     self.hosts[index].finding = false
                 }

@@ -166,6 +166,8 @@ final class ConnectionManager: ObservableObject {
     private var appleDevicesExpiry: Task<Void, Never>?
     /// The wall clock for the Apple Devices sighting. Tests replace it.
     var now: () -> Date = { Date() }
+    /// Hears, from each accepted HELLO_ACK, whether the PC is older than 0.3.4.
+    var oldPCPrompt = OldPCPrompt.shared
     private var mediaLink: (any MediaLink)?
     private var usbListener: USBListener?
     private var isForeground = true
@@ -685,6 +687,8 @@ final class ConnectionManager: ObservableObject {
                                               at: isUSB ? nil : "\(normalizedHost):\(port)")
                 self.livenessTimeoutUs = UInt64(info.livenessTimeoutMs) * 1000
                 self.hostInfo = info
+                self.oldPCPrompt.answered(hostName: info.hostName, pairingToken: info.authToken,
+                                          hostCaps: info.hostCaps, address: isUSB ? nil : normalizedHost)
                 if self.waitingForStream {
                     self.waitingForStream = false
                     if case .pcNotStreaming = self.problem { self.problem = nil }
