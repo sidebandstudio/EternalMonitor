@@ -155,6 +155,22 @@ impl Machine {
                     Effect::Restart
                 }
             },
+            SupervisorCommand::RestartStream { generation } => match self.state {
+                SupervisorState::Running {
+                    generation: live_generation,
+                } if live_generation == *generation => {
+                    self.attempt = 0;
+                    self.restarts.clear();
+                    Effect::Restart
+                }
+                _ => {
+                    info!(
+                        generation,
+                        "A stream that no longer runs asked to start again: left as it is"
+                    );
+                    Effect::None
+                }
+            },
             SupervisorCommand::Stop => match self.state {
                 SupervisorState::Running { .. }
                 | SupervisorState::BackingOff { .. }
@@ -919,6 +935,35 @@ mod tests {
         let effect = machine.on_stage_exit(3, Stage::Encoder, &failed("zombie"), Instant::now());
         assert_eq!(effect, Effect::None);
         assert!(matches!(machine.state, SupervisorState::Running { .. }));
+    }
+
+    /// A stream asks to start again on its own only while it runs: after
+    /// Stop, the storm brake or a newer stream, nothing starts.
+    #[test]
+    fn a_stream_restarts_itself_only_while_it_runs() {
+        let restart = |generation| SupervisorCommand::RestartStream { generation };
+        let mut machine = Machine::new(5);
+        assert_eq!(machine.on_command(&restart(4)), Effect::None);
+        assert_eq!(machine.on_command(&restart(5)), Effect::Restart);
+        machine.note_started(6);
+
+        assert_eq!(
+            machine.on_command(&SupervisorCommand::Stop),
+            Effect::StopPipeline
+        );
+        assert_eq!(machine.on_command(&restart(6)), Effect::None);
+        assert_eq!(machine.state, SupervisorState::Stopped);
+
+        machine.state = SupervisorState::Failed {
+            reason: "encoder".into(),
+            stage: Stage::Encoder,
+        };
+        assert_eq!(machine.on_command(&restart(6)), Effect::None);
+        let t0 = Instant::now();
+        machine.note_started(7);
+        machine.on_stage_exit(7, Stage::Capture, &failed("dxgi died"), t0);
+        assert_eq!(machine.on_command(&restart(7)), Effect::None);
+        assert!(matches!(machine.state, SupervisorState::BackingOff { .. }));
     }
 
     #[test]

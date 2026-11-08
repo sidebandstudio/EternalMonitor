@@ -266,6 +266,13 @@ pub fn merge_fps(host: u32, client: u32) -> u32 {
 pub enum SupervisorCommand {
     /// Tear the current pipeline down and start a fresh generation.
     Restart,
+    /// The stream of `generation` asks to start again: its chosen network
+    /// changed, or its virtual display has to go. Only while that stream
+    /// still runs: one the user stopped, or one a newer stream replaced,
+    /// stays as it is.
+    RestartStream {
+        generation: u64,
+    },
     /// Stop streaming (pipeline down, GUI stays). `Start` resumes.
     Stop,
     /// Start a fresh pipeline from Stopped/Failed.
