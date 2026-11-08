@@ -46,7 +46,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -105,6 +105,10 @@ const DRIVER_MODULES: [&str; 18] = [
 /// PCI vendor id of Intel GPUs.
 const INTEL: u32 = 0x8086;
 const HISTORY_FILE: &str = "history.json";
+/// The marker backend of a launch listing the graphics cards through DXGI,
+/// before it knows their keys. A launch that dies there makes the next ones
+/// key the GPUs by wgpu's driver text instead, until clean launches retry.
+const LISTING: &str = "list dxgi";
 /// Held while one instance reads, changes and saves the history.
 const HISTORY_LOCK: &str = "history.lock";
 /// The window counts as working after this long and this many frames with no
@@ -114,14 +118,21 @@ const CONFIRM_AFTER: Duration = Duration::from_secs(3);
 const CONFIRM_FRAMES: u64 = 10;
 
 static STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
-static STARTED: Mutex<Option<Marker>> = Mutex::new(None);
+static LAUNCH: Mutex<Launch> = Mutex::new(Launch::new());
 static PRESENT: Mutex<PresentTracker> = Mutex::new(PresentTracker::new());
 /// Frames whose surface texture could not be acquired, so nothing was presented.
 static FAILED_ACQUIRES: AtomicU64 = AtomicU64::new(0);
 static STATUS: Mutex<Option<Status>> = Mutex::new(None);
-/// The window's first frame was presented: its thread is past every
-/// graphics call of startup.
-static FIRST_PAINT: AtomicBool = AtomicBool::new(false);
+/// The DXGI adapter list taken before the window, which the window's GPU
+/// keys come from until it is confirmed drawing: no more DXGI calls on its
+/// thread before then.
+static ADAPTERS: Mutex<Option<Vec<(u32, u32, String)>>> = Mutex::new(None);
+/// When the window's thread last began a UI pass, and whether the window
+/// was minimized then.
+static LAST_PASS: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+/// Run once, when the window is confirmed drawing.
+type OnDrawing = Box<dyn FnOnce() + Send>;
+static ON_DRAWING: Mutex<Option<OnDrawing>> = Mutex::new(None);
 
 /// How this launch draws its window, for Settings > Troubleshooting.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -275,9 +286,13 @@ fn driver_module(module: &str) -> bool {
     DRIVER_MODULES.iter().any(|name| module.starts_with(name))
 }
 
-/// Choose the instance backends and install the adapter selector, after
-/// recording failed earlier starts.
-pub(super) fn configure(config: &mut WgpuConfiguration) {
+/// The failed starts this launch knows of: earlier launches' markers are
+/// recorded first. Makes no graphics call.
+pub(super) struct Prepared {
+    history: Vec<Failure>,
+}
+
+pub(super) fn prepare() -> Prepared {
     let history = match crate::settings::app_data_dir() {
         Some(base) => {
             let directory = base.join("renderer");
@@ -288,6 +303,57 @@ pub(super) fn configure(config: &mut WgpuConfiguration) {
         }
         None => Vec::new(),
     };
+    Prepared { history }
+}
+
+impl Prepared {
+    /// A launch died listing the graphics cards through DXGI, and that is
+    /// not retried yet.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(super) fn listing_avoided(&self) -> bool {
+        avoided(&self.history, "", LISTING)
+    }
+}
+
+/// The DXGI adapter list, for another thread to take before the window
+/// (`skip`: a launch died there; the GPUs are keyed by wgpu's driver text).
+/// This launch's marker names the listing before it starts, and the thread
+/// it runs on once it does, until a later step replaces it: a crash there,
+/// even after the caller gave up on a list that did not return, is the
+/// window's.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn adapter_list(skip: bool) -> impl FnOnce() -> Vec<(u32, u32, String)> + Send {
+    if skip {
+        info!(
+            "A launch died listing the graphics cards; keying them by the renderer's driver text"
+        );
+    } else {
+        let _ = start(Marker {
+            gpu: String::new(),
+            backend: LISTING.to_string(),
+            thread: None,
+        });
+    }
+    move || {
+        if skip {
+            return Vec::new();
+        }
+        mark_thread(current_thread());
+        list_dxgi_adapters()
+    }
+}
+
+/// Choose the instance backends and install the adapter selector, with the
+/// graphics cards `adapters` listed before the window.
+pub(super) fn configure(
+    config: &mut WgpuConfiguration,
+    prepared: Prepared,
+    adapters: Vec<(u32, u32, String)>,
+) {
+    let Prepared { history } = prepared;
+    if let Ok(mut listed) = ADAPTERS.lock() {
+        *listed = Some(adapters);
+    }
     let choice = crate::settings::SettingsFile::load().window_drawing;
     // Saved by the last update check; this launch's choice only.
     let rules = if cfg!(windows) {
@@ -375,15 +441,68 @@ pub(super) fn adapter_probe(spec: ProbeSpec) -> impl FnOnce() + Send + 'static {
 
 /// Name `thread` in this launch's marker and save it again.
 fn mark_thread(thread: Option<u32>) {
-    let Ok(mut started) = STARTED.lock() else {
-        return;
-    };
-    let Some(marker) = started.as_mut() else {
-        return;
-    };
-    marker.thread = thread;
-    if let Some(directory) = STATE_DIR.get() {
-        let _ = save_marker(directory, ProcessId::current(), marker);
+    if let Ok(mut launch) = LAUNCH.lock() {
+        launch.mark_thread(
+            STATE_DIR.get().map(PathBuf::as_path),
+            ProcessId::current(),
+            thread,
+        );
+    }
+}
+
+/// This launch's marker, and whether the user quit before the window drew.
+/// One lock holds both, so a worker still in the driver cannot save the
+/// marker again after the quit cleared it.
+struct Launch {
+    started: Option<Marker>,
+    abandoned: bool,
+}
+
+impl Launch {
+    const fn new() -> Self {
+        Self {
+            started: None,
+            abandoned: false,
+        }
+    }
+
+    /// Leave `marker` in `directory` until the window is confirmed working.
+    /// False when it could not be saved, or the launch was abandoned.
+    fn start(&mut self, directory: Option<&Path>, owner: ProcessId, marker: Marker) -> bool {
+        if self.abandoned {
+            return false;
+        }
+        let saved = directory.is_some_and(|directory| save_marker(directory, owner, &marker));
+        self.started = Some(marker);
+        saved
+    }
+
+    fn mark_thread(&mut self, directory: Option<&Path>, owner: ProcessId, thread: Option<u32>) {
+        if self.abandoned {
+            return;
+        }
+        let Some(marker) = self.started.as_mut() else {
+            return;
+        };
+        marker.thread = thread;
+        if let Some(directory) = directory {
+            let _ = save_marker(directory, owner, marker);
+        }
+    }
+
+    /// Clear the marker, after recording that its backend drew when `drew`.
+    fn clear(&mut self, directory: &Path, owner: ProcessId, drew: bool) {
+        if let Some(marker) = self.started.as_ref() {
+            if finish_launch(directory, marker, owner, drew) {
+                self.started = None;
+            }
+        }
+    }
+
+    /// The user quit: the marker goes without counting, for good.
+    fn abandon(&mut self, directory: &Path, owner: ProcessId) {
+        self.abandoned = true;
+        self.clear(directory, owner, false);
     }
 }
 
@@ -411,6 +530,9 @@ fn choose_backends(
                 backend: plan.stage().to_string(),
                 thread: current_thread(),
             });
+        } else {
+            // The listing's marker: nothing is recorded under WGPU_BACKEND.
+            clear_marker(false);
         }
         descriptor.backends = instance_backends(forced, plan);
     }
@@ -496,13 +618,13 @@ fn current_thread() -> Option<u32> {
 /// Leave this launch's marker until the window is confirmed working. False
 /// when it could not be saved.
 fn start(marker: Marker) -> bool {
-    let saved = STATE_DIR
-        .get()
-        .is_some_and(|directory| save_marker(directory, ProcessId::current(), &marker));
-    if let Ok(mut started) = STARTED.lock() {
-        *started = Some(marker);
-    }
-    saved
+    LAUNCH.lock().is_ok_and(|mut launch| {
+        launch.start(
+            STATE_DIR.get().map(PathBuf::as_path),
+            ProcessId::current(),
+            marker,
+        )
+    })
 }
 
 fn save_marker(directory: &Path, owner: ProcessId, marker: &Marker) -> bool {
@@ -513,12 +635,11 @@ fn save_marker(directory: &Path, owner: ProcessId, marker: &Marker) -> bool {
 /// Called at the start of each UI pass; clears this launch's marker once the
 /// window has kept drawing without a surface error.
 pub(super) fn frame_started(ctx: &egui::Context) {
-    // A pass after the first: the first frame was presented.
-    if ctx.cumulative_frame_nr() >= 1 {
-        FIRST_PAINT.store(true, Ordering::SeqCst);
-    }
     crate::startup::simulate_surface_error(&FAILED_ACQUIRES);
     let visible = ctx.input(|input| input.viewport().minimized != Some(true));
+    if let Ok(mut last) = LAST_PASS.lock() {
+        *last = Some((Instant::now(), !visible));
+    }
     let Ok(mut tracker) = PRESENT.lock() else {
         return;
     };
@@ -533,16 +654,40 @@ pub(super) fn frame_started(ctx: &egui::Context) {
     if now_drawing {
         crate::startup::mark_window_shown();
         info!("Window renderer is drawing");
+        let on_drawing = ON_DRAWING.lock().ok().and_then(|mut hook| hook.take());
+        if let Some(on_drawing) = on_drawing {
+            on_drawing();
+        }
     }
     if drawing {
         clear_marker(true);
     }
 }
 
-/// The window's first frame was presented.
+/// When the window's thread last began a UI pass, and whether the window
+/// was minimized then. None before the first.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub(super) fn first_frame_painted() -> bool {
-    FIRST_PAINT.load(Ordering::SeqCst)
+pub(super) fn last_pass() -> Option<(Instant, bool)> {
+    LAST_PASS.lock().ok().and_then(|last| *last)
+}
+
+/// Run `hook` once, when the window is confirmed drawing: frames presented
+/// for a while with no surface error, visible ([`PresentTracker`]).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn when_drawing(hook: OnDrawing) {
+    if let Ok(mut on_drawing) = ON_DRAWING.lock() {
+        *on_drawing = Some(hook);
+    }
+}
+
+/// The user quit before the window drew. A deliberate quit is no failed
+/// start: the marker goes without counting, and no worker still in the
+/// driver writes it again.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn abandon() {
+    if let (Some(directory), Ok(mut launch)) = (STATE_DIR.get(), LAUNCH.lock()) {
+        launch.abandon(directory, ProcessId::current());
+    }
 }
 
 /// The window closed normally. A launch that quits before its window is
@@ -555,13 +700,8 @@ pub(super) fn window_closed() {
 /// `drew`. The history may be busy with another instance; the next frame
 /// tries again, so the GUI never waits for it.
 fn clear_marker(drew: bool) {
-    let (Some(directory), Ok(mut started)) = (STATE_DIR.get(), STARTED.lock()) else {
-        return;
-    };
-    if let Some(marker) = started.as_ref() {
-        if finish_launch(directory, marker, ProcessId::current(), drew) {
-            started.take();
-        }
+    if let (Some(directory), Ok(mut launch)) = (STATE_DIR.get(), LAUNCH.lock()) {
+        launch.clear(directory, ProcessId::current(), drew);
     }
 }
 
@@ -906,28 +1046,23 @@ fn system_gpus() -> String {
 }
 
 /// Vendor, device and driver version of each DXGI adapter. Creates no device.
-/// Runs under a limit on a thread of its own: empty if it does not return
-/// in time, or while an earlier call of its lane is still stuck. While it
-/// lists, the marker names that thread, so a driver crash there is still
-/// the window's.
+/// Until the window is confirmed drawing, the list taken before it. After
+/// that (a renderer rebuilt after a lost device), a fresh one under a limit
+/// on a thread of its own: empty if it does not return in time.
 #[cfg(windows)]
 fn dxgi_adapters() -> Vec<(u32, u32, String)> {
-    let window = current_thread();
-    let listed = crate::stall::run(
-        adapters_lane(first_frame_painted()),
-        || {
-            mark_thread(current_thread());
-            list_dxgi_adapters()
-        },
-        || {},
-    );
-    mark_thread(window);
-    listed.unwrap_or_default()
+    let shown = crate::startup::window_shown();
+    if !shown {
+        if let Some(listed) = ADAPTERS.lock().ok().and_then(|listed| listed.clone()) {
+            return listed;
+        }
+    }
+    crate::stall::run(adapters_lane(shown), list_dxgi_adapters, || {}).unwrap_or_default()
 }
 
-/// The lane of the window's DXGI adapter list: startup's until the first
-/// frame, then the one the second screen's graphics reads use, so a later
-/// renderer (after a lost device) neither waits behind nor holds startup's.
+/// The lane of a DXGI adapter list the window takes itself: startup's until
+/// it is confirmed drawing, then the one the second screen's graphics reads
+/// use, so a later renderer neither waits behind nor holds startup's.
 #[cfg_attr(not(windows), allow(dead_code))]
 fn adapters_lane(painted: bool) -> crate::stall::Call {
     if painted {
@@ -963,6 +1098,11 @@ fn list_dxgi_adapters() -> Vec<(u32, u32, String)> {
 
 #[cfg(not(windows))]
 fn dxgi_adapters() -> Vec<(u32, u32, String)> {
+    Vec::new()
+}
+
+#[cfg(not(windows))]
+fn list_dxgi_adapters() -> Vec<(u32, u32, String)> {
     Vec::new()
 }
 
@@ -1741,9 +1881,60 @@ mod tests {
     }
 
     #[test]
+    fn a_quit_from_the_driver_notice_leaves_no_marker_and_no_worker_writes_it_again() {
+        let directory = temp_dir("abandon");
+        let owner = exited_process();
+        let mut launch = Launch::new();
+        assert!(launch.start(
+            Some(&directory),
+            owner,
+            marker("10de:2c02 32.0", "enumerate")
+        ));
+        assert!(marker_path(&directory, owner).exists());
+        // Cancel while the window's thread is stuck in the driver.
+        launch.abandon(&directory, owner);
+        assert!(!marker_path(&directory, owner).exists());
+        // A probe or list still in the driver returns later, and the
+        // window's thread may still reach its adapter selector.
+        launch.mark_thread(Some(&directory), owner, Some(WINDOW));
+        assert!(!launch.start(Some(&directory), owner, marker("10de:2c02 32.0", "dx12")));
+        assert!(!marker_path(&directory, owner).exists());
+        // The next launch counts no failed start.
+        assert!(sweep(&directory, ProcessId::current()).is_empty());
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_launch_that_dies_listing_the_graphics_cards_skips_the_list_next_time() {
+        let directory = temp_dir("listing");
+        let owner = exited_process();
+        let mut launch = Launch::new();
+        // The marker is there before the list starts, and names the thread
+        // that lists once it runs. A crash there is the window's.
+        launch.start(Some(&directory), owner, marker("", LISTING));
+        launch.mark_thread(Some(&directory), owner, Some(0x5150));
+        let saved: Marker =
+            serde_json::from_slice(&fs::read(marker_path(&directory, owner)).unwrap()).unwrap();
+        assert_eq!(saved.thread, Some(0x5150));
+        // That launch died in the driver while listing.
+        let history = sweep(&directory, ProcessId::current());
+        assert_eq!(history.len(), 1, "{history:?}");
+        assert_eq!(
+            (history[0].gpu.as_str(), history[0].backend.as_str()),
+            ("", LISTING)
+        );
+        assert!(Prepared { history }.listing_avoided());
+        assert!(!Prepared {
+            history: Vec::new()
+        }
+        .listing_avoided());
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
     fn after_the_first_frame_the_adapter_list_leaves_the_startup_lane() {
         use crate::stall::Call;
-        // Before it, a stuck startup call refuses it at once.
+        // Before the window is confirmed, a stuck startup call refuses it.
         assert_eq!(adapters_lane(false), Call::GpuDetect);
         // A renderer started later (after a lost device) neither waits behind
         // nor holds startup's lane, nor logs its stalls as startup's.

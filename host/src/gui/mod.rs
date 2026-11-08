@@ -1798,40 +1798,48 @@ pub fn run_gui(
         ..Default::default()
     };
     // The window's thread makes its first graphics call only once the
-    // driver has answered the same calls on another thread, and a stall
-    // after that is watched until the first frame.
+    // driver has answered the same calls on another thread, and is watched
+    // until it is confirmed drawing.
+    let prepared = renderer::prepare();
     #[cfg(windows)]
     let watch = {
-        let lanes = crate::stall::lanes();
-        let limits = crate::stall::Call::GpuProbe.limits();
         let prompt = driver_wait::Prompt::new(driver_wait::MessageNotice::default());
+        let skip_listing = prepared.listing_avoided();
+        let probe_limits = crate::stall::Call::GpuProbe.limits();
         let opened = driver_wait::before_window(
-            lanes,
-            limits,
+            crate::stall::lanes(),
+            crate::stall::Call::GpuDetect.limits(),
+            probe_limits,
             &prompt,
             driver_wait::POLL,
-            || {
-                renderer::configure(&mut options.wgpu_options);
+            || renderer::adapter_list(skip_listing),
+            |adapters| {
+                renderer::configure(&mut options.wgpu_options, prepared, adapters);
                 renderer::probe_spec(&options.wgpu_options)
             },
             |spec| renderer::adapter_probe(spec.clone()),
         );
         if !opened {
-            renderer::window_closed();
+            renderer::abandon();
             return Ok(());
         }
-        driver_wait::watch_first_paint(
+        let watch = driver_wait::watch_first_paint(
             prompt,
-            limits.limit,
+            probe_limits.limit,
             driver_wait::POLL,
             std::time::Instant::now,
-            renderer::first_frame_painted,
-            quit_while_stuck,
-        )
+            renderer::last_pass,
+            move || {
+                renderer::abandon();
+                quit_while_stuck();
+            },
+        );
+        renderer::when_drawing(watch.finisher());
+        watch
     };
     #[cfg(not(windows))]
     {
-        renderer::configure(&mut options.wgpu_options);
+        renderer::configure(&mut options.wgpu_options, prepared, Vec::new());
         drop(quit_while_stuck);
     }
 
