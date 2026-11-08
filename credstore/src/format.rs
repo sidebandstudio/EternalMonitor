@@ -35,6 +35,8 @@
 //! committed generation u64, committed W 32
 //! base generation u64 (≤ committed), base W 32 (equal to committed W when
 //!   the generations are equal)
+//! boot length u8 (≤ MAX_BOOT_ID_LEN) + boot id (the boot that stored the
+//!   blob; empty where a store is durable at once, or the id is unknown)
 //! staged flag u8 (0 or 1), [staged generation u64, staged W 32]
 //! intent flag u8 (0 or 1), [op_id 16,
 //!   invalidate count u8 (≤ MAX_RECORDS) + dev_id 16 × count,
@@ -62,6 +64,8 @@ pub const MAX_TOMBSTONE_SLOTS: usize = 1024;
 pub const MAX_NAME_LEN: usize = 64;
 /// Pending records a slot may hold, next to its one active record.
 pub const MAX_PENDING_PER_SLOT: usize = 3;
+/// Longest boot id a keyring blob records.
+pub const MAX_BOOT_ID_LEN: usize = 64;
 /// Every generation, in either format, is at least 1 and below this. One
 /// rotation per user action never gets near it.
 pub const MAX_GENERATION: u64 = 1 << 62;
@@ -145,6 +149,9 @@ pub struct KeyringState {
     pub committed: (u64, Zeroizing<Key32>),
     /// The generation and key the database file is under.
     pub base: (u64, Zeroizing<Key32>),
+    /// The id of the boot that stored this blob (empty if unknown, or not
+    /// needed).
+    pub boot: Vec<u8>,
     /// A rotation in progress: the next generation's key and what it does.
     pub staged: Option<(u64, Zeroizing<Key32>, Intent)>,
 }
@@ -478,6 +485,8 @@ fn check_db(db: &DbFile) -> Result<(), FormatError> {
 fn keyring_len(state: &KeyringState) -> usize {
     8 + 1
         + (8 + 32) * 2
+        + 1
+        + state.boot.len()
         + match &state.staged {
             Some((_, _, i)) => {
                 1 + 8 + 32 + 1 + 16 + 1 + 16 * i.invalidate.len() + 1 + 16 * i.promote.len()
@@ -501,6 +510,9 @@ pub fn encode_keyring(state: &KeyringState) -> Zeroizing<Vec<u8>> {
     out.extend_from_slice(&state.committed.1[..]);
     out.extend_from_slice(&state.base.0.to_le_bytes());
     out.extend_from_slice(&state.base.1[..]);
+    assert!(state.boot.len() <= MAX_BOOT_ID_LEN);
+    out.push(state.boot.len() as u8);
+    out.extend_from_slice(&state.boot);
     match &state.staged {
         Some((g, w, intent)) => {
             assert!(*g > state.committed.0);
@@ -549,6 +561,11 @@ pub fn parse_keyring(blob: &[u8]) -> Result<KeyringState, FormatError> {
     if !valid_generation(base_g) || base_g > g || (base_g == g && base_w != w) {
         return Err(FormatError::InvalidField("base"));
     }
+    let boot_len = usize::from(r.u8()?);
+    if boot_len > MAX_BOOT_ID_LEN {
+        return Err(FormatError::InvalidField("boot_len"));
+    }
+    let boot = r.take(boot_len)?.to_vec();
     let staged = match (r.u8()?, ()) {
         (0, ()) => {
             if r.u8()? != 0 {
@@ -589,6 +606,7 @@ pub fn parse_keyring(blob: &[u8]) -> Result<KeyringState, FormatError> {
     Ok(KeyringState {
         committed: (g, w),
         base: (base_g, base_w),
+        boot,
         staged,
     })
 }
@@ -822,6 +840,7 @@ mod tests {
             let mut blob = encode_keyring(&KeyringState {
                 committed: (5, Zeroizing::new([1; 32])),
                 base: (5, Zeroizing::new([1; 32])),
+                boot: Vec::new(),
                 staged: staged.then(|| (6, Zeroizing::new([2; 32]), Intent::default())),
             })
             .to_vec();
@@ -829,7 +848,7 @@ mod tests {
             // The base stays at 5 with its own key: below the committed one.
             blob[57..89].copy_from_slice(&[7; 32]);
             if staged {
-                blob[90..98].copy_from_slice(&(committed.wrapping_add(1)).to_le_bytes());
+                blob[91..99].copy_from_slice(&(committed.wrapping_add(1)).to_le_bytes());
             }
             parse_keyring(&blob).is_ok()
         };
@@ -852,6 +871,7 @@ mod tests {
         let state = KeyringState {
             committed: (5, Zeroizing::new([1; 32])),
             base: (5, Zeroizing::new([1; 32])),
+            boot: Vec::new(),
             staged: Some((
                 6,
                 Zeroizing::new([2; 32]),
@@ -868,6 +888,7 @@ mod tests {
         let plain = encode_keyring(&KeyringState {
             committed: (5, Zeroizing::new([1; 32])),
             base: (5, Zeroizing::new([1; 32])),
+            boot: Vec::new(),
             staged: None,
         });
         assert_eq!(plain.len(), plain.capacity());
@@ -879,6 +900,7 @@ mod tests {
         let behind = KeyringState {
             committed: (7, Zeroizing::new([1; 32])),
             base: (5, Zeroizing::new([2; 32])),
+            boot: Vec::new(),
             staged: None,
         };
         let blob = encode_keyring(&behind);
@@ -908,16 +930,37 @@ mod tests {
     }
 
     #[test]
+    fn the_boot_id_round_trips_and_is_bounded() {
+        let state = KeyringState {
+            committed: (4, Zeroizing::new([1; 32])),
+            base: (4, Zeroizing::new([1; 32])),
+            boot: b"1D2C3B4A-0000-4000-8000-00000000000F".to_vec(),
+            staged: None,
+        };
+        let blob = encode_keyring(&state);
+        assert_eq!(blob.len(), blob.capacity());
+        assert_eq!(parse_keyring(&blob).unwrap(), state);
+        let mut long = blob.to_vec();
+        long[89] = MAX_BOOT_ID_LEN as u8 + 1;
+        assert_eq!(
+            parse_keyring(&long),
+            Err(FormatError::InvalidField("boot_len"))
+        );
+    }
+
+    #[test]
     fn keyring_round_trip_and_rules() {
         let plain = KeyringState {
             committed: (4, Zeroizing::new([1; 32])),
             base: (4, Zeroizing::new([1; 32])),
+            boot: Vec::new(),
             staged: None,
         };
         assert_eq!(parse_keyring(&encode_keyring(&plain)).unwrap(), plain);
         let rotating = KeyringState {
             committed: (4, Zeroizing::new([1; 32])),
             base: (4, Zeroizing::new([1; 32])),
+            boot: Vec::new(),
             staged: Some((
                 5,
                 Zeroizing::new([2; 32]),
@@ -931,7 +974,7 @@ mod tests {
         let bytes = encode_keyring(&rotating);
         assert_eq!(parse_keyring(&bytes).unwrap(), rotating);
         let mut wrong_gen = bytes.to_vec();
-        wrong_gen[90] = 4; // staged generation, level with the committed one
+        wrong_gen[91] = 4; // staged generation, level with the committed one
         assert!(parse_keyring(&wrong_gen).is_err());
         assert!(parse_keyring(&bytes[..bytes.len() - 1]).is_err());
     }

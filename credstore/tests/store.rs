@@ -7,7 +7,7 @@ use eternal_credstore::format::{
     encode_db, encode_keyring, DbFile, GenerationKeys, KeyringState, MAX_GENERATION,
 };
 use eternal_credstore::format::{parse_db, parse_keyring};
-use eternal_credstore::store::{db_file, BOOT_MARKER, DB_TMP};
+use eternal_credstore::store::{db_file, DB_TMP};
 use eternal_credstore::{Finalize, NewRecord, Recovery, StoreCredentials, StoreError};
 use eternal_wire::v3::host::HostCredentials;
 use eternal_wire::v3::wire::{Accept, RecordState};
@@ -442,28 +442,168 @@ fn promotion_waits_for_a_later_boot_without_a_flush() {
     assert_eq!(db_generations(&live.same_boot()), vec![g[0] + 1]);
 }
 
-/// The boot marker: an open with no marker, or the same boot's, confirms
-/// nothing; the next boot's open does.
+/// Each keyring blob records the boot that stored it. A blob from this boot
+/// confirms nothing, however often the store reopens; the first open in a
+/// later boot finds one from an earlier boot, which survived it.
 #[test]
-fn the_boot_marker_tells_a_later_boot_from_a_reopen() {
+fn the_boot_id_in_the_blob_tells_a_later_boot_from_a_reopen() {
     let base = base_world();
     let (mut store, _, live) = base.open();
     store.remove(&[id(0x21)]).unwrap();
     let rotated = store.generation();
     drop(store);
-    let marker = live.disk.borrow().get(BOOT_MARKER).cloned();
-    assert_eq!(
-        marker,
-        Some(live.keyring.borrow().boot().to_le_bytes().to_vec())
-    );
-    // A lost marker: not proof of a later boot, even in one.
-    let mut no_marker = live.at_rest();
-    no_marker.disk.remove_now(BOOT_MARKER);
-    let (store, _, live) = no_marker.open();
-    assert!(store.base_generation() < rotated);
-    drop(store);
+    let boot = live.keyring.borrow().boot().to_le_bytes().to_vec();
+    let blob = live.keyring.borrow().get().cloned().unwrap();
+    assert_eq!(parse_keyring(&blob).unwrap().boot, boot);
+    for _ in 0..3 {
+        let (store, _, _) = live.same_boot().open();
+        assert!(store.base_generation() < rotated, "same boot");
+    }
     let (store, _, _) = live.at_rest().open();
-    assert_eq!(store.base_generation(), rotated);
+    assert_eq!(store.base_generation(), rotated, "a later boot");
+}
+
+/// A keyring blob restored on its own (an older one, from an earlier boot)
+/// can't confirm the current one: whatever is then lost to a power cut,
+/// every acknowledged write and untouched record is still there.
+#[test]
+fn a_restored_older_keyring_blob_confirms_nothing_unsafe() {
+    let base = base_world();
+    let old_blob = base.keyring.get().cloned();
+    let (mut store, _, live) = base.open();
+    store.remove(&[id(0x21)]).unwrap();
+    store.add_pending(new_record(0x51, 5, None), NOW).unwrap();
+    store.persist_timestamp(&id(0x11), 9_000).unwrap();
+    let after = logical(&store);
+    drop(store);
+    let mut restored = live.same_boot();
+    restored.keyring.put(old_blob);
+    let (store, _, live) = restored.open();
+    assert_eq!(logical(&store), after);
+    drop(store);
+    for choice in 0..live.keyring_choices() {
+        let (store, _, _) = live.after_crash(false, choice).open();
+        assert_eq!(logical(&store), after, "keyring choice {choice}");
+    }
+}
+
+/// With this boot's id unreadable the store still opens and serves every
+/// write, and confirms nothing: the database stays under its key.
+#[test]
+fn an_unreadable_boot_id_confirms_nothing() {
+    let base = base_world();
+    let (mut store, _, live) = base.open();
+    store.remove(&[id(0x21)]).unwrap();
+    let after = logical(&store);
+    let base_g = store.base_generation();
+    drop(store);
+    let mut world = live.at_rest();
+    world.keyring.set_boot_unreadable(true);
+    let (mut store, _, live) = world.open();
+    assert_eq!(logical(&store), after);
+    assert_eq!(store.base_generation(), base_g, "nothing promoted");
+    store.persist_timestamp(&id(0x11), 9_000).unwrap();
+    let after = logical(&store);
+    drop(store);
+    // A power cut that loses every keyring store since the last confirmed
+    // one: still every write.
+    for choice in 0..live.keyring_choices() {
+        let mut world = live.after_crash(false, choice);
+        world.keyring.set_boot_unreadable(true);
+        let (store, _, _) = world.open();
+        assert_eq!(logical(&store), after, "keyring choice {choice}");
+    }
+}
+
+/// A database file restored from before a rotation (its head predates the
+/// committed generation) is never used: in the same boot, or after a
+/// reboot before the first open, the removed record doesn't come back, the
+/// discard is reported, and every listed record is tombstoned.
+#[test]
+fn a_database_restored_before_promotion_is_discarded() {
+    for reboot in [false, true] {
+        let base = base_world();
+        let (mut store, _, live) = base.open();
+        let g = store.base_generation();
+        let backup = live.disk.borrow().get(&db_file(g)).unwrap().clone();
+        store.remove(&[id(0x11)]).unwrap();
+        assert!(store.snapshot().key(&id(0x11)).is_none());
+        drop(store);
+        let mut restored = if reboot {
+            live.at_rest()
+        } else {
+            live.same_boot()
+        };
+        restored.disk.put(&db_file(g), backup.clone());
+        let (store, report, live) = restored.open();
+        assert!(
+            report.recovery.contains(&Recovery::Discarded),
+            "reboot {reboot}"
+        );
+        assert!(store.snapshot().key(&id(0x11)).is_none(), "reboot {reboot}");
+        assert!(is_tombstoned(&store, 0x11), "reboot {reboot}");
+        assert!(store.records().is_empty());
+        drop(store);
+        // And never later either.
+        let (store, _, _) = live.at_rest().open();
+        assert!(store.snapshot().key(&id(0x11)).is_none());
+    }
+}
+
+/// A startup discard leaves only its own file: nothing else could be opened
+/// by any keyring blob that may survive, so no later rollback can open an
+/// old copy.
+#[test]
+fn a_discard_leaves_only_its_own_file() {
+    let mut world = base_world();
+    let g = *db_generations(&world).last().unwrap();
+    let mut bytes = world.disk.get(&db_file(g)).unwrap().clone();
+    *bytes.last_mut().unwrap() ^= 1;
+    world.disk.put(&db_file(g), bytes.clone());
+    world.disk.put(&db_file(g + 7), bytes);
+    let (store, report, live) = world.open();
+    assert!(report.recovery.contains(&Recovery::Discarded));
+    drop(store);
+    assert_eq!(db_generations(&live.same_boot()), vec![g]);
+}
+
+/// A promotion interrupted after its file and keyring store, before the old
+/// file goes, again and again: files never pile up.
+#[test]
+fn interrupted_promotions_never_pile_up_files() {
+    let base = base_world();
+    let (mut store, _, live) = base.open();
+    store.remove(&[id(0x21)]).unwrap();
+    drop(store);
+    let mut world = live.at_rest();
+    for dev in 0x61..0x6Bu8 {
+        // Kill the promoting open at each step; carry on from the latest kill
+        // that left the most files (after the keyring store, before the old
+        // file goes).
+        let steps = {
+            let (live, opened) = world.open_live(7, None, false);
+            opened.unwrap();
+            live.steps.count.get()
+        };
+        let mut worst = None;
+        for k in 0..steps {
+            let (live, opened) = world.open_live(7, Some(k), false);
+            assert!(opened.is_err());
+            let left = live.same_boot();
+            let n = db_generations(&left).len();
+            assert!(n <= 2, "killed at {k}: {n} files");
+            if worst.as_ref().is_none_or(|(m, _)| n >= *m) {
+                worst = Some((n, left));
+            }
+        }
+        let (_, left) = worst.unwrap();
+        let (mut store, _, live) = left.open();
+        store.add_pending(new_record(dev, dev, None), NOW).unwrap();
+        store.remove(&[id(dev)]).unwrap();
+        drop(store);
+        world = live.at_rest();
+        assert!(db_generations(&world).len() <= 2);
+    }
 }
 
 /// Unconfirmed rotations add no files, and an open reads at most two.
@@ -590,6 +730,7 @@ fn world_at(generation: u64) -> World {
         encode_keyring(&KeyringState {
             committed: (generation, eternal_wire::v3::Zeroizing::new(w)),
             base: (generation, eternal_wire::v3::Zeroizing::new(w)),
+            boot: Vec::new(),
             staged: None,
         })
         .to_vec(),

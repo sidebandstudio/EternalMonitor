@@ -14,7 +14,11 @@
 //! - after any restart, every acknowledged write is there (R1): the state
 //!   is exactly the acknowledged one, or, if an operation was killed, that
 //!   or the state after it;
-//! - damage never brings back a record.
+//! - damage never brings back a record;
+//! - a retired record (removed, expired, conflicted, discarded) never comes
+//!   back, also when an earlier authentic copy of
+//!   the database files, or an older keyring blob, is restored on its own;
+//!   and what such a reopen serves survives a further power cut.
 #![no_main]
 
 use eternal_credstore::keyring::MemKeyring;
@@ -93,6 +97,96 @@ fn restart(live: &Live, c: u8, d: u8) -> World {
 /// Opens `world`. A fresh keyring (first run, or after the keyring was
 /// dropped) is settled first: losing it to a power cut before it's durable
 /// is the documented first-run case, outside R1.
+/// Every database file of `live`, as a restore would put them back.
+fn db_files(live: &Live) -> Vec<(String, Vec<u8>)> {
+    let disk = live.disk.borrow();
+    let mut files: Vec<(String, Vec<u8>)> = disk
+        .list()
+        .unwrap()
+        .into_iter()
+        .filter(|n| n.starts_with("credentials-"))
+        .map(|n| {
+            let bytes = disk.get(&n).unwrap().clone();
+            (n, bytes)
+        })
+        .collect();
+    files.sort();
+    files
+}
+
+/// Moves `acked` to `new`. With `retiring`, the step was an acknowledged
+/// operation (or a discard): every `dev_id` it retired is remembered with
+/// the committed generation it was retired under. (The fuzzer reuses
+/// `dev_id`s, so one that an acknowledged operation adds again is no longer
+/// retired.)
+fn advance(
+    acked: &mut Logical,
+    new: Logical,
+    gone: &mut Vec<(Id16, u64)>,
+    generation: u64,
+    retiring: bool,
+) {
+    if retiring {
+        let left = acked
+            .records
+            .iter()
+            .map(|r| r.0)
+            .filter(|id| !new.records.iter().any(|n| n.0 == *id));
+        // Tombstones this step added (not ones a restore brought back).
+        let had = |id: &Id16| acked.tombstones.iter().any(|(_, ids)| ids.contains(id));
+        let tombstoned = new
+            .tombstones
+            .iter()
+            .flat_map(|(_, ids)| ids.iter().copied())
+            .filter(|id| !had(id));
+        for id in left.chain(tombstoned).collect::<Vec<_>>() {
+            if !gone.iter().any(|(g, _)| *g == id) {
+                gone.push((id, generation));
+            }
+        }
+        gone.retain(|(g, _)| !new.records.iter().any(|n| n.0 == *g));
+    }
+    *acked = new;
+}
+
+/// The generations the store has used, for telling which retirements it
+/// can still know of.
+#[derive(Default)]
+struct Generations {
+    /// The highest committed generation seen since the last rewind.
+    high: u64,
+    /// Generations up to here may have been used twice: the keyring fell
+    /// back below them (stores lost to a power cut) after damage or a
+    /// restore erased the database's own record of them.
+    reusable: u64,
+}
+
+impl Generations {
+    fn saw(&mut self, store: &Store) {
+        let g = store.generation();
+        if g < self.high {
+            self.reusable = self.reusable.max(self.high);
+        }
+        self.high = g;
+    }
+}
+
+/// No retired record is served again. Only retirements the store can still
+/// know of count: one recorded under a generation the keyring has since
+/// fallen below, or under one that may have been used twice, is forgotten
+/// (only lost keyring stores together with damage or a restore that erased
+/// the database's own record of them can do that).
+fn assert_none_back(store: &Store, gone: &mut Vec<(Id16, u64)>, gens: &mut Generations) {
+    gens.saw(store);
+    gone.retain(|(_, g)| *g <= store.generation() && *g > gens.reusable);
+    for r in store.records() {
+        assert!(
+            !gone.iter().any(|(g, _)| *g == r.dev_id),
+            "a retired record never comes back"
+        );
+    }
+}
+
 fn open(world: &World) -> (Store, Live) {
     let (store, report, live) = world.open();
     check_invariants(&store);
@@ -118,11 +212,63 @@ fuzz_target!(|data: &[u8]| {
         ..World::default()
     };
     let (mut store, mut live) = open(&world);
-    // The state every acknowledged write adds up to.
+    // The state every acknowledged write adds up to, and every record that
+    // ever left it.
     let mut acked: Logical = logical(&store);
+    let mut gone: Vec<(Id16, u64)> = Vec::new();
+    let mut gens = Generations::default();
+    // Earlier authentic copies, for restores.
+    let mut snapshots: Vec<Vec<(String, Vec<u8>)>> = Vec::new();
+    let mut blobs: Vec<Vec<u8>> = Vec::new();
     let mut now = 400 * DAY;
     for chunk in data.chunks_exact(5).take(40) {
         let (kind, a, b, c, d) = (chunk[0], chunk[1], chunk[2], chunk[3], chunk[4]);
+        assert_none_back(&store, &mut gone, &mut gens);
+        if snapshots.len() < 8 {
+            snapshots.push(db_files(&live));
+            if let Some(blob) = live.keyring.borrow().get() {
+                blobs.push(blob.clone());
+            }
+        }
+        if kind >= 0xF0 && kind & 2 == 2 {
+            // Restore an earlier copy on its own, in the same boot or after
+            // a reboot: the database files, or the keyring blob.
+            drop(store);
+            let mut restored = if c & 1 == 0 {
+                live.same_boot()
+            } else {
+                live.at_rest()
+            };
+            if kind & 1 == 0 {
+                let snapshot = &snapshots[usize::from(a) % snapshots.len()];
+                for (name, _) in db_files(&live) {
+                    restored.disk.remove_now(&name);
+                }
+                for (name, bytes) in snapshot {
+                    restored.disk.put(name, bytes.clone());
+                }
+            } else if !blobs.is_empty() {
+                restored
+                    .keyring
+                    .put(Some(blobs[usize::from(a) % blobs.len()].clone()));
+            }
+            (store, live) = open(&restored);
+            assert_none_back(&store, &mut gone, &mut gens);
+            let served = logical(&store);
+            advance(
+                &mut acked,
+                served.clone(),
+                &mut gone,
+                store.generation(),
+                false,
+            );
+            // What the reopen serves survives a further power cut.
+            drop(store);
+            (store, live) = open(&live.after_crash(c & 2 != 0, usize::from(d)));
+            gens.saw(&store);
+            assert_eq!(logical(&store), served, "what a reopen serves survives");
+            continue;
+        }
         if kind >= 0xF0 {
             // Damage at rest, then a restart.
             drop(store);
@@ -135,13 +281,16 @@ fuzz_target!(|data: &[u8]| {
                     assert!(!held.contains(&r.0), "damage never brings a record back");
                 }
             }
-            acked = logical(&store);
+            assert_none_back(&store, &mut gone, &mut gens);
+            let served = logical(&store);
+            advance(&mut acked, served, &mut gone, store.generation(), true);
             continue;
         }
         if kind >= 0xE0 {
             // A restart with every write acknowledged: exactly that state.
             drop(store);
             (store, live) = open(&restart(&live, c, d));
+            gens.saw(&store);
             assert_eq!(logical(&store), acked, "every acknowledged write survives");
             continue;
         }
@@ -163,7 +312,7 @@ fuzz_target!(|data: &[u8]| {
         if !crashed {
             // Ok or a refusal: exactly what the uncrashed run did.
             assert_eq!(logical(&store), after);
-            acked = after;
+            advance(&mut acked, after, &mut gone, store.generation(), true);
             continue;
         }
         let visible = live.keyring.borrow().get().cloned() != keyring_before;
@@ -186,10 +335,13 @@ fuzz_target!(|data: &[u8]| {
                     assert!(!held.contains(&r.0), "damage never brings a record back");
                 }
             }
-            acked = logical(&store);
+            assert_none_back(&store, &mut gone, &mut gens);
+            let served = logical(&store);
+            advance(&mut acked, served, &mut gone, store.generation(), true);
             continue;
         }
         (store, live) = open(&next);
+        gens.saw(&store);
         let reached = logical(&store);
         if result.is_ok() {
             assert_eq!(reached, after, "it returned Ok");
@@ -199,6 +351,6 @@ fuzz_target!(|data: &[u8]| {
                 "exactly before or after"
             );
         }
-        acked = reached;
+        advance(&mut acked, reached, &mut gone, store.generation(), true);
     }
 });

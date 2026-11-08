@@ -50,8 +50,7 @@ const OPS: &[(&str, bool, Op)] = &[
 ];
 
 /// Unsettled sequences on one open store, mixing rotations and plain writes.
-/// The first two are the shape of the r2 probes: a rotation, then an
-/// acknowledged plain write.
+/// The first two are a rotation, then an acknowledged plain write.
 const SEQUENCES: &[(&str, &[Op])] = &[
     (
         "remove, then add",
@@ -301,8 +300,9 @@ fn acknowledged_writes_survive_unsettled_sequences() {
     }
 }
 
-/// The r2 probes, spelled out: a Remove, then an acknowledged plain write,
-/// then the pre-rotation keyring is all that survives.
+/// A Remove, then acknowledged plain writes (a pairing and a timestamp),
+/// then a power loss that keeps only the pre-rotation keyring: every write
+/// is still there.
 #[test]
 fn a_lost_rotation_keyring_keeps_later_writes() {
     let base = base_world();
@@ -326,8 +326,8 @@ fn a_lost_rotation_keyring_keeps_later_writes() {
     assert_eq!(report.recovery, vec![Recovery::RotatedAgain]);
 }
 
-/// The r2 same-boot probe: a Remove, a reopen in the same boot, then a
-/// power loss that keeps only the pre-rotation keyring.
+/// A Remove, reopens in the same boot, then a power loss that keeps only
+/// the pre-rotation keyring: the untouched records are still there.
 #[test]
 fn a_same_boot_reopen_never_drops_the_fallback() {
     let base = base_world();

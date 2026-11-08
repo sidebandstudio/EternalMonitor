@@ -157,6 +157,27 @@ impl Live {
 }
 
 impl World {
+    /// A seed for an open of this world: `seed` mixed with everything the
+    /// open will read, so runs stay reproducible while opens of different
+    /// states never draw the same keys (real keys come from the system's
+    /// random source).
+    fn seed(&self, seed: u64) -> u64 {
+        let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
+        ctx.update(&seed.to_le_bytes());
+        for name in self.disk.list().unwrap_or_default() {
+            ctx.update(name.as_bytes());
+            if let Some(bytes) = self.disk.get(&name) {
+                ctx.update(bytes);
+            }
+        }
+        if let Some(blob) = self.keyring.get() {
+            ctx.update(blob);
+        }
+        ctx.update(&self.keyring.boot().to_le_bytes());
+        let digest = ctx.finish();
+        u64::from_le_bytes(digest.as_ref()[..8].try_into().expect("8 bytes"))
+    }
+
     pub fn live(&self) -> Live {
         Live {
             disk: Rc::new(RefCell::new(self.disk.clone())),
@@ -195,7 +216,8 @@ impl World {
             inner: live.keyring.clone(),
             steps: live.steps.clone(),
         };
-        let opened = CredentialStore::open(disk, keyring, Box::new(SeededRandom::new(seed)));
+        let opened =
+            CredentialStore::open(disk, keyring, Box::new(SeededRandom::new(self.seed(seed))));
         (live, opened)
     }
 

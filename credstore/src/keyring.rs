@@ -56,6 +56,8 @@ pub struct MemKeyring {
     flushes: bool,
     /// The boot this keyring is in; a crash is a power loss and a new boot.
     boot: u64,
+    /// This boot's id can't be read.
+    boot_unreadable: bool,
     calls: usize,
     crash_at: Option<usize>,
 }
@@ -101,6 +103,7 @@ impl MemKeyring {
             durable: vec![kept],
             flushes: self.flushes,
             boot: self.boot + 1,
+            boot_unreadable: self.boot_unreadable,
             calls: 0,
             crash_at: None,
         }
@@ -118,6 +121,11 @@ impl MemKeyring {
 
     pub fn boot(&self) -> u64 {
         self.boot
+    }
+
+    /// Makes this boot's id unreadable (or readable again).
+    pub fn set_boot_unreadable(&mut self, unreadable: bool) {
+        self.boot_unreadable = unreadable;
     }
 
     /// Makes a stored blob visible, and durable only if `durable`.
@@ -169,6 +177,9 @@ impl Keyring for MemKeyring {
             self.durable = vec![self.visible.clone()];
             Ok(Durability::Durable)
         } else {
+            if self.boot_unreadable {
+                return Err(io::Error::other("boot id unreadable"));
+            }
             Ok(Durability::LaterBoot(self.boot.to_le_bytes().to_vec()))
         }
     }
@@ -716,8 +727,8 @@ mod tests {
         assert_ne!(m.after_crash(0).flush().unwrap(), boot, "the next boot");
     }
 
-    /// The boot id the store's marker compares: present, and the same for
-    /// the whole boot.
+    /// The boot id the store records in each keyring blob: present, and the
+    /// same for the whole boot.
     #[cfg(target_os = "macos")]
     #[test]
     fn mac_boot_id_is_stable_within_a_boot() {
