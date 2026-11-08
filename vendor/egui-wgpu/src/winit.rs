@@ -109,12 +109,8 @@ fn block_on<F: core::future::Future>(future: F) -> F::Output {
     }
 }
 
-/// EternalMonitor patch: a replacement device being made on another thread, with the
-/// surface it was made for.
-type Replacing = Answer<(
-    wgpu::Surface<'static>,
-    Result<RenderState, crate::WgpuError>,
-)>;
+/// EternalMonitor patch: a replacement device being made on another thread.
+type Replacing = Answer<Result<crate::NewDevice, crate::WgpuError>>;
 
 /// EternalMonitor patch: when the painter tries to replace a lost device, and when it
 /// stops trying.
@@ -505,13 +501,14 @@ impl Painter {
 
     /// EternalMonitor patch: work towards a new device for a lost one, without blocking.
     ///
-    /// The surface is made here, on the window's thread: it is the window's (Metal wants
-    /// it on the main thread) and calls no driver for a device. Listing adapters and
-    /// making the device, where a driver can stall, run on another thread, which this
-    /// polls. One that hasn't answered in [`REPLACEMENT_TIMEOUT`] counts as a failed try,
-    /// and no other starts while it is out; its late device is still taken. Configuring
-    /// the new surface, which makes the swapchain, stays here too: DXGI sends the window
-    /// messages while it does.
+    /// Listing adapters and making the device, where a driver can stall, run on another
+    /// thread, which this polls. That thread gets no window or surface, so one stuck in a
+    /// driver neither keeps the window alive (eframe ends its loop only once the window is
+    /// destroyed) nor touches it after it is gone. One that hasn't answered in
+    /// [`REPLACEMENT_TIMEOUT`] counts as a failed try, and no other starts while it is out;
+    /// its late device is still taken. On this thread the window's surface is then made,
+    /// checked against the new adapter and configured (DXGI sends the window messages while
+    /// it makes the swapchain), and the renderer is made; a mismatch is a failed try.
     fn replace_device(&mut self, viewport_id: ViewportId, window: Arc<winit::window::Window>) {
         let now = Instant::now();
         if let Some(replacing) = &mut self.replacing {
@@ -522,18 +519,14 @@ impl Painter {
                     self.replacing = None;
                     self.replacement_failed(now, &"the thread making it ended");
                 }
-                Asked::Answered((surface, Ok(render_state))) => {
+                Asked::Answered(Ok(new)) => {
                     self.replacing = None;
-                    self.watch_device(&render_state.device);
-                    self.render_state = Some(render_state);
-                    let size = window.inner_size();
-                    self.install_surface(surface, viewport_id, size.width, size.height, false);
-                    self.rebuilding = false;
-                    self.restore_fonts = true;
-                    log::info!("Replaced the lost wgpu device");
-                    return;
+                    match self.adopt(new, viewport_id, window) {
+                        Ok(()) => return,
+                        Err(err) => self.replacement_failed(now, &err),
+                    }
                 }
-                Asked::Answered((_, Err(err))) => {
+                Asked::Answered(Err(err)) => {
                     self.replacing = None;
                     self.replacement_failed(now, &err);
                 }
@@ -551,35 +544,9 @@ impl Painter {
             }
             Some(_) => {}
         }
-        // The surface goes to the replacement thread, which a driver can hold forever. Made
-        // from the window's handles, it doesn't keep the window alive: eframe ends its loop
-        // only once the window is destroyed, so a surface holding it would keep the app from
-        // quitting.
-        // SAFETY: the surface is used while the window lives: here and by the replacement
-        // thread, and on this thread once installed. The window is the root viewport,
-        // destroyed only as the app quits, after which a stuck thread can only drop the
-        // surface, never configured.
-        let made = || -> Result<wgpu::Surface<'static>, crate::WgpuError> {
-            let target = unsafe { wgpu::SurfaceTargetUnsafe::from_window(&*window) }?;
-            Ok(unsafe { self.instance.create_surface_unsafe(target) }?)
-        };
-        let surface = match made() {
-            Ok(surface) => surface,
-            Err(err) => {
-                self.replacement_failed(now, &err);
-                return;
-            }
-        };
-        let (config, instance, options) =
-            (self.config.clone(), self.instance.clone(), self.options);
+        let (config, instance) = (self.config.clone(), self.instance.clone());
         let asked = Answer::ask(REPLACEMENT_THREAD, now, REPLACEMENT_TIMEOUT, move || {
-            let made = block_on(RenderState::create(
-                &config,
-                &instance,
-                Some(&surface),
-                options,
-            ));
-            (surface, made)
+            block_on(RenderState::new_device(&config, &instance))
         });
         match asked {
             Ok(replacing) => {
@@ -588,6 +555,32 @@ impl Painter {
             }
             Err(err) => self.replacement_failed(now, &err),
         }
+    }
+
+    /// EternalMonitor patch: on the window's thread, make the window's surface for a device
+    /// from the replacement thread, check them together and draw with them.
+    fn adopt(
+        &mut self,
+        new: crate::NewDevice,
+        viewport_id: ViewportId,
+        window: Arc<winit::window::Window>,
+    ) -> Result<(), crate::WgpuError> {
+        let size = window.inner_size();
+        let surface = self.instance.create_surface(window)?;
+        let render_state = RenderState::with_new_device(
+            new,
+            &self.config,
+            &self.instance,
+            &surface,
+            self.options,
+        )?;
+        self.watch_device(&render_state.device);
+        self.render_state = Some(render_state);
+        self.install_surface(surface, viewport_id, size.width, size.height, false);
+        self.rebuilding = false;
+        self.restore_fonts = true;
+        log::info!("Replaced the lost wgpu device");
+        Ok(())
     }
 
     /// EternalMonitor patch: a try at a new device failed at `now`.

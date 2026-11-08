@@ -30,19 +30,22 @@ The patch:
   its own devices and is not affected. The new device's first frame uploads
   the font atlas again. Other textures are the app's to load again
   (`host/src/gui/renderer.rs` counts devices for that).
-- A replacement never blocks the window's thread. The window makes the new
-  surface (it belongs to the window, and Metal wants it on the main thread).
-  Listing adapters and making the device, where a driver can stall, run on
-  their own thread (`winit::Answer`), which the window polls each frame. One
-  that hasn't answered in 10 s counts as a failed try, and no other starts
-  while it is out; a late device is still taken. The surface it gets is
-  made from the window's handles, so a stuck thread doesn't keep the window
-  alive: eframe ends its loop only once the window is destroyed. The thread
-  is named `winit::REPLACEMENT_THREAD`, so the host's panic hook treats a panic there
-  as one failed try: it doesn't turn the virtual display off as it does for
-  other background threads. Configuring the new surface,
-  which makes the swapchain, stays on the window's thread, because DXGI sends
-  the window messages while it does that.
+- A replacement never blocks the window's thread. Listing adapters and
+  making the device, where a driver can stall, run on their own thread
+  (`winit::Answer`, `RenderState::new_device`), which the window polls each
+  frame. That thread gets no window or surface: the adapter is chosen as at
+  start but with no surface to check. So a thread stuck in a driver neither
+  keeps the window alive (eframe ends its loop only once the window is
+  destroyed) nor touches it after it is gone; a late answer after quitting is
+  dropped with the closed channel. One that hasn't answered in 10 s counts as
+  a failed try, and no other starts while it is out; a late device is still
+  taken. The window's thread then makes the surface, checks the new adapter
+  can draw on it (a failed try if not), makes the renderer for its format
+  (`RenderState::with_new_device`) and configures it. The swapchain stays on
+  that thread because DXGI sends the window messages while it makes one.
+  The thread is named `winit::REPLACEMENT_THREAD`, so the host's panic hook
+  treats a panic there as one failed try: it doesn't turn the virtual display
+  off as it does for other background threads.
 - `configure_surface` replaces the device, instead of panicking, when the
   adapter supports no surface any more.
 - `Renderer::upload_failed`, `winit::SKIPPED_FRAMES` and `winit::DEVICES_LOST`

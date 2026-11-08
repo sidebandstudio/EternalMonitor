@@ -8,7 +8,9 @@ use std::time::{Duration, Instant};
 
 use eframe::egui;
 use eframe::egui_wgpu::winit::{Answer, Asked, Replacement, REPLACEMENT_TIMEOUT};
-use eframe::egui_wgpu::{Renderer, RendererOptions, ScreenDescriptor};
+use eframe::egui_wgpu::{
+    RenderState, Renderer, RendererOptions, ScreenDescriptor, WgpuConfiguration,
+};
 use eframe::wgpu;
 
 fn block_on<F: std::future::Future>(future: F) -> F::Output {
@@ -227,4 +229,21 @@ fn a_replacement_that_never_answers_ends_in_giving_up() {
         assert!(timeouts <= Replacement::MAX_FAILURES);
     }
     assert_eq!(timeouts, Replacement::MAX_FAILURES);
+}
+
+#[test]
+fn a_replacement_device_is_made_without_any_window_or_surface() {
+    // What the replacement thread runs gets the configuration and the
+    // instance only, so a thread stuck in a driver can't hold the window or
+    // touch it after it is gone.
+    let config = WgpuConfiguration::default();
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+    let new = block_on(RenderState::new_device(&config, &instance)).expect("a device");
+    let buffer = new.device().create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 256,
+        usage: wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    assert_eq!(buffer.size(), 256);
 }
