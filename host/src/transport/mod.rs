@@ -1,7 +1,10 @@
 pub mod abr;
 pub mod apple_usb;
 mod audio;
+#[cfg(test)]
+pub(crate) use audio::tests::session as test_session;
 pub mod beat;
+pub mod congestion;
 pub mod fault;
 pub mod link;
 pub mod pacer;
@@ -58,8 +61,9 @@ fn now() -> Instant {
 /// is in flight before moving the clock on.
 #[cfg(feature = "test-hooks")]
 pub mod probe {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
     use std::net::SocketAddr;
+    use std::time::Instant;
 
     use parking_lot::Mutex;
 
@@ -80,6 +84,126 @@ pub mod probe {
 
     pub fn taken_from(addr: SocketAddr) -> u64 {
         TAKEN.lock().get(&addr).copied().unwrap_or(0)
+    }
+
+    /// The datagrams a refusal applies to.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Kind {
+        Media,
+        Control,
+    }
+
+    /// How a failed send fails.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Fail {
+        /// As if the system had no buffer space (WSAENOBUFS, ENOBUFS).
+        NoBufferSpace,
+        /// Any other error: connection reset.
+        Other,
+    }
+
+    struct Failing {
+        kind: Kind,
+        after: u64,
+        fails: VecDeque<Fail>,
+    }
+
+    static FAIL: Mutex<BTreeMap<SocketAddr, Failing>> = Mutex::new(BTreeMap::new());
+
+    /// Of the UDP sends of `kind` to `addr`, the next `after` go out and
+    /// the ones after them fail as `fails` says, in order.
+    pub fn fail_sends(addr: SocketAddr, kind: Kind, after: u64, fails: &[Fail]) {
+        let fails = fails.iter().copied().collect();
+        FAIL.lock().insert(addr, Failing { kind, after, fails });
+    }
+
+    /// As [`fail_sends`], with `count` sends refused for lack of buffer space.
+    pub fn refuse_sends(addr: SocketAddr, kind: Kind, after: u64, count: usize) {
+        fail_sends(addr, kind, after, &vec![Fail::NoBufferSpace; count]);
+    }
+
+    /// Failures [`fail_sends`] still has to give.
+    pub fn refusals_left(addr: SocketAddr) -> usize {
+        FAIL.lock()
+            .get(&addr)
+            .map_or(0, |failing| failing.fails.len())
+    }
+
+    /// How this send of `datagram` to `addr` fails, if it does.
+    pub(crate) fn fail(addr: SocketAddr, datagram: &[u8]) -> Option<std::io::Error> {
+        use eternal_wire::v2::{classify, Classified};
+        let kind = match classify(datagram) {
+            Classified::Media { .. } => Kind::Media,
+            Classified::Control(_) => Kind::Control,
+            _ => return None,
+        };
+        let fail = match FAIL.lock().get_mut(&addr).filter(|f| f.kind == kind) {
+            Some(failing) if failing.after > 0 => {
+                failing.after -= 1;
+                None
+            }
+            Some(failing) => failing.fails.pop_front(),
+            None => None,
+        };
+        attempted(addr, datagram, fail);
+        fail.map(|fail| match fail {
+            Fail::NoBufferSpace => super::congestion::no_buffer_space(),
+            Fail::Other => std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+        })
+    }
+
+    /// One video datagram the transport tried to send, as the send saw it.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Attempt {
+        pub at: Instant,
+        pub frame_seq: u32,
+        pub frag_index: u16,
+        pub retransmit: bool,
+        pub failed: Option<Fail>,
+    }
+
+    static RECORDED: Mutex<Option<SocketAddr>> = Mutex::new(None);
+    static ATTEMPTS: Mutex<Vec<Attempt>> = Mutex::new(Vec::new());
+    /// When each pacing wait was asked for, and its deadline.
+    static WAITS: Mutex<Vec<(Instant, Instant)>> = Mutex::new(Vec::new());
+
+    /// Records every video send to `addr` from now on, and every pacing
+    /// wait, clearing what was recorded.
+    pub fn record(addr: SocketAddr) {
+        *RECORDED.lock() = Some(addr);
+        ATTEMPTS.lock().clear();
+        WAITS.lock().clear();
+    }
+
+    /// The video sends recorded so far, in order.
+    pub fn attempts() -> Vec<Attempt> {
+        ATTEMPTS.lock().clone()
+    }
+
+    /// The pacing waits recorded so far: when each was asked for, and until when.
+    pub fn waits() -> Vec<(Instant, Instant)> {
+        WAITS.lock().clone()
+    }
+
+    fn attempted(addr: SocketAddr, datagram: &[u8], failed: Option<Fail>) {
+        if *RECORDED.lock() != Some(addr) {
+            return;
+        }
+        if let Ok((header, _)) = eternal_wire::v2::media::MediaHeader::decode(datagram) {
+            ATTEMPTS.lock().push(Attempt {
+                at: Instant::now(),
+                frame_seq: header.frame_seq,
+                frag_index: header.frag_index,
+                retransmit: header.is_retransmit,
+                failed,
+            });
+        }
+    }
+
+    pub(crate) fn waited(deadline: Instant) {
+        if RECORDED.lock().is_some() {
+            WAITS.lock().push((Instant::now(), deadline));
+        }
     }
 }
 
@@ -366,6 +490,8 @@ pub async fn start_sender(
             _ = liveness_tick.tick() => {
                 beat.mark(Phase::Tick);
                 links.update_stats();
+                links.congestion.lock().settle(now());
+                ease_congestion(&links, &mut state, &shared, &config).await;
                 if !shared.running.load(Ordering::SeqCst) {
                     info!("Transport loop stopping on running=false");
                     break;
@@ -520,31 +646,44 @@ pub async fn start_sender(
                 }
 
                 let mut frame_pacer = FramePacer::new(frag_count_usize, Instant::now());
+                let mut backed_off = false;
                 for datagram in &stored {
                     // A busy machine can exhaust the pacing budget mid-frame.
                     // Keep serving audio even when there are no more pauses;
                     // otherwise a large IDR can fill its 60 ms capture queue.
                     audio_sender.send_queued(&mut audio_rx, &links, &shared, stream_epoch).await;
-                    if target_addr.link == LinkId::Udp && state.fault.enabled() {
-                        for due in state.fault.push(datagram, Instant::now()) {
-                            if let Err(e) = links.send_to(&due, target_addr).await {
-                                if !send_failed {
-                                    log_send_failed(target_addr.link, &e);
-                                    send_failed = true;
-                                }
-                            }
-                        }
-                    } else if let Err(e) = links.send_to(datagram, target_addr).await {
-                        if !send_failed {
+                    let mut refused = false;
+                    let mut note = |sent: std::io::Result<()>| match sent {
+                        Err(e) if congestion::is_no_buffer_space(&e) => refused = true,
+                        Err(e) if !send_failed => {
                             log_send_failed(target_addr.link, &e);
                             send_failed = true;
                         }
+                        _ => {}
+                    };
+                    if target_addr.link == LinkId::Udp && state.fault.enabled() {
+                        for due in state.fault.push(datagram, Instant::now()) {
+                            note(links.send_to(&due, target_addr).await);
+                        }
+                    } else {
+                        note(links.send_to(datagram, target_addr).await);
+                    }
+                    // The system had no buffer space for it. A frame backs
+                    // off once and sends it again; a refusal after that gives
+                    // up the rest of the frame, which repair recovers.
+                    if refused && backed_off {
+                        break;
+                    }
+                    if refused {
+                        backed_off = true;
+                        ease_congestion(&links, &mut state, &shared, &config).await;
                     }
 
-                    let pause = frame_pacer.after_send(Instant::now());
+                    let paced = frame_pacer.after_send(Instant::now());
+                    let pause = if refused { congestion::BACKOFF } else { paced };
                     if target_addr.link == LinkId::Udp && pause > Duration::ZERO {
                         let repairs = repair_while_pacing(&links, &mut state, &shared, &config, &supervisor_tx,
-                            pacing_clock.wait(pause), &mut deferred_control);
+                            pacing_clock.until(Instant::now() + pause), &mut deferred_control);
                         tokio::pin!(repairs);
                         loop {
                             tokio::select! {
@@ -554,6 +693,16 @@ pub async fn start_sender(
                                     audio_sender.send(packet, &links, &shared, stream_epoch).await;
                                 }
                             }
+                        }
+                    }
+                    if refused {
+                        match links.send_to(datagram, target_addr).await {
+                            Err(e) if congestion::is_no_buffer_space(&e) => break,
+                            Err(e) if !send_failed => {
+                                log_send_failed(target_addr.link, &e);
+                                send_failed = true;
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -747,15 +896,15 @@ async fn receive_control(
 }
 
 async fn send_repairs(
-    socket: &UdpSocket,
+    links: &TransportLinks,
     ring: &mut RetransmitRing,
     shared: &SharedControl,
     nack: &eternal_wire::v2::control::Nack,
 ) {
     let target = *shared.target_addr.lock();
-    let Some(destination) = target.addr.filter(|_| target.link == LinkId::Udp) else {
+    if target.link != LinkId::Udp || target.addr.is_none() {
         return;
-    };
+    }
     let mut sent = 0;
     for datagram in ring.resend(
         nack.stream_epoch,
@@ -764,9 +913,8 @@ async fn send_repairs(
         &nack.missing,
         Instant::now(),
     ) {
-        if socket.send_to(&datagram, destination).await.is_ok() {
-            #[cfg(feature = "test-hooks")]
-            probe::sent(destination);
+        // Through the links, so a refused repair counts in the episode.
+        if links.send_to(&datagram, target).await.is_ok() {
             sent += 1;
         }
     }
@@ -848,7 +996,7 @@ async fn act(
         state.input.reset();
     }
     if let Some(nack) = actions.retransmit.take() {
-        send_repairs(&links.udp.socket, &mut state.retransmit_ring, shared, &nack).await;
+        send_repairs(links, &mut state.retransmit_ring, shared, &nack).await;
     }
     if let Some((session_id, event)) = actions.input.take() {
         shared.transport_beat.mark(Phase::Input);
@@ -897,18 +1045,7 @@ async fn act(
             target_bps: reported.target_bps,
             changed: clamped.changed || reported.changed,
         };
-        if decision.changed {
-            shared
-                .abr_current_bps
-                .store(decision.target_bps, Ordering::SeqCst);
-            PIPELINE_STATS.lock().set_bitrate(decision.target_bps);
-            // One immediate notify; the 1s heartbeat's embedded config
-            // self-heals any loss.
-            let notify = shared.session.lock().stream_config_notify(config);
-            for (destination, datagram) in notify {
-                let _ = links.send_to(&datagram, destination).await;
-            }
-        }
+        apply_bitrate(decision, links, shared, config).await;
     }
     execute_actions(actions, links, shared, supervisor_tx).await;
     send_pointer(&mut state.pointer, links, shared).await;
@@ -999,6 +1136,40 @@ async fn send_pointer(
     }
 }
 
+/// Steps the bitrate down once for each episode of sends the system had no
+/// buffer space for, without waiting for the iPad to report the loss.
+async fn ease_congestion(
+    links: &TransportLinks,
+    state: &mut LoopState,
+    shared: &SharedControl,
+    config: &impl ConfigSource,
+) {
+    if links.congestion.lock().take_step_down() {
+        let decision = state.abr.on_send_refused(Instant::now());
+        apply_bitrate(decision, links, shared, config).await;
+    }
+}
+
+async fn apply_bitrate(
+    decision: abr::AbrDecision,
+    links: &TransportLinks,
+    shared: &SharedControl,
+    config: &impl ConfigSource,
+) {
+    if decision.changed {
+        shared
+            .abr_current_bps
+            .store(decision.target_bps, Ordering::SeqCst);
+        PIPELINE_STATS.lock().set_bitrate(decision.target_bps);
+        // One immediate notify; the 1s heartbeat's embedded config
+        // self-heals any loss.
+        let notify = shared.session.lock().stream_config_notify(config);
+        for (destination, datagram) in notify {
+            let _ = links.send_to(&datagram, destination).await;
+        }
+    }
+}
+
 async fn execute_actions(
     mut actions: Actions,
     links: &TransportLinks,
@@ -1019,8 +1190,18 @@ async fn execute_actions(
         }
     }
     for (destination, datagram) in &actions.replies {
-        if let Err(e) = links.send_to(datagram, *destination).await {
-            warn!(peer = %destination, error = %e, "Failed to send control reply");
+        let mut sent = links.send_to(datagram, *destination).await;
+        // The system had no buffer space for it: one short retry. The
+        // episode's own lines report it if that fails too.
+        if sent.as_ref().is_err_and(congestion::is_no_buffer_space) {
+            tokio::time::sleep(congestion::REPLY_RETRY).await;
+            sent = links.send_to(datagram, *destination).await;
+        }
+        match sent {
+            Err(e) if !congestion::is_no_buffer_space(&e) => {
+                warn!(peer = %destination, error = %e, "Failed to send control reply");
+            }
+            _ => {}
         }
     }
 

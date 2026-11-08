@@ -123,14 +123,15 @@ impl AudioSender {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use eternal_wire::v2::control::*;
     use std::sync::atomic::Ordering;
     use std::time::Instant;
 
-    /// A session whose iPad answered, as the app does at once.
-    fn session(caps: u16) -> (SharedControl, u32) {
+    /// A session whose iPad advertised `caps` and answered, as the app does
+    /// at once, and its id.
+    pub(crate) fn session(caps: u16) -> (SharedControl, u32) {
         let (shared, id) = unanswered_session(caps);
         let config = super::super::SharedConfigSource {
             shared: &shared,
@@ -186,8 +187,7 @@ mod tests {
         (shared, id)
     }
 
-    /// Tests that replace the global audio stats run one at a time.
-    static AUDIO_STATS: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    use crate::audio::STATS_TEST_LOCK as AUDIO_STATS;
 
     fn packet(id: u32, time: u64) -> SessionPacket {
         SessionPacket {

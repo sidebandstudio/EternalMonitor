@@ -658,7 +658,7 @@ pub fn with_gpu(xml: &str, gpu: &str) -> Option<String> {
 /// would leave it none. A file that does not parse as expected is left
 /// alone, and the error says why.
 pub fn pin_gpu_in(path: &Path, gpu: &str) -> io::Result<bool> {
-    let current = std::fs::read_to_string(path)?;
+    let current = read_settings(path)?;
     let updated = gpu_edit(&current, gpu)
         .map_err(|reason| io::Error::new(io::ErrorKind::InvalidData, reason))?;
     if updated == current {
@@ -820,7 +820,7 @@ pub fn apply_pin(
     wanted: Option<&str>,
 ) -> io::Result<PinOutcome> {
     let invalid = |reason| io::Error::new(io::ErrorKind::InvalidData, reason);
-    let current = std::fs::read_to_string(path)?;
+    let current = read_settings(path)?;
     let named = named_gpu(&current).map_err(invalid)?;
     let ours = recorded_pins(record);
     let ours: Vec<&str> = ours.iter().map(String::as_str).collect();
@@ -891,7 +891,7 @@ pub fn write_with_pin(
     modes: &[VddMode],
     wanted: Option<&str>,
 ) -> io::Result<PinOutcome> {
-    let named = match std::fs::read_to_string(path) {
+    let named = match read_settings(path) {
         Ok(current) => match named_gpu(&current) {
             Ok(named) => named,
             Err(_) if owned && wanted.is_some() => None,
@@ -929,6 +929,79 @@ pub fn pin_result(
         (Ok(_), Err(_)) => Err("the settings file was left as it is"),
         (Ok(card), Ok(_)) => Ok(card.to_string()),
     }
+}
+
+/// The settings file as text. Another tool may have saved it as UTF-16
+/// (Windows PowerShell's `Out-File` does), with a byte order mark or, as XML
+/// allows, without one; it is read and, when this host writes it, written
+/// back as UTF-8, the encoding the driver's own file has and every file this
+/// host writes. A UTF-16 document's `encoding="utf-16"` declaration becomes
+/// `utf-8` with it, so the declaration always names what is on disk. UTF-8
+/// keeps any byte order mark. Any other encoding, UTF-32 included, is left
+/// alone, and the error says so.
+fn read_settings(path: &Path) -> io::Result<String> {
+    decode_settings(&std::fs::read(path)?).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the settings file is neither UTF-8 nor UTF-16",
+        )
+    })
+}
+
+fn decode_settings(bytes: &[u8]) -> Option<String> {
+    let text = decode_text(bytes)?;
+    // XML never holds NUL: text with one was read in the wrong encoding,
+    // such as UTF-32 without a byte order mark, which reads as UTF-8.
+    (!text.contains('\0')).then_some(text)
+}
+
+fn decode_text(bytes: &[u8]) -> Option<String> {
+    // UTF-32's byte order marks; the little-endian one starts like UTF-16's.
+    if bytes.starts_with(&[0xFF, 0xFE, 0, 0]) || bytes.starts_with(&[0, 0, 0xFE, 0xFF]) {
+        return None;
+    }
+    let (units, big_endian): (&[u8], bool) = match bytes {
+        [0xFF, 0xFE, rest @ ..] => (rest, false),
+        [0xFE, 0xFF, rest @ ..] => (rest, true),
+        // "<?" without a byte order mark (XML 1.0, appendix F).
+        [b'<', 0, b'?', 0, ..] => (bytes, false),
+        [0, b'<', 0, b'?', ..] => (bytes, true),
+        _ => return String::from_utf8(bytes.to_vec()).ok(),
+    };
+    let (pairs, odd) = units.as_chunks::<2>();
+    if !odd.is_empty() {
+        return None;
+    }
+    let units = pairs.iter().map(|&pair| {
+        if big_endian {
+            u16::from_be_bytes(pair)
+        } else {
+            u16::from_le_bytes(pair)
+        }
+    });
+    let text = char::decode_utf16(units)
+        .collect::<Result<String, _>>()
+        .ok()?;
+    Some(declared_utf8(text))
+}
+
+/// `xml` with its declaration's UTF-16 encoding named as UTF-8, quote and
+/// all else unchanged.
+fn declared_utf8(xml: String) -> String {
+    let Some(end) = xml.starts_with("<?xml").then(|| xml.find("?>")).flatten() else {
+        return xml;
+    };
+    let declaration = &xml[..end];
+    for quote in ['"', '\''] {
+        for label in ["utf-16", "utf-16le", "utf-16be"] {
+            let pattern = format!("encoding={quote}{label}{quote}");
+            if let Some(at) = declaration.to_ascii_lowercase().find(&pattern) {
+                let utf8 = format!("encoding={quote}utf-8{quote}");
+                return format!("{}{utf8}{}", &xml[..at], &xml[at + pattern.len()..]);
+            }
+        }
+    }
+    xml
 }
 
 /// Write atomically (tmp + rename) so the driver never reads a torn file.
@@ -2071,5 +2144,172 @@ mod tests {
         assert!(written.contains("<width>2420</width>"));
         assert!(!path.with_extension("xml.tmp").exists(), "tmp cleaned up");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `text` as UTF-16, little or big endian, with or without a byte order
+    /// mark.
+    fn utf16(text: &str, big_endian: bool, bom: bool) -> Vec<u8> {
+        let units = bom.then_some(0xFEFF).into_iter().chain(text.encode_utf16());
+        units
+            .flat_map(|unit| {
+                if big_endian {
+                    unit.to_be_bytes()
+                } else {
+                    unit.to_le_bytes()
+                }
+            })
+            .collect()
+    }
+
+    /// Field triage round 2: a settings file saved as UTF-16 was "not valid
+    /// UTF-8", so the second screen kept the driver's old modes and the card
+    /// was never named.
+    #[test]
+    fn a_utf16_or_bom_settings_file_is_read_and_written_back_as_utf8() {
+        let dir = std::env::temp_dir().join(format!("vdd-encoding-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, record) = (
+            dir.join("vdd_settings.xml"),
+            dir.join("app").join("vdd-pin.txt"),
+        );
+        const INTEL: &str = "Intel(R) HD Graphics 630";
+        let declared16 = VENDOR.replace("encoding='utf-8'", "encoding='UTF-16'");
+        let fixtures: Vec<(&str, Vec<u8>)> = vec![
+            ("utf-16 le, bom", utf16(&declared16, false, true)),
+            ("utf-16 be, bom", utf16(&declared16, true, true)),
+            ("utf-16 le, no bom", utf16(&declared16, false, false)),
+            ("utf-16 be, no bom", utf16(&declared16, true, false)),
+            ("utf-16 le, bom, utf-8 declared", utf16(VENDOR, false, true)),
+            (
+                "utf-8, bom",
+                [&[0xEF, 0xBB, 0xBF][..], VENDOR.as_bytes()].concat(),
+            ),
+        ];
+        for (name, bytes) in &fixtures {
+            // Only the card changes, as the driver will read it.
+            std::fs::write(&path, bytes).unwrap();
+            let _ = std::fs::remove_file(&record);
+            let pinned = apply_pin(&path, &record, false, Some(INTEL));
+            assert_eq!(pinned.ok(), Some(PinOutcome::Named), "{name}");
+            let written = std::fs::read(&path).unwrap();
+            let text = String::from_utf8(written.clone()).expect(name);
+            let body = text.strip_prefix('\u{feff}').unwrap_or(&text);
+            assert!(
+                body.starts_with("<?xml version='1.0' encoding='utf-8'?>\r\n"),
+                "{name}: {body:?}"
+            );
+            assert_eq!(named_gpu(&text), Ok(Some(INTEL.to_string())), "{name}");
+            assert_eq!(
+                text.starts_with('\u{feff}'),
+                name.starts_with("utf-8"),
+                "{name}"
+            );
+            assert_eq!(
+                body,
+                VENDOR.replace(">default<", &format!(">{INTEL}<")),
+                "{name}"
+            );
+
+            // Match the iPad's resolution writes the whole file, as UTF-8.
+            std::fs::write(&path, bytes).unwrap();
+            let _ = std::fs::remove_file(&record);
+            let modes = modes_for_client(1640, 2360, 60);
+            let written = write_with_pin(&path, &record, false, &modes, Some(INTEL));
+            assert_eq!(written.ok(), Some(PinOutcome::Named), "{name}");
+            let text = std::fs::read_to_string(&path).expect(name);
+            assert_eq!(text, render(&modes, Some(INTEL)), "{name}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Review r1: UTF-32's little-endian byte order mark starts like
+    /// UTF-16's. Read as UTF-16 it held NULs, did not parse, and a driver
+    /// Setup installed with a card to name had the whole file replaced.
+    #[test]
+    fn a_utf32_settings_file_is_left_byte_for_byte() {
+        let dir = std::env::temp_dir().join(format!("vdd-encoding-32-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, record) = (
+            dir.join("vdd_settings.xml"),
+            dir.join("app").join("vdd-pin.txt"),
+        );
+        const INTEL: &str = "Intel(R) HD Graphics 630";
+        let utf32 = |big_endian: bool, bom: bool| -> Vec<u8> {
+            bom.then_some('\u{feff}')
+                .into_iter()
+                .chain(VENDOR.chars())
+                .flat_map(|c| {
+                    let c = c as u32;
+                    if big_endian {
+                        c.to_be_bytes()
+                    } else {
+                        c.to_le_bytes()
+                    }
+                })
+                .collect()
+        };
+        for (name, bytes) in [
+            ("utf-32 le, bom", utf32(false, true)),
+            ("utf-32 be, bom", utf32(true, true)),
+            ("utf-32 le, no bom", utf32(false, false)),
+            ("utf-32 be, no bom", utf32(true, false)),
+        ] {
+            for owned in [false, true] {
+                std::fs::write(&path, &bytes).unwrap();
+                let written = write_with_pin(&path, &record, owned, &default_modes(), Some(INTEL));
+                assert!(written.is_err(), "{name} owned={owned}");
+                assert!(
+                    apply_pin(&path, &record, owned, Some(INTEL)).is_err(),
+                    "{name}"
+                );
+                assert!(pin_gpu_in(&path, INTEL).is_err(), "{name}");
+                assert_eq!(std::fs::read(&path).unwrap(), bytes, "{name} owned={owned}");
+                assert!(!record.exists(), "{name} owned={owned}");
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A file in another encoding, or broken UTF-16, may hold anything:
+    /// it stays byte for byte, and the error says why.
+    #[test]
+    fn a_settings_file_in_another_encoding_is_left_alone() {
+        let dir = std::env::temp_dir().join(format!("vdd-encoding-other-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, record) = (
+            dir.join("vdd_settings.xml"),
+            dir.join("app").join("vdd-pin.txt"),
+        );
+        let ansi = VENDOR
+            .replace(">default<", ">Radeon\u{AE}<")
+            .replace('\u{AE}', "");
+        let mut ansi = ansi.into_bytes();
+        let at = ansi.windows(7).position(|w| w == b"Radeon<").unwrap() + 6;
+        ansi.insert(at, 0xAE);
+        let mut odd = utf16(VENDOR, false, true);
+        odd.push(b' ');
+        let mut lone = utf16(VENDOR, false, true);
+        lone.extend_from_slice(&0xD800u16.to_le_bytes());
+        for (name, bytes) in [
+            ("ansi", ansi),
+            ("odd utf-16", odd),
+            ("lone surrogate", lone),
+        ] {
+            std::fs::write(&path, &bytes).unwrap();
+            let pinned = apply_pin(&path, &record, false, Some("Intel(R) HD Graphics 630"));
+            let error = pinned.expect_err(name);
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{name}");
+            assert_eq!(
+                error.to_string(),
+                "the settings file is neither UTF-8 nor UTF-16"
+            );
+            let written = write_with_pin(&path, &record, false, &default_modes(), Some("x"));
+            assert!(written.is_err(), "{name}");
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{name}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
