@@ -313,6 +313,12 @@ final class ConnectionManager: ObservableObject {
     private var pcReturnPaused = false
     private var pcReturnTry: Task<Void, Never>?
     private var pcReturnLimit: Task<Void, Never>?
+    /// The automatic try checking that the PC is the same one.
+    private var pcReturnCheck: UUID?
+    /// The pairing an automatic try's session must give back, for the next
+    /// attempt and the current one.
+    private var pendingPairing: Data?
+    private var attemptPairing: Data?
     /// The automatic try is starting: the attempt it starts doesn't end the watch.
     private var startingPCReturnTry = false
 
@@ -561,6 +567,8 @@ final class ConnectionManager: ObservableObject {
         pendingMove = nil
         attemptRedirect = isUSB ? nil : pendingRedirect
         pendingRedirect = nil
+        attemptPairing = isUSB ? nil : pendingPairing
+        pendingPairing = nil
         noVideoFallback = nil
         noVideoStep = nil
         let connectionID = UUID()
@@ -595,6 +603,11 @@ final class ConnectionManager: ObservableObject {
         sessionWantsAudio = wantsAudio
         audioStats = AudioStats()
         debugState = ConnectionDebugState(host: normalizedHost, port: port)
+        // Watched for from the start, so the search knows what Bonjour
+        // already listed before this attempt's HELLO2s stop.
+        if !isUSB, attemptMove == nil, attemptRedirect == nil, reconnectCycleID == nil {
+            watchForPC(host: normalizedHost, port: port)
+        }
         record(.info, "connection", "Starting connection attempt=\(connectionID) transport=\(transportMode) to \(normalizedHost):\(port) drawing=\(drawing.enabled) input=\(wantsInput) audio=\(wantsAudio)")
         if attemptMove != nil {
             record(.info, "connection", attemptMove?.noVideo == true
@@ -810,6 +823,14 @@ final class ConnectionManager: ObservableObject {
             let acceptedAt = ProcessInfo.processInfo.systemUptime
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                // An automatic try streams only from the PC that gives the
+                // saved pairing back, whatever answered at that address.
+                if let pairing = self.attemptPairing, info.authToken != pairing {
+                    self.record(.warning, "connection", "pc_return result=other_pc")
+                    self.disconnect(.otherPC)
+                    self.problem = .noReply(usb: false)
+                    return
+                }
                 if let move = self.attemptMove {
                     guard Self.isSamePC(move, info) else {
                         self.record(.warning, "connection", "The PC at the new address isn't the saved one")
@@ -862,6 +883,14 @@ final class ConnectionManager: ObservableObject {
             let mismatch = channel?.lastMismatch
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                // Nor did the PC an automatic try reached: no pairing prompt,
+                // and the saved pairing stays.
+                if self.attemptPairing != nil, self.attemptMove == nil, status == .unauthorized || status == .rateLimited {
+                    self.record(.warning, "connection", "pc_return result=other_pc")
+                    self.disconnect(.otherPC)
+                    self.problem = .noReply(usb: false)
+                    return
+                }
                 // A PC that wants a code didn't take the saved PC's pairing:
                 // it is another PC, and the saved pairing stays.
                 if self.attemptMove != nil, status == .unauthorized || status == .rateLimited {
@@ -932,11 +961,6 @@ final class ConnectionManager: ObservableObject {
                     self.disconnect(.legacyPC)
                 } else {
                     self.record(.warning, "ctrl", "HELLO2 handshake got no reply yet")
-                    // No more HELLO2s go out: a PC app that opens from now
-                    // on is watched for.
-                    if !isUSB, self.attemptMove == nil, self.attemptRedirect == nil, self.reconnectCycleID == nil {
-                        self.watchForPC(host: normalizedHost, port: port)
-                    }
                     if self.leaveRememberedAddress(.pcMoved, result: "no_reply") {
                         // Back to the address tapped.
                     } else if !isUSB {
@@ -1473,15 +1497,23 @@ final class ConnectionManager: ObservableObject {
         }
     }
 
-    /// Starts watching Bonjour for the PC at `host:port`, by its service
-    /// when this iPad knows its name. A watch for that PC goes on as it was.
+    /// The pairing saved for the PC at `host:port`, if a valid one.
+    private func savedPairing(host: String, port: UInt16) -> Data? {
+        let token = (try? pairingStore.token(address: PairingStore.address(host: host, port: port))) ?? nil
+        return token.flatMap { PairingStore.valid($0) ? $0 : nil }
+    }
+
+    /// Starts watching Bonjour for the paired PC at `host:port`, by its
+    /// service when this iPad knows its name, as an attempt to it starts. An
+    /// automatic try must prove it is the same PC with the pairing, so an
+    /// unpaired PC isn't watched for. A watch for that PC goes on as it was.
     private func watchForPC(host: String, port: UInt16) {
         if let watch = pcReturn, watch.host == host, watch.port == port { return }
         endPCReturn()
-        let address = PairingStore.address(host: host, port: port)
-        let name = RecentConnectionStore.shared.entry(host: host, port: port)?.name ?? pairingStore.pcName(address: address)
-        pcReturn = PCReturn(service: name.flatMap { $0.isEmpty ? nil : MovedPC.serviceName(pcName: $0) },
-                            host: host, port: port, at: now())
+        guard savedPairing(host: host, port: port) != nil else { return }
+        let name = RecentConnectionStore.shared.entry(host: host, port: port)?.name
+            ?? pairingStore.pcName(address: PairingStore.address(host: host, port: port))
+        pcReturn = PCReturn(name: name, host: host, port: port, at: now())
         let browser = makePCBrowser()
         browser.onHosts = { [weak self] hosts in self?.pcReturnHeard(hosts) }
         pcReturnBrowser = browser
@@ -1489,10 +1521,10 @@ final class ConnectionManager: ObservableObject {
         if isForeground { browser.start() }
     }
 
-    /// The "didn't answer" card is up for the PC at `host:port`: it connects
+    /// The "didn't answer" card is up for the PC watched for: it connects
     /// once the PC shows up, until the time limit.
-    private func armPCReturn(host: String, port: UInt16) {
-        watchForPC(host: host, port: port)
+    private func armPCReturn() {
+        guard pcReturn != nil else { return }
         guard pcReturn?.armedAt == nil else { return considerPCReturn() }
         pcReturn?.arm(at: now())
         watchingForPC = true
@@ -1513,37 +1545,81 @@ final class ConnectionManager: ObservableObject {
         considerPCReturn()
     }
 
+    /// The card is up, in the foreground, with no try under way.
+    private var pcReturnMayTry: Bool {
+        guard let watch = pcReturn else { return false }
+        return isForeground && state == .disconnected && showsNoReplyOverWiFi && pcReturnCheck == nil
+            && !watch.expired(at: now(), limit: timing.pcReturnLimitSeconds)
+    }
+
     /// The PC showed up while the card is up, in the foreground: one try,
     /// after the debounce. Updates meanwhile count as the same appearance.
     private func considerPCReturn() {
-        guard let watch = pcReturn, watch.armedAt != nil, watch.appeared else { return }
+        guard let watch = pcReturn, watch.armedAt != nil, watch.appeared != nil else { return }
         guard !watch.expired(at: now(), limit: timing.pcReturnLimitSeconds) else {
             record(.info, "connection", "pc_return result=expired")
             return endPCReturn()
         }
-        guard isForeground, state == .disconnected, showsNoReplyOverWiFi, pcReturnTry == nil else { return }
+        guard pcReturnMayTry, pcReturnTry == nil else { return }
         let wait = timing.pcReturnDebounceSeconds
         pcReturnTry = Task { @MainActor [weak self] in
             try? await Task.sleep(for: .seconds(wait))
             guard !Task.isCancelled, let self else { return }
             self.pcReturnTry = nil
-            guard self.isForeground, self.state == .disconnected, self.showsNoReplyOverWiFi,
-                  let watch = self.pcReturn, !watch.expired(at: self.now(), limit: self.timing.pcReturnLimitSeconds),
-                  self.pcReturn?.takeAppearance() == true else { return }
-            self.tryPCAgain(host: watch.host, port: watch.port)
+            guard self.pcReturnMayTry, let found = self.pcReturn?.takeAppearance() else { return }
+            self.tryPCAgain(at: found)
         }
     }
 
-    /// Connects as Try again does, without ending the watch: if the PC
-    /// still doesn't answer, the card comes back and waits for it again.
-    private func tryPCAgain(host: String, port: UInt16) {
+    /// One try at where Bonjour has the PC now. First the PC there shows it
+    /// holds the saved pairing, as a moved PC does, so nothing goes to
+    /// another PC that took the address; an address other than the one
+    /// tried must also be on this iPad's own network. Then the attempt
+    /// carries the pairing, and only a session that gives it back counts.
+    /// If the PC still doesn't answer, the card comes back and waits again.
+    private func tryPCAgain(at found: DiscoveredHost) {
+        guard let watch = pcReturn, let host = found.address,
+              let token = savedPairing(host: watch.host, port: watch.port) else { return }
+        let port = found.port
+        let moved = host != watch.host || port != watch.port
         record(.info, "connection", "pc_return result=tried")
-        startingPCReturnTry = true
-        defer { startingPCReturnTry = false }
-        problem = nil
-        connectionError = nil
-        let target = lastTarget ?? (host: host, port: port)
-        connect(host: target.host, port: target.port)
+        let check = UUID()
+        pcReturnCheck = check
+        // The card may go, or another attempt start, while the PC is asked.
+        let current = { [weak self] () -> Bool in
+            guard let self, self.pcReturnCheck == check, self.pcReturn != nil else { return false }
+            return self.isForeground && self.state == .disconnected && self.showsNoReplyOverWiFi
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let done = { (result: String) in
+                if self.pcReturnCheck == check { self.pcReturnCheck = nil }
+                self.record(.info, "connection", "pc_return result=\(result)")
+            }
+            if host != watch.host {
+                guard self.homeAddress(host) else { return done("not_local") }
+                let route = await self.localRoute(host, port)
+                guard current() else { return }
+                guard let route, MovedPC.isLocal(host, over: route) else { return done("not_local") }
+            }
+            let same = await MovedPC.confirm(host: host, port: port, token: token, link: self.makeUDPLink(port))
+            guard current() else { return }
+            guard same else { return done("not_confirmed") }
+            self.pcReturnCheck = nil
+            self.startingPCReturnTry = true
+            defer { self.startingPCReturnTry = false }
+            self.problem = nil
+            self.connectionError = nil
+            // A PC at a new address or port moves the saved entry once it shows a picture.
+            if moved, let name = watch.name {
+                self.pendingMove = Move(from: (watch.host, watch.port), name: name, token: token)
+            }
+            self.pendingPairing = token
+            self.explicitPairingToken = token
+            self.connect(target: .udp(host: host, port: port))
+            self.pendingMove = nil
+            self.pendingPairing = nil
+        }
     }
 
     /// Dismissed, or replaced by another card: the watch ends. An attempt
@@ -1559,6 +1635,7 @@ final class ConnectionManager: ObservableObject {
     private func pausePCReturn() {
         pcReturnTry?.cancel()
         pcReturnTry = nil
+        pcReturnCheck = nil
         guard let browser = pcReturnBrowser, !pcReturnPaused else { return }
         pcReturnPaused = true
         browser.stop()
@@ -1577,6 +1654,7 @@ final class ConnectionManager: ObservableObject {
     private func endPCReturn() {
         pcReturnTry?.cancel()
         pcReturnTry = nil
+        pcReturnCheck = nil
         pcReturnLimit?.cancel()
         pcReturnLimit = nil
         pcReturnBrowser?.onHosts = nil
@@ -1625,9 +1703,7 @@ final class ConnectionManager: ObservableObject {
                 // The app gave up, not the user: the PC's log tells them apart.
                 self.disconnect(.connectTimeout)
                 if handshakeDone && self.noPictureStreak.stopsReconnecting { self.stopAutomaticAttempts(isUSB: isUSB) }
-                if self.showsNoReplyOverWiFi && self.reconnectCycleID == nil {
-                    self.armPCReturn(host: debug.host, port: debug.port)
-                }
+                if self.showsNoReplyOverWiFi && self.reconnectCycleID == nil { self.armPCReturn() }
             }
         }
     }
