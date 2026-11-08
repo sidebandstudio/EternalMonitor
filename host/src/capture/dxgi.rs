@@ -17,8 +17,8 @@ use super::recovery::{
 };
 use super::{
     acquired, client_connected, frame_budget_for, frame_buffer, heartbeat, idle_heartbeat,
-    keepalive_allowed, keepalive_due, read_back_image, reconcile_virtual_display, recovery_poll,
-    resolve_target, Acquired, FrameSlot, FrameUse, IdleGate, OutputInfo, RawFrame,
+    keepalive_allowed, keepalive_due, pointer_apart, read_back_image, reconcile_virtual_display,
+    recovery_poll, resolve_target, Acquired, FrameSlot, FrameUse, IdleGate, OutputInfo, RawFrame,
     ACQUIRE_TIMEOUT_MS, FPS_WINDOW, FRAME_PADDING,
 };
 use crate::control::{CaptureTarget, SharedControl};
