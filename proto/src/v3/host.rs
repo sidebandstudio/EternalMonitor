@@ -1260,6 +1260,36 @@ impl<A: PeerAddr> HostSessions<A> {
         out
     }
 
+    /// Answers a [`HostOutput::ConfirmRequested`] with `SessionBusy`: another
+    /// iPad is streaming. Seals it once under the pending session's send key,
+    /// to the confirm's address, and destroys the pending session; nothing
+    /// else changes. A lost answer leaves the iPad's attempt to time out.
+    /// Does nothing if that pending session is gone or past its lifetime.
+    pub fn busy(&mut self, now: Duration, dev_id: &Id16, session_id: u32) -> Vec<HostOutput<A>> {
+        let mut out = Vec::new();
+        let Some(device) = self.devices.get_mut(dev_id) else {
+            return out;
+        };
+        if !device
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.session_id == session_id && p.confirming && now < p.deadline)
+        {
+            return out;
+        }
+        let mut p = device.pending.take().expect("checked above");
+        self.sessions.remove(&session_id);
+        self.remember_expired(p.msg1_key, now);
+        let message = SessionMessage::Busy;
+        if let Ok(sealed) = p.sealer.seal(message.inner_type(), &message.encode_body()) {
+            out.push(HostOutput::Send {
+                to: p.peer.clone(),
+                datagram: sealed,
+            });
+        }
+        out
+    }
+
     /// Starts refusing a pending session whose record conflicts at Finalize.
     /// Keeps a send-only context (its send key, its `session_id`, the
     /// confirm's address) and destroys everything else, including the
@@ -1743,6 +1773,30 @@ mod tests {
             session_id: sid,
             reason: CloseReason::Superseded,
         }));
+        host.check_invariants();
+    }
+
+    #[test]
+    fn busy_answers_a_confirm_once_and_ends_the_pending_session() {
+        let (mut host, creds) = setup();
+        let (mut sealer, opener, sid) = confirming(&mut host, &creds, 10, T0);
+        let out = host.busy(T0 + ms(10), &DEV, sid);
+        let busy = sends(&out);
+        assert_eq!(busy.len(), 1);
+        let opened = opener.open(&busy[0]).unwrap();
+        assert_eq!(
+            (opened.inner_type, opened.body),
+            (wire::INNER_SESSION_BUSY, vec![])
+        );
+        assert_eq!(host.pending_session(&DEV), None);
+        assert_eq!(host.live_session(&DEV), None);
+        // Late answers and retries change nothing.
+        assert!(host.commit(T0 + ms(20), &DEV, sid).is_empty());
+        assert!(host.busy(T0 + ms(20), &DEV, sid).is_empty());
+        let retry = sealer.seal(wire::INNER_SESSION_CONFIRM, &[]).unwrap();
+        assert!(host
+            .handle_datagram(T0 + ms(30), &ADDR, &retry, &creds)
+            .is_empty());
         host.check_invariants();
     }
 

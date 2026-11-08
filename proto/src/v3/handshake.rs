@@ -12,7 +12,7 @@ use super::record::{wipe, SessionKeys};
 use super::wire::{self, HelloPayload, Msg1, Msg2Payload, MAX_NOISE_MESSAGE};
 use super::{session_prologue, Id16, Key32, V3Error, NOISE_PARAMS};
 
-fn builder<'a>(k_dev: &'a Key32, prologue: &'a [u8]) -> Builder<'a> {
+pub(super) fn builder<'a>(k_dev: &'a Key32, prologue: &'a [u8]) -> Builder<'a> {
     Builder::new(NOISE_PARAMS.parse().expect("valid Noise params"))
         .psk(0, k_dev)
         .expect("psk slot 0 exists for NNpsk0")
@@ -20,14 +20,14 @@ fn builder<'a>(k_dev: &'a Key32, prologue: &'a [u8]) -> Builder<'a> {
         .expect("prologue set once")
 }
 
-fn map_snow(error: snow::Error) -> V3Error {
+pub(super) fn map_snow(error: snow::Error) -> V3Error {
     match error {
         snow::Error::Decrypt => V3Error::Auth,
         _ => V3Error::Handshake,
     }
 }
 
-fn split(state: &mut HandshakeState) -> SessionKeys {
+pub(super) fn split(state: &mut HandshakeState) -> SessionKeys {
     let (mut k1, mut k2) = state.dangerously_get_raw_split();
     let mut handshake_hash = [0u8; 32];
     handshake_hash.copy_from_slice(state.get_handshake_hash());

@@ -995,7 +995,7 @@ fn a_replacing_pairing_retires_the_record_it_replaces() {
 }
 
 #[test]
-fn a_second_ipad_waits_while_one_streams() {
+fn a_second_ipad_is_told_the_host_is_busy() {
     let mut rig = Rig::new(&world(&[
         (0x11, 1, None, true, 0),
         (0x21, 2, None, true, 0),
@@ -1007,7 +1007,19 @@ fn a_second_ipad_waits_while_one_streams() {
     second.addr = SocketAddr::from(([10, 0, 0, 6], 50_001));
     connect(&mut rig, &mut second, 0x21);
     assert!(second.live().is_none());
+    assert!(second.saw(|o| matches!(o, ClientOutput::Busy { dev_id } if *dev_id == id(0x21))));
+    assert!(rig.host.table().pending_session(&id(0x21)).is_none());
     assert_eq!(rig.session.v3_session_id(), streaming);
+    assert_eq!(
+        rig.state(0x21),
+        Some(RecordState::Active),
+        "nothing changed"
+    );
+    // Once the first iPad is gone, the second connects.
+    let sends = rig.remove(&[id(0x11)]);
+    to_pad(&mut rig, &mut first, sends);
+    connect(&mut rig, &mut second, 0x21);
+    assert!(second.live().is_some());
 }
 
 #[test]
@@ -1575,4 +1587,238 @@ fn a_closed_store_stays_closed() {
     );
     assert!(matches!(rig.host.pairings(), Pairings::Unavailable(_)));
     assert_eq!(rig.host.held_invalid(), 0);
+}
+
+use eternal_wire::v3::pairing::{PairResult, PairingClient};
+
+fn host_addr() -> SocketAddr {
+    SocketAddr::from(([10, 0, 0, 1], 47_700))
+}
+
+/// Runs a QR pairing from slot `slot`, optionally proving `old`. Returns the
+/// iPad's pairing side and its new key, and what the host answered.
+fn pair(
+    rig: &mut Rig,
+    from: SocketAddr,
+    slot: u8,
+    old: Option<u8>,
+) -> (PairingClient, ClientKey, Option<PairResult>) {
+    let at = rig.at();
+    let qr = rig
+        .host
+        .open_pairing(at, host_addr(), "PC")
+        .expect("the window opens");
+    let mut ipad = PairingClient::start(
+        &qr,
+        &id(slot),
+        "0.4.0",
+        "Paired iPad",
+        from.port(),
+        &mut SeededRandom::new(u64::from(slot) + 40),
+    )
+    .unwrap();
+    let msg2 = rig.receive(from, ipad.msg1());
+    assert_eq!(msg2.len(), 1, "message 2");
+    let accept = ipad.read_msg2(&msg2[0].1).unwrap();
+    let key = ClientKey {
+        dev_id: accept.dev_id,
+        k_dev: *accept.k_new,
+    };
+    let proof = old.map(|n| ClientKey {
+        dev_id: id(n),
+        k_dev: self::key(n),
+    });
+    let confirm = ipad.confirm(proof.as_ref()).unwrap();
+    let answer = rig
+        .receive(from, &confirm)
+        .iter()
+        .find_map(|(_, d)| ipad.handle_record(d));
+    (ipad, key, answer)
+}
+
+fn connect_with(rig: &mut Rig, pad: &mut Pad, key: &ClientKey) {
+    let clock = Pad::clock(rig);
+    let outputs = pad.client.connect(rig.now, key.clone(), clock);
+    settle(rig, pad, outputs);
+}
+
+#[test]
+fn an_ipad_pairs_by_qr_then_connects_and_finalizes() {
+    let mut rig = Rig::new(&world(&[]));
+    let mut pad = Pad::new(50_000);
+    let (_, key, answer) = pair(&mut rig, pad.addr, 7, None);
+    let Some(PairResult::Done(status)) = answer else {
+        panic!("PairDone, after the write: {answer:?}");
+    };
+    assert_eq!(status.held, vec![(key.dev_id, RecordState::Pending)]);
+    let stored = rig
+        .store()
+        .records()
+        .into_iter()
+        .find(|r| r.dev_id == key.dev_id)
+        .expect("written");
+    assert_eq!(
+        (
+            stored.slot_id,
+            stored.state,
+            stored.replaces,
+            stored.device_name.as_str()
+        ),
+        (id(7), RecordState::Pending, None, "Paired iPad")
+    );
+    assert!(rig
+        .store()
+        .snapshot()
+        .key(&key.dev_id)
+        .is_some_and(|k| *k == key.k_dev));
+
+    // The new key connects, and that commit finalizes it.
+    connect_with(&mut rig, &mut pad, &key);
+    assert!(pad.live().is_some());
+    assert_eq!(
+        rig.store()
+            .records()
+            .into_iter()
+            .find(|r| r.dev_id == key.dev_id)
+            .map(|r| r.state),
+        Some(RecordState::Active)
+    );
+
+    // The QR is used up: pairing again needs a new one.
+    let at = rig.at();
+    assert!(rig.host.open_pairing(at, host_addr(), "PC").is_ok());
+}
+
+#[test]
+fn a_re_pairing_with_a_replace_proof_takes_over_the_slot() {
+    let mut rig = Rig::new(&world(&[(0x11, 1, None, true, 0)]));
+    let mut pad = Pad::new(50_000);
+    let (_, key, answer) = pair(&mut rig, pad.addr, 1, Some(0x11));
+    assert!(matches!(answer, Some(PairResult::Done(_))));
+    let stored = rig
+        .store()
+        .records()
+        .into_iter()
+        .find(|r| r.dev_id == key.dev_id)
+        .unwrap();
+    assert_eq!(stored.replaces, Some(id(0x11)), "the proof checked out");
+    connect_with(&mut rig, &mut pad, &key);
+    assert!(pad.live().is_some());
+    assert!(
+        rig.tombstoned(0x11),
+        "the old record is retired at Finalize"
+    );
+
+    // Without a proof, the same slot's new record conflicts at its commit.
+    let mut rig = Rig::new(&world(&[(0x11, 1, None, true, 0)]));
+    let mut pad = Pad::new(50_000);
+    let (_, key, answer) = pair(&mut rig, pad.addr, 1, None);
+    assert!(matches!(answer, Some(PairResult::Done(_))));
+    connect_with(&mut rig, &mut pad, &key);
+    assert!(pad.saw(|o| matches!(o, ClientOutput::Refused { dev_id, .. } if *dev_id == key.dev_id)));
+    assert_eq!(rig.state(0x11), Some(RecordState::Active));
+}
+
+#[test]
+fn caps_refuse_a_pairing_and_a_full_host_opens_no_window() {
+    // Slot 1 holds 1 active and 3 pending: the write is refused.
+    let mut rig = Rig::new(&world(&[
+        (0x11, 1, None, true, 0),
+        (0x12, 1, Some(0x11), false, 0),
+        (0x13, 1, Some(0x11), false, 0),
+        (0x14, 1, Some(0x11), false, 0),
+    ]));
+    let pad = Pad::new(50_000);
+    let (_, key, answer) = pair(&mut rig, pad.addr, 1, None);
+    assert_eq!(
+        answer,
+        Some(PairResult::Refused(
+            eternal_wire::v3::wire::PAIR_REFUSED_TOO_MANY
+        ))
+    );
+    assert!(rig.store().snapshot().key(&key.dev_id).is_none());
+
+    // 64 records: no QR at all.
+    let records: Vec<(u8, u8, Option<u8>, bool, u64)> =
+        (0..64u8).map(|n| (0x40 + n, n, None, true, 0)).collect();
+    let mut rig = Rig::new(&world(&records));
+    let at = rig.at();
+    assert_eq!(
+        rig.host.open_pairing(at, host_addr(), "PC").err(),
+        Some(PairingClosed::Full)
+    );
+}
+
+#[test]
+fn pairings_that_are_unavailable_open_no_window() {
+    let host = &mut V3Host::new(
+        HOST_ID,
+        None,
+        Pairings::Unavailable("test".into()),
+        Box::new(SeededRandom::new(1)),
+        Instant::now(),
+        WALL_S * 1_000_000,
+    );
+    assert_eq!(
+        host.open_pairing(Instant::now(), host_addr(), "PC").err(),
+        Some(PairingClosed::Unavailable)
+    );
+}
+
+/// Fails the store at every step of the pairing write, with the store
+/// reopened the way the writer does: the record is there or not, PairDone
+/// went out only if it is, and the iPad's next confirm finishes the job.
+#[test]
+fn a_crash_in_the_pairing_write_never_answers_what_isnt_stored() {
+    for k in 0.. {
+        let world = world(&[]);
+        let (store, _, live) = world.open();
+        let mut rig = Rig::with(store, live);
+        let pad = Pad::new(50_000);
+        let at = rig.at();
+        let qr = rig.host.open_pairing(at, host_addr(), "PC").unwrap();
+        let mut ipad = PairingClient::start(
+            &qr,
+            &id(7),
+            "0.4.0",
+            "iPad",
+            pad.addr.port(),
+            &mut SeededRandom::new(3),
+        )
+        .unwrap();
+        let msg2 = rig.receive(pad.addr, ipad.msg1());
+        let accept = ipad.read_msg2(&msg2[0].1).unwrap();
+        let dev_id = accept.dev_id;
+        let base = rig.live.steps.count.get();
+        rig.live.steps.crash_at.set(Some(base + k));
+        let confirm = ipad.confirm(None).unwrap();
+        let answer = rig
+            .receive(pad.addr, &confirm)
+            .iter()
+            .find_map(|(_, d)| ipad.handle_record(d));
+        let crashed = rig.live.steps.count.get() > base + k;
+        rig.live.steps.crash_at.set(None);
+        let held = rig.store().snapshot().key(&dev_id).is_some();
+        assert_eq!(matches!(answer, Some(PairResult::Done(_))), held, "k={k}");
+        assert_eq!(rig.host.held_invalid(), 0);
+        // A restart finds the same.
+        let (reopened, _, _) = rig.live.same_boot().open();
+        check_invariants(&reopened);
+        assert_eq!(reopened.snapshot().key(&dev_id).is_some(), held);
+        if !held {
+            // The iPad retries its confirm: written now, and answered.
+            rig.now += Duration::from_millis(100);
+            let retry = ipad.confirm(None).unwrap();
+            let answer = rig
+                .receive(pad.addr, &retry)
+                .iter()
+                .find_map(|(_, d)| ipad.handle_record(d));
+            assert!(matches!(answer, Some(PairResult::Done(_))), "k={k}");
+            assert!(rig.store().snapshot().key(&dev_id).is_some());
+        }
+        if !crashed {
+            break;
+        }
+        assert!(k < 100, "a write of bounded steps");
+    }
 }

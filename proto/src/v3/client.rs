@@ -153,6 +153,11 @@ pub enum ClientOutput {
     PairAgain {
         dev_id: Id16,
     },
+    /// Another iPad is streaming from the host: this attempt is over and
+    /// nothing changed. Show it; no attempt starts on its own.
+    Busy {
+        dev_id: Id16,
+    },
     /// No usable answer within the attempt's window. Try the next key.
     AttemptFailed {
         dev_id: Id16,
@@ -193,6 +198,7 @@ impl std::fmt::Debug for ClientOutput {
             Self::PairAgain { dev_id } => {
                 f.debug_struct("PairAgain").field("dev_id", dev_id).finish()
             }
+            Self::Busy { dev_id } => f.debug_struct("Busy").field("dev_id", dev_id).finish(),
             Self::AttemptFailed { dev_id } => f
                 .debug_struct("AttemptFailed")
                 .field("dev_id", dev_id)
@@ -602,6 +608,11 @@ impl Client {
                         self.retire_key(&dev_id);
                         out.push(ClientOutput::Refused { dev_id, status });
                     }
+                    Ok(Some(SessionMessage::Busy)) => {
+                        // The host dropped this session: nothing to keep.
+                        self.attempt = Attempt::Idle;
+                        out.push(ClientOutput::Busy { dev_id });
+                    }
                     Ok(None) => {
                         let Attempt::Confirming {
                             started, last_sent, ..
@@ -647,6 +658,10 @@ impl Client {
                 Ok(Some(SessionMessage::Refused(status))) => {
                     self.retire_key(&dev_id);
                     out.push(ClientOutput::Refused { dev_id, status });
+                }
+                Ok(Some(SessionMessage::Busy)) => {
+                    self.abandoned.remove(index);
+                    out.push(ClientOutput::Busy { dev_id });
                 }
                 Ok(None) => {
                     if !self.promote_abandoned(now, index, out) {
@@ -1022,6 +1037,42 @@ mod tests {
         ipad.handle_datagram(T0, &record, 1_000);
         assert_eq!(ipad.live_session(), Some(77));
         (ipad, host_sealer)
+    }
+
+    #[test]
+    fn busy_ends_the_attempt_and_keeps_everything_else() {
+        // A live session under the key, then a new attempt the host answers
+        // busy (the host's other iPad case, sealed under the new session).
+        let (mut ipad, _) = live_client();
+        let msg1 = sent(&ipad.connect(T0 + Duration::from_secs(1), key(), 2_000)).remove(0);
+        let parsed = wire::parse_msg1(&msg1).unwrap();
+        let host = Responder::read_msg1(&parsed, &key().k_dev, &HOST).unwrap();
+        let accept = Msg2Payload::Accept(Accept {
+            session_id: 78,
+            ..Default::default()
+        });
+        let (msg2, keys) = host.write_msg2(&accept).unwrap();
+        let (mut host_sealer, _) = keys.unwrap().responder(78);
+        ipad.handle_datagram(T0 + Duration::from_secs(1), &msg2, 2_000);
+        assert!(ipad.is_confirming());
+        let busy = SessionMessage::Busy;
+        let record = host_sealer
+            .seal(busy.inner_type(), &busy.encode_body())
+            .unwrap();
+        let out = ipad.handle_datagram(T0 + Duration::from_secs(1), &record, 2_000);
+        assert!(out.contains(&ClientOutput::Busy {
+            dev_id: key().dev_id
+        }));
+        assert!(!ipad.is_confirming() && !ipad.is_connecting());
+        assert_eq!(
+            ipad.live_session(),
+            Some(77),
+            "the live session is untouched"
+        );
+        assert_eq!(ipad.abandoned_count(), 0);
+        // No retry of its own (within the live session's liveness window).
+        let later = ipad.poll(T0 + Duration::from_millis(2_500), 5_000);
+        assert!(sent(&later).is_empty());
     }
 
     #[test]

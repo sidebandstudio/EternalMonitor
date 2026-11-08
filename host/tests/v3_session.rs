@@ -35,6 +35,7 @@ use eternal_wire::v2::control::{
 use eternal_wire::v2::media::MediaHeader;
 use eternal_wire::v2::{classify, Classified, PacketType};
 use eternal_wire::v3::client::{Client, ClientClose, ClientConfig, ClientKey, ClientOutput};
+use eternal_wire::v3::pairing::{PairResult, PairingClient};
 use eternal_wire::v3::wire::{HelloPayload, RecordState};
 use eternal_wire::v3::{Id16, SeededRandom, Zeroizing};
 use tokio::sync::mpsc;
@@ -136,6 +137,9 @@ struct Ipad {
     /// Cleartext control that reached the iPad.
     cleartext: usize,
     next_report: Duration,
+    /// A QR pairing in progress, and the key and answer it got.
+    pairing: Option<PairingClient>,
+    paired: Option<(ClientKey, Option<PairResult>)>,
 }
 
 impl Ipad {
@@ -173,7 +177,51 @@ impl Ipad {
             video: Vec::new(),
             cleartext: 0,
             next_report: Duration::MAX,
+            pairing: None,
+            paired: None,
         }
+    }
+
+    /// Scans a QR and sends pairing message 1.
+    async fn pair(&mut self, qr: &eternal_wire::v3::pairing::QrPayload) {
+        let port = self.address().port();
+        let client = PairingClient::start(
+            qr,
+            &id(0x77),
+            "0.4.0",
+            "v3 test iPad",
+            port,
+            &mut SeededRandom::new(21),
+        )
+        .unwrap();
+        let msg1 = client.msg1().to_vec();
+        self.pairing = Some(client);
+        self.send(&msg1).await;
+    }
+
+    /// A pairing datagram: message 2 (the key is stored, then confirmed)
+    /// or the host's answer. False if it isn't one.
+    async fn pairing_datagram(&mut self, datagram: &[u8]) -> bool {
+        let Some(pairing) = self.pairing.as_mut() else {
+            return false;
+        };
+        if let Ok(accept) = pairing.read_msg2(datagram) {
+            let key = ClientKey {
+                dev_id: accept.dev_id,
+                k_dev: *accept.k_new,
+            };
+            self.paired = Some((key, None));
+            let confirm = pairing.confirm(None).unwrap();
+            self.send(&confirm).await;
+            return true;
+        }
+        if let Some(answer) = pairing.handle_record(datagram) {
+            if let Some((_, slot)) = self.paired.as_mut() {
+                *slot = Some(answer);
+            }
+            return true;
+        }
+        false
     }
 
     fn address(&self) -> SocketAddr {
@@ -258,6 +306,7 @@ impl Ipad {
                     self.video.push((header.session_id, header.is_keyframe));
                 }
                 Classified::Control(_) => self.cleartext += 1,
+                _ if self.pairing_datagram(&datagram).await => {}
                 _ => {
                     let (now, clock) = (self.now(), self.clock_us());
                     let outputs = self.client.handle_datagram(now, &datagram, clock);
@@ -454,13 +503,17 @@ impl Sim {
     }
 
     fn state(&self, dev: u8) -> Option<RecordState> {
+        self.state_of(&id(dev))
+    }
+
+    fn state_of(&self, dev_id: &Id16) -> Option<RecordState> {
         let v3 = self.shared.v3.lock();
         let snapshot = v3.as_ref().unwrap().host.snapshot();
         snapshot
-            .slot_status(&id(dev))
+            .slot_status(dev_id)
             .held
             .iter()
-            .find(|(d, _)| *d == id(dev))
+            .find(|(d, _)| d == dev_id)
             .map(|(_, s)| *s)
     }
 
@@ -624,6 +677,39 @@ fn video_follows_a_replacing_record_to_its_session() {
             sim.ipad.video_of(new) > before + 10,
             "video reaches the new session"
         );
+        sim.stop().await;
+    });
+}
+
+/// A new iPad pairs by QR over the network (the host stores second, then
+/// answers), connects with the key it got, and streams.
+#[test]
+fn an_ipad_pairs_by_qr_then_connects_and_streams() {
+    run(async {
+        let mut sim = Sim::start(&[]).await;
+        let qr = transport::v3::open_pairing(&sim.shared, sim.ipad.host, "PC")
+            .expect("v3 is on")
+            .expect("the window opens");
+        sim.ipad.pair(&qr).await;
+        sim.run_for(Duration::from_millis(500)).await;
+        let (key, answer) = sim.ipad.paired.clone().expect("message 2 arrived");
+        let Some(PairResult::Done(status)) = answer else {
+            panic!("PairDone: {answer:?}");
+        };
+        assert_eq!(status.held, vec![(key.dev_id, RecordState::Pending)]);
+        assert_eq!(sim.state_of(&key.dev_id), Some(RecordState::Pending));
+
+        let (now, clock) = (sim.ipad.now(), sim.ipad.clock_us());
+        let outputs = sim.ipad.client.connect(now, key.clone(), clock);
+        sim.ipad.act(outputs).await;
+        sim.run_for(Duration::from_secs(1)).await;
+        let session = sim.ipad.live().expect("live under the new key");
+        assert_eq!(
+            sim.state_of(&key.dev_id),
+            Some(RecordState::Active),
+            "finalized"
+        );
+        assert!(sim.ipad.video_of(session) > 30);
         sim.stop().await;
     });
 }

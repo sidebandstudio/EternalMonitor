@@ -30,7 +30,7 @@
 //!   invalidation procedure), then the store retires them. A Finalize that
 //!   replaces a record does the same for the record it replaces.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::net::IpAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -41,8 +41,11 @@ use eternal_wire::v2::{CommonPrefix, PacketType};
 use eternal_wire::v3::host::{
     CloseReason, HostConfig, HostCredentials, HostOutput, HostSessions, PeerAddr,
 };
+use eternal_wire::v3::pairing::{
+    PairCredentials, PairOutput, PairingConfig, PairingHost, QrPayload, StoreResult,
+};
 use eternal_wire::v3::wire::{Accept, SlotStatus};
-use eternal_wire::v3::{Id16, Key32, Random, Zeroizing};
+use eternal_wire::v3::{Id16, Key32, Random, Zeroizing, EXT_PAIR_QR};
 use tracing::{info, warn};
 
 use super::link::{LinkId, PeerId};
@@ -97,6 +100,25 @@ pub enum StoreJob {
     /// Expire the pending records at least 7 days old at `now_s`; `dev_ids`
     /// are those this host ended at step 1.
     Expire { now_s: u64, dev_ids: Vec<Id16> },
+    /// Pairing step 5: add the pending record the iPad confirmed it stored.
+    AddPending {
+        dev_id: Id16,
+        slot_id: Id16,
+        key: SecretKey,
+        replaces: Option<Id16>,
+        device_name: String,
+        now_s: u64,
+    },
+}
+
+/// A record key in a job. `Debug` never shows it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SecretKey(pub Box<Zeroizing<Key32>>);
+
+impl std::fmt::Debug for SecretKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SecretKey(..)")
+    }
 }
 
 impl StoreJob {
@@ -104,7 +126,7 @@ impl StoreJob {
     fn holds(&self) -> &[Id16] {
         match self {
             Self::Commit { retires, .. } => retires.as_slice(),
-            Self::Retire { .. } => &[],
+            Self::Retire { .. } | Self::AddPending { .. } => &[],
             Self::Remove { dev_ids } | Self::Expire { dev_ids, .. } => dev_ids,
         }
     }
@@ -152,6 +174,25 @@ pub fn run_job<D: eternal_credstore::Disk, K: eternal_credstore::Keyring>(
         StoreJob::Retire { .. } => Ok(None),
         StoreJob::Remove { dev_ids } => store.remove(dev_ids).map(|()| None),
         StoreJob::Expire { now_s, .. } => store.expire(*now_s).map(|_| None),
+        StoreJob::AddPending {
+            dev_id,
+            slot_id,
+            key,
+            replaces,
+            device_name,
+            now_s,
+        } => store
+            .add_pending(
+                eternal_credstore::NewRecord {
+                    dev_id: *dev_id,
+                    slot_id: *slot_id,
+                    key: key.0.clone(),
+                    replaces: *replaces,
+                    device_name: device_name.clone(),
+                },
+                *now_s,
+            )
+            .map(|()| None),
     };
     JobDone {
         job,
@@ -257,7 +298,7 @@ impl HostCredentials for Credentials {
 
     fn accept_template(&self, dev_id: &Id16) -> Accept {
         let mut accept = self.accept.clone();
-        accept.slot_status = self.slot_status(dev_id);
+        accept.slot_status = HostCredentials::slot_status(self, dev_id);
         accept
     }
 
@@ -271,6 +312,27 @@ impl HostCredentials for Credentials {
 struct Queued {
     dev_id: Id16,
     slot: Option<Id16>,
+}
+
+impl PairCredentials for Credentials {
+    fn active_in_slot(&self, slot_id: &Id16) -> Option<(Id16, Zeroizing<Key32>)> {
+        let active = self.snapshot.active_in(slot_id)?;
+        // A record on its way out proves nothing.
+        Some((active, self.key(&active)?))
+    }
+
+    fn slot_status(&self, dev_id: &Id16) -> SlotStatus {
+        self.snapshot.slot_status(dev_id)
+    }
+}
+
+/// Why the pairing window can't open.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairingClosed {
+    /// The store can't be used.
+    Unavailable,
+    /// The host holds as many records as it may; remove one first.
+    Full,
 }
 
 /// The v3 session [`Session`] streams to.
@@ -287,9 +349,8 @@ pub struct V3Host {
     streaming: Option<Streaming>,
     /// Jobs for the writer, oldest first.
     outbox: VecDeque<StoreJob>,
-    /// Decisions owed on confirms that wait for nothing: a busy host lets
-    /// them time out.
-    busy_logged: HashSet<u32>,
+    /// QR pairing: the window and the pairing in flight.
+    pairing: PairingHost<PeerId>,
     /// A job came back with the store closed: it stays closed until the
     /// host restarts.
     store_closed: bool,
@@ -333,7 +394,13 @@ impl V3Host {
             pairings,
             streaming: None,
             outbox: VecDeque::new(),
-            busy_logged: HashSet::new(),
+            pairing: PairingHost::new(
+                PairingConfig::default(),
+                host_id,
+                env!("CARGO_PKG_VERSION"),
+                "",
+                Box::new(eternal_wire::v3::SystemRandom::default()),
+            ),
             store_closed: false,
             queued: Vec::new(),
             origin: now,
@@ -408,6 +475,22 @@ impl V3Host {
             // v3 over the USB tunnel comes with sealed media (phase 5).
             return actions;
         }
+        let at = self.at(now);
+        let pairing = match kind {
+            V3Kind::Handshake1 => {
+                eternal_wire::v3::wire::extension_tag(datagram) == Some(EXT_PAIR_QR)
+            }
+            V3Kind::Sealed => eternal_wire::v3::record::RecordHeader::parse(datagram)
+                .is_ok_and(|h| Some(h.session_id) == self.pairing.session_id()),
+            _ => false,
+        };
+        if pairing {
+            let out = self
+                .pairing
+                .handle_datagram(at, &source, datagram, &self.creds);
+            self.apply_pairing(out, now, &mut actions);
+            return actions;
+        }
         match kind {
             // Message 2 carries the host's HelloAck fields.
             V3Kind::Handshake1 => self.refresh_accept(session, config),
@@ -423,13 +506,62 @@ impl V3Host {
                 return actions;
             }
         }
-        let at = self.at(now);
         let out = self
             .sessions
             .handle_datagram(at, &source, datagram, &self.creds);
         self.follow_peer(session, &mut actions);
         self.apply(session, out, config, now, &mut actions);
         actions
+    }
+
+    /// Acts on the pairing's outputs: answers go out as they are (sealed, or
+    /// message 2), and a confirmed record goes to the writer.
+    fn apply_pairing(&mut self, out: Vec<PairOutput<PeerId>>, now: Instant, actions: &mut Actions) {
+        for output in out {
+            match output {
+                PairOutput::Send { to, datagram } => actions.replies.push((to, datagram)),
+                PairOutput::Store(pending) => self.outbox.push_back(StoreJob::AddPending {
+                    dev_id: pending.dev_id,
+                    slot_id: pending.slot_id,
+                    key: SecretKey(pending.key),
+                    replaces: pending.replaces,
+                    device_name: pending.device_name,
+                    now_s: self.wall_s(now),
+                }),
+                PairOutput::Paired { device_name, .. } => {
+                    info!(device = %device_name, "Paired an iPad: it can connect now");
+                }
+            }
+        }
+    }
+
+    /// The wall clock at `now`, in seconds since the Unix epoch.
+    fn wall_s(&self, now: Instant) -> u64 {
+        (self.wall_origin_us + u64::try_from(self.at(now).as_micros()).unwrap_or(0)) / 1_000_000
+    }
+
+    /// Opens the pairing window: a fresh QR for `addr`, where the host
+    /// listens. Any earlier QR stops working. Refused while the store can't
+    /// be used, or when the host already holds as many records as it may.
+    pub fn open_pairing(
+        &mut self,
+        now: Instant,
+        addr: std::net::SocketAddr,
+        host_name: &str,
+    ) -> Result<QrPayload, PairingClosed> {
+        if self.pairings != Pairings::Ready {
+            return Err(PairingClosed::Unavailable);
+        }
+        if self.creds.snapshot.len() >= eternal_wire::v3::host::MAX_CREDENTIALS {
+            return Err(PairingClosed::Full);
+        }
+        self.pairing.set_host_name(host_name);
+        Ok(self.pairing.open(self.at(now), addr))
+    }
+
+    /// Closes the pairing window: its QR stops working.
+    pub fn close_pairing(&mut self) {
+        self.pairing.close();
     }
 
     /// The live session moved: [`Session`] and the media follow.
@@ -458,9 +590,7 @@ impl V3Host {
                 HostOutput::ConfirmRequested { dev_id, session_id } => {
                     queue.extend(self.decide(session, dev_id, session_id, now));
                 }
-                HostOutput::ConfirmCancelled { session_id, .. } => {
-                    self.busy_logged.remove(&session_id);
-                }
+                HostOutput::ConfirmCancelled { .. } => {}
                 HostOutput::Committed {
                     dev_id,
                     session_id,
@@ -469,7 +599,6 @@ impl V3Host {
                     peer,
                     ..
                 } => {
-                    self.busy_logged.remove(&session_id);
                     if let Some(other) = self.streaming.filter(|s| s.dev_id != dev_id) {
                         // The same iPad under another of its records is
                         // superseded; another iPad's session on hold gives
@@ -596,10 +725,11 @@ impl V3Host {
                 .streaming
                 .is_none_or(|s| !self.same_slot(&s.dev_id, &dev_id));
         if busy {
-            if self.busy_logged.insert(session_id) {
-                info!(session_id, "Second client waits while a session is active");
-            }
-            return Vec::new();
+            info!(
+                session_id,
+                "Second client turned away while a session is active"
+            );
+            return self.sessions.busy(at, &dev_id, session_id);
         }
         self.sessions.commit(at, &dev_id, session_id)
     }
@@ -806,6 +936,23 @@ impl V3Host {
                 }
             }
             (StoreJob::Remove { .. }, Ok(_)) => {}
+            (StoreJob::AddPending { dev_id, .. }, result) => {
+                // The store's state after the job (and any reopen) decides:
+                // a write that failed after it reached the disk is stored,
+                // and a retry of it would only find a duplicate.
+                let landed = self.creds.snapshot.key(&dev_id).is_some();
+                let result = match result {
+                    Ok(_) => StoreResult::Stored,
+                    _ if landed => StoreResult::Stored,
+                    Err(StoreError::TooMany) => StoreResult::TooMany,
+                    Err(error) => {
+                        warn!(%error, "Could not store a new pairing; the iPad's next confirm tries again");
+                        StoreResult::Failed
+                    }
+                };
+                let out = self.pairing.stored(at, &dev_id, result, &self.creds);
+                self.apply_pairing(out, now, &mut actions);
+            }
         }
         self.apply(session, out, config, now, &mut actions);
         actions
@@ -822,6 +969,7 @@ impl V3Host {
         let mut actions = Actions::default();
         let at = self.at(now);
         let mut out = self.sessions.poll(at);
+        self.pairing.poll(at);
         if now >= self.next_expire_check && !self.expiring {
             self.next_expire_check = now + EXPIRE_CHECK;
             let now_s = (self.wall_origin_us
@@ -1175,6 +1323,17 @@ pub fn on_jobs_done(
     drop(session);
     runtime.flush();
     Some(actions)
+}
+
+/// Opens the pairing window for a QR that points at `addr`, in v3 mode.
+pub fn open_pairing(
+    shared: &crate::control::SharedControl,
+    addr: std::net::SocketAddr,
+    host_name: &str,
+) -> Option<Result<QrPayload, PairingClosed>> {
+    let mut v3 = shared.v3.lock();
+    let runtime = v3.as_mut()?;
+    Some(runtime.host.open_pairing(Instant::now(), addr, host_name))
 }
 
 /// Seals control datagrams [`Session`] made outside a pass of this module
