@@ -65,6 +65,54 @@ struct UpdateBanner: View {
     }
 }
 
+/// Connect screen: the PC this iPad found or streamed from runs an
+/// EternalMonitor older than 0.3.4. Quiet, and only in the screen's flow.
+struct OldPCCard: View {
+    let card: OldPCPrompt.Card
+    let close: () -> Void
+
+    var body: some View {
+        let title = L("Your PC app is out of date")
+        let detail = L("Update EternalMonitor on \(card.pc) for faster, steadier streaming. Download it on the PC from eternalmonitor.dev.")
+        HStack(alignment: .top, spacing: 12) {
+            Image(systemName: "desktopcomputer")
+                .font(.system(size: 15, weight: .semibold))
+                .foregroundStyle(Theme.accent)
+                .frame(width: 34, height: 34)
+                .background(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(Theme.accent.opacity(0.1))
+                )
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title)
+                    .font(.app(15, .semibold, relativeTo: .subheadline))
+                    .foregroundStyle(Theme.text)
+                Text(detail)
+                    .font(.app(13, relativeTo: .footnote))
+                    .foregroundStyle(Theme.textMuted)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityIdentifier("connect.oldPC")
+            Spacer(minLength: 0)
+            Button(action: close) {
+                Image(systemName: "xmark")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(Theme.textFaint)
+                    .frame(width: 44, height: 44)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .padding(.top, -6)
+            .accessibilityLabel(Text(verbatim: L("Close")))
+            .accessibilityIdentifier("connect.oldPCClose")
+        }
+        .card(padding: 12)
+        .transition(.opacity)
+    }
+}
+
 /// Connect screen: a small card over the screen when a newer build is ready.
 /// `allowed` is false while the user is busy (connecting, typing, or in a
 /// sheet). The Connect screen is never on screen during a stream.
