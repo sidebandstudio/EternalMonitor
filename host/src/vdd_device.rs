@@ -140,83 +140,232 @@ pub fn from_task_stderr(stderr: &str) -> Option<DeviceState> {
 /// Read the driver's device from Configuration Manager.
 #[cfg(windows)]
 pub fn query() -> DeviceState {
-    use windows::core::{w, PCWSTR};
     use windows::Win32::Devices::DeviceAndDriverInstallation::{
-        CM_Get_Child, CM_Get_DevNode_Registry_PropertyW, CM_Get_DevNode_Status,
-        CM_Get_Device_ID_ListW, CM_Get_Device_ID_List_SizeW, CM_Locate_DevNodeW,
-        CM_DEVNODE_STATUS_FLAGS, CM_DRP_DRIVER, CM_DRP_HARDWAREID, CM_GETIDLIST_FILTER_ENUMERATOR,
-        CM_GETIDLIST_FILTER_PRESENT, CM_LOCATE_DEVNODE_NORMAL, CM_PROB, CR_BUFFER_SMALL,
-        CR_SUCCESS,
+        CM_Get_Child, CM_DRP_DRIVER, CR_SUCCESS,
     };
 
-    let status = |devinst: u32| {
-        let (mut status, mut problem) = (CM_DEVNODE_STATUS_FLAGS(0), CM_PROB(0));
-        (unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, devinst, 0) } == CR_SUCCESS)
-            .then_some((status.0, problem.0))
+    let Some(devnodes) = root_devnodes() else {
+        return DeviceState::Missing;
     };
-    let property = |devinst: u32, which: u32| -> Option<Vec<u16>> {
-        let mut bytes = 0u32;
-        let result =
-            unsafe { CM_Get_DevNode_Registry_PropertyW(devinst, which, None, None, &mut bytes, 0) };
-        if result != CR_BUFFER_SMALL || bytes == 0 {
+    let states = devnodes.into_iter().filter_map(|devnode| {
+        let Devnode::Driver { devinst, status } = devnode else {
             return None;
-        }
-        let mut buffer = vec![0u16; bytes.div_ceil(2) as usize];
-        (unsafe {
-            CM_Get_DevNode_Registry_PropertyW(
+        };
+        let (flags, problem) = status?;
+        let mut child = 0u32;
+        let monitor = (unsafe { CM_Get_Child(&mut child, devinst, 0) } == CR_SUCCESS).then(|| {
+            devnode_status(child)
+                .is_some_and(|(flags, _)| flags & DN_STARTED != 0 && flags & DN_HAS_PROBLEM == 0)
+        });
+        let has_driver = matches!(registry_property(devinst, CM_DRP_DRIVER), Ok(Some(_)));
+        Some(DeviceState::from_devnode(
+            flags, problem, has_driver, monitor,
+        ))
+    });
+    DeviceState::best(states)
+}
+
+/// One present root device, as Configuration Manager read it.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Devnode {
+    /// Its hardware IDs were read (or it has none) and don't name the driver.
+    Other,
+    /// The driver's device, with its status flags and problem code, `None`
+    /// when they couldn't be read.
+    Driver {
+        devinst: u32,
+        status: Option<(u32, u32)>,
+    },
+    /// It couldn't be located, or its hardware IDs couldn't be read: it may
+    /// be the driver's.
+    Unread,
+}
+
+/// The driver as Configuration Manager reads it (`vdd_settings::DriverRun`),
+/// from the present root devices (`None` when they couldn't be listed):
+/// off when every device of the driver reads as not started, or there is
+/// none; running with the start `start` reads for its one running device;
+/// unreadable when any read failed, a device started with a problem, or
+/// more than one runs.
+#[cfg(any(windows, test))]
+pub(crate) fn run_from(
+    devnodes: Option<&[Devnode]>,
+    start: impl FnOnce(u32) -> Option<crate::vdd_settings::DriverInstance>,
+) -> crate::vdd_settings::DriverRun {
+    use crate::vdd_settings::DriverRun;
+    let Some(devnodes) = devnodes else {
+        return DriverRun::Unreadable;
+    };
+    let mut running = None;
+    for devnode in devnodes {
+        match *devnode {
+            Devnode::Other => {}
+            Devnode::Unread | Devnode::Driver { status: None, .. } => return DriverRun::Unreadable,
+            Devnode::Driver {
                 devinst,
-                which,
-                None,
-                Some(buffer.as_mut_ptr().cast()),
-                &mut bytes,
-                0,
-            )
-        } == CR_SUCCESS)
-            .then_some(buffer)
+                status: Some((flags, _)),
+            } => {
+                if flags & DN_STARTED == 0 {
+                    continue;
+                }
+                if flags & DN_HAS_PROBLEM != 0 || running.replace(devinst).is_some() {
+                    return DriverRun::Unreadable;
+                }
+            }
+        }
+    }
+    match running {
+        None => DriverRun::Off,
+        Some(devinst) => start(devinst).map_or(DriverRun::Unreadable, DriverRun::Running),
+    }
+}
+
+/// The driver as Configuration Manager reads it now (`run_from`).
+#[cfg(windows)]
+pub fn run_state() -> crate::vdd_settings::DriverRun {
+    run_from(root_devnodes().as_deref(), driver_start)
+}
+
+/// The start of the driver running on `devinst`: this boot and the
+/// device's last arrival.
+#[cfg(windows)]
+fn driver_start(devinst: u32) -> Option<crate::vdd_settings::DriverInstance> {
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{
+        CM_Get_DevNode_PropertyW, CR_SUCCESS,
+    };
+    use windows::Win32::Devices::Properties::{
+        DEVPKEY_Device_LastArrivalDate, DEVPROPTYPE, DEVPROP_TYPE_FILETIME,
+    };
+    let (mut arrival, mut kind, mut size) = (0u64, DEVPROPTYPE(0), 8u32);
+    let result = unsafe {
+        CM_Get_DevNode_PropertyW(
+            devinst,
+            &DEVPKEY_Device_LastArrivalDate,
+            &mut kind,
+            Some((&mut arrival as *mut u64).cast()),
+            &mut size,
+            0,
+        )
+    };
+    if result != CR_SUCCESS || kind != DEVPROP_TYPE_FILETIME || size != 8 || arrival == 0 {
+        return None;
+    }
+    Some(crate::vdd_settings::DriverInstance {
+        boot_id: boot_id()?,
+        arrival,
+    })
+}
+
+/// Windows' count of boots, which the kernel raises at each one.
+#[cfg(windows)]
+fn boot_id() -> Option<u32> {
+    use windows::core::w;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD};
+    let (mut value, mut bytes) = (0u32, 4u32);
+    unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            w!(r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters"),
+            w!("BootId"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut value as *mut u32).cast()),
+            Some(&mut bytes),
+        )
+    }
+    .is_ok()
+    .then_some(value)
+}
+
+/// The present root devices (`Devnode`), or `None` when Windows can't list
+/// them. A device that can't be located or whose hardware IDs can't be read
+/// is kept as `Unread`, never dropped.
+#[cfg(windows)]
+fn root_devnodes() -> Option<Vec<Devnode>> {
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{
+        CM_Get_Device_ID_ListW, CM_Get_Device_ID_List_SizeW, CM_Locate_DevNodeW, CM_DRP_HARDWAREID,
+        CM_GETIDLIST_FILTER_ENUMERATOR, CM_GETIDLIST_FILTER_PRESENT, CM_LOCATE_DEVNODE_NORMAL,
+        CR_SUCCESS,
     };
 
     let flags = CM_GETIDLIST_FILTER_ENUMERATOR | CM_GETIDLIST_FILTER_PRESENT;
     let mut len = 0u32;
     if unsafe { CM_Get_Device_ID_List_SizeW(&mut len, w!("ROOT"), flags) } != CR_SUCCESS {
-        return DeviceState::Missing;
+        return None;
     }
     let mut ids = vec![0u16; len as usize];
     if unsafe { CM_Get_Device_ID_ListW(w!("ROOT"), &mut ids, flags) } != CR_SUCCESS {
-        return DeviceState::Missing;
+        return None;
     }
-    let states = ids
-        .split(|&unit| unit == 0)
-        .filter(|id| !id.is_empty())
-        .filter_map(|id| {
-            let id: Vec<u16> = id.iter().copied().chain(Some(0)).collect();
-            let mut devinst = 0u32;
-            if unsafe {
-                CM_Locate_DevNodeW(&mut devinst, PCWSTR(id.as_ptr()), CM_LOCATE_DEVNODE_NORMAL)
-            } != CR_SUCCESS
-            {
-                return None;
-            }
-            let hardware_ids = property(devinst, CM_DRP_HARDWAREID)?;
-            hardware_ids
-                .split(|&unit| unit == 0)
-                .any(|hwid| String::from_utf16_lossy(hwid).eq_ignore_ascii_case(HARDWARE_ID))
-                .then_some(devinst)
-        })
-        .filter_map(|devinst| {
-            let (flags, problem) = status(devinst)?;
-            let mut child = 0u32;
-            let monitor =
-                (unsafe { CM_Get_Child(&mut child, devinst, 0) } == CR_SUCCESS).then(|| {
-                    status(child).is_some_and(|(flags, _)| {
-                        flags & DN_STARTED != 0 && flags & DN_HAS_PROBLEM == 0
-                    })
-                });
-            let has_driver = property(devinst, CM_DRP_DRIVER).is_some();
-            Some(DeviceState::from_devnode(
-                flags, problem, has_driver, monitor,
-            ))
-        });
-    DeviceState::best(states)
+    Some(
+        ids.split(|&unit| unit == 0)
+            .filter(|id| !id.is_empty())
+            .map(|id| {
+                let id: Vec<u16> = id.iter().copied().chain(Some(0)).collect();
+                let mut devinst = 0u32;
+                if unsafe {
+                    CM_Locate_DevNodeW(&mut devinst, PCWSTR(id.as_ptr()), CM_LOCATE_DEVNODE_NORMAL)
+                } != CR_SUCCESS
+                {
+                    return Devnode::Unread;
+                }
+                match registry_property(devinst, CM_DRP_HARDWAREID) {
+                    Err(()) => Devnode::Unread,
+                    Ok(Some(hardware_ids))
+                        if hardware_ids.split(|&unit| unit == 0).any(|hwid| {
+                            String::from_utf16_lossy(hwid).eq_ignore_ascii_case(HARDWARE_ID)
+                        }) =>
+                    {
+                        Devnode::Driver {
+                            devinst,
+                            status: devnode_status(devinst),
+                        }
+                    }
+                    Ok(_) => Devnode::Other,
+                }
+            })
+            .collect(),
+    )
+}
+
+#[cfg(windows)]
+fn devnode_status(devinst: u32) -> Option<(u32, u32)> {
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{
+        CM_Get_DevNode_Status, CM_DEVNODE_STATUS_FLAGS, CM_PROB, CR_SUCCESS,
+    };
+    let (mut status, mut problem) = (CM_DEVNODE_STATUS_FLAGS(0), CM_PROB(0));
+    (unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, devinst, 0) } == CR_SUCCESS)
+        .then_some((status.0, problem.0))
+}
+
+/// A device's registry property: `Ok(None)` when it has none
+/// (`CR_NO_SUCH_VALUE`), `Err` when the read failed.
+#[cfg(windows)]
+fn registry_property(devinst: u32, which: u32) -> Result<Option<Vec<u16>>, ()> {
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{
+        CM_Get_DevNode_Registry_PropertyW, CR_BUFFER_SMALL, CR_NO_SUCH_VALUE, CR_SUCCESS,
+    };
+    let mut bytes = 0u32;
+    match unsafe { CM_Get_DevNode_Registry_PropertyW(devinst, which, None, None, &mut bytes, 0) } {
+        CR_NO_SUCH_VALUE => return Ok(None),
+        CR_BUFFER_SMALL if bytes > 0 => {}
+        _ => return Err(()),
+    }
+    let mut buffer = vec![0u16; bytes.div_ceil(2) as usize];
+    (unsafe {
+        CM_Get_DevNode_Registry_PropertyW(
+            devinst,
+            which,
+            None,
+            Some(buffer.as_mut_ptr().cast()),
+            &mut bytes,
+            0,
+        )
+    } == CR_SUCCESS)
+        .then_some(Some(buffer))
+        .ok_or(())
 }
 
 /// Set the mode of the virtual display `device` (a GDI name like
@@ -297,6 +446,88 @@ pub fn query() -> DeviceState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Review r6: a root device whose location or hardware IDs couldn't be
+    /// read may be the driver's, so the driver's state is unreadable, not
+    /// off, and an Enable after it keeps no record. One whose hardware IDs
+    /// were read and don't name the driver is not the driver's.
+    #[test]
+    fn a_device_that_could_not_be_read_makes_the_driver_unreadable() {
+        use crate::vdd_settings::{DriverCursor, DriverInstance, DriverRun};
+        let start = DriverInstance {
+            boot_id: 205,
+            arrival: 30,
+        };
+        let starts = |devinst| (devinst == 7).then_some(start);
+        let off = Devnode::Driver {
+            devinst: 7,
+            status: Some((0, 22)),
+        };
+        let on = Devnode::Driver {
+            devinst: 7,
+            status: Some((DN_STARTED, 0)),
+        };
+        let unread = [Devnode::Other, off, Devnode::Unread];
+        let before = run_from(Some(&unread), starts);
+        assert_eq!(before, DriverRun::Unreadable);
+        assert_eq!(
+            crate::vdd_settings::record_after_enable(
+                before,
+                run_from(Some(&[Devnode::Other, on]), starts),
+                Some("<vdd_settings/>"),
+                DriverCursor::Software,
+            ),
+            None,
+            "no record after an unreadable before"
+        );
+
+        for (devnodes, run) in [
+            (None, DriverRun::Unreadable),
+            (Some(&[][..]), DriverRun::Off),
+            (Some(&[Devnode::Other][..]), DriverRun::Off),
+            (Some(&[Devnode::Other, off][..]), DriverRun::Off),
+            (Some(&[Devnode::Unread][..]), DriverRun::Unreadable),
+            (Some(&[Devnode::Unread, on][..]), DriverRun::Unreadable),
+            (Some(&[Devnode::Other, on][..]), DriverRun::Running(start)),
+            (
+                Some(
+                    &[Devnode::Driver {
+                        devinst: 7,
+                        status: None,
+                    }][..],
+                ),
+                DriverRun::Unreadable,
+            ),
+            (
+                Some(
+                    &[Devnode::Driver {
+                        devinst: 7,
+                        status: Some((DN_STARTED | DN_HAS_PROBLEM, 43)),
+                    }][..],
+                ),
+                DriverRun::Unreadable,
+            ),
+            (
+                Some(
+                    &[
+                        on,
+                        Devnode::Driver {
+                            devinst: 8,
+                            status: Some((DN_STARTED, 0)),
+                        },
+                    ][..],
+                ),
+                DriverRun::Unreadable,
+            ),
+        ] {
+            assert_eq!(run_from(devnodes, starts), run, "{devnodes:?}");
+        }
+        assert_eq!(
+            run_from(Some(&[on]), |_| None),
+            DriverRun::Unreadable,
+            "its start couldn't be read"
+        );
+    }
 
     #[test]
     fn the_enable_task_result_names_the_device_state() {

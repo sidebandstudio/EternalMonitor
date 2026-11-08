@@ -9,6 +9,10 @@
 //! Every frame carries its frame number encoded as a row of black/white
 //! squares that survives lossy H.264 encoding, so end-to-end tests can decode
 //! frames and assert real progression through the entire stack.
+//!
+//! `ETERNAL_SYNTH_POINTER=1` instead holds a still picture and moves a
+//! pointer over it every frame, as when only the mouse moves on a still
+//! desktop (see [`PointerScene`]).
 
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -16,7 +20,8 @@ use std::time::Instant;
 
 use tracing::info;
 
-use super::{frame_budget_for, heartbeat, keepalive_due, FrameSlot, RawFrame};
+use super::pointer::{convert_shape, PointerImage, Position, SHAPE_COLOR};
+use super::{frame_budget_for, heartbeat, keepalive_due, FrameSlot, RawFrame, IDLE_KEEPALIVE};
 use crate::control::SharedControl;
 use crate::stats::PIPELINE_STATS;
 
@@ -86,6 +91,9 @@ pub fn run_capture_loop(
     // avoids normal sleep coalescing without burning an entire CPU core.
     let mut timer = super::timing::FrameTimer::new();
     let mut next_deadline = Instant::now();
+    let mut pointer = std::env::var("ETERNAL_SYNTH_POINTER")
+        .is_ok_and(|v| v.trim() == "1")
+        .then(|| PointerScene::new(&shared, width, height));
     // `ETERNAL_SYNTH_STILL=1`: the first picture, then only what DXGI sends
     // for a desktop that never changes.
     let mut still: Option<Arc<Vec<u8>>> = None;
@@ -105,42 +113,49 @@ pub fn run_capture_loop(
 
         heartbeat(&shared.hb_capture_loop_ms);
 
-        let data = match still.as_ref() {
-            Some(picture)
-                if shared.client_connected()
-                    && keepalive_due(
-                        frame_start.duration_since(last_send),
-                        shared.force_next_idr.load(Ordering::SeqCst),
-                        true,
-                    ) =>
-            {
-                Arc::clone(picture)
+        let data = if let Some(scene) = pointer.as_mut() {
+            scene.tick(&shared, &mut buffers, frame_start, frame_number)
+        } else {
+            let data = match still.as_ref() {
+                Some(picture)
+                    if shared.client_connected()
+                        && keepalive_due(
+                            frame_start.duration_since(last_send),
+                            shared.force_next_idr.load(Ordering::SeqCst),
+                            true,
+                        ) =>
+                {
+                    Arc::clone(picture)
+                }
+                Some(_) => {
+                    timer.wait_until(frame_start + frame_budget);
+                    continue;
+                }
+                None => render_next_frame(&mut buffers, width, height, *frame_number + 1),
+            };
+            *frame_number += 1;
+            last_send = frame_start;
+            if still_mode && still.is_none() {
+                still = Some(Arc::clone(&data));
             }
-            Some(_) => {
-                timer.wait_until(frame_start + frame_budget);
-                continue;
-            }
-            None => render_next_frame(&mut buffers, width, height, *frame_number + 1),
+            Some(data)
         };
-        *frame_number += 1;
-        last_send = frame_start;
-        if still_mode && still.is_none() {
-            still = Some(Arc::clone(&data));
-        }
 
-        PIPELINE_STATS.lock().record_capture(width, height);
-        heartbeat(&shared.hb_capture_frame_ms);
+        if let Some(data) = data {
+            PIPELINE_STATS.lock().record_capture(width, height);
+            heartbeat(&shared.hb_capture_frame_ms);
 
-        slot.publish(RawFrame {
-            frame_number: *frame_number,
-            timestamp: frame_start,
-            data,
-            width,
-            height,
-        });
-        #[cfg(debug_assertions)]
-        if std::mem::take(&mut proving) {
-            super::second_screen::note_image(&shared, generation);
+            slot.publish(RawFrame {
+                frame_number: *frame_number,
+                timestamp: frame_start,
+                data,
+                width,
+                height,
+            });
+            #[cfg(debug_assertions)]
+            if std::mem::take(&mut proving) {
+                super::second_screen::note_image(&shared, generation);
+            }
         }
 
         next_deadline += frame_budget;
@@ -154,6 +169,146 @@ pub fn run_capture_loop(
     }
 
     Ok(())
+}
+
+/// A still picture with a pointer that moves every frame. For a client that
+/// draws the pointer it goes to the pointer feed only, and a frame is sent
+/// only for an IDR or the idle keepalive, as the DXGI loop does. For any
+/// other client each move is a new frame with the pointer drawn in.
+struct PointerScene {
+    width: u32,
+    height: u32,
+    picture: Vec<u8>,
+    image: PointerImage,
+    step: u32,
+    last_publish: Option<Instant>,
+}
+
+impl PointerScene {
+    fn new(shared: &SharedControl, width: u32, height: u32) -> Self {
+        let mut picture = super::frame_buffer((width * 4) as usize * height as usize);
+        render_synthetic_frame(&mut picture, width, height, 0);
+        let image = arrow();
+        shared.pointer.set_shape(image.clone());
+        info!(width, height, "Synthetic pointer over a still picture");
+        Self {
+            width,
+            height,
+            picture,
+            image,
+            step: 0,
+            last_publish: None,
+        }
+    }
+
+    fn tick(
+        &mut self,
+        shared: &SharedControl,
+        buffers: &mut [Arc<Vec<u8>>; 3],
+        now: Instant,
+        frame_number: &mut u64,
+    ) -> Option<Arc<Vec<u8>>> {
+        self.step = self.step.wrapping_add(1);
+        let (x, y) = pointer_path(self.step, self.width, self.height);
+        shared.pointer.set_position(Position {
+            visible: true,
+            x,
+            y,
+            host_time_us: crate::clock::host_now_us(),
+        });
+        let draws = shared.client_draws_pointer();
+        let due = !draws
+            || self
+                .last_publish
+                .is_none_or(|at| now - at >= IDLE_KEEPALIVE)
+            || shared.force_next_idr.load(Ordering::SeqCst);
+        if !due {
+            return None;
+        }
+        self.last_publish = Some(now);
+        *frame_number += 1;
+        let buffer = buffers
+            .iter_mut()
+            .find(|buffer| Arc::strong_count(buffer) == 1)
+            .expect("encoder and latest-frame slot retain at most two buffers");
+        let buf = Arc::get_mut(buffer).unwrap();
+        buf.copy_from_slice(&self.picture);
+        draw_frame_counter(buf, self.width, *frame_number);
+        if !draws {
+            draw_pointer(buf, self.width, self.height, &self.image, x, y);
+        }
+        Some(Arc::clone(buffer))
+    }
+}
+
+/// Where the synthetic pointer is at `step`: across the picture and back,
+/// a new position every step.
+pub fn pointer_path(step: u32, width: u32, height: u32) -> (i32, i32) {
+    let span = width.saturating_sub(64).max(2);
+    let along = (step * 5) % (2 * span);
+    let x = 16
+        + if along < span {
+            along
+        } else {
+            2 * span - along
+        } as i32;
+    let y = (height / 2) as i32 + ((step % 40) as i32 - 20);
+    (x, y)
+}
+
+/// A 12x19 white arrow with a black edge, as Windows' color pointer is.
+fn arrow() -> PointerImage {
+    let (w, h) = (12u32, 19u32);
+    let mut raw = vec![0u8; (w * h * 4) as usize];
+    for y in 0..h {
+        for x in 0..=y.min(w - 1) {
+            let edge = x == 0 || x == y.min(w - 1) || y == h - 1;
+            let v = if edge { 0 } else { 255 };
+            raw[((y * w + x) * 4) as usize..][..4].copy_from_slice(&[v, v, v, 255]);
+        }
+    }
+    convert_shape(SHAPE_COLOR, w, h, w * 4, (0, 0), &raw).expect("a valid arrow")
+}
+
+/// Draws a converted pointer image over a BGRA frame: "over" for its
+/// premultiplied pixels, then inverting where its mask says.
+pub fn draw_pointer(
+    buf: &mut [u8],
+    width: u32,
+    height: u32,
+    image: &PointerImage,
+    px: i32,
+    py: i32,
+) {
+    let (iw, ih) = (usize::from(image.width), usize::from(image.height));
+    let mask = (image.flags & eternal_wire::v2::control::POINTER_SHAPE_INVERT != 0)
+        .then(|| &image.bytes[iw * ih * 4..]);
+    for row in 0..ih {
+        let sy = py + row as i32;
+        if sy < 0 || sy >= height as i32 {
+            continue;
+        }
+        for col in 0..iw {
+            let sx = px + col as i32;
+            if sx < 0 || sx >= width as i32 {
+                continue;
+            }
+            let src = &image.bytes[(row * iw + col) * 4..][..4];
+            let at = (sy as usize * width as usize + sx as usize) * 4;
+            let dst = &mut buf[at..at + 3];
+            let keep = 255 - u32::from(src[3]);
+            for c in 0..3 {
+                dst[c] = (u32::from(src[c]) + u32::from(dst[c]) * keep / 255).min(255) as u8;
+            }
+            if mask
+                .is_some_and(|mask| mask[row * iw.div_ceil(8) + col / 8] & (0x80 >> (col % 8)) != 0)
+            {
+                for c in dst.iter_mut() {
+                    *c = !*c;
+                }
+            }
+        }
+    }
 }
 
 /// The encoder and latest-frame slot can each retain one buffer. Keep three

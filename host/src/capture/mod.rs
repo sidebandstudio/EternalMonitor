@@ -23,6 +23,7 @@ use crate::vdd_device::DeviceState;
 #[cfg(windows)]
 pub mod dxgi;
 pub mod listing;
+pub mod pointer;
 pub mod recovery;
 pub mod second_screen;
 pub mod synthetic;
@@ -106,6 +107,137 @@ impl IdleGate {
 #[cfg(any(windows, test))]
 pub(crate) fn frame_has_image(last_present_time: i64, seen_image: bool) -> bool {
     last_present_time != 0 || seen_image
+}
+
+/// Where Windows puts the pointer on a captured output.
+#[cfg(any(windows, test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PointerPlace {
+    /// Apart from the picture, as Desktop Duplication reports it.
+    Apart,
+    /// Windows draws it into the picture.
+    InPicture,
+    /// The second screen's driver can't be told (`DriverCursor::Unknown`).
+    /// The pointer is handled as in 0.3.4: no pointer messages, and capture
+    /// draws the reported pointer when Desktop Duplication reports it
+    /// visible with an image.
+    Unknown,
+}
+
+/// Where Windows puts the pointer: apart, except on the second screen,
+/// where the running driver decides (`vdd_settings::running_cursor`).
+/// With its hardware cursor, an image larger than its caps goes into the
+/// picture; without one, every image does. Measured on the reference PC,
+/// a pointer in the picture made every move a new image, and Desktop
+/// Duplication kept reporting a stale position.
+#[cfg(any(windows, test))]
+pub(crate) fn pointer_place(
+    second_screen: bool,
+    driver: crate::vdd_settings::DriverCursor,
+    shape: Option<(u32, u32)>,
+) -> PointerPlace {
+    use crate::vdd_settings::DriverCursor;
+    match driver {
+        _ if !second_screen => PointerPlace::Apart,
+        DriverCursor::Hardware(caps) if shape.is_none_or(|size| caps.takes(size)) => {
+            PointerPlace::Apart
+        }
+        DriverCursor::Hardware(_) | DriverCursor::Software => PointerPlace::InPicture,
+        DriverCursor::Unknown => PointerPlace::Unknown,
+    }
+}
+
+/// Whether capture draws the pointer into the video: for a client that
+/// doesn't draw it, unless Windows already drew it there. Drawing the
+/// reported pointer over Windows' own put a second, frozen pointer at the
+/// stale position. Where that can't be told, as 0.3.4 did: whenever
+/// Desktop Duplication reports it visible with an image, which it doesn't
+/// for a pointer Windows drew in (on the reference PC's second screen
+/// without the driver's cursor it reported it hidden from the first frame).
+#[cfg(any(windows, test))]
+pub(crate) fn composite_pointer(
+    client_draws_pointer: bool,
+    place: PointerPlace,
+    visible: bool,
+    has_shape: bool,
+) -> bool {
+    let drawn_elsewhere = match place {
+        PointerPlace::Apart => client_draws_pointer,
+        PointerPlace::InPicture => true,
+        PointerPlace::Unknown => false,
+    };
+    !drawn_elsewhere && visible && has_shape
+}
+
+/// Whether the pointer goes apart from the video for this capture: to an
+/// iPad that draws it, when Windows keeps it apart. Otherwise it stays in
+/// the video, as before, and the iPad is told it is hidden.
+#[cfg(any(windows, test))]
+pub(crate) fn pointer_apart(client_draws_pointer: bool, place: PointerPlace) -> bool {
+    client_draws_pointer && place == PointerPlace::Apart
+}
+
+/// What the capture loop does with an acquired frame.
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Acquired {
+    /// Read the image back for the encoder.
+    ReadBack,
+    /// Release it: there is no image yet ([`frame_has_image`]).
+    Skip,
+    /// Release it: only the pointer moved, and the iPad draws the pointer.
+    /// The last picture still goes out as on a still desktop
+    /// ([`keepalive_due`]): a moving pointer keeps the duplication from ever
+    /// timing out, and without it the watchdog took the silence for a stuck
+    /// capture and restarted the stream, and keyframe requests went
+    /// unanswered.
+    PointerOnly,
+}
+
+#[cfg(any(windows, test))]
+pub(crate) fn acquired(last_present_time: i64, seen_image: bool, draws_pointer: bool) -> Acquired {
+    if !frame_has_image(last_present_time, seen_image) {
+        Acquired::Skip
+    } else if draws_pointer && last_present_time == 0 {
+        Acquired::PointerOnly
+    } else {
+        Acquired::ReadBack
+    }
+}
+
+/// What the cached-frame rebuild for a changed pointer answer does with its
+/// copy of the staging texture.
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Redraw<E> {
+    /// Copied: draw the pointer as the answer wants and keep the frame.
+    Copied,
+    /// A lost duplication is waiting for the loop's handler: rebuild after
+    /// it, with the cache kept as it is.
+    Later,
+    /// The copy hit ACCESS_LOST: hand it to the loop's handler, which
+    /// re-creates the duplication and keeps the cached picture.
+    Lost(E),
+}
+
+/// Copies the staging texture for the rebuild (`copy`), unless a loss is
+/// pending. ACCESS_LOST (`access_lost`) goes to the loop's handler as one
+/// after an acquire does; any other error, such as DEVICE_REMOVED, ends
+/// the capture loop so the pipeline re-creates the device.
+#[cfg(any(windows, test))]
+pub(crate) fn redraw_cached<E>(
+    pending_loss: bool,
+    copy: impl FnOnce() -> Result<(), E>,
+    access_lost: impl FnOnce(&E) -> bool,
+) -> Result<Redraw<E>, E> {
+    if pending_loss {
+        return Ok(Redraw::Later);
+    }
+    match copy() {
+        Ok(()) => Ok(Redraw::Copied),
+        Err(error) if access_lost(&error) => Ok(Redraw::Lost(error)),
+        Err(error) => Err(error),
+    }
 }
 
 pub(crate) fn frame_budget_for(target_fps: u32) -> Duration {
@@ -447,6 +579,12 @@ struct VddRequest {
     mode: Option<crate::vdd_settings::VddMode>,
     /// The adapters' LUIDs before the Enable, to find the driver's own.
     before: Vec<u64>,
+    /// The driver's start before the Enable, if it was running, and what
+    /// an Enable that starts it gives Windows for the pointer, from the
+    /// file it reads (see `vdd_settings::record_after_enable`).
+    instance: crate::vdd_settings::DriverRun,
+    settings: Option<String>,
+    cursor: crate::vdd_settings::DriverCursor,
 }
 
 /// Before each enable: name the main screen's graphics card for the driver
@@ -532,11 +670,56 @@ fn prepare_vdd_settings(shared: &SharedControl, outputs: &[OutputInfo]) -> VddRe
         }
         Err(_) => {}
     }
+    // The driver reads this file when it starts; a driver already running
+    // keeps what it read then.
+    let settings = std::fs::read_to_string(path).ok();
+    let reads_cursor = owned
+        || crate::vdd_settings::driver_version()
+            .is_some_and(|version| crate::vdd_settings::driver_reads_cursor(&version));
+    let overridden = crate::vdd_settings::registry_overrides_cursor();
+    let cursor =
+        crate::vdd_settings::starting_cursor(settings.as_deref(), reads_cursor, overridden);
+    let instance = crate::vdd_device::run_state();
+    info!(
+        ?instance,
+        reads_cursor,
+        overridden,
+        ?cursor,
+        "The virtual display's pointer settings"
+    );
     VddRequest {
         pin: crate::vdd_settings::pin_result(wanted, &applied),
         mode,
         before,
+        instance,
+        settings,
+        cursor,
     }
+}
+
+/// Where the record of the driver's last start is kept.
+#[cfg(windows)]
+pub(crate) fn cursor_record_path() -> Option<std::path::PathBuf> {
+    crate::settings::app_data_dir().map(|dir| dir.join(crate::vdd_settings::CURSOR_RECORD))
+}
+
+/// What the running driver does with the pointer, from the record of its
+/// start (`vdd_settings::running_cursor`).
+#[cfg(windows)]
+pub(crate) fn running_driver_cursor() -> crate::vdd_settings::DriverCursor {
+    let record = cursor_record_path().and_then(|path| crate::vdd_settings::load_record(&path));
+    let running = crate::vdd_device::run_state();
+    let cursor = crate::vdd_settings::running_cursor(record.as_ref(), running);
+    info!(
+        recorded = record.is_some(),
+        ?running,
+        settings_sha256 = record
+            .as_ref()
+            .map_or("", |record| record.settings_sha256.as_str()),
+        ?cursor,
+        "The running virtual display's pointer"
+    );
+    cursor
 }
 
 /// Bring a freshly attached second screen to the mode asked for, when
@@ -1226,6 +1409,166 @@ mod tests {
         assert!(frame_has_image(756_304_210_358, false));
         // Once an image exists the surface holds it; pointer moves still render.
         assert!(frame_has_image(0, true));
+    }
+
+    /// While only the pointer moves and the iPad draws it, the duplication
+    /// returns pointer updates (here 600 a second) and never times out. The
+    /// last picture must still go out every keepalive, and a keyframe request
+    /// be answered within its resend time, as on a still desktop.
+    #[test]
+    fn pointer_only_updates_keep_the_picture_alive_for_an_ipad_that_draws_it() {
+        assert_eq!(acquired(0, false, true), Acquired::Skip, "no image yet");
+        assert_eq!(acquired(0, true, false), Acquired::ReadBack, "older iPad");
+        assert_eq!(
+            acquired(42, true, true),
+            Acquired::ReadBack,
+            "the desktop changed"
+        );
+        let mut since_send = Duration::ZERO;
+        let mut resends = Vec::new();
+        let step = Duration::from_micros(1_600);
+        let mut now = Duration::ZERO;
+        let (mut asked, mut pending) = (false, false);
+        while now < Duration::from_secs(3) {
+            now += step;
+            since_send += step;
+            if !asked && now >= Duration::from_millis(2_000) {
+                (asked, pending) = (true, true);
+            }
+            assert_eq!(acquired(0, true, true), Acquired::PointerOnly);
+            if keepalive_due(since_send, pending, true) {
+                resends.push(now);
+                since_send = Duration::ZERO;
+                pending = false;
+            }
+        }
+        assert!(resends.len() >= 4, "{resends:?}");
+        for pair in resends.windows(2) {
+            assert!(pair[1] - pair[0] <= IDLE_KEEPALIVE + step, "{resends:?}");
+        }
+        assert!(
+            resends.iter().any(|at| *at >= Duration::from_millis(2_000)
+                && *at <= Duration::from_millis(2_000) + KEYFRAME_RESEND + step),
+            "the keyframe request waited: {resends:?}"
+        );
+    }
+
+    /// #183 is a second screen report: with the driver's hardware cursor
+    /// the second screen sends the pointer apart, as Mirror does. Review
+    /// r4: an image goes into the picture when it is larger than the caps
+    /// the running driver started with, the user's own (64, 256) as well as
+    /// this host's 128.
+    #[test]
+    fn the_second_screen_places_the_pointer_by_the_running_drivers_caps() {
+        use crate::vdd_settings::{CursorCaps, DriverCursor};
+        use PointerPlace::{Apart, InPicture, Unknown};
+        let caps = |max| {
+            DriverCursor::Hardware(CursorCaps {
+                max_x: max,
+                max_y: max,
+                alpha: true,
+                xor: 2,
+            })
+        };
+        for (second_screen, driver, shape, place) in [
+            (false, DriverCursor::Software, Some((300, 300)), Apart),
+            (false, DriverCursor::Unknown, Some((32, 32)), Apart),
+            (true, caps(128), Some((32, 32)), Apart),
+            (true, caps(128), None, Apart),
+            (true, caps(128), Some((128, 128)), Apart),
+            (true, caps(128), Some((129, 32)), InPicture),
+            (true, caps(128), Some((32, 129)), InPicture),
+            (true, caps(64), Some((64, 64)), Apart),
+            (true, caps(64), Some((65, 64)), InPicture),
+            (true, caps(64), Some((96, 96)), InPicture),
+            (true, caps(256), Some((160, 160)), Apart),
+            (true, caps(256), Some((256, 256)), Apart),
+            (true, caps(256), Some((257, 32)), InPicture),
+            (true, DriverCursor::Software, Some((32, 32)), InPicture),
+            (true, DriverCursor::Software, None, InPicture),
+            (true, DriverCursor::Unknown, Some((32, 32)), Unknown),
+        ] {
+            assert_eq!(
+                pointer_place(second_screen, driver, shape),
+                place,
+                "second_screen={second_screen} driver={driver:?} shape={shape:?}"
+            );
+            assert_eq!(pointer_apart(true, place), place == Apart);
+            assert!(!pointer_apart(false, place), "an older iPad");
+        }
+    }
+
+    /// Review r7: an ACCESS_LOST from the rebuild's copy goes to the loop's
+    /// handler, which keeps the cached picture, instead of ending the
+    /// capture loop; a pending loss is handled before the rebuild is tried
+    /// again; any other error still ends the loop.
+    #[test]
+    fn a_lost_duplication_during_the_pointer_rebuild_goes_to_the_handler() {
+        const ACCESS_LOST: u32 = 0x887A_0026;
+        const DEVICE_REMOVED: u32 = 0x887A_0005;
+        let lost = |code: &u32| *code == ACCESS_LOST;
+        assert_eq!(redraw_cached(false, || Ok(()), lost), Ok(Redraw::Copied));
+        assert_eq!(
+            redraw_cached(false, || Err(ACCESS_LOST), lost),
+            Ok(Redraw::Lost(ACCESS_LOST))
+        );
+        assert_eq!(
+            redraw_cached(false, || Err(DEVICE_REMOVED), lost),
+            Err(DEVICE_REMOVED),
+            "the device itself goes: the pipeline re-creates it"
+        );
+        let mut copied = false;
+        assert_eq!(
+            redraw_cached(
+                true,
+                || {
+                    copied = true;
+                    Ok::<(), u32>(())
+                },
+                lost
+            ),
+            Ok(Redraw::Later)
+        );
+        assert!(!copied, "not tried while a loss waits for the handler");
+    }
+
+    /// One pointer, never none and never two. Review r3: with the pointer
+    /// in the picture Desktop Duplication can still report it visible,
+    /// with a shape, at a stale spot, and drawing that over Windows' own
+    /// left a second, frozen one. Review r4: where the driver can't be
+    /// told, capture draws what Desktop Duplication reports, as 0.3.4 did,
+    /// whoever the client is.
+    #[test]
+    fn capture_draws_the_pointer_only_when_nobody_else_does() {
+        use PointerPlace::{Apart, InPicture, Unknown};
+        assert!(
+            composite_pointer(false, Apart, true, true),
+            "Mirror, an older iPad"
+        );
+        assert!(
+            !composite_pointer(true, Apart, true, true),
+            "the iPad draws it"
+        );
+        for client_draws in [false, true] {
+            assert!(
+                !composite_pointer(client_draws, InPicture, true, true),
+                "Windows drew it into the picture"
+            );
+            assert!(
+                composite_pointer(client_draws, Unknown, true, true),
+                "a driver that can't be told: as 0.3.4"
+            );
+            for place in [Apart, InPicture, Unknown] {
+                assert!(
+                    !composite_pointer(client_draws, place, false, true),
+                    "hidden"
+                );
+                assert!(
+                    !composite_pointer(client_draws, place, true, false),
+                    "no shape yet"
+                );
+            }
+        }
     }
 
     pub(super) fn connect_viewer(shared: &SharedControl) {

@@ -36,10 +36,12 @@ pub enum Phase {
     Video,
     /// Sending PC audio.
     Audio,
+    /// Sending the pointer to an iPad that draws it.
+    Pointer,
 }
 
 impl Phase {
-    const ALL: [Phase; 8] = [
+    const ALL: [Phase; 9] = [
         Phase::Waiting,
         Phase::Tick,
         Phase::Control,
@@ -48,6 +50,7 @@ impl Phase {
         Phase::SecondScreen,
         Phase::Video,
         Phase::Audio,
+        Phase::Pointer,
     ];
 
     /// Stable log value.
@@ -61,6 +64,7 @@ impl Phase {
             Phase::SecondScreen => "second_screen",
             Phase::Video => "video",
             Phase::Audio => "audio",
+            Phase::Pointer => "pointer",
         }
     }
 }

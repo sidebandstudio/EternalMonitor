@@ -48,6 +48,59 @@ impl PacingClock {
     }
 }
 
+/// Wakes the transport at a deadline from a dedicated thread, as
+/// `PacingClock` does, for a pointer position waiting for the next frame
+/// budget (Tokio's timer can wake 15 ms late on Windows). The transport arms
+/// it at the top of each loop and selects on `wait`; arming the same
+/// deadline again sends nothing, and the thread serves deadlines in order,
+/// so only ones that never move earlier are armed.
+pub struct Deadline {
+    tx: std::sync::mpsc::Sender<Instant>,
+    due: std::sync::Arc<tokio::sync::Notify>,
+    armed: Option<Instant>,
+}
+
+impl Deadline {
+    pub fn new(name: &str) -> std::io::Result<Self> {
+        let (tx, rx) = std::sync::mpsc::channel::<Instant>();
+        let due = std::sync::Arc::new(tokio::sync::Notify::new());
+        let notify = std::sync::Arc::clone(&due);
+        std::thread::Builder::new()
+            .name(name.into())
+            .spawn(move || {
+                let mut timer = crate::capture::timing::FrameTimer::new();
+                while let Ok(deadline) = rx.recv() {
+                    timer.wait_until(deadline);
+                    notify.notify_one();
+                }
+            })?;
+        Ok(Self {
+            tx,
+            due,
+            armed: None,
+        })
+    }
+
+    pub fn arm(&mut self, deadline: Option<Instant>) {
+        if deadline == self.armed {
+            return;
+        }
+        self.armed = deadline;
+        if let Some(deadline) = deadline {
+            let _ = self.tx.send(deadline);
+        }
+    }
+
+    pub fn armed(&self) -> bool {
+        self.armed.is_some()
+    }
+
+    pub async fn wait(&mut self) {
+        self.due.notified().await;
+        self.armed = None;
+    }
+}
+
 /// Frames at or below this many fragments go out unpaced.
 pub const PACE_THRESHOLD_FRAGS: usize = 16;
 /// Datagrams per burst between gaps.

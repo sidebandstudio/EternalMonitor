@@ -111,6 +111,11 @@ pub struct SharedControl {
     pub pairing: Arc<Mutex<crate::pairing::Pairing>>,
     /// Which network the next stream listens on.
     pub listen_on: Arc<Mutex<crate::network::ListenOn>>,
+    /// The pointer for an iPad that draws it (see `capture::pointer`).
+    pub pointer: Arc<crate::capture::pointer::PointerFeed>,
+    /// The session whose iPad reported it holds the pointer image whole
+    /// (see [`SharedControl::client_draws_pointer`]).
+    pub(crate) pointer_confirmed: Arc<AtomicU32>,
 }
 
 /// Runtime state of the managed virtual extended display.
@@ -173,6 +178,8 @@ impl SharedControl {
                 .expect("OS entropy for pairing code"),
             )),
             listen_on: Arc::new(Mutex::new(Default::default())),
+            pointer: Arc::new(Default::default()),
+            pointer_confirmed: Arc::new(AtomicU32::new(0)),
             running: Arc::new(AtomicBool::new(false)),
             bitrate_bps: Arc::new(AtomicU32::new(initial_bitrate_bps)),
             abr_current_bps: Arc::new(AtomicU32::new(initial_bitrate_bps)),
@@ -242,6 +249,26 @@ impl SharedControl {
     /// A client is connected and heard from: one whose session is on hold
     /// after a silence counts as gone for the second screen, so its display
     /// still goes the same time after the iPad's last packet.
+    /// The connected iPad draws the pointer, so capture leaves it out of
+    /// the video. From when its reports say it holds the current pointer
+    /// image whole: until then it has nothing to draw, so the pointer stays
+    /// in the video and the positions sent say hidden.
+    pub fn client_draws_pointer(&self) -> bool {
+        let session = self.session.lock().pointer_session_id();
+        session.is_some_and(|id| self.pointer_confirmed.load(Ordering::Relaxed) == id)
+    }
+
+    /// A receiver report named the pointer image its iPad holds.
+    pub(crate) fn note_pointer_report(&self, shape_id: u32) {
+        let Some(session) = self.session.lock().pointer_session_id() else {
+            return;
+        };
+        let current = self.pointer.latest().0.map(|shape| shape.id);
+        if shape_id != 0 && current == Some(shape_id) {
+            self.pointer_confirmed.store(session, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn client_heard(&self) -> bool {
         let session = self.session.lock();
         session.is_active() && !session.on_hold()
@@ -334,6 +361,79 @@ mod tests {
             shared.client_preferred_fps.store(client, Ordering::SeqCst);
             assert_eq!(shared.effective_fps(), expected);
             assert_eq!(shared.target_fps.load(Ordering::SeqCst), host);
+        }
+    }
+
+    /// Capture asks this before leaving the pointer out of the video.
+    #[test]
+    fn capture_draws_the_pointer_unless_the_connected_ipad_does() {
+        use eternal_wire::v2::control::{ControlMessage, Hello2, FEATURE_DRAWS_POINTER};
+        let shared = SharedControl::new(9876, 15_000_000);
+        assert!(!shared.client_draws_pointer(), "nobody connected");
+        for (nonce, caps, draws) in [(1, 0, false), (2, FEATURE_DRAWS_POINTER, true)] {
+            let hello = ControlMessage::Hello2(Hello2 {
+                proto_min: 2,
+                proto_max: 2,
+                client_nonce: nonce,
+                listen_port: 50000,
+                decoder_caps: 1,
+                feature_caps: caps,
+                screen_px_w: 2420,
+                screen_px_h: 1668,
+                screen_pt_w: 1210,
+                screen_pt_h: 834,
+                refresh_hz: 120,
+                device_name: "Test iPad".into(),
+                device_id: 0,
+                preferred_fps: 0,
+                auth_token: [0; 16],
+                pairing_code: 0,
+            });
+            struct Config;
+            impl crate::transport::session::ConfigSource for Config {
+                fn stream_config(&self) -> eternal_wire::v2::control::StreamConfig {
+                    Default::default()
+                }
+                fn host_name(&self) -> String {
+                    "TEST".into()
+                }
+            }
+            shared.session.lock().handle_control(
+                PeerId::udp("10.0.0.5:50000".parse().unwrap()),
+                0,
+                hello,
+                &Config,
+                std::time::Instant::now(),
+            );
+            assert!(shared.client_connected());
+            assert!(!shared.client_draws_pointer(), "not before it answers");
+            let session_id = shared.session.lock().session_id().unwrap();
+            shared.session.lock().handle_control(
+                PeerId::udp("10.0.0.5:50000".parse().unwrap()),
+                session_id,
+                ControlMessage::ReceiverReport(Default::default()),
+                &Config,
+                std::time::Instant::now(),
+            );
+            assert!(
+                !shared.client_draws_pointer(),
+                "not before it holds the image"
+            );
+            shared
+                .pointer
+                .set_shape(crate::capture::pointer::PointerImage {
+                    source_type: 2,
+                    flags: 0,
+                    width: 1,
+                    height: 1,
+                    hot: (0, 0),
+                    bytes: vec![nonce as u8; 4],
+                });
+            let current = shared.pointer.latest().0.unwrap().id;
+            shared.note_pointer_report(current + 1);
+            assert!(!shared.client_draws_pointer(), "another image");
+            shared.note_pointer_report(current);
+            assert_eq!(shared.client_draws_pointer(), draws, "caps {caps:#x}");
         }
     }
 

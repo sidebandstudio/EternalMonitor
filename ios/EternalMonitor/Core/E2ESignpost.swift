@@ -33,6 +33,18 @@ enum E2E {
         #endif
     }
 
+    /// `EM_DRAWS_POINTER=0` leaves the pointer in the PC's video, as apps
+    /// before 0.3.5 did, for the end-to-end compatibility run.
+    static var drawsPointer: Bool {
+        ProcessInfo.processInfo.environment["EM_DRAWS_POINTER"] != "0"
+    }
+
+    /// The pointer counters next to the decoded frame count: with the PC
+    /// sending the pointer apart, it moves while no frame decodes.
+    static func pointer(_ counters: PointerOverlay.Counters, decoded: Int) {
+        emit("E2E_POINTER states=\(counters.states) stale=\(counters.staleStates) shapes=\(counters.shapes) drawn=\(counters.drawn) moves=\(counters.drawnMoves) decoded=\(decoded)")
+    }
+
     /// `EM_AUTOCONNECT=host:port` makes the app connect immediately on launch,
     /// bypassing the connect screen — the harness's way in. A pairing link
     /// (`eternaldisplay://host:port?t=…`, the QR code's text) also brings its

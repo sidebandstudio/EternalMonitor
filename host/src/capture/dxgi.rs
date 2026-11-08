@@ -17,9 +17,10 @@ use super::recovery::{
     LossStep, OpenStep, Reopen, LOSS_GIVE_UP,
 };
 use super::{
-    client_connected, frame_budget_for, frame_buffer, frame_has_image, heartbeat, idle_heartbeat,
-    keepalive_allowed, keepalive_due, read_back_image, reconcile_virtual_display, recovery_poll,
-    resolve_target, FrameSlot, FrameUse, IdleGate, OutputInfo, Picture, RawFrame,
+    acquired, client_connected, composite_pointer, frame_budget_for, frame_buffer, heartbeat,
+    idle_heartbeat, keepalive_allowed, keepalive_due, pointer_apart, pointer_place,
+    read_back_image, reconcile_virtual_display, recovery_poll, redraw_cached, resolve_target,
+    Acquired, FrameSlot, FrameUse, IdleGate, OutputInfo, Picture, PointerPlace, RawFrame, Redraw,
     ACQUIRE_TIMEOUT_MS, FPS_WINDOW, FRAME_PADDING, PICTURE_HOLD,
 };
 use crate::control::{CaptureTarget, SharedControl};
@@ -310,6 +311,35 @@ pub fn run_capture_loop(
     // Map). It is handled as if the next acquire had returned it: before,
     // it ended the capture loop and restarted the pipeline.
     let mut lost_after_acquire: Option<windows::core::Error> = None;
+    // Whether `last_frame` has the pointer drawn in: it has unless the
+    // client draws the pointer itself (`SharedControl::client_draws_pointer`).
+    let mut last_frame_has_pointer = true;
+    // Where Windows puts the pointer (`pointer_place`): into the picture on
+    // the second screen without the driver's hardware cursor, or for an
+    // image too large for it, and then nothing else draws one. Where the
+    // running driver can't be told, as 0.3.4: no pointer messages.
+    let driver = if second_screen {
+        super::running_driver_cursor()
+    } else {
+        crate::vdd_settings::DriverCursor::Unknown
+    };
+    shared
+        .pointer
+        .set_withheld(second_screen && driver == crate::vdd_settings::DriverCursor::Unknown);
+    let place_of = |cursor: &CursorState| pointer_place(second_screen, driver, cursor.size());
+    let mut place;
+    {
+        // The feed outlives this capture: a position from the output
+        // captured before (the mirror a second screen starts from) would be
+        // drawn on this one until Desktop Duplication reports its own,
+        // which it does once the pointer is on this output.
+        shared.pointer.set_position(super::pointer::Position {
+            visible: false,
+            x: 0,
+            y: 0,
+            host_time_us: crate::clock::host_now_us(),
+        });
+    }
 
     loop {
         if !shared.running.load(Ordering::SeqCst)
@@ -351,6 +381,61 @@ pub fn run_capture_loop(
                 );
             }
             continue;
+        }
+
+        // An iPad that draws the pointer gets a picture without it; any
+        // other client, or none, one with it. The staging texture still
+        // holds the last desktop image, so the cached frame is redrawn from
+        // it when the connected client's answer differs from the cache's.
+        place = place_of(&cursor);
+        let draws_pointer = pointer_apart(shared.client_draws_pointer(), place);
+        if picture.seen_image && last_frame_has_pointer == draws_pointer {
+            let mut pixel_buf = frame_buffer(frame_bytes);
+            // A lost duplication goes to the handler below, which keeps the
+            // cache; the rebuild is tried again after it.
+            let copied = redraw_cached(
+                lost_after_acquire.is_some(),
+                || {
+                    copy_staging(
+                        &device_context,
+                        &staging_texture,
+                        tex_height,
+                        row_bytes,
+                        &mut pixel_buf,
+                    )
+                },
+                |error| error.code() == DXGI_ERROR_ACCESS_LOST,
+            )?;
+            match copied {
+                Redraw::Later => {}
+                Redraw::Lost(error) => lost_after_acquire = Some(error),
+                Redraw::Copied => {
+                    if composite_pointer(draws_pointer, place, cursor_visible, cursor.has_shape) {
+                        draw_cursor(
+                            &mut pixel_buf,
+                            tex_width,
+                            tex_height,
+                            row_bytes,
+                            &cursor,
+                            cursor_x,
+                            cursor_y,
+                        );
+                    }
+                    spare = None;
+                    last_frame = Arc::new(pixel_buf);
+                    last_frame_has_pointer = !draws_pointer;
+                    if client_connected(&shared) {
+                        resend_last_frame(
+                            slot,
+                            &shared,
+                            frame_number,
+                            &mut last_send,
+                            &last_frame,
+                            (tex_width, tex_height),
+                        );
+                    }
+                }
+            }
         }
 
         let frame_start = Instant::now();
@@ -402,14 +487,37 @@ pub fn run_capture_loop(
                     super::second_screen::note_image(&shared, generation);
                 }
 
-                // --- Track cursor position/shape (must read shape before ReleaseFrame) ---
-                if frame_info.LastMouseUpdateTime != 0 {
-                    cursor_visible = frame_info.PointerPosition.Visible.as_bool();
-                    cursor_x = frame_info.PointerPosition.Position.x;
-                    cursor_y = frame_info.PointerPosition.Position.y;
+                // --- Track cursor shape/position (must read shape before ReleaseFrame) ---
+                // The shape is always read: its size decides whether Windows
+                // draws it into the picture.
+                let new_shape = frame_info.PointerShapeBufferSize > 0
+                    && cursor.update_shape(dupl, frame_info.PointerShapeBufferSize);
+                place = place_of(&cursor);
+                if new_shape && place == PointerPlace::Apart {
+                    if let Some(image) = super::pointer::convert_shape(
+                        cursor.shape_type,
+                        cursor.width,
+                        cursor.height,
+                        cursor.pitch,
+                        cursor.hot,
+                        &cursor.shape,
+                    ) {
+                        shared.pointer.set_shape(image);
+                    }
                 }
-                if frame_info.PointerShapeBufferSize > 0 {
-                    cursor.update_shape(dupl, frame_info.PointerShapeBufferSize);
+                if frame_info.LastMouseUpdateTime != 0 || new_shape {
+                    if frame_info.LastMouseUpdateTime != 0 {
+                        cursor_visible = frame_info.PointerPosition.Visible.as_bool();
+                        cursor_x = frame_info.PointerPosition.Position.x;
+                        cursor_y = frame_info.PointerPosition.Position.y;
+                    }
+                    shared.pointer.set_position(super::pointer::Position {
+                        // Only a pointer Windows keeps apart is shown apart.
+                        visible: cursor_visible && place == PointerPlace::Apart,
+                        x: cursor_x,
+                        y: cursor_y,
+                        host_time_us: crate::clock::host_now_us(),
+                    });
                 }
 
                 // --- Get dirty rect count ---
@@ -448,11 +556,39 @@ pub fn run_capture_loop(
 
                 // --- Copy desktop texture to staging and read pixels into a
                 // recycled buffer (the readback is the ONLY full-frame copy) ---
-                if !frame_has_image(frame_info.LastPresentTime, picture.seen_image) {
-                    if let Err(error) = unsafe { dupl.ReleaseFrame() } {
-                        lost_after_acquire = Some(access_lost_or(error)?);
+                // A pointer-only update needs no new frame when the iPad
+                // draws the pointer: the transport sends the position.
+                match acquired(
+                    frame_info.LastPresentTime,
+                    picture.seen_image,
+                    draws_pointer,
+                ) {
+                    Acquired::ReadBack => {}
+                    skip => {
+                        if let Err(error) = unsafe { dupl.ReleaseFrame() } {
+                            lost_after_acquire = Some(access_lost_or(error)?);
+                            continue;
+                        }
+                        if skip == Acquired::PointerOnly
+                            && client_connected(&shared)
+                            && keepalive_due(
+                                last_send.elapsed(),
+                                shared.force_next_idr.load(Ordering::SeqCst),
+                                picture.real(),
+                            )
+                            && keepalive_allowed(picture.real(), second_screen)
+                        {
+                            resend_last_frame(
+                                slot,
+                                &shared,
+                                frame_number,
+                                &mut last_send,
+                                &last_frame,
+                                (tex_width, tex_height),
+                            );
+                        }
+                        continue;
                     }
-                    continue;
                 }
                 let seen_image = &mut picture.seen_image;
                 let frame_data = read_back_image(&shared, generation, seen_image, || {
@@ -476,39 +612,21 @@ pub fn run_capture_loop(
                                     _ => frame_buffer(frame_bytes),
                                 };
 
-                                // Map staging texture for CPU read
-                                let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-                                unsafe {
-                                    device_context.Map(
-                                        &staging_texture,
-                                        0,
-                                        D3D11_MAP_READ,
-                                        0,
-                                        Some(&mut mapped),
-                                    )?;
-                                }
-
-                                // Copy row-by-row (pitch may differ from width*4)
-                                let src_pitch = mapped.RowPitch as usize;
-                                let src_ptr = mapped.pData as *const u8;
-                                for row in 0..tex_height as usize {
-                                    let src_offset = row * src_pitch;
-                                    let dst_offset = row * row_bytes;
-                                    unsafe {
-                                        std::ptr::copy_nonoverlapping(
-                                            src_ptr.add(src_offset),
-                                            pixel_buf.as_mut_ptr().add(dst_offset),
-                                            row_bytes,
-                                        );
-                                    }
-                                }
-
-                                unsafe {
-                                    device_context.Unmap(&staging_texture, 0);
-                                }
+                                copy_staging(
+                                    &device_context,
+                                    &staging_texture,
+                                    tex_height,
+                                    row_bytes,
+                                    &mut pixel_buf,
+                                )?;
 
                                 // Composite the mouse cursor into the BGRA frame.
-                                if cursor_visible && cursor.has_shape {
+                                if composite_pointer(
+                                    draws_pointer,
+                                    place,
+                                    cursor_visible,
+                                    cursor.has_shape,
+                                ) {
                                     draw_cursor(
                                         &mut pixel_buf,
                                         tex_width,
@@ -566,6 +684,7 @@ pub fn run_capture_loop(
                     // two buffers alive; steady state recycles them.
                     spare = Some(Arc::clone(&last_frame));
                     last_frame = data;
+                    last_frame_has_pointer = !draws_pointer;
                 }
             }
             Err(e) if e.code() == DXGI_ERROR_WAIT_TIMEOUT => {
@@ -1078,6 +1197,37 @@ fn publish_capture_geometry(output: &IDXGIOutput1, shared: &SharedControl) {
     }
 }
 
+/// Reads the staging texture's image into `buf`, row by row (its pitch may
+/// differ from `row_bytes`).
+fn copy_staging(
+    device_context: &ID3D11DeviceContext,
+    staging_texture: &ID3D11Texture2D,
+    height: u32,
+    row_bytes: usize,
+    buf: &mut [u8],
+) -> windows::core::Result<()> {
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    unsafe {
+        device_context.Map(staging_texture, 0, D3D11_MAP_READ, 0, Some(&mut mapped))?;
+    }
+    let src_pitch = mapped.RowPitch as usize;
+    let src_ptr = mapped.pData as *const u8;
+    debug_assert!(buf.len() >= height as usize * row_bytes);
+    for row in 0..height as usize {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                src_ptr.add(row * src_pitch),
+                buf.as_mut_ptr().add(row * row_bytes),
+                row_bytes,
+            );
+        }
+    }
+    unsafe {
+        device_context.Unmap(staging_texture, 0);
+    }
+    Ok(())
+}
+
 fn make_staging_desc(width: u32, height: u32) -> D3D11_TEXTURE2D_DESC {
     D3D11_TEXTURE2D_DESC {
         Width: width,
@@ -1123,10 +1273,10 @@ fn get_dirty_rect_count(
     }
 }
 
-// DXGI pointer shape types (DXGI_OUTDUPL_POINTER_SHAPE_TYPE_*).
-const DXGI_POINTER_SHAPE_MONOCHROME: u32 = 1;
-const DXGI_POINTER_SHAPE_COLOR: u32 = 2;
-const DXGI_POINTER_SHAPE_MASKED_COLOR: u32 = 4;
+use super::pointer::{
+    SHAPE_COLOR as DXGI_POINTER_SHAPE_COLOR, SHAPE_MASKED_COLOR as DXGI_POINTER_SHAPE_MASKED_COLOR,
+    SHAPE_MONOCHROME as DXGI_POINTER_SHAPE_MONOCHROME,
+};
 
 /// Caches the latest mouse-cursor shape from DXGI Desktop Duplication. The shape only
 /// arrives when it changes, so it's kept across frames and composited at the per-frame
@@ -1138,13 +1288,24 @@ struct CursorState {
     width: u32,
     height: u32,
     pitch: u32,
+    hot: (u32, u32),
     has_shape: bool,
 }
 
 impl CursorState {
+    /// The pointer image's size in pixels, once there is one. A monochrome
+    /// shape's buffer stacks two masks.
+    fn size(&self) -> Option<(u32, u32)> {
+        self.has_shape.then_some(match self.shape_type {
+            DXGI_POINTER_SHAPE_MONOCHROME => (self.width, self.height / 2),
+            _ => (self.width, self.height),
+        })
+    }
+
     /// Fetch the current pointer shape. Must be called while a frame is acquired
-    /// (before `ReleaseFrame`). On failure the previous shape is kept.
-    fn update_shape(&mut self, duplication: &IDXGIOutputDuplication, buffer_size: u32) {
+    /// (before `ReleaseFrame`). On failure the previous shape is kept and
+    /// this returns false.
+    fn update_shape(&mut self, duplication: &IDXGIOutputDuplication, buffer_size: u32) -> bool {
         self.shape.resize(buffer_size as usize, 0);
         let mut required = 0u32;
         let mut info = DXGI_OUTDUPL_POINTER_SHAPE_INFO::default();
@@ -1161,10 +1322,13 @@ impl CursorState {
                 self.width = info.Width;
                 self.height = info.Height;
                 self.pitch = info.Pitch;
+                self.hot = (info.HotSpot.x.max(0) as u32, info.HotSpot.y.max(0) as u32);
                 self.has_shape = true;
+                true
             }
             Err(e) => {
                 warn!(error = %e, "GetFramePointerShape failed — cursor shape not updated");
+                false
             }
         }
     }

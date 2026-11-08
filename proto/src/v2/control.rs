@@ -44,6 +44,10 @@ pub const FEATURE_STANDBY_STATUS: u16 = 1 << 3;
 /// The iPad app checks for its own updates (0.3.2 and later), so a HELLO2
 /// without it comes from 0.3.1 or older. Older hosts ignore it.
 pub const FEATURE_CHECKS_UPDATES: u16 = 1 << 4;
+/// The iPad draws the pointer itself from POINTER_SHAPE and POINTER_STATE.
+/// A host with [`HOSTCAP_POINTER`] then leaves the pointer out of the video.
+/// Bit 3 is taken by another change in review.
+pub const FEATURE_DRAWS_POINTER: u16 = 1 << 5;
 pub const HOSTCAP_NACK: u16 = 1 << 0;
 pub const HOSTCAP_AUDIO: u16 = 1 << 1;
 pub const HOSTCAP_USB: u16 = 1 << 2;
@@ -57,6 +61,9 @@ pub const HOSTCAP_PEN: u16 = 1 << 4;
 /// session, and iPads read an accepted reply without it as a PC to update,
 /// so it stays set there.
 pub const HOSTCAP_CONTIGUOUS_FRAME_SEQ: u16 = 1 << 5;
+/// The host sends POINTER_SHAPE and POINTER_STATE, and leaves the pointer
+/// out of the video, to a client with [`FEATURE_DRAWS_POINTER`].
+pub const HOSTCAP_POINTER: u16 = 1 << 6;
 
 /// [`StreamConfig::flags`] bits.
 pub const STREAM_FLAG_SOFTWARE_ENCODER: u8 = 1 << 0;
@@ -373,6 +380,9 @@ pub struct ReceiverReport {
     pub nacks_sent: u32,
     pub audio_packets_lost: u32,
     pub audio_buffer_ms: u16,
+    /// The last pointer shape the client holds complete, 0 for none. The
+    /// host sends the current shape again when this differs from it.
+    pub pointer_shape_id: u32,
 }
 
 pub const RECEIVER_REPORT_SIZE: usize = 36;
@@ -470,6 +480,99 @@ pub fn identity_message(nonce: &[u8; 16], port: u16, addresses: &[[u8; 4]]) -> V
 pub const INPUT_EVENT_SIZE: usize = 30;
 pub const PEN_INPUT_EVENT_SIZE: usize = INPUT_EVENT_SIZE + 4;
 
+/// The pointer messages' body layout version.
+pub const POINTER_VERSION: u8 = 1;
+/// [`PointerShapeChunk::flags`]: the image is followed by an invert mask.
+pub const POINTER_SHAPE_INVERT: u8 = 1 << 0;
+/// [`PointerState::flags`]: the pointer is on the captured screen and shown.
+pub const POINTER_VISIBLE: u8 = 1 << 0;
+/// Widest and tallest pointer image sent, in pixels.
+pub const POINTER_MAX_SIDE: u16 = 512;
+/// The fixed fields of a POINTER_SHAPE body, before its bytes.
+pub const POINTER_SHAPE_FIXED_SIZE: usize = 26;
+/// Image bytes in one POINTER_SHAPE datagram.
+pub const POINTER_CHUNK_MAX: usize =
+    super::MAX_DGRAM_SIZE - CONTROL_HEADER_SIZE - POINTER_SHAPE_FIXED_SIZE;
+pub const POINTER_STATE_SIZE: usize = 24;
+
+/// Bytes of a pointer image: `height` rows of `width` premultiplied BGRA
+/// pixels, then, with [`POINTER_SHAPE_INVERT`], `height` rows of
+/// `ceil(width / 8)` mask bytes, most significant bit first, where a set bit
+/// inverts the picture under that pixel.
+pub fn pointer_shape_len(width: u16, height: u16, flags: u8) -> usize {
+    let (w, h) = (usize::from(width), usize::from(height));
+    let mask = if flags & POINTER_SHAPE_INVERT != 0 {
+        w.div_ceil(8) * h
+    } else {
+        0
+    };
+    w * h * 4 + mask
+}
+
+/// Host → client: one chunk of the pointer image with id `shape_id`. The
+/// client keeps chunks until it holds all `total_len` bytes, then draws that
+/// image at the position in [`PointerState`]. A new id replaces the image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PointerShapeChunk {
+    /// Nonzero; changes whenever the image does.
+    pub shape_id: u32,
+    /// The Windows pointer type it came from (1 monochrome, 2 color,
+    /// 4 masked color). For diagnostics; the bytes are already converted.
+    pub source_type: u8,
+    pub flags: u8,
+    pub width: u16,
+    pub height: u16,
+    /// The click point inside the image.
+    pub hot_x: u16,
+    pub hot_y: u16,
+    pub total_len: u32,
+    pub offset: u32,
+    pub data: Vec<u8>,
+}
+
+/// Splits one pointer image into the chunks that carry it.
+#[allow(clippy::too_many_arguments)]
+pub fn pointer_shape_chunks(
+    shape_id: u32,
+    source_type: u8,
+    flags: u8,
+    (width, height): (u16, u16),
+    (hot_x, hot_y): (u16, u16),
+    bytes: &[u8],
+) -> Vec<PointerShapeChunk> {
+    debug_assert_eq!(bytes.len(), pointer_shape_len(width, height, flags));
+    bytes
+        .chunks(POINTER_CHUNK_MAX)
+        .enumerate()
+        .map(|(index, data)| PointerShapeChunk {
+            shape_id,
+            source_type,
+            flags,
+            width,
+            height,
+            hot_x,
+            hot_y,
+            total_len: bytes.len() as u32,
+            offset: (index * POINTER_CHUNK_MAX) as u32,
+            data: data.to_vec(),
+        })
+        .collect()
+}
+
+/// Host → client: where the pointer is, latest wins by `msg_seq`. `x`/`y`
+/// place the image's top-left corner in video pixels, and may be negative
+/// or past the edge when the pointer is partly off the screen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PointerState {
+    pub flags: u8,
+    /// The image to draw; 0 while the host has none.
+    pub shape_id: u32,
+    pub x: i32,
+    pub y: i32,
+    /// Host clock when the host read this position.
+    pub host_time_us: u64,
+}
+
 /// One parsed control message.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ControlMessage {
@@ -484,6 +587,8 @@ pub enum ControlMessage {
     Pong(Pong),
     StreamConfig(StreamConfig),
     InputEvent(InputEvent),
+    PointerShape(PointerShapeChunk),
+    PointerState(PointerState),
     Identify(Identify),
     Identity(Identity),
 }
@@ -502,6 +607,8 @@ impl ControlMessage {
             Self::Pong(_) => PacketType::Pong,
             Self::StreamConfig(_) => PacketType::StreamConfig,
             Self::InputEvent(_) => PacketType::InputEvent,
+            Self::PointerShape(_) => PacketType::PointerShape,
+            Self::PointerState(_) => PacketType::PointerState,
             Self::Identify(_) => PacketType::Identify,
             Self::Identity(_) => PacketType::Identity,
         }
@@ -606,11 +713,15 @@ pub fn encode_control(session_id: u32, msg_seq: u32, message: &ControlMessage) -
                 || r.nacks_sent != 0
                 || r.audio_packets_lost != 0
                 || r.audio_buffer_ms != 0
+                || r.pointer_shape_id != 0
             {
                 body.extend_from_slice(&r.frags_repaired.to_le_bytes());
                 body.extend_from_slice(&r.nacks_sent.to_le_bytes());
                 body.extend_from_slice(&r.audio_packets_lost.to_le_bytes());
                 body.extend_from_slice(&r.audio_buffer_ms.to_le_bytes());
+            }
+            if r.pointer_shape_id != 0 {
+                body.extend_from_slice(&r.pointer_shape_id.to_le_bytes());
             }
         }
         ControlMessage::Ping(p) => body.extend_from_slice(&p.t1_us.to_le_bytes()),
@@ -659,6 +770,25 @@ pub fn encode_control(session_id: u32, msg_seq: u32, message: &ControlMessage) -
                 body.extend_from_slice(&e.tilt_x.to_le_bytes());
                 body.extend_from_slice(&e.tilt_y.to_le_bytes());
             }
+        }
+        ControlMessage::PointerShape(c) => {
+            body.extend_from_slice(&[POINTER_VERSION, c.source_type, c.flags, 0]);
+            body.extend_from_slice(&c.shape_id.to_le_bytes());
+            body.extend_from_slice(&c.width.to_le_bytes());
+            body.extend_from_slice(&c.height.to_le_bytes());
+            body.extend_from_slice(&c.hot_x.to_le_bytes());
+            body.extend_from_slice(&c.hot_y.to_le_bytes());
+            body.extend_from_slice(&c.total_len.to_le_bytes());
+            body.extend_from_slice(&c.offset.to_le_bytes());
+            body.extend_from_slice(&(c.data.len() as u16).to_le_bytes());
+            body.extend_from_slice(&c.data);
+        }
+        ControlMessage::PointerState(p) => {
+            body.extend_from_slice(&[POINTER_VERSION, p.flags, 0, 0]);
+            body.extend_from_slice(&p.shape_id.to_le_bytes());
+            body.extend_from_slice(&p.x.to_le_bytes());
+            body.extend_from_slice(&p.y.to_le_bytes());
+            body.extend_from_slice(&p.host_time_us.to_le_bytes());
         }
     }
 
@@ -841,6 +971,9 @@ pub fn parse_control(datagram: &[u8]) -> Result<(ControlHeader, ControlMessage),
                 report.audio_packets_lost = r.u32()?;
                 report.audio_buffer_ms = r.u16()?;
             }
+            if r.remaining() >= 4 {
+                report.pointer_shape_id = r.u32()?;
+            }
             ControlMessage::ReceiverReport(report)
         }
         PacketType::Ping => ControlMessage::Ping(Ping { t1_us: r.u64()? }),
@@ -876,6 +1009,56 @@ pub fn parse_control(datagram: &[u8]) -> Result<(ControlHeader, ControlMessage),
                 tilt_y: if input_ver == 2 { r.i16()? } else { 0 },
             })
         }
+        PacketType::PointerShape => {
+            pointer_version(r.u8()?)?;
+            let source_type = r.u8()?;
+            let flags = r.u8()?;
+            let _reserved = r.u8()?;
+            let chunk = PointerShapeChunk {
+                shape_id: r.u32()?,
+                source_type,
+                flags,
+                width: r.u16()?,
+                height: r.u16()?,
+                hot_x: r.u16()?,
+                hot_y: r.u16()?,
+                total_len: r.u32()?,
+                offset: r.u32()?,
+                data: {
+                    let len = usize::from(r.u16()?);
+                    r.take(len)?.to_vec()
+                },
+            };
+            if chunk.shape_id == 0 {
+                return Err(WireError::InvalidField("shape_id"));
+            }
+            if !(1..=POINTER_MAX_SIDE).contains(&chunk.width)
+                || !(1..=POINTER_MAX_SIDE).contains(&chunk.height)
+            {
+                return Err(WireError::InvalidField("pointer_size"));
+            }
+            if chunk.total_len as usize != pointer_shape_len(chunk.width, chunk.height, flags) {
+                return Err(WireError::InvalidField("total_len"));
+            }
+            if chunk.data.is_empty()
+                || chunk.offset as usize + chunk.data.len() > chunk.total_len as usize
+            {
+                return Err(WireError::InvalidField("offset"));
+            }
+            ControlMessage::PointerShape(chunk)
+        }
+        PacketType::PointerState => {
+            pointer_version(r.u8()?)?;
+            let flags = r.u8()?;
+            let _reserved = r.u16()?;
+            ControlMessage::PointerState(PointerState {
+                flags,
+                shape_id: r.u32()?,
+                x: r.i32()?,
+                y: r.i32()?,
+                host_time_us: r.u64()?,
+            })
+        }
         PacketType::Identify => {
             let version = r.u8()?;
             let nonce = r.take(16)?.try_into().unwrap();
@@ -906,6 +1089,15 @@ pub fn parse_control(datagram: &[u8]) -> Result<(ControlHeader, ControlMessage),
     };
 
     Ok((header, message))
+}
+
+/// A pointer body of another layout version is not one this parser knows.
+fn pointer_version(version: u8) -> Result<(), WireError> {
+    if version == POINTER_VERSION {
+        Ok(())
+    } else {
+        Err(WireError::InvalidField("pointer_version"))
+    }
 }
 
 fn truncated_name(name: &str) -> &str {
@@ -966,6 +1158,10 @@ impl<'a> Reader<'a> {
     fn u32(&mut self) -> Result<u32, WireError> {
         let b = self.take(4)?;
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    }
+
+    fn i32(&mut self) -> Result<i32, WireError> {
+        Ok(self.u32()? as i32)
     }
 
     fn u64(&mut self) -> Result<u64, WireError> {
@@ -1081,6 +1277,7 @@ mod tests {
                     assert_eq!(report.nacks_sent, 0);
                     assert_eq!(report.audio_packets_lost, 0);
                     assert_eq!(report.audio_buffer_ms, 0);
+                    assert_eq!(report.pointer_shape_id, 0);
                 }
                 _ => {}
             }
@@ -1194,7 +1391,130 @@ mod tests {
                 tilt_x: 0,
                 tilt_y: 0,
             }),
+            ControlMessage::PointerShape(PointerShapeChunk {
+                shape_id: 7,
+                source_type: 1,
+                flags: POINTER_SHAPE_INVERT,
+                width: 2,
+                height: 2,
+                hot_x: 1,
+                hot_y: 0,
+                total_len: 18,
+                offset: 16,
+                data: vec![0x80, 0x40],
+            }),
+            ControlMessage::PointerState(PointerState {
+                flags: POINTER_VISIBLE,
+                shape_id: 7,
+                x: -3,
+                y: 1439,
+                host_time_us: 5_000_001,
+            }),
         ]
+    }
+
+    fn shape_chunk() -> PointerShapeChunk {
+        all_messages()
+            .into_iter()
+            .find_map(|message| match message {
+                ControlMessage::PointerShape(chunk) => Some(chunk),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn pointer_shape_chunks_cover_the_image_in_order_within_a_datagram() {
+        let (width, height) = (64u16, 48u16);
+        let bytes: Vec<u8> = (0..pointer_shape_len(width, height, POINTER_SHAPE_INVERT))
+            .map(|i| i as u8)
+            .collect();
+        let chunks =
+            pointer_shape_chunks(9, 1, POINTER_SHAPE_INVERT, (width, height), (3, 4), &bytes);
+        assert_eq!(chunks.len(), bytes.len().div_ceil(POINTER_CHUNK_MAX));
+        let mut joined = Vec::new();
+        for chunk in &chunks {
+            assert_eq!(chunk.offset as usize, joined.len());
+            let datagram = encode_control(1, 1, &ControlMessage::PointerShape(chunk.clone()));
+            assert!(datagram.len() <= super::super::MAX_DGRAM_SIZE);
+            let (_, parsed) = parse_control(&datagram).unwrap();
+            assert_eq!(parsed, ControlMessage::PointerShape(chunk.clone()));
+            joined.extend_from_slice(&chunk.data);
+        }
+        assert_eq!(joined, bytes);
+    }
+
+    #[test]
+    fn pointer_shapes_reject_a_zero_id_bad_sizes_lengths_and_versions() {
+        let mut cases: Vec<(PointerShapeChunk, &str)> = Vec::new();
+        let mut zero = shape_chunk();
+        zero.shape_id = 0;
+        cases.push((zero, "shape_id"));
+        for (w, h) in [(0, 2), (2, 0), (POINTER_MAX_SIDE + 1, 2)] {
+            let mut sized = shape_chunk();
+            (sized.width, sized.height) = (w, h);
+            cases.push((sized, "pointer_size"));
+        }
+        let mut no_mask = shape_chunk();
+        no_mask.flags = 0;
+        cases.push((no_mask, "total_len"));
+        let mut past_end = shape_chunk();
+        past_end.offset = 17;
+        cases.push((past_end, "offset"));
+        let mut empty = shape_chunk();
+        empty.data.clear();
+        cases.push((empty, "offset"));
+        for (chunk, field) in cases {
+            let datagram = encode_control(1, 1, &ControlMessage::PointerShape(chunk));
+            assert_eq!(
+                parse_control(&datagram),
+                Err(WireError::InvalidField(field))
+            );
+        }
+        for message in [
+            ControlMessage::PointerShape(shape_chunk()),
+            ControlMessage::PointerState(PointerState::default()),
+        ] {
+            let mut datagram = encode_control(1, 1, &message);
+            datagram[CONTROL_HEADER_SIZE] = POINTER_VERSION + 1;
+            assert_eq!(
+                parse_control(&datagram),
+                Err(WireError::InvalidField("pointer_version"))
+            );
+        }
+    }
+
+    #[test]
+    fn a_report_names_the_pointer_shape_after_the_older_tail() {
+        let report = ReceiverReport {
+            stream_epoch: 3,
+            pointer_shape_id: 0x0102_0304,
+            ..Default::default()
+        };
+        let datagram = encode_control(1, 1, &ControlMessage::ReceiverReport(report));
+        assert_eq!(
+            datagram.len(),
+            CONTROL_HEADER_SIZE + RECEIVER_REPORT_SIZE + 14 + 4
+        );
+        assert_eq!(
+            parse_control(&datagram).unwrap().1,
+            ControlMessage::ReceiverReport(report)
+        );
+        // A parser that stops after the older tail reads the same report
+        // without the id: the tail is appended, so nothing before it moved.
+        let mut older = datagram[..datagram.len() - 4].to_vec();
+        let body_len = (older.len() - CONTROL_HEADER_SIZE) as u16;
+        older[6..8].copy_from_slice(&body_len.to_le_bytes());
+        let ControlMessage::ReceiverReport(old) = parse_control(&older).unwrap().1 else {
+            unreachable!()
+        };
+        assert_eq!(
+            old,
+            ReceiverReport {
+                pointer_shape_id: 0,
+                ..report
+            }
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ pub mod congestion;
 pub mod fault;
 pub mod link;
 pub mod pacer;
+pub mod pointer;
 pub mod retransmit;
 pub mod session;
 pub mod standby;
@@ -20,6 +21,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::time::{Duration, Instant};
 
+use eternal_wire::v2::control::ControlMessage;
 use eternal_wire::v2::media::{
     media_payload_size, MediaHeader, MAX_FRAG_COUNT, MAX_MEDIA_PAYLOAD, MEDIA_HEADER_SIZE,
 };
@@ -36,7 +38,7 @@ use abr::AbrController;
 use beat::Phase;
 use fault::FaultInjector;
 use link::{LinkId, PeerId};
-use pacer::{FramePacer, PacingClock};
+use pacer::{Deadline, FramePacer, PacingClock};
 use retransmit::RetransmitRing;
 use session::{Actions, ConfigSource, HEARTBEAT_INTERVAL};
 use usb::{LinkEvent, TransportLinks};
@@ -285,6 +287,7 @@ impl ConfigSource for SharedConfigSource<'_> {
         };
         numbering
             | eternal_wire::v2::control::HOSTCAP_KEYBOARD
+            | eternal_wire::v2::control::HOSTCAP_POINTER
             | if self.pen_available {
                 eternal_wire::v2::control::HOSTCAP_PEN
             } else {
@@ -433,6 +436,7 @@ pub async fn start_sender(
         fault,
         input,
         abr,
+        pointer: Default::default(),
     };
     let mut audio_sender = audio::AudioSender::default();
     let pacing_clock = PacingClock::new()?;
@@ -462,8 +466,21 @@ pub async fn start_sender(
     // starts. It is looked at again while nobody streams.
     let mut network_check = tokio::time::interval(Duration::from_secs(10));
     network_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut pointer_budget = Deadline::new("pointer-budget")?;
 
     loop {
+        // Tokio's timer can wake 15 ms late on Windows, longer than a frame
+        // budget: the budget's end waits on a high-resolution timer.
+        let pointer_repeat = {
+            let (shape, position) = pointer_latest(&shared);
+            let budget = crate::capture::frame_budget_for(shared.effective_fps());
+            pointer_budget.arm(state.pointer.budget_end(
+                budget,
+                position,
+                shape.map(|shape| shape.id),
+            ));
+            state.pointer.repeat_due(budget)
+        };
         beat.mark(Phase::Waiting);
         tokio::select! {
             // Service timers and queued control before another paced frame.
@@ -478,6 +495,7 @@ pub async fn start_sender(
                 }
             }
             _ = heartbeat.tick() => {
+                state.pointer.refresh(now());
                 beat.mark(Phase::Tick);
                 let actions = shared.session.lock().tick(&config, true, now());
                 act(actions, &mut state, &links, &shared, &config, &supervisor).await;
@@ -549,6 +567,19 @@ pub async fn start_sender(
                 }
             }
 
+            // Before video: a position is small and the iPad draws it at once.
+            _ = shared.pointer.changed() => {
+                beat.mark(Phase::Pointer);
+                send_pointer(&mut state.pointer, &links, &shared).await;
+            }
+            _ = pointer_budget.wait(), if pointer_budget.armed() => {
+                beat.mark(Phase::Pointer);
+                send_pointer(&mut state.pointer, &links, &shared).await;
+            }
+            _ = tokio::time::sleep_until(pointer_repeat.unwrap_or_else(Instant::now).into()), if pointer_repeat.is_some() => {
+                beat.mark(Phase::Pointer);
+                send_pointer(&mut state.pointer, &links, &shared).await;
+            }
             Some(packet) = audio_rx.recv() => {
                 beat.mark(Phase::Audio);
                 audio_sender.send(packet, &links, &shared, stream_epoch).await;
@@ -965,6 +996,7 @@ struct LoopState {
     /// wait seconds while it reconfigures displays.
     input: crate::input::Injector,
     abr: AbrController,
+    pointer: pointer::PointerSender,
 }
 
 /// Carries out everything the session decided. Every path that feeds the
@@ -996,6 +1028,13 @@ async fn act(
                 .input
                 .relay(session_id, event, geometry, actions.input_late);
         }
+    }
+    if actions.force_idr || actions.new_target.is_some() {
+        state.pointer.keyframe(now());
+    }
+    if let Some(report) = actions.report.as_ref() {
+        state.pointer.report(report.pointer_shape_id, now());
+        shared.note_pointer_report(report.pointer_shape_id);
     }
     if let Some(report) = actions.report.take() {
         // A slow log sink must not hold the capture/encode stats lock.
@@ -1032,6 +1071,92 @@ async fn act(
         apply_bitrate(decision, links, shared, config).await;
     }
     execute_actions(actions, links, shared, supervisor).await;
+    send_pointer(&mut state.pointer, links, shared).await;
+}
+
+/// The pointer to send: hidden until the iPad holds its image, while
+/// capture still draws it into the video (`client_draws_pointer`). No image
+/// and hidden while capture withholds it (`PointerFeed::set_withheld`).
+fn pointer_latest(
+    shared: &SharedControl,
+) -> (
+    Option<std::sync::Arc<crate::capture::pointer::Shape>>,
+    Option<crate::capture::pointer::Position>,
+) {
+    let (shape, position) = shared.pointer.latest();
+    let withheld = shared.pointer.withheld();
+    let shown = shared.client_draws_pointer() && !withheld;
+    let position = position.map(|position| crate::capture::pointer::Position {
+        visible: position.visible && shown,
+        ..position
+    });
+    (shape.filter(|_| !withheld), position)
+}
+
+/// Sends what [`pointer::PointerSender`] says is due, to a client that
+/// draws the pointer.
+async fn send_pointer(
+    sender: &mut pointer::PointerSender,
+    links: &TransportLinks,
+    shared: &SharedControl,
+) {
+    let session_id = shared.session.lock().pointer_session_id();
+    if session_id.is_some() && sender.session_id() != session_id {
+        info!(
+            ?session_id,
+            "The iPad draws the pointer: sending it apart from the video"
+        );
+    }
+    sender.serve(session_id);
+    if session_id.is_none() || (shared.pointer.withheld() && !sender.withhold()) {
+        return;
+    }
+    let budget = crate::capture::frame_budget_for(shared.effective_fps());
+    for send in sender.poll(now(), budget, pointer_latest(shared)) {
+        match send {
+            pointer::Send::Shape(shape, from) => {
+                let image = &shape.image;
+                let chunks = eternal_wire::v2::control::pointer_shape_chunks(
+                    shape.id,
+                    image.source_type,
+                    image.flags,
+                    (image.width, image.height),
+                    image.hot,
+                    &image.bytes,
+                );
+                let total = chunks.len();
+                let mut next = from;
+                let mut refused = false;
+                for chunk in chunks.into_iter().skip(from) {
+                    let message = ControlMessage::PointerShape(chunk);
+                    let Some((peer, datagram)) = shared.session.lock().encode_for_client(&message)
+                    else {
+                        return;
+                    };
+                    // A full USB control queue refuses it: resume here later.
+                    if links.send_to(&datagram, peer).await.is_err() {
+                        refused = true;
+                        break;
+                    }
+                    next += 1;
+                }
+                if next >= total {
+                    PIPELINE_STATS.lock().pointer_shapes_sent += 1;
+                }
+                sender.shape_progress(shape.id, next, total, refused, now());
+            }
+            pointer::Send::State(state) => {
+                PIPELINE_STATS.lock().pointer_states_sent += 1;
+                let message = ControlMessage::PointerState(state);
+                let Some((peer, datagram)) = shared.session.lock().encode_for_client(&message)
+                else {
+                    return;
+                };
+                // A lost position is replaced by the next, or the repeat.
+                let _ = links.send_to(&datagram, peer).await;
+            }
+        }
+    }
 }
 
 /// Steps the bitrate down once for each episode of sends the system had no
@@ -1512,7 +1637,121 @@ mod tests {
             fault: FaultInjector::new(0.0, 0.0, Duration::ZERO),
             input: crate::input::InputThread::default().begin(Default::default()),
             abr: AbrController::new(15_000_000, true),
+            pointer: Default::default(),
         }
+    }
+
+    /// Review r2: the USB tunnel's control queue takes 64 datagrams and
+    /// refuses more while its writer is blocked. A 256x256 image is 194
+    /// chunks: they went out until the queue filled, the rest were dropped,
+    /// and the image counted as sent, so the iPad never had it whole. The
+    /// chunks now resume where the link refused them.
+    #[tokio::test]
+    async fn an_image_larger_than_the_usb_queue_arrives_whole_after_backpressure() {
+        use crate::capture::pointer::{PointerImage, Position};
+        use eternal_wire::v2::control::{parse_control, FEATURE_DRAWS_POINTER};
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let shared = SharedControl::new(socket.local_addr().unwrap().port(), 15_000_000);
+        shared.pairing.lock().required = false;
+        let config = SharedConfigSource {
+            shared: &shared,
+            stream_epoch: 1,
+            pen_available: false,
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+        };
+        let mut links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
+        let cable = PeerId::usb(5);
+        let (host_end, mut ipad_end) = tokio::io::duplex(4096);
+        let link = link::FramedLink::connect(
+            host_end,
+            cable,
+            std::sync::Arc::clone(&shared.force_next_idr),
+        )
+        .await
+        .unwrap();
+        links.adopt_for_test(std::sync::Arc::new(link));
+        link::read_preamble(&mut ipad_end).await.unwrap();
+        let hello = ControlMessage::Hello2(Hello2 {
+            proto_min: 2,
+            proto_max: 2,
+            client_nonce: 1,
+            listen_port: 0,
+            decoder_caps: CAP_DECODE_H264,
+            feature_caps: FEATURE_DRAWS_POINTER,
+            screen_px_w: 1920,
+            screen_px_h: 1080,
+            screen_pt_w: 960,
+            screen_pt_h: 540,
+            refresh_hz: 60,
+            device_name: "cable test".into(),
+            device_id: 0,
+            preferred_fps: 0,
+            auth_token: [0; 16],
+            pairing_code: 0,
+        });
+        shared
+            .session
+            .lock()
+            .handle_control(cable, 0, hello, &config, now());
+        assert!(
+            shared.session.lock().pointer_session_id().is_some(),
+            "a cable counts as answered"
+        );
+        let (side, total_bytes) = (256u16, 256usize * 256 * 4);
+        shared.pointer.set_shape(PointerImage {
+            source_type: 2,
+            flags: 0,
+            width: side,
+            height: side,
+            hot: (0, 0),
+            bytes: (0..total_bytes).map(|i| i as u8).collect(),
+        });
+        shared.pointer.set_position(Position {
+            visible: true,
+            x: 10,
+            y: 10,
+            host_time_us: 0,
+        });
+        let chunk_count = total_bytes.div_ceil(eternal_wire::v2::control::POINTER_CHUNK_MAX);
+        assert!(chunk_count > 64, "{chunk_count} chunks");
+
+        // Nobody reads the tunnel: the queue fills and refuses the rest.
+        let mut sender = pointer::PointerSender::default();
+        send_pointer(&mut sender, &links, &shared).await;
+        let mut got = vec![false; chunk_count];
+        let mut first = 0;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut rounds = 0;
+        while got.iter().any(|g| !g) {
+            assert!(
+                Instant::now() < deadline,
+                "only {} of {chunk_count} chunks arrived",
+                got.iter().filter(|g| **g).count()
+            );
+            // Drain what the tunnel holds, then let the sender go on.
+            while let Ok(Ok(datagram)) = tokio::time::timeout(
+                Duration::from_millis(20),
+                link::read_datagram(&mut ipad_end),
+            )
+            .await
+            {
+                if let Ok((_, ControlMessage::PointerShape(chunk))) = parse_control(&datagram) {
+                    got[chunk.offset as usize / eternal_wire::v2::control::POINTER_CHUNK_MAX] =
+                        true;
+                }
+            }
+            if rounds == 0 {
+                first = got.iter().filter(|g| **g).count();
+            }
+            rounds += 1;
+            tokio::time::sleep(pointer::SHAPE_RETRY).await;
+            send_pointer(&mut sender, &links, &shared).await;
+        }
+        assert!(
+            first < chunk_count,
+            "the queue refused some at first ({first} of {chunk_count})"
+        );
+        assert!(rounds > 1);
     }
 
     /// A cable pulled while a key and a mouse button are down ends the USB

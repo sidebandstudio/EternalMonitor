@@ -96,10 +96,12 @@ final class ConnectionManager: ObservableObject {
 
     /// HELLO2 feature bits. Every build says it checks for its own updates,
     /// so the PC tells only older iPad apps to update, and that it
-    /// understands why a PC isn't streaming.
+    /// understands why a PC isn't streaming. It draws the PC's pointer
+    /// itself, so pointer motion needs no video frame.
     nonisolated static func featureCaps(wantsInput: Bool, wantsAudio: Bool, isUSB: Bool) -> UInt16 {
         (wantsInput ? Hello2.featureWantsInput : 0) | (wantsAudio ? Hello2.featureWantsAudio : 0)
             | (isUSB ? 0 : Hello2.featureSupportsNack) | Hello2.featureChecksUpdates | Hello2.featureStandbyStatus
+            | (E2E.drawsPointer ? Hello2.featureDrawsPointer : 0)
     }
     private var awaitingPairing = false
     /// The PC answered that it isn't streaming; the attempt waits for it.
@@ -209,6 +211,8 @@ final class ConnectionManager: ObservableObject {
     private var summarizedNonces: [UInt32] = []
 
     let frameSlot = FrameSlot()
+    /// The PC's pointer, drawn by `MetalView` when the PC sends it apart.
+    let pointerOverlay = PointerOverlay()
     /// Lets hot-path closures reach the CURRENT control channel without
     /// retaining self (rebuilt each connect).
     private let controlChannelBox = ControlChannelBox()
@@ -626,6 +630,8 @@ final class ConnectionManager: ObservableObject {
             receiver?.send(data)
         })
         controlChannelBox.value = channel
+        pointerOverlay.reset()
+        channel.pointer = pointerOverlay
         assembler.rttUs = { [weak channel] in channel?.clockSnapshot.withLock { $0.rttUs } ?? 10_000 }
         assembler.onNack = { [weak channel] nack in channel?.sendNack(nack) }
         assembler.onNeedsKeyframe = { [weak channel] epoch, seq in
@@ -649,6 +655,7 @@ final class ConnectionManager: ObservableObject {
             let stats = audio?.stats ?? AudioStats()
             report.audioPacketsLost = UInt32(clamping: stats.lost)
             report.audioBufferMs = UInt16(clamping: stats.bufferMs)
+            report.pointerShapeId = channel?.pointer?.completeShapeId ?? 0
             return report
         }
         channel.onHelloAttempt = { [weak self] attempt, total in
@@ -1005,6 +1012,9 @@ final class ConnectionManager: ObservableObject {
                 // neither media nor heartbeats, so skipping this when nothing
                 // arrived is exactly when the liveness watchdog is needed.
                 self.refreshStatsAndWatchdog()
+                if E2E.enabled, self.state == .connected {
+                    E2E.pointer(self.pointerOverlay.counters, decoded: self.debugState.decodedFrames)
+                }
                 if ProcessInfo.processInfo.systemUptime - lastSummary >= 10 {
                     lastSummary = ProcessInfo.processInfo.systemUptime
                     self.recordStreamSummary(reason: "periodic")
