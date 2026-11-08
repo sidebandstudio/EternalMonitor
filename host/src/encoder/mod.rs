@@ -636,7 +636,7 @@ struct EncoderState {
     native_converter: Option<vimage::Converter>,
     encoder: ffmpeg_next::codec::encoder::video::Encoder,
     /// BGRA to the encoder's YUV input, reading capture's buffer directly.
-    scaler: Option<ffmpeg_next::software::scaling::Context>,
+    scaler: Option<input::Scaler>,
     frame: ffmpeg_next::frame::Video,
     packet: ffmpeg_next::Packet,
     h264: H264BitstreamState,
@@ -814,27 +814,43 @@ impl EncoderState {
         let mut h264 = H264BitstreamState::default();
         h264.refresh_parameter_sets_from_extradata(encoder_extradata(&encoder));
 
-        let scaler = input::conversion_context(pixel_format, width, height)?;
-        if scaler.is_some() {
-            info!(output = ?pixel_format, "swscale BGRA conversion context created");
+        #[cfg(target_os = "macos")]
+        let native_converter = if pixel_format == ffmpeg_next::format::Pixel::YUV420P {
+            match vimage::Converter::new() {
+                Ok(converter) => {
+                    info!("Accelerate BGRA->YUV420P converter ready");
+                    Some(converter)
+                }
+                Err(error) => {
+                    warn!(%error, "Using swscale color conversion");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        // Where Accelerate converts, swscale is only its fallback, so it
+        // keeps no threads waiting.
+        #[cfg(target_os = "macos")]
+        let threads = if native_converter.is_some() {
+            1
+        } else {
+            input::scaler_threads()
+        };
+        #[cfg(not(target_os = "macos"))]
+        let threads = input::scaler_threads();
+        let scaler = input::conversion_context(pixel_format, width, height, threads)?;
+        if let Some(scaler) = &scaler {
+            info!(
+                output = ?pixel_format,
+                threads = scaler.threads(),
+                "swscale BGRA conversion context created"
+            );
         }
 
         Ok(Self {
             #[cfg(target_os = "macos")]
-            native_converter: if pixel_format == ffmpeg_next::format::Pixel::YUV420P {
-                match vimage::Converter::new() {
-                    Ok(converter) => {
-                        info!("Accelerate BGRA->YUV420P converter ready");
-                        Some(converter)
-                    }
-                    Err(error) => {
-                        warn!(%error, "Using swscale color conversion");
-                        None
-                    }
-                }
-            } else {
-                None
-            },
+            native_converter,
             encoder,
             scaler,
             frame: ffmpeg_next::frame::Video::new(pixel_format, width, height),
@@ -2351,6 +2367,21 @@ mod tests {
         .unwrap_or_else(|error| panic!("{width}x{height}: {error}"))
     }
 
+    /// swscale gets threads only where it converts every frame: with
+    /// Accelerate converting on macOS it is a fallback and runs on one.
+    #[test]
+    fn swscale_gets_threads_only_where_it_converts_every_frame() {
+        let state = libx264_at(96, 64);
+        let scaler = state.scaler.as_ref().expect("x264 takes YUV420P");
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            (state.native_converter.is_some(), scaler.threads()),
+            (true, 1)
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(scaler.threads(), input::scaler_threads());
+    }
+
     /// A synthetic capture, in a buffer as capture hands it over.
     fn synthetic_capture(width: u32, height: u32, frame_number: u64) -> Vec<u8> {
         let frame_bytes = width as usize * 4 * height as usize;
@@ -2492,7 +2523,13 @@ mod tests {
                     _ => Pixel::YUV420P,
                 };
                 state.frame = ffmpeg_next::frame::Video::new(format, even_width, even_height);
-                state.scaler = input::conversion_context(format, even_width, even_height).unwrap();
+                state.scaler = input::conversion_context(
+                    format,
+                    even_width,
+                    even_height,
+                    input::scaler_threads(),
+                )
+                .unwrap();
                 assert_eq!(state.scaler.is_some(), format != Pixel::BGRA);
                 state.convert(&alone, even_bytes).unwrap();
                 let expected = picture(&state.frame);
