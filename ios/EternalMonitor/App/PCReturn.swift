@@ -43,8 +43,10 @@ final class BonjourPCBrowser: PCBrowser {
 /// the PC is asked to prove it holds the saved pairing: at once when it
 /// turns up or changes, then every few seconds, because a PC that closed
 /// without saying goodbye stays listed, unchanged, after it opens again.
-/// A listing that proves it gets one try; only a new or changed one gets
-/// another.
+/// Every such listing is asked in turn, so one that never answers, such as
+/// another PC at the saved address, can't keep the PC from being asked
+/// where it is now. A listing that proves it gets one try; only a new or
+/// changed one gets another.
 struct PCReturn {
     /// The PC's name, when this iPad knows it: its Bonjour service is the
     /// PC, wherever it is. The service at the address tried is the PC too.
@@ -87,9 +89,16 @@ struct PCReturn {
         return !new.isEmpty
     }
 
-    /// The listing to ask next: one that hasn't had its try.
-    var candidate: DiscoveredHost? {
-        listed.keys.sorted().first { !tried.contains($0) }.flatMap { listed[$0] }
+    /// The listings to ask, each in its turn: those that haven't had their
+    /// try. One that doesn't answer stays among them.
+    var candidates: [DiscoveredHost] {
+        listed.keys.sorted().filter { !tried.contains($0) }.compactMap { listed[$0] }
+    }
+
+    /// Whether `pc` is still listed and hasn't had its try.
+    func awaits(_ pc: DiscoveredHost) -> Bool {
+        let key = Self.key(pc)
+        return listed[key] != nil && !tried.contains(key)
     }
 
     /// `pc` had its try, or can't have one.

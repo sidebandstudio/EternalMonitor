@@ -1612,9 +1612,10 @@ final class ConnectionManager: ObservableObject {
             && !watch.expired(at: now(), limit: timing.pcReturnLimitSeconds)
     }
 
-    /// Asks the PC's listings after `delay`, so a few Bonjour updates count
-    /// as one, then every few seconds, until one proves the pairing and has
-    /// its try or none is left to ask. A newer call starts over.
+    /// Asks each of the PC's listings in turn after `delay`, so a few
+    /// Bonjour updates count as one, then again every few seconds, until one
+    /// proves the pairing and has its try or none is left to ask. A newer
+    /// call starts over.
     private func askPCReturn(after delay: Double) {
         guard let watch = pcReturn, watch.armedAt != nil else { return }
         guard !watch.expired(at: now(), limit: timing.pcReturnLimitSeconds) else {
@@ -1626,13 +1627,16 @@ final class ConnectionManager: ObservableObject {
             var wait = delay
             while true {
                 try? await Task.sleep(for: .seconds(wait))
-                guard !Task.isCancelled, let self, self.pcReturnMayTry, let pc = self.pcReturn?.candidate else { return }
-                let proved = await self.provePCReturn(pc)
-                guard !Task.isCancelled, self.pcReturnMayTry else { return }
-                if proved {
-                    self.pcReturnTry = nil
-                    self.pcReturn?.didTry(pc)
-                    return self.tryPCAgain(at: pc)
+                guard !Task.isCancelled, let self, self.pcReturnMayTry,
+                      let round = self.pcReturn?.candidates, !round.isEmpty else { return }
+                for pc in round where self.pcReturn?.awaits(pc) == true {
+                    let proved = await self.provePCReturn(pc)
+                    guard !Task.isCancelled, self.pcReturnMayTry else { return }
+                    if proved {
+                        self.pcReturnTry = nil
+                        self.pcReturn?.didTry(pc)
+                        return self.tryPCAgain(at: pc)
+                    }
                 }
                 wait = self.timing.pcReturnProbeSeconds
             }

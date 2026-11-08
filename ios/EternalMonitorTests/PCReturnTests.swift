@@ -45,22 +45,37 @@ final class PCReturnTests: XCTestCase {
         XCTAssertTrue(watch.heard([listed]), "asked at once")
         // Not proved yet: asked again, every few seconds.
         XCTAssertFalse(watch.heard([listed]))
-        XCTAssertEqual(watch.candidate, listed)
+        XCTAssertEqual(watch.candidates.first, listed)
         watch.didTry(listed)
-        XCTAssertNil(watch.candidate, "one try per listing")
+        XCTAssertNil(watch.candidates.first, "one try per listing")
         XCTAssertFalse(watch.heard([listed]))
-        XCTAssertNil(watch.candidate)
+        XCTAssertNil(watch.candidates.first)
         // It leaves (the app closed) and comes back.
         XCTAssertFalse(watch.heard([]))
         XCTAssertTrue(watch.heard([listed]))
-        XCTAssertEqual(watch.candidate, listed)
+        XCTAssertEqual(watch.candidates.first, listed)
         watch.didTry(listed)
         // A change is a new listing, and the try goes where the PC is now.
         XCTAssertTrue(watch.heard([pc(port: 9877)]))
-        XCTAssertEqual(watch.candidate?.port, 9877, "a new port")
+        XCTAssertEqual(watch.candidates.first?.port, 9877, "a new port")
         watch.didTry(pc(port: 9877))
         XCTAssertTrue(watch.heard([pc(port: 9877, version: "0.3.6")]))
-        XCTAssertEqual(watch.candidate?.version, "0.3.6", "a new version")
+        XCTAssertEqual(watch.candidates.first?.version, "0.3.6", "a new version")
+    }
+
+    /// A listing that never answers stays to be asked, beside the others.
+    func testEveryUntriedListingIsAsked() {
+        var watch = PCReturn(name: "Test PC", host: "192.0.2.20", port: 9876)
+        let stale = pc("EternalMonitor (Another PC)", "192.0.2.20", port: 9876)
+        let moved = pc("EternalMonitor (Test PC)", "192.0.2.40", port: 9876)
+        XCTAssertTrue(watch.heard([stale, moved]))
+        XCTAssertEqual(watch.candidates, [stale, moved])
+        XCTAssertTrue(watch.awaits(moved))
+        watch.didTry(moved)
+        XCTAssertEqual(watch.candidates, [stale])
+        XCTAssertFalse(watch.awaits(moved))
+        XCTAssertFalse(watch.heard([stale]))
+        XCTAssertFalse(watch.awaits(moved), "no longer listed")
     }
 
     func testOnlyThisPCCounts() {
@@ -72,13 +87,13 @@ final class PCReturnTests: XCTestCase {
                       pc("EternalMonitor (Test PC)", nil, port: 9876)]
         XCTAssertFalse(named.heard(others))
         XCTAssertFalse(unnamed.heard(others))
-        XCTAssertNil(named.candidate)
-        XCTAssertNil(unnamed.candidate)
+        XCTAssertNil(named.candidates.first)
+        XCTAssertNil(unnamed.candidates.first)
         // By name at another address, or by the address tried.
         XCTAssertTrue(named.heard(others + [pc("EternalMonitor (Test PC)", "192.0.2.40", port: 9876)]))
-        XCTAssertEqual(named.candidate?.address, "192.0.2.40")
+        XCTAssertEqual(named.candidates.first?.address, "192.0.2.40")
         XCTAssertTrue(unnamed.heard(others + [pc("EternalMonitor (Any)", "192.0.2.20", port: 9876)]))
-        XCTAssertEqual(unnamed.candidate?.name, "EternalMonitor (Any)")
+        XCTAssertEqual(unnamed.candidates.first?.name, "EternalMonitor (Any)")
     }
 
     func testTheTimeLimitStartsWhenTheCardGoesUp() {
@@ -252,6 +267,22 @@ final class PCReturnTests: XCTestCase {
         XCTAssertEqual(atOld, 0, "nothing went to the old port")
         XCTAssertEqual(RecentConnectionStore.shared.connections.first?.port, moved.port)
         XCTAssertEqual(try setup.pairings.token(address: PairingStore.address(host: "127.0.0.1", port: moved.port)), Self.token)
+    }
+
+    /// Another PC sits at the saved address and never answers; Bonjour has
+    /// the saved PC at a new port too, and that listing sorts after it. Both
+    /// are asked in turn, so the PC streams from its new port.
+    func testASilentListingDoesNotKeepThePCFromBeingAsked() async throws {
+        let setup = try await noReply()
+        defer { setup.manager.cancel() }
+        let moved = FakeUDPHost()
+        let stale = DiscoveredHost(name: "EternalMonitor (Another PC)", address: "127.0.0.1", port: setup.host.port)
+        let pc = DiscoveredHost(name: "EternalMonitor (Test PC)", address: "127.0.0.1", port: moved.port)
+        setup.browser.list([stale, pc])
+        try await stream(setup, from: moved)
+        let atStale = await Task.detached { [host = setup.host] in host.received(within: 0.3) }.value
+        XCTAssertFalse(atStale.contains(.hello2), "\(atStale)")
+        XCTAssertEqual(setup.tries, 1)
     }
 
     /// Another PC took the saved address, with pairing off: it can't prove
