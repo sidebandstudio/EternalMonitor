@@ -16,7 +16,8 @@ use tracing::{error, info, warn};
 use crate::control::{SharedControl, SupervisorCommand};
 use crate::gpu::GpuInfo;
 use crate::stats::PIPELINE_STATS;
-use crate::transport::session::{StageFailure, StreamStop};
+use crate::transport::session::{NotStreaming, StageFailure, StreamStop};
+use crate::transport::standby::Standby;
 
 /// The current pipeline generation. Stage health reports carry the generation
 /// they belong to; anything from an older generation is ignored (a "poisoned"
@@ -82,6 +83,21 @@ const WATCH_GAP_MS: u64 = 2_000;
 /// them. Waking displays and drivers can hold capture for seconds while
 /// nothing is wrong; a stage still silent after it is restarted then.
 const WAKE_GRACE_MS: u64 = 10_000;
+
+/// Lets integration tests trip the storm brake in milliseconds instead of
+/// half a minute: the first backoff, in ms.
+#[cfg(feature = "test-hooks")]
+pub static TEST_BACKOFF_BASE_MS: AtomicU64 = AtomicU64::new(BACKOFF_BASE.as_millis() as u64);
+
+#[cfg(feature = "test-hooks")]
+fn backoff_base() -> Duration {
+    Duration::from_millis(TEST_BACKOFF_BASE_MS.load(Ordering::SeqCst))
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn backoff_base() -> Duration {
+    BACKOFF_BASE
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SupervisorState {
@@ -251,7 +267,7 @@ impl Machine {
         }
         self.restarts.push(now);
         self.attempt += 1;
-        let backoff = BACKOFF_BASE
+        let backoff = backoff_base()
             .saturating_mul(1u32 << (self.attempt - 1).min(6))
             .min(BACKOFF_MAX);
         warn!(
@@ -353,6 +369,8 @@ pub fn run(
     } else {
         machine.wait_for_port(Instant::now() + crate::startup::port::RECHECK);
     }
+    let mut standby = None;
+    settle(&machine, &shared, &mut standby, listen_port);
     let mut healthy_since = Instant::now();
     let mut transport_watch = crate::transport::beat::Watch::default();
 
@@ -394,16 +412,34 @@ pub fn run(
         match effect {
             Effect::None => {}
             Effect::StopPipeline => {
+                // Before the join: a HELLO2 the stopping transport still
+                // takes hears why.
+                shared
+                    .session
+                    .lock()
+                    .set_not_streaming(not_streaming(&machine.state, &shared));
                 stop_pipeline(&shared, &machine.state);
                 bounded_join(&mut pipeline, generation);
             }
             Effect::Restart | Effect::Start => {
+                // A HELLO2 meanwhile is told to ask again in a moment.
+                shared
+                    .session
+                    .lock()
+                    .set_not_streaming(Some(NotStreaming::Restarting));
                 shared.stop();
                 bounded_join(&mut pipeline, generation);
+                // The check below binds the port: the standby lets go first.
+                if let Some(standby) = standby.take() {
+                    standby.stop();
+                }
                 // Before anything of the new generation starts: a held port
-                // leaves capture and the encoder closed while it waits.
-                if !crate::startup::port::check(listen_port) {
+                // leaves capture and the encoder closed while it waits. One
+                // the last owner left bound is this host's own.
+                let ours = shared.stream_socket.lock().is_some();
+                if !ours && !crate::startup::port::check(listen_port) {
                     machine.wait_for_port(now + crate::startup::port::RECHECK);
+                    settle(&machine, &shared, &mut standby, listen_port);
                     continue;
                 }
                 crate::audio::restart_stats(&PIPELINE_STATS, |stats| {
@@ -412,6 +448,7 @@ pub fn run(
                 });
                 generation = CURRENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
                 machine.note_started(generation);
+                settle(&machine, &shared, &mut standby, listen_port);
                 healthy_since = Instant::now();
                 pipeline = Some(spawn_generation(
                     generation,
@@ -425,15 +462,81 @@ pub fn run(
             Effect::Shutdown => {
                 shared.stop();
                 bounded_join(&mut pipeline, generation);
+                // The port closes as the stream ends, as it always did: a
+                // copy that takes over after this one quits binds it.
+                shared.stream_socket.lock().take();
                 break;
             }
         }
+        settle(&machine, &shared, &mut standby, listen_port);
         // Stopped by the user (or given up) while waiting: no notice.
         if !matches!(machine.state, SupervisorState::WaitingForPort { .. }) {
             crate::startup::port::forget();
         }
     }
+    if let Some(standby) = standby.take() {
+        standby.stop();
+    }
+    shared.stream_socket.lock().take();
     info!("Supervisor loop ended");
+}
+
+/// Makes what iPads hear match `machine`: the session's answer to a HELLO2,
+/// and the standby responder on the port while no generation streams.
+fn settle(
+    machine: &Machine,
+    shared: &SharedControl,
+    standby: &mut Option<Standby>,
+    listen_port: u16,
+) {
+    if !standby_answers(&machine.state) {
+        if let Some(standby) = standby.take() {
+            standby.stop();
+        }
+    }
+    // Cleared only once the standby has stopped: it never starts a session.
+    shared
+        .session
+        .lock()
+        .set_not_streaming(not_streaming(&machine.state, shared));
+    if standby_answers(&machine.state) && standby.is_none() {
+        *standby = Standby::start(listen_port, shared.clone());
+    }
+}
+
+/// Whether the standby responder holds the port in `state`. Not while a
+/// generation runs, and not while another program holds the port.
+fn standby_answers(state: &SupervisorState) -> bool {
+    matches!(
+        state,
+        SupervisorState::BackingOff { .. }
+            | SupervisorState::Stopped
+            | SupervisorState::Failed { .. }
+    )
+}
+
+/// What a HELLO2 hears in `state`. Nothing starts streaming by itself after
+/// Stop or the storm brake: only Start does.
+fn not_streaming(state: &SupervisorState, shared: &SharedControl) -> Option<NotStreaming> {
+    use eternal_wire::v2::control::FailedReason;
+    match state {
+        SupervisorState::Running { .. } => None,
+        SupervisorState::BackingOff { .. } | SupervisorState::WaitingForPort { .. } => {
+            Some(NotStreaming::Restarting)
+        }
+        SupervisorState::Stopped | SupervisorState::ShutDown => Some(NotStreaming::Stopped),
+        SupervisorState::Failed { stage, .. } => {
+            let block = *shared.capture_block.lock();
+            Some(NotStreaming::Failed(block.map_or(
+                match stage {
+                    Stage::Capture | Stage::Audio => FailedReason::Capture,
+                    Stage::Encoder => FailedReason::Encoder,
+                    Stage::Transport => FailedReason::Transport,
+                },
+                crate::capture::recovery::CaptureBlock::failed_reason,
+            )))
+        }
+    }
 }
 
 /// Stops the pipeline that the machine stopped in `state`, first ending the

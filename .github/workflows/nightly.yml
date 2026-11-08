@@ -7,8 +7,10 @@ name: Beta builds
 # https://github.com/sidebandstudio/EternalMonitor/releases/download/beta/EternalMonitor-Setup-beta.exe
 # never changes (docs/download.html?channel=beta links it). No tag here starts
 # with v, so release.yml and testflight.yml never run for a beta build, and
-# docs/latest.json, /releases/latest and the apps' update checks never see
-# one. scripts/nightly.py has the version, branch and retention rules.
+# docs/latest.json, /releases/latest and stable installs never see one. A
+# Beta install reads the beta release's body for the newest Beta
+# (host/src/updates.rs). scripts/nightly.py has the version, branch and
+# retention rules.
 #
 # Only a run on main publishes. A manual run with dry_run, on any other
 # branch or for a pull request that changes this pipeline, builds and scans
@@ -162,6 +164,19 @@ jobs:
           mv dist/EternalMonitor-Setup.exe "dist/$ASSET"
           python3 scripts/nightly.py notes --version "$VERSION" --branch "$BRANCH" \
             --sha "$SHA" --stable "$STABLE" --sha256 "$SHA256" > notes.md
+
+      # What scripts/sign_beta_manifest.py --sha256/--version must be given:
+      # the hash the build computed, which the step above checked.
+      - name: Summarize the build to sign
+        run: |
+          {
+            echo "### Beta build to sign"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version | $VERSION |"
+            echo "| Installer SHA-256 | \`$SHA256\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # The dated release first, checked anonymously; then the fixed beta link,
       # swapped by renames and checked byte for byte before the old asset goes;

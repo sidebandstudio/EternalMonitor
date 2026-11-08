@@ -948,6 +948,7 @@ pub(crate) mod tests {
         let shared = SharedControl::new(9876, 15_000_000);
         *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
         let subscriber = tracing_subscriber::registry().with(FallbackWatch);
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!(second_screen_fallback = "remembered", "before the session");
             note_session_start(1, &shared);
@@ -987,6 +988,7 @@ pub(crate) mod tests {
             session_id: Some(id),
             ..end(EndReason::Goodbye(ByeReason::UserDisconnect), None, 1_000)
         };
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(subscriber, || {
             *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
             note_session_start(1, &shared);

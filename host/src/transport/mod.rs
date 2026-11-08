@@ -7,6 +7,7 @@ pub mod link;
 pub mod pacer;
 pub mod retransmit;
 pub mod session;
+pub mod standby;
 pub mod usb;
 pub mod usbmuxd;
 
@@ -200,42 +201,11 @@ pub async fn start_sender(
         );
     }
     let bind_addr = SocketAddr::from((bind_ip, listen_port));
-    let socket = {
-        let raw = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
-        // A 4 MiB send buffer lets the kernel absorb whatever the pacer's
-        // hard budget doesn't smooth (best effort — some platforms clamp it).
-        let _ = raw.set_send_buffer_size(4 * 1024 * 1024);
-        let _ = raw.set_recv_buffer_size(4 * 1024 * 1024);
-        let _ = raw.set_tos(0xB8);
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::AsRawSocket;
-            use windows::Win32::Networking::WinSock::{
-                WSAGetLastError, WSAIoctl, SIO_UDP_CONNRESET, SOCKET,
-            };
-            let disabled = 0u32;
-            let mut returned = 0;
-            let result = unsafe {
-                WSAIoctl(
-                    SOCKET(raw.as_raw_socket() as usize),
-                    SIO_UDP_CONNRESET,
-                    Some((&disabled as *const u32).cast()),
-                    std::mem::size_of_val(&disabled) as u32,
-                    None,
-                    0,
-                    &mut returned,
-                    None,
-                    None,
-                )
-            };
-            if result != 0 {
-                warn!(error = ?unsafe { WSAGetLastError() }, "Could not disable UDP connection-reset notifications");
-            }
-        }
-        raw.set_nonblocking(true)?;
-        raw.bind(&bind_addr.into())?;
-        UdpSocket::from_std(raw.into())?
+    let socket = match take_stream_socket(&shared, bind_addr) {
+        Some(socket) => socket,
+        None => bind_stream_socket(bind_addr)?,
     };
+    let socket = UdpSocket::from_std(socket)?;
 
     // Never 0 — the receiver treats epoch 0 as invalid. (Wrap after 2^32 runs is
     // harmless: a fresh session id accompanies any host relaunch.)
@@ -428,6 +398,7 @@ pub async fn start_sender(
                                             src,
                                             &header,
                                             message,
+                                            datagram.len(),
                                             &config,
                                             now(),
                                         );
@@ -602,8 +573,69 @@ pub async fn start_sender(
     if let Some(goodbye) = goodbye {
         say_goodbye(&links, goodbye).await;
     }
+    park_stream_socket(&shared, links.into_udp_socket());
     info!("NAL channel closed, transport sender shutting down");
     Ok(())
+}
+
+/// The UDP socket iPads send HELLO2 to and the stream is sent from, bound
+/// to `bind_addr`. The standby responder binds it the same way.
+fn bind_stream_socket(bind_addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    let raw = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
+    // A 4 MiB send buffer lets the kernel absorb whatever the pacer's
+    // hard budget doesn't smooth (best effort — some platforms clamp it).
+    let _ = raw.set_send_buffer_size(4 * 1024 * 1024);
+    let _ = raw.set_recv_buffer_size(4 * 1024 * 1024);
+    let _ = raw.set_tos(0xB8);
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows::Win32::Networking::WinSock::{
+            WSAGetLastError, WSAIoctl, SIO_UDP_CONNRESET, SOCKET,
+        };
+        let disabled = 0u32;
+        let mut returned = 0;
+        let result = unsafe {
+            WSAIoctl(
+                SOCKET(raw.as_raw_socket() as usize),
+                SIO_UDP_CONNRESET,
+                Some((&disabled as *const u32).cast()),
+                std::mem::size_of_val(&disabled) as u32,
+                None,
+                0,
+                &mut returned,
+                None,
+                None,
+            )
+        };
+        if result != 0 {
+            warn!(error = ?unsafe { WSAGetLastError() }, "Could not disable UDP connection-reset notifications");
+        }
+    }
+    raw.set_nonblocking(true)?;
+    raw.bind(&bind_addr.into())?;
+    Ok(raw.into())
+}
+
+/// The stream socket the last owner of the port left, if it is bound to
+/// `bind_addr`. One bound elsewhere (the chosen network changed) closes.
+fn take_stream_socket(
+    shared: &SharedControl,
+    bind_addr: SocketAddr,
+) -> Option<std::net::UdpSocket> {
+    shared
+        .stream_socket
+        .lock()
+        .take()
+        .filter(|socket| socket.local_addr().is_ok_and(|addr| addr == bind_addr))
+}
+
+/// Leaves the stream socket, still bound, for the next owner of the port.
+fn park_stream_socket(shared: &SharedControl, socket: UdpSocket) {
+    match socket.into_std() {
+        Ok(socket) => *shared.stream_socket.lock() = Some(socket),
+        Err(error) => debug!(%error, "Closed the stream port between owners"),
+    }
 }
 
 /// Marks the transport ended however `start_sender` stops, so the watch
@@ -760,7 +792,7 @@ async fn repair_while_pacing(
                     #[cfg(feature = "test-hooks")]
                     probe::taken(peer);
                     let actions = shared.session.lock().handle_datagram(PeerId::udp(peer), &header,
-                        message, config, now());
+                        message, len, config, now());
                     act(actions, state, links, shared, config, supervisor_tx).await;
                     continue;
                 }
@@ -1015,6 +1047,7 @@ mod tests {
         use tracing_subscriber::prelude::*;
         let _slot = crate::diagnostics::tests::FALLBACK_SLOT.lock();
         let summaries = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        crate::logging::prepare_log_capture();
         let _log = tracing::subscriber::set_default(
             tracing_subscriber::registry()
                 .with(crate::diagnostics::FallbackWatch)
@@ -1253,11 +1286,16 @@ mod tests {
     /// session, and both go up, as at every other end of a session.
     #[cfg(not(windows))]
     #[tokio::test]
+    // The slot only keeps other tests out; nothing on this test's runtime
+    // takes it.
+    #[allow(clippy::await_holding_lock)]
     async fn a_usb_session_ended_by_its_cable_releases_held_input() {
         use crate::input::{
             recorder, CaptureGeometry, Injection, KIND_KEY, KIND_MOUSE_ABS, PHASE_BEGAN,
         };
         use eternal_wire::v2::control::{InputEvent, FEATURE_WANTS_INPUT};
+        // The session starts and ends through `act`, which uses the fallback slot.
+        let _slot = crate::diagnostics::tests::FALLBACK_SLOT.lock();
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let shared = SharedControl::new(socket.local_addr().unwrap().port(), 15_000_000);
         shared.pairing.lock().required = false;
@@ -1758,6 +1796,7 @@ mod tests {
             .with_writer(move || Sink(std::sync::Arc::clone(&writer)))
             .finish();
         let error = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(subscriber, || {
             log_send_failed(LinkId::Usb { device_id: 3 }, &error);
             log_send_failed(LinkId::Usb { device_id: 3 }, &error);

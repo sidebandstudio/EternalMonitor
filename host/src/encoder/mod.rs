@@ -2835,6 +2835,7 @@ mod tests {
             .with_ansi(false)
             .with_writer(move || Sink(Arc::clone(&writer)))
             .finish();
+        crate::logging::prepare_log_capture();
         let result = tracing::subscriber::with_default(subscriber, run);
         let lines = String::from_utf8(out.lock().clone()).unwrap();
         (result, lines.lines().map(str::to_string).collect())
@@ -4156,6 +4157,7 @@ mod tests {
         let start = Instant::now();
         let reads = Arc::new(AtomicU64::new(0));
         let clock_reads = Arc::clone(&reads);
+        crate::logging::prepare_log_capture();
         let opened = tracing::subscriber::with_default(subscriber, || {
             run_in(
                 lanes,
