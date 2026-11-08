@@ -24,6 +24,9 @@
 //!    networks not in use and other programs' rules stay as they are.
 //! 3. It reads everything again and fails unless the verdict now finds the
 //!    exe allowed, and not blocked by its own rule, on every network in use.
+//!    A Block rule that may be this exe's, with its file name and a path the
+//!    machine's values can't resolve, is never removed and keeps the fix
+//!    from claiming success.
 //!
 //! The exe's path comes from the elevated process itself, and the port is
 //! only ever a number. A rule's path is this exe's only as written, or with
@@ -987,14 +990,6 @@ mod tests {
                     PUBLIC,
                 ),
             ),
-            (
-                "Users own",
-                Rule::unscoped(
-                    &format!(r"%{USERS_OWN}%\EternalMonitor\EternalMonitor-host.exe"),
-                    false,
-                    PUBLIC,
-                ),
-            ),
         ];
         // The process would say D:\Apps for ProgramFiles; the machine says
         // C:\Program Files.
@@ -1014,7 +1009,9 @@ mod tests {
             [format!("add {EXE}"), "remove Program Files copy".into()]
         );
 
-        // And as the elevated copy runs it.
+        // A variable only this process has, as the elevated copy runs it:
+        // the rule is never removed, and as it may be this exe's, the fix
+        // doesn't claim success.
         let rules = vec![
             (ALLOW_NAME, installer_allow()),
             (
@@ -1027,9 +1024,51 @@ mod tests {
             ),
         ];
         let mut store = Fake::new(&[on(PUBLIC)], rules);
-        assert_eq!(fix_on_this_machine(&mut store, exe(), PORT), Ok(()));
-        assert!(store.calls.is_empty(), "{:?}", store.calls);
+        assert_eq!(
+            fix_on_this_machine(&mut store, exe(), PORT),
+            Err(Failure::StillBlocked)
+        );
+        assert!(store.names().contains(&"Users own"));
+        assert!(!store.calls.iter().any(|call| call.starts_with("remove")));
         std::env::remove_var(USERS_OWN);
+    }
+
+    /// A machine value naming another (`EMROOT=%SystemDrive%\Apps`) makes
+    /// the rule this exe's: it goes. One that can't be resolved, with this
+    /// exe's file name, stays, and the fix fails rather than claim success.
+    #[test]
+    fn a_block_through_nested_machine_values_goes_and_an_unresolved_one_fails_the_fix() {
+        use crate::firewall::{resolve, Stored};
+        let stored = |name: &str| match name.to_lowercase().as_str() {
+            "systemdrive" => Some(Stored::Literal("C:".into())),
+            "emroot" => Some(Stored::Expand(r"%SystemDrive%\Apps".into())),
+            "userish" => Some(Stored::Expand(r"%USERPROFILE%\Apps".into())),
+            _ => None,
+        };
+        let lookup = |name: &str| resolve(name, &stored);
+        let exe = Path::new(r"C:\Apps\EternalMonitor\EternalMonitor-host.exe");
+        let allow = Rule::unscoped(&exe.to_string_lossy(), true, ALLOW_PROFILES);
+        let block = |root: &str| {
+            Rule::unscoped(
+                &format!(r"%{root}%\EternalMonitor\EternalMonitor-host.exe"),
+                false,
+                PUBLIC,
+            )
+        };
+
+        let rules = vec![(ALLOW_NAME, allow.clone()), ("Nested", block("EMROOT"))];
+        let mut store = Fake::new(&[on(PUBLIC)], rules);
+        assert_eq!(fix_rules(&mut store, exe, PORT, &lookup), Ok(()));
+        assert_eq!(store.calls, ["remove Nested"]);
+
+        let rules = vec![(ALLOW_NAME, allow), ("Unresolved", block("USERISH"))];
+        let mut store = Fake::new(&[on(PUBLIC)], rules);
+        assert_eq!(
+            fix_rules(&mut store, exe, PORT, &lookup),
+            Err(Failure::StillBlocked)
+        );
+        assert!(store.names().contains(&"Unresolved"));
+        assert!(!store.calls.iter().any(|call| call.starts_with("remove")));
     }
 
     #[test]

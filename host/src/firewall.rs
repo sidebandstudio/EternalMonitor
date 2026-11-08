@@ -257,6 +257,9 @@ enum Whose {
     AllPrograms,
     /// The program could not be read.
     Unknown,
+    /// A path with this exe's file name that names a variable the machine
+    /// has no value for: it may be this exe's.
+    Unresolved,
     Other,
 }
 
@@ -268,8 +271,11 @@ fn whose(rule: &Rule, exe: &Path, lookup: impl Fn(&str) -> Option<String>) -> Wh
     match rule.program.as_deref() {
         None => Whose::Unknown,
         Some(program) if program.trim().is_empty() => Whose::AllPrograms,
-        Some(program) if same_program(program, exe, lookup) => Whose::Ours,
-        Some(_) => Whose::Other,
+        Some(program) => match expand_known(program, lookup) {
+            Some(path) if same_path(&path, exe) => Whose::Ours,
+            None if file_name(program) == file_name(&exe.to_string_lossy()) => Whose::Unresolved,
+            _ => Whose::Other,
+        },
     }
 }
 
@@ -289,6 +295,9 @@ pub enum Verdict {
     NoRule,
     /// Windows Firewall is off on this profile: another firewall may be on.
     Off,
+    /// An unscoped Block rule that may be this exe's: its path has this
+    /// exe's file name but names a variable the machine has no value for.
+    Uncertain,
 }
 
 impl Verdict {
@@ -300,6 +309,7 @@ impl Verdict {
             Verdict::BlocksAll => "blocks_all",
             Verdict::NoRule => "no_rule",
             Verdict::Off => "off",
+            Verdict::Uncertain => "uncertain",
         }
     }
 
@@ -349,7 +359,8 @@ impl Report {
     /// The whole picture in one word for the log.
     pub fn verdict(&self) -> &'static str {
         let blocking = self.profiles.iter().filter(|(_, v)| v.blocks()).count();
-        if blocking > 0 && self.bypass_rules > 0 {
+        let unsure = self.profiles.iter().any(|(_, v)| *v == Verdict::Uncertain);
+        if unsure || (blocking > 0 && self.bypass_rules > 0) {
             "uncertain"
         } else if !self.profiles.is_empty() && blocking == self.profiles.len() {
             "blocked"
@@ -427,12 +438,12 @@ pub fn profile_name(bit: u32) -> &'static str {
 /// `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment`.
 /// Never this process's environment, which any user can change for their
 /// own programs: a rule for another program must not look like this exe's,
-/// to the verdict or to the elevated fix. A system value that itself names
-/// a variable, or one only a user has, is unknown, and the path keeps it as
-/// written.
+/// to the verdict or to the elevated fix. A system value that names other
+/// variables is expanded from these values too ([`resolve`]); one only a
+/// user has is unknown.
 #[cfg(windows)]
 pub fn machine_env(name: &str) -> Option<String> {
-    windows_policy::machine_env(name)
+    resolve(name, &windows_policy::machine_value)
 }
 
 /// Off Windows no rule has a path to expand.
@@ -441,9 +452,50 @@ pub fn machine_env(_name: &str) -> Option<String> {
     None
 }
 
-/// `%NAME%` replaced with `lookup(NAME)`, as Windows stores a rule made in
-/// its own window (`%ProgramFiles%\...`). An unknown name stays as written.
-pub fn expand(path: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+/// A machine value as stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Stored {
+    /// A known folder, or a REG_SZ value: as written, `%` and all.
+    Literal(String),
+    /// A REG_EXPAND_SZ value: its `%name%`s are machine values too.
+    Expand(String),
+}
+
+/// How deep REG_EXPAND_SZ values may name one another.
+pub const EXPAND_DEPTH: usize = 8;
+
+/// `name`'s value among the machine values `stored`, each REG_EXPAND_SZ
+/// value's own `%name%`s resolved the same way. `None` when `name`, or a
+/// value it names, has no machine value, when values name each other in a
+/// cycle, or when more than [`EXPAND_DEPTH`] of them nest.
+pub fn resolve(name: &str, stored: &impl Fn(&str) -> Option<Stored>) -> Option<String> {
+    resolve_within(name, stored, &mut Vec::new())
+}
+
+fn resolve_within(
+    name: &str,
+    stored: &impl Fn(&str) -> Option<Stored>,
+    expanding: &mut Vec<String>,
+) -> Option<String> {
+    match stored(name)? {
+        Stored::Literal(value) => Some(value),
+        Stored::Expand(value) => {
+            let key = name.to_lowercase();
+            if expanding.len() >= EXPAND_DEPTH || expanding.contains(&key) {
+                return None;
+            }
+            expanding.push(key);
+            let value = expand_known(&value, |inner| resolve_within(inner, stored, expanding));
+            expanding.pop();
+            value
+        }
+    }
+}
+
+/// `path` with every `%NAME%` replaced with `lookup(NAME)`, as Windows
+/// stores a rule made in its own window (`%ProgramFiles%\...`), or `None` if
+/// one has no value. `%%` and a lone `%` stay as written.
+fn expand_known(path: &str, mut lookup: impl FnMut(&str) -> Option<String>) -> Option<String> {
     let mut out = String::new();
     let mut rest = path;
     while let Some(start) = rest.find('%') {
@@ -452,28 +504,44 @@ pub fn expand(path: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
         };
         let name = &rest[start + 1..start + 1 + len];
         out.push_str(&rest[..start]);
-        match lookup(name).filter(|_| !name.is_empty()) {
-            Some(value) => out.push_str(&value),
-            None => out.push_str(&rest[start..start + len + 2]),
+        if name.is_empty() {
+            out.push_str("%%");
+        } else {
+            out.push_str(&lookup(name)?);
         }
         rest = &rest[start + len + 2..];
     }
     out.push_str(rest);
-    out
+    Some(out)
+}
+
+/// A path as Windows compares it: no quotes or `\\?\`, backslashes, no case.
+fn plain(path: &str) -> String {
+    let path = path
+        .trim()
+        .trim_matches('"')
+        .replace('/', "\\")
+        .to_lowercase();
+    path.strip_prefix(r"\\?\")
+        .map(str::to_string)
+        .unwrap_or(path)
+}
+
+fn same_path(path: &str, exe: &Path) -> bool {
+    let exe = plain(&exe.to_string_lossy());
+    !exe.is_empty() && plain(path) == exe
+}
+
+/// The last part of a path, as Windows compares it.
+fn file_name(path: &str) -> String {
+    let path = plain(path);
+    path.rsplit('\\').next().unwrap_or_default().to_string()
 }
 
 /// Whether a rule's program is `exe`. Windows compares paths without case,
 /// and its prompt stores them in lower case.
 pub fn same_program(program: &str, exe: &Path, lookup: impl Fn(&str) -> Option<String>) -> bool {
-    let plain = |path: &str| {
-        path.trim()
-            .trim_matches('"')
-            .replace('/', "\\")
-            .to_lowercase()
-    };
-    let exe = plain(&exe.to_string_lossy());
-    let exe = exe.strip_prefix(r"\\?\").unwrap_or(&exe);
-    !exe.is_empty() && plain(&expand(program, lookup)) == exe
+    expand_known(program, lookup).is_some_and(|path| same_path(&path, exe))
 }
 
 /// The verdict on each profile for inbound UDP to `exe` on `port`. Windows
@@ -509,8 +577,11 @@ pub fn judge(
     let ours = |r: &Rule, whose, reach| !r.allow && whose == Whose::Ours && reach == Reach::All;
     let everyone =
         |r: &Rule, whose, reach| !r.allow && whose == Whose::AllPrograms && reach == Reach::All;
-    let unsure =
-        |r: &Rule, whose, reach| !r.allow && (whose == Whose::Unknown || reach == Reach::Some);
+    let unsure = |r: &Rule, whose, reach| {
+        !r.allow && (matches!(whose, Whose::Unknown | Whose::Unresolved) || reach == Reach::Some)
+    };
+    let maybe_ours =
+        |r: &Rule, whose, reach| !r.allow && whose == Whose::Unresolved && reach == Reach::All;
     // An Allow rule that asks for IPsec (SecureFlags) can come with
     // "Override block rules": IPsec-authenticated traffic then gets past
     // Block rules for the exe. iPads never authenticate, so it changes
@@ -538,6 +609,8 @@ pub fn judge(
                 Verdict::BlockedForAllApps
             } else if count(p.bit, &ours) > 0 {
                 Verdict::Blocked
+            } else if count(p.bit, &maybe_ours) > 0 {
+                Verdict::Uncertain
             } else if count(p.bit, &allows) > 0 {
                 Verdict::Allowed
             } else {
@@ -667,7 +740,7 @@ pub(crate) mod windows_policy {
     use windows::Win32::System::Ole::IEnumVARIANT;
 
     use super::{
-        judge, rule_from, Field, Profile, Report, Rule, RuleSource, DOMAIN, PRIVATE, PUBLIC,
+        judge, rule_from, Field, Profile, Report, Rule, RuleSource, Stored, DOMAIN, PRIVATE, PUBLIC,
     };
 
     /// VT_DISPATCH: what the rule enumerator hands out.
@@ -697,8 +770,8 @@ pub(crate) mod windows_policy {
         Ok(judge(&profiles, &rules, exe, port, lan, super::machine_env))
     }
 
-    /// See [`super::machine_env`].
-    pub(crate) fn machine_env(name: &str) -> Option<String> {
+    /// One machine value as stored, for [`super::resolve`].
+    pub(crate) fn machine_value(name: &str) -> Option<Stored> {
         use windows::Win32::UI::Shell::{
             FOLDERID_ProgramData, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesCommon,
             FOLDERID_ProgramFilesCommonX64, FOLDERID_ProgramFilesCommonX86,
@@ -717,10 +790,11 @@ pub(crate) mod windows_policy {
                 return known_folder(&FOLDERID_Windows)
                     .and_then(|windows| windows.get(..2).map(str::to_string))
                     .filter(|drive| drive.ends_with(':'))
+                    .map(Stored::Literal)
             }
             _ => return system_variable(name),
         };
-        known_folder(&folder)
+        known_folder(&folder).map(Stored::Literal)
     }
 
     fn known_folder(id: &windows::core::GUID) -> Option<String> {
@@ -733,24 +807,26 @@ pub(crate) mod windows_policy {
         text
     }
 
-    /// A value of the system environment as stored, never expanded: the
-    /// expansion would use this process's environment.
-    fn system_variable(name: &str) -> Option<String> {
+    /// A value of the system environment as stored, never expanded by
+    /// Windows: that would use this process's environment.
+    fn system_variable(name: &str) -> Option<Stored> {
         use windows::core::{w, PCWSTR};
         use windows::Win32::Foundation::ERROR_SUCCESS;
         use windows::Win32::System::Registry::{
-            RegGetValueW, HKEY_LOCAL_MACHINE, RRF_NOEXPAND, RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
+            RegGetValueW, HKEY_LOCAL_MACHINE, REG_EXPAND_SZ, REG_SZ, REG_VALUE_TYPE, RRF_NOEXPAND,
+            RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
         };
         let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
         let mut value = [0u16; 1024];
         let mut bytes = std::mem::size_of_val(&value) as u32;
+        let mut kind = REG_VALUE_TYPE::default();
         let result = unsafe {
             RegGetValueW(
                 HKEY_LOCAL_MACHINE,
                 w!(r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
                 PCWSTR(name.as_ptr()),
                 RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND,
-                None,
+                Some(&mut kind),
                 Some(value.as_mut_ptr().cast()),
                 Some(&mut bytes),
             )
@@ -759,7 +835,12 @@ pub(crate) mod windows_policy {
             return None;
         }
         let length = value.iter().position(|&c| c == 0).unwrap_or(value.len());
-        Some(String::from_utf16_lossy(&value[..length])).filter(|value| !value.contains('%'))
+        let value = String::from_utf16_lossy(&value[..length]);
+        match kind {
+            REG_SZ => Some(Stored::Literal(value)),
+            REG_EXPAND_SZ => Some(Stored::Expand(value)),
+            _ => None,
+        }
     }
 
     /// The profiles of the networks in use now, as the verdict sees them.
@@ -1477,9 +1558,97 @@ mod tests {
     }
 
     #[test]
-    fn expansion_leaves_unknown_and_unpaired_names() {
-        assert_eq!(expand(r"%nope%\a%", env), r"%nope%\a%");
-        assert_eq!(expand(r"%%\%ProgramFiles%", env), r"%%\C:\Program Files");
+    fn expansion_refuses_unknown_names_and_keeps_unpaired_ones() {
+        assert_eq!(expand_known(r"%nope%\a", env), None);
+        assert_eq!(
+            expand_known(r"%%\%ProgramFiles%\a%", env).as_deref(),
+            Some(r"%%\C:\Program Files\a%")
+        );
+    }
+
+    /// Machine values as Windows stores them: known folders and REG_SZ
+    /// values as written, REG_EXPAND_SZ values naming others.
+    fn stored(name: &str) -> Option<Stored> {
+        let expand = |value: &str| Some(Stored::Expand(value.into()));
+        match name.to_lowercase().as_str() {
+            "systemdrive" => Some(Stored::Literal("C:".into())),
+            "programfiles" => Some(Stored::Literal(r"C:\Program Files".into())),
+            "emroot" => expand(r"%SystemDrive%\Apps"),
+            "literal" => Some(Stored::Literal(r"C:\100%\%SystemDrive%".into())),
+            "userish" => expand(r"%USERPROFILE%\Apps"),
+            "loop_a" => expand(r"%loop_b%\a"),
+            "loop_b" => expand(r"%LOOP_A%\b"),
+            "self" => expand(r"%self%"),
+            deep => {
+                // deep0 is a folder; each deepN names deepN-1.
+                let n: usize = deep.strip_prefix("deep")?.parse().ok()?;
+                if n == 0 {
+                    Some(Stored::Literal(r"C:\Deep".into()))
+                } else {
+                    expand(&format!(r"%deep{}%\{n}", n - 1))
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn machine_values_naming_others_are_expanded_from_machine_values_only() {
+        let value = |name| resolve(name, &stored);
+        assert_eq!(value("EMROOT").as_deref(), Some(r"C:\Apps"));
+        assert_eq!(value("ProgramFiles").as_deref(), Some(r"C:\Program Files"));
+        // A REG_SZ value is never expanded, as Windows doesn't.
+        assert_eq!(value("literal").as_deref(), Some(r"C:\100%\%SystemDrive%"));
+        // A value only a user has, or no value at all.
+        assert_eq!(value("userish"), None);
+        assert_eq!(value("nope"), None);
+        // Values naming each other, or themselves.
+        assert_eq!(value("loop_a"), None);
+        assert_eq!(value("self"), None);
+        // Up to EXPAND_DEPTH nested values, and no deeper.
+        let deepest = format!("deep{EXPAND_DEPTH}");
+        assert_eq!(value(&deepest).as_deref(), Some(r"C:\Deep\1\2\3\4\5\6\7\8"));
+        assert_eq!(value(&format!("deep{}", EXPAND_DEPTH + 1)), None);
+    }
+
+    /// A Block rule whose path names a machine value that names another
+    /// (`EMROOT=%SystemDrive%\Apps`) is this exe's block. One whose path
+    /// can't be resolved but has this exe's file name may be: never
+    /// "allowed", and never certain.
+    #[test]
+    fn a_block_through_nested_machine_values_counts_and_an_unresolved_one_is_uncertain() {
+        let exe = r"C:\Apps\EternalMonitor\EternalMonitor-host.exe";
+        let allow = Rule::unscoped(exe, true, 0x7fff_ffff);
+        let nested = Rule::unscoped(
+            r"%EMROOT%\EternalMonitor\EternalMonitor-host.exe",
+            false,
+            PUBLIC,
+        );
+        let judged = |rules: &[Rule]| {
+            judge(&[on(PUBLIC)], rules, Path::new(exe), PORT, true, |name| {
+                resolve(name, &stored)
+            })
+        };
+        let blocked = judged(&[allow.clone(), nested]);
+        assert_eq!(blocked.profiles, [(PUBLIC, Verdict::Blocked)]);
+        assert!(blocked.certain_block().is_some());
+
+        let unresolved = Rule::unscoped(
+            r"%USERISH%\EternalMonitor\EternalMonitor-host.exe",
+            false,
+            PUBLIC,
+        );
+        let unsure = judged(&[allow.clone(), unresolved]);
+        assert_eq!(unsure.profiles, [(PUBLIC, Verdict::Uncertain)]);
+        assert_eq!(unsure.verdict(), "uncertain");
+        assert_eq!(unsure.certain_block(), None);
+        assert_eq!(unsure.scoped_block_rules, 1);
+
+        // Another file name is another program's rule.
+        let other = Rule::unscoped(r"%USERISH%\Other\other.exe", false, PUBLIC);
+        assert_eq!(
+            judged(&[allow, other]).profiles,
+            [(PUBLIC, Verdict::Allowed)]
+        );
     }
 
     /// A read that fails drops the last reading, so a block that is gone
