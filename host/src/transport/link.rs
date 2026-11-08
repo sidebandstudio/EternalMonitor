@@ -1031,7 +1031,7 @@ mod tests {
             .is_err());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn silent_listener_peer_times_out_and_dropping_the_link_closes_io() {
         let (server, _silent) = tokio::io::duplex(32);
         let failed =
