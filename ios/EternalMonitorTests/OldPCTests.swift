@@ -76,6 +76,9 @@ final class OldPCTests: XCTestCase {
         XCTAssertEqual(OldPC.pcName(bonjour: "EternalMonitor (OLD-PC)"), "OLD-PC")
         XCTAssertEqual(OldPC.pcName(bonjour: "Studio"), "Studio")
         XCTAssertEqual(OldPC.pcName(bonjour: "EternalMonitor ()"), "EternalMonitor ()")
+        XCTAssertEqual(OldPC.pcName(bonjour: "EternalMonitor (Lab) (2)"), "Lab (2)")
+        XCTAssertEqual(OldPC.pcName(bonjour: "EternalMonitor (Lab (Home)) (12)"), "Lab (Home) (12)")
+        XCTAssertEqual(OldPC.pcName(bonjour: "EternalMonitor (Lab (Home))"), "Lab (Home)")
     }
 
     private func defaults() -> UserDefaults {
@@ -333,6 +336,76 @@ final class OldPCTests: XCTestCase {
         prompt.discovered([service("Studio", at: "192.0.2.10", version: "0.3.3")])
         prompt.show()
         XCTAssertNil(prompt.card, "proved current over USB")
+    }
+
+    /// r3: a name links a service only when the search lists exactly one
+    /// for it. B and A both answer as "Lab"; Bonjour lists B as "Lab (2)".
+    /// B proving current over USB never hides A's card, in either order.
+    func testANameLinksOnlyAnUnambiguousService() {
+        let a = DiscoveredHost(name: "EternalMonitor (Lab)", address: "192.0.2.70", port: 9876, version: "0.3.2")
+        let b = DiscoveredHost(name: "EternalMonitor (Lab) (2)", address: "192.0.2.71", port: 9876, version: "0.3.4")
+        for usbFirst in [true, false] {
+            let prompt = OldPCPrompt(defaults: defaults(), now: { Date() }, log: { _ in })
+            let steps: [() -> Void] = [
+                { prompt.answered(hostName: "Lab", pairingToken: self.tokenB, hostCaps: self.currentCaps, address: nil) },
+                { prompt.discovered([a, b]) },
+            ]
+            for step in usbFirst ? steps : steps.reversed() { step() }
+            prompt.show()
+            XCTAssertEqual(prompt.card?.key, OldPCPrompt.serviceKey(a.name), "usbFirst \(usbFirst): A's card")
+        }
+
+        // With A gone, B's own suffixed service is the only one: it is B's,
+        // and B's proof holds against its stale TXT record.
+        let staleB = DiscoveredHost(name: b.name, address: b.address, port: 9876, version: "0.3.3")
+        for usbFirst in [true, false] {
+            let prompt = OldPCPrompt(defaults: defaults(), now: { Date() }, log: { _ in })
+            let steps: [() -> Void] = [
+                { prompt.answered(hostName: "Lab", pairingToken: self.tokenB, hostCaps: self.currentCaps, address: nil) },
+                { prompt.discovered([staleB]) },
+            ]
+            for step in usbFirst ? steps : steps.reversed() { step() }
+            prompt.show()
+            XCTAssertNil(prompt.card, "usbFirst \(usbFirst): B proved current")
+            XCTAssertEqual(prompt.memory.services, [:], "kept for this launch only")
+        }
+
+        XCTAssertTrue(OldPCPrompt.isOwnService("EternalMonitor (Lab)", of: "Lab"))
+        XCTAssertTrue(OldPCPrompt.isOwnService("EternalMonitor (Lab) (2)", of: "Lab"))
+        XCTAssertTrue(OldPCPrompt.isOwnService("EternalMonitor (Lab) (12)", of: "Lab"))
+        for other in ["EternalMonitor (Lab2)", "EternalMonitor (Lab) ()", "EternalMonitor (Lab) (x)",
+                      "EternalMonitor (Lab) (2) (3)", "EternalMonitor (Lab)(2)", "Lab"] {
+            XCTAssertFalse(OldPCPrompt.isOwnService(other, of: "Lab"), other)
+        }
+    }
+
+    /// r3: a name a PC gave up is free for another PC: after a rename in the
+    /// same launch, and in any later launch.
+    func testANameIsNotKeptForAnotherPC() {
+        let store = defaults()
+        var prompt = OldPCPrompt(defaults: store, now: { Date() }, log: { _ in })
+        prompt.discovered([service("Lab", at: "192.0.2.80", version: nil)])
+        prompt.answered(hostName: "Lab", pairingToken: tokenA, hostCaps: currentCaps, address: nil)
+        prompt.discovered([service("Lab", at: "192.0.2.80", version: "0.3.3")])
+        prompt.show()
+        XCTAssertNil(prompt.card, "linked while A is the only Lab")
+        XCTAssertEqual(prompt.memory.services, [:])
+
+        // A is renamed; another PC takes the name "Lab".
+        prompt.answered(hostName: "Studio", pairingToken: tokenA, hostCaps: currentCaps, address: nil)
+        prompt.discovered([service("Lab", at: "192.0.2.81", version: "0.3.2")])
+        prompt.show()
+        XCTAssertEqual(prompt.card?.pc, "Lab", "same launch, after the rename")
+        prompt.close()
+
+        let other = defaults()
+        prompt = OldPCPrompt(defaults: other, now: { Date() }, log: { _ in })
+        prompt.discovered([service("Lab", at: "192.0.2.80", version: nil)])
+        prompt.answered(hostName: "Lab", pairingToken: tokenA, hostCaps: currentCaps, address: nil)
+        prompt = OldPCPrompt(defaults: other, now: { Date() }, log: { _ in })
+        prompt.discovered([service("Lab", at: "192.0.2.81", version: "0.3.2")])
+        prompt.show()
+        XCTAssertEqual(prompt.card?.pc, "Lab", "a later launch")
     }
 
     /// r2: a link never takes a service, or a proof, from another PC. Here

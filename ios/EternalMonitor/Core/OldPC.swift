@@ -24,11 +24,21 @@ enum OldPC {
         return hostCaps == nil ? nil : true
     }
 
-    /// The name a PC gives itself, from its Bonjour service name.
+    /// The name a PC gives itself, from its Bonjour service name, with
+    /// Bonjour's collision number if it has one: "Lab (2)".
     static func pcName(bonjour name: String) -> String {
-        let prefix = "EternalMonitor (", suffix = ")"
-        guard name.hasPrefix(prefix), name.hasSuffix(suffix), name.count > prefix.count + suffix.count else { return name }
-        return String(name.dropFirst(prefix.count).dropLast(suffix.count))
+        let prefix = "EternalMonitor ("
+        guard name.hasPrefix(prefix), name.hasSuffix(")") else { return name }
+        var inner = name.dropFirst(prefix.count).dropLast()
+        var number = ""
+        if let open = inner.range(of: ") (", options: .backwards) {
+            let digits = inner[open.upperBound...]
+            if !digits.isEmpty, digits.allSatisfy({ $0.isASCII && $0.isNumber }) {
+                number = " (\(digits))"
+                inner = inner[..<open.lowerBound]
+            }
+        }
+        return inner.isEmpty ? name : String(inner) + number
     }
 }
 
@@ -38,12 +48,20 @@ enum OldPC {
 ///
 /// A PC is known by its pairing token (hashed) when it has one, otherwise by
 /// its Bonjour service name, which is unique on a network, and last by the
-/// name it answers with. A session links one service to the PC that
-/// answered: the one the user tapped, the one the search lists at the
-/// session's address right now, or else the PC's own. What a session showed
-/// about a PC outlasts the session: a PC that proved current gets no card
-/// from a later Bonjour record. Links only ever keep a card away, and never
-/// take a service, or a proof, from another PC.
+/// name it answers with. A session at an address links the service the user
+/// tapped there, or the one the search lists there right now, to the PC that
+/// answered. What a session showed about a PC outlasts the session: a PC
+/// that proved current gets no card from a later Bonjour record. Links only
+/// ever keep a card away, and never take a service, or a proof, from another
+/// PC.
+///
+/// Over USB, or at an address the search doesn't list, a session only has
+/// the PC's name, and no PC sends anything in Bonjour that ties a service to
+/// its pairing. Such a session links the one service the search lists as
+/// "EternalMonitor (<that name>)", with or without a collision suffix such as
+/// " (2)", for this launch only, and nothing while the search lists two or
+/// more. Known limit: two PCs with one name on a network, one of them used
+/// over USB, can get one extra or one missed card per PC every three days.
 @MainActor
 final class OldPCPrompt: ObservableObject {
     static let shared = OldPCPrompt()
@@ -81,6 +99,10 @@ final class OldPCPrompt: ObservableObject {
     private var listed: [DiscoveredHost] = []
     /// The service the user tapped, and its address.
     private var tapped: (service: String, address: String)?
+    /// This launch's sessions that no address linked, by PC name.
+    private var unlinked: [String: String] = [:]
+    /// Services linked by those sessions' names, for this launch only.
+    private var named: [String: String] = [:]
     private let defaults: UserDefaults
     private let now: () -> Date
     private let log: (String) -> Void
@@ -111,13 +133,48 @@ final class OldPCPrompt: ObservableObject {
 
     /// The PC behind a Bonjour service.
     private func key(service: String, in memory: Memory) -> String {
-        memory.services[service] ?? Self.serviceKey(service)
+        memory.services[service] ?? named[service] ?? Self.serviceKey(service)
+    }
+
+    /// Whether `service` is the name a PC called `hostName` registers, or
+    /// that name with a Bonjour collision suffix.
+    static func isOwnService(_ service: String, of hostName: String) -> Bool {
+        let own = "EternalMonitor (\(hostName))"
+        if service == own { return true }
+        guard service.hasPrefix(own + " ("), service.hasSuffix(")") else { return false }
+        let number = service.dropFirst(own.count + 2).dropLast()
+        return !number.isEmpty && number.allSatisfy { $0.isASCII && $0.isNumber }
+    }
+
+    /// Links each unlinked session's PC to its own service while the search
+    /// lists exactly one, and to nothing otherwise.
+    private func linkNames() {
+        var memory = self.memory
+        var changed = false
+        named.removeAll()
+        for (hostName, key) in unlinked {
+            let matches = listed.map(\.name).filter { Self.isOwnService($0, of: hostName) }
+            guard matches.count == 1, let service = matches.first, memory.services[service] == nil else { continue }
+            let target = Self.serviceKey(service)
+            guard target == key || memory.pcs[target]?.current == nil else { continue }
+            named[service] = key
+            guard target != key else { continue }
+            if let shown = memory.pcs[target]?.shownAt, var pc = memory.pcs[key] {
+                pc.shownAt = max(pc.shownAt ?? shown, shown)
+                memory.pcs[key] = pc
+                changed = true
+            }
+            if waiting?.key == target { waiting = nil }
+            if let shown = card, shown.key == target { card = Card(key: key, pc: shown.pc, version: shown.version) }
+        }
+        if changed { save(memory) }
     }
 
     /// The services the search lists now, each with the version its own
     /// TXT record announced.
     func discovered(_ hosts: [DiscoveredHost]) {
         listed = hosts
+        linkNames()
         let memory = self.memory
         for host in hosts {
             let key = key(service: host.name, in: memory)
@@ -141,9 +198,9 @@ final class OldPCPrompt: ObservableObject {
     /// `address` is nil over USB.
     ///
     /// The session's service is the one the user tapped at that address,
-    /// else the one the search lists there, else the PC's own: every PC
-    /// registers "EternalMonitor (<its name>)". A service already linked to
-    /// a PC with a proof of its own stays with it.
+    /// else the one the search lists there. A service already linked to a PC
+    /// with a proof of its own stays with it. Without either, the PC's name
+    /// may link its own service for this launch (see the type's note).
     func answered(hostName: String, pairingToken: Data, hostCaps: UInt16, address: String?) {
         var memory = self.memory
         let found = address.flatMap { address in
@@ -151,7 +208,7 @@ final class OldPCPrompt: ObservableObject {
                 ?? listed.first { $0.address == address }?.name
         }
         tapped = nil
-        var service = found ?? (hostName.isEmpty ? nil : "EternalMonitor (\(hostName))")
+        var service = found
         var linkedTo: String?
         if let candidate = service {
             let key = Self.key(hostName: hostName, pairingToken: pairingToken, service: candidate)
@@ -180,8 +237,12 @@ final class OldPCPrompt: ObservableObject {
         pc.seenAt = now()
         memory.pcs[key] = pc
         save(memory)
+        // A PC answers under one name at a time.
+        unlinked = unlinked.filter { $0.value != key }
+        if found == nil, !hostName.isEmpty { unlinked[hostName] = key }
+        linkNames()
         if old {
-            queue(Card(key: key, pc: hostName, version: nil), memory: memory)
+            queue(Card(key: key, pc: hostName, version: nil), memory: self.memory)
         } else {
             drop(key)
         }
