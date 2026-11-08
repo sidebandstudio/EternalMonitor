@@ -1503,8 +1503,8 @@ pub(crate) trait Driver {
     /// Say why the display did not appear or showed no picture, while it is
     /// still on.
     fn report(&self, _failure: Failure) {}
-    /// The device's state while the attach waits, `None` when it can't be
-    /// read.
+    /// The device's state while the attach waits. `None` when it can't be
+    /// read, or a monitor may still be arriving.
     fn device(&self) -> Option<DeviceState> {
         None
     }
@@ -1935,7 +1935,7 @@ impl Driver for WindowsDriver<'_> {
     }
 
     fn device(&self) -> Option<DeviceState> {
-        Some(crate::vdd_device::query())
+        crate::vdd_device::query_confirmed()
     }
 
     fn turned_on(&self) -> TurnedOn {
@@ -2089,6 +2089,9 @@ mod tests {
         /// What the device reads while it is on and no display has attached
         /// yet; `None` when it can't be read. Attached, it reads ready.
         device_until_attached: Option<DeviceState>,
+        /// When set, what the device reads that long after it was turned on,
+        /// in place of `device_until_attached`: the last entry not later.
+        device_since_on: Vec<(Duration, Option<DeviceState>)>,
         calls: RefCell<Vec<Call>>,
     }
 
@@ -2110,6 +2113,7 @@ mod tests {
                 enable_fails: None,
                 turned_on: TurnedOn::Beside,
                 device_until_attached: None,
+                device_since_on: Vec::new(),
                 calls: RefCell::new(Vec::new()),
             }
         }
@@ -2127,7 +2131,17 @@ mod tests {
             if self.outputs().iter().any(|output| !output.is_primary) {
                 return Some(DeviceState::Ready);
             }
-            self.device_until_attached
+            let since_on = self.elapsed.get() - self.on_since.get().unwrap_or_default();
+            match self
+                .device_since_on
+                .iter()
+                .rev()
+                .find(|(at, _)| *at <= since_on)
+            {
+                Some((_, device)) => *device,
+                None if self.device_since_on.is_empty() => self.device_until_attached,
+                None => None,
+            }
         }
 
         fn outputs(&self) -> Vec<OutputInfo> {
@@ -2267,6 +2281,71 @@ mod tests {
         attach(&shared, &driver, ATTACH_TIMEOUT);
         assert_eq!(*shared.vdd_status.lock(), VddStatus::Active);
         assert_eq!(remembered_failure(&shared), None);
+    }
+
+    /// Review r1: only a confirmed absence counts. A monitor that hasn't
+    /// started, or a read that isn't certain (`None`), never ends the wait,
+    /// however long it lasts; the 10 s count starts at the first confirmed
+    /// absence and starts over when it stops.
+    #[test]
+    fn the_early_end_counts_only_confirmed_absence_and_starts_over() {
+        let run = |schedule: Vec<(Duration, Option<DeviceState>)>,
+                   attach_after: Option<Duration>| {
+            let shared = second_screen_selected();
+            connect_viewer(&shared);
+            assert_eq!(next_step(&shared, Instant::now()), Step::Attach);
+            let on_sleep = |_: Duration| {};
+            let mut driver = FakeDriver::new(secs(2.0), attach_after, &on_sleep);
+            driver.device_since_on = schedule;
+            attach(&shared, &driver, ATTACH_TIMEOUT);
+            let toggles = driver.toggles.borrow().clone();
+            let waited = toggles.get(1).map(|(at, _)| *at - toggles[0].0);
+            let status = *shared.vdd_status.lock();
+            (status, waited)
+        };
+        // A monitor still on its way for longer than 10 s, then attached.
+        let (status, _) = run(vec![(secs(0.0), None)], Some(secs(14.0)));
+        assert_eq!(
+            status,
+            VddStatus::Active,
+            "a pending monitor ended the wait"
+        );
+        // Uncertain all along: the whole wait, as before.
+        let (status, waited) = run(vec![(secs(0.0), None)], None);
+        assert_eq!(status, VddStatus::Failed);
+        assert!(waited.unwrap() >= ATTACH_TIMEOUT, "{waited:?}");
+        // Uncertain for 5 s, then a confirmed absence: 10 s from then. Reads
+        // come once a second, so a change is seen up to one read late, and
+        // the count ends up to one read late.
+        let (_, waited) = run(
+            vec![(secs(0.0), None), (secs(5.0), Some(DeviceState::NoMonitor))],
+            None,
+        );
+        let waited = waited.unwrap();
+        assert!(
+            waited >= secs(15.0) && waited < secs(15.0) + DEVICE_READ_EVERY * 2 + secs(0.5),
+            "{waited:?}"
+        );
+        // A confirmed absence broken by an uncertain read starts over.
+        let (_, waited) = run(
+            vec![
+                (secs(0.0), Some(DeviceState::NoMonitor)),
+                (secs(8.0), None),
+                (secs(9.0), Some(DeviceState::NoMonitor)),
+            ],
+            None,
+        );
+        let waited = waited.unwrap();
+        assert!(
+            waited >= secs(19.0) && waited < secs(19.0) + DEVICE_READ_EVERY * 2 + secs(0.5),
+            "{waited:?}"
+        );
+        // No monitor, then a monitor arrives before 10 s.
+        let (status, _) = run(
+            vec![(secs(0.0), Some(DeviceState::NoMonitor))],
+            Some(secs(8.0)),
+        );
+        assert_eq!(status, VddStatus::Active);
     }
 
     /// A 0.3.2 log and the 0.3.1 field data: the display never attaches,
