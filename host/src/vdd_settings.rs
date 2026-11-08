@@ -856,10 +856,14 @@ fn declared_utf8(xml: String) -> String {
 /// hold something else; one that holds the same bytes is kept as it is.
 /// The backup's file name.
 fn back_up(path: &Path) -> io::Result<String> {
+    back_up_dated(path, &utc_date(std::time::SystemTime::now()))
+}
+
+/// `back_up` on `date`.
+fn back_up_dated(path: &Path, date: &str) -> io::Result<String> {
     use std::io::Write;
     let original = std::fs::read(path)?;
     let name = path.file_name().unwrap_or_default().to_string_lossy();
-    let date = utc_date(std::time::SystemTime::now());
     let mut n = 1;
     loop {
         let backup = match n {
@@ -1949,9 +1953,19 @@ mod tests {
         // UTF-8 with a stray byte: after a byte order mark, or with UTF-8
         // beyond ASCII after it (the vendor file's comments) or before it.
         let bom = [&[0xEF, 0xBB, 0xBF][..], &stray_byte(VENDOR)].concat();
-        let mixed_after = stray_byte(VENDOR_FILE);
-        let mixed_before =
-            stray_byte(&VENDOR.replace("<vdd_settings>", "<vdd_settings><!-- \u{E9} -->"));
+        // A double-byte system code page may read these as its own text, so
+        // they are refused only in a single-byte one (and off Windows, where
+        // no code page is read); utf8_with_a_stray_byte_is_not_read_in_a_
+        // single_byte_code_page tests both in 1252 on any system.
+        let mixed = if cfg!(not(windows)) || single_byte(ANSI) {
+            vec![
+                ("utf-8 after a stray byte", mixed_after()),
+                ("utf-8 before a stray byte", mixed_before()),
+            ]
+        } else {
+            eprintln!("skipped the mixed UTF-8 cases: the system's code page is not single-byte");
+            Vec::new()
+        };
         // A double-byte character cut short.
         let mut broken = declared(CP949, "euc-kr");
         let at = broken.iter().position(|&b| b >= 0x80).unwrap();
@@ -1966,13 +1980,12 @@ mod tests {
         for (name, bytes) in [
             ("unknown encoding", unknown),
             ("utf-8 bom, stray byte", bom),
-            ("utf-8 after a stray byte", mixed_after),
-            ("utf-8 before a stray byte", mixed_before),
             ("broken code page", broken),
             ("odd utf-16", odd),
             ("lone surrogate", lone),
         ]
         .into_iter()
+        .chain(mixed)
         .chain(ansi)
         {
             std::fs::write(&path, &bytes).unwrap();
@@ -2000,6 +2013,16 @@ mod tests {
         let at = bytes.windows(7).position(|w| w == b"Radeon<").unwrap() + 6;
         bytes.insert(at, 0xAE);
         bytes
+    }
+
+    /// UTF-8 beyond ASCII after a stray byte: the vendor file's comments.
+    fn mixed_after() -> Vec<u8> {
+        stray_byte(VENDOR_FILE)
+    }
+
+    /// UTF-8 beyond ASCII before a stray byte.
+    fn mixed_before() -> Vec<u8> {
+        stray_byte(&VENDOR.replace("<vdd_settings>", "<vdd_settings><!-- \u{E9} -->"))
     }
 
     /// The driver's file saved in code page 949 as Notepad's ANSI does: its
@@ -2255,7 +2278,8 @@ mod tests {
         );
         let bom = [&[0xEF, 0xBB, 0xBF][..], &stray_byte(VENDOR)].concat();
         assert_eq!(decode_settings(&bom, 1252), None);
-        assert_eq!(decode_settings(&stray_byte(VENDOR_FILE), 1252), None);
+        assert_eq!(decode_settings(&mixed_after(), 1252), None);
+        assert_eq!(decode_settings(&mixed_before(), 1252), None);
         assert!(single_byte(1252) && !single_byte(949) && !single_byte(936));
     }
 
@@ -2267,11 +2291,11 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("vdd_settings.xml");
-        let date = utc_date(std::time::SystemTime::now());
+        let date = "20261108";
         let mut names = Vec::new();
         for original in ["one", "two", "one", "three", "two"] {
             std::fs::write(&path, original).unwrap();
-            names.push(back_up(&path).unwrap());
+            names.push(back_up_dated(&path, date).unwrap());
         }
         let name = |suffix: &str| format!("vdd_settings.xml.bak-{date}{suffix}");
         assert_eq!(
