@@ -21,7 +21,7 @@ use super::{
     idle_heartbeat, keepalive_allowed, keepalive_due, pointer_apart, pointer_place,
     read_back_image, reconcile_virtual_display, recovery_poll, redraw_cached, resolve_target,
     Acquired, FrameSlot, FrameUse, IdleGate, OutputInfo, Picture, PointerPlace, RawFrame, Redraw,
-    ACQUIRE_TIMEOUT_MS, FPS_WINDOW, FRAME_PADDING, PICTURE_HOLD,
+    StartPicture, ACQUIRE_TIMEOUT_MS, FPS_WINDOW, FRAME_PADDING, PICTURE_HOLD,
 };
 use crate::control::{CaptureTarget, SharedControl};
 use crate::gpu_preference::Outcome;
@@ -307,6 +307,7 @@ pub fn run_capture_loop(
     let mut resumed = false;
     let mut idle = IdleGate::new();
     let mut picture = Picture::default();
+    let mut start_picture = StartPicture::new(Instant::now());
     // ACCESS_LOST from a call after the acquire (ReleaseFrame, the staging
     // Map). It is handled as if the next acquire had returned it: before,
     // it ended the capture loop and restarted the pipeline.
@@ -434,6 +435,33 @@ pub fn run_capture_loop(
                             (tex_width, tex_height),
                         );
                     }
+                }
+            }
+        }
+
+        if start_picture.due(picture.real(), second_screen, Instant::now()) {
+            if let Some(pixels) = read_screen_gdi(&output1, (tex_width, tex_height)) {
+                info!(
+                    device = %chosen.device_name,
+                    "Desktop duplication gave no image yet — starting from the screen's picture"
+                );
+                spare = None;
+                last_frame = Arc::new(pixels);
+                last_frame_has_pointer = false;
+                picture.cached();
+                let now = Instant::now();
+                if idle.on_frame(client_connected(&shared), now) == FrameUse::Publish {
+                    *frame_number += 1;
+                    PIPELINE_STATS.lock().record_capture(tex_width, tex_height);
+                    heartbeat(&shared.hb_capture_frame_ms);
+                    slot.publish(RawFrame {
+                        frame_number: *frame_number,
+                        timestamp: now,
+                        data: Arc::clone(&last_frame),
+                        width: tex_width,
+                        height: tex_height,
+                    });
+                    last_send = now;
                 }
             }
         }
@@ -849,6 +877,7 @@ pub fn run_capture_loop(
                         Ok(d) => {
                             duplication = Some(d);
                             picture.recreated(Instant::now());
+                            start_picture.duplicated(Instant::now());
                             super::second_screen::note_recovery(
                                 &shared,
                                 generation,
@@ -912,6 +941,7 @@ pub fn run_capture_loop(
                     spare = None;
                     last_frame = Arc::new(frame_buffer(frame_bytes));
                     picture.resized();
+                    start_picture.duplicated(Instant::now());
                     staging_texture = unsafe {
                         let mut tex = None;
                         device.CreateTexture2D(
@@ -1194,6 +1224,87 @@ fn publish_capture_geometry(output: &IDXGIOutput1, shared: &SharedControl) {
             width: (r.right - r.left).max(1) as u32,
             height: (r.bottom - r.top).max(1) as u32,
         });
+    }
+}
+
+/// The picture `output` shows, read through GDI, as `width`x`height` BGRA
+/// rows in a [`frame_buffer`]: for a duplication that gives no image (see
+/// [`StartPicture`]). The pointer is not in it. None if the output's desktop
+/// rect isn't that size (a rotated display) or GDI can't read it (no
+/// interactive desktop).
+fn read_screen_gdi(output: &IDXGIOutput1, (width, height): (u32, u32)) -> Option<Vec<u8>> {
+    use windows::Win32::Graphics::Gdi::{
+        BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GdiFlush, GetDC,
+        ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
+    };
+    let rect = unsafe { output.GetDesc() }.ok()?.DesktopCoordinates;
+    if (rect.right - rect.left, rect.bottom - rect.top) != (width as i32, height as i32) {
+        return None;
+    }
+    let row_bytes = width as usize * 4;
+    let info = BITMAPINFO {
+        bmiHeader: BITMAPINFOHEADER {
+            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+            biWidth: width as i32,
+            // Negative: top-down rows, as capture's.
+            biHeight: -(height as i32),
+            biPlanes: 1,
+            biBitCount: 32,
+            biCompression: BI_RGB.0,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    unsafe {
+        let screen = GetDC(None);
+        if screen.is_invalid() {
+            return None;
+        }
+        let memory = CreateCompatibleDC(screen);
+        let mut bits = std::ptr::null_mut();
+        let pixels = match CreateDIBSection(memory, &info, DIB_RGB_COLORS, &mut bits, None, 0) {
+            Ok(bitmap) if !bits.is_null() => {
+                let previous = SelectObject(memory, bitmap);
+                let copied = BitBlt(
+                    memory,
+                    0,
+                    0,
+                    width as i32,
+                    height as i32,
+                    screen,
+                    rect.left,
+                    rect.top,
+                    SRCCOPY,
+                )
+                .is_ok();
+                let _ = GdiFlush();
+                let pixels = copied.then(|| {
+                    let mut buf = frame_buffer(row_bytes * height as usize);
+                    std::ptr::copy_nonoverlapping(
+                        bits as *const u8,
+                        buf.as_mut_ptr(),
+                        row_bytes * height as usize,
+                    );
+                    // GDI leaves the alpha byte 0; Desktop Duplication's is opaque.
+                    let (pixels, _) = buf[..row_bytes * height as usize].as_chunks_mut::<4>();
+                    for pixel in pixels {
+                        pixel[3] = 255;
+                    }
+                    buf
+                });
+                SelectObject(memory, previous);
+                let _ = DeleteObject(bitmap);
+                pixels
+            }
+            Ok(bitmap) => {
+                let _ = DeleteObject(bitmap);
+                None
+            }
+            Err(_) => None,
+        };
+        let _ = DeleteDC(memory);
+        ReleaseDC(None, screen);
+        pixels
     }
 }
 
