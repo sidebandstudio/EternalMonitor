@@ -20,10 +20,11 @@ final class FakeUDPHost: @unchecked Sendable {
     /// The pairing token the HELLO2 answered last carried.
     private(set) var lastAuthToken = Data()
     /// When the HELLO2 answered last arrived, by the kernel's receive
-    /// time: how fast this fake read it doesn't move it.
+    /// time: how fast this fake read it doesn't move it. Nil if the kernel
+    /// gave none.
     private(set) var lastHelloArrival: Date?
     /// When the datagram read last arrived, by the kernel's receive time.
-    private var arrival = Date()
+    private var arrival: Date?
     /// A HELLO2 came before the identify request was answered.
     private(set) var helloBeforeIdentify = false
 
@@ -74,7 +75,7 @@ final class FakeUDPHost: @unchecked Sendable {
             }
         }
         guard count > 0 else { return nil }
-        arrival = Self.kernelTimestamp(control.prefix(controlLength)) ?? Date()
+        arrival = Self.kernelTimestamp(control.prefix(controlLength))
         return (Data(buffer.prefix(count)), from, length)
     }
 

@@ -46,7 +46,8 @@ final class PCNotStreamingTests: XCTestCase {
             let again = await Task.detached { host.acceptSession(status: .stopped) }.value
             XCTAssertTrue(again, "the iPad stopped asking")
             XCTAssertEqual(host.lastNonce, firstNonce)
-            if let arrival = host.lastHelloArrival, arrival > told { askedAt.append(arrival) }
+            let arrival = try XCTUnwrap(host.lastHelloArrival, "no kernel receive time for the HELLO2")
+            if arrival > told { askedAt.append(arrival) }
         }
         XCTAssertEqual(askedAt.count, 3, "the iPad stopped asking")
         for (earlier, later) in zip(askedAt.dropLast(), askedAt.dropFirst()) {
