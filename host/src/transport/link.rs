@@ -1141,10 +1141,11 @@ mod tests {
         );
     }
 
-    /// A tunnel says which end closed it first. In the field some closed on
-    /// both sides 9.5-9.8 s after they opened, and neither side said why.
+    /// A tunnel says which end this host saw close it first, which is not
+    /// necessarily the end that started the close. In the field some closed
+    /// on both sides 9.5-9.8 s after they opened, and neither side said why.
     #[tokio::test]
-    async fn a_closed_tunnel_reports_which_end_closed_it() {
+    async fn a_closed_tunnel_reports_the_first_end_seen() {
         let force_idr = || Arc::new(AtomicBool::new(false));
         let open = || async {
             let (host, mut ipad) = tokio::io::duplex(1024);

@@ -803,7 +803,9 @@ mod tests {
         drop(ipad);
         gone(Arc::clone(&state)).await;
 
-        // A pipeline gets the events, and the lines are not logged again.
+        // A subscriber (standing in for a pipeline) gets the events, and the
+        // hub does not log the lines again. This checks the hub only: the
+        // pipeline's TransportLinks no longer logs these lines at all.
         let (pipeline, mut hub) = mpsc::channel(8);
         state.lock().subscriber = Some((1, pipeline));
         let (event, ipad) = open(42).await;
