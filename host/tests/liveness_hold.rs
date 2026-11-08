@@ -381,7 +381,7 @@ impl Sim {
             let control = shared.clone();
             let transport = tokio::spawn(async move {
                 let _audio = audio_tx;
-                transport::start_sender(nal_rx, audio_rx, port, control, supervisor_tx).await
+                transport::start_sender(nal_rx, audio_rx, port, control, supervisor_tx, 1).await
             });
             // The transport binds before its first wait.
             for _ in 0..10 {

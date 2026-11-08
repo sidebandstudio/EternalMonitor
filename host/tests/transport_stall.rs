@@ -64,6 +64,7 @@ fn a_stuck_transport_loop_is_named_with_its_step() {
                 port,
                 control,
                 supervisor_tx,
+                1,
             ))
             .unwrap();
     });

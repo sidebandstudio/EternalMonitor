@@ -51,7 +51,7 @@ socket2 = "0.5"
 [features]
 # Lets a release build obey ETERNAL_SIMULATE_STARTUP_FAILURE, for native
 # failure-path checks. Debug builds always do; shipped builds never do.
-fault-injection = []
+fault-injection = ["windows/Win32_Graphics_Direct3D12"]
 # Lets a release build obey ETERNAL_USB_DIRECT, for the end-to-end scripts.
 # Debug builds always do; shipped builds never do.
 usb-direct = []

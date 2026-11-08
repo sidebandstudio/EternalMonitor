@@ -123,6 +123,68 @@ impl Drop for Host {
     }
 }
 
+/// The supervisor's log lines since [`capture_supervisor_log`], from every
+/// thread.
+#[cfg(debug_assertions)]
+static SUPERVISOR_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(debug_assertions)]
+struct SupervisorLog;
+
+#[cfg(debug_assertions)]
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SupervisorLog {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Message(Option<String>);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = Some(format!("{value:?}"));
+                }
+            }
+        }
+        let mut message = Message(None);
+        event.record(&mut message);
+        if let Some(line) = message.0 {
+            SUPERVISOR_LOG.lock().unwrap().push(line);
+        }
+    }
+}
+
+/// Starts capturing the supervisor's log lines afresh. The capture is the
+/// process's subscriber, and sees nothing else; `ENV_LOCK` runs one test at
+/// a time.
+#[cfg(debug_assertions)]
+fn capture_supervisor_log() {
+    use tracing_subscriber::prelude::*;
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let only_the_supervisor = tracing_subscriber::filter::filter_fn(|metadata| {
+            metadata.target() == "eternal_host::supervisor"
+        });
+        let _ = tracing_subscriber::registry()
+            .with(SupervisorLog.with_filter(only_the_supervisor))
+            .try_init();
+    });
+    SUPERVISOR_LOG.lock().unwrap().clear();
+}
+
+/// Waits for the supervisor to log `line`.
+#[cfg(debug_assertions)]
+fn wait_for_supervisor_line(line: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let logged = SUPERVISOR_LOG.lock().unwrap().clone();
+        if logged.iter().any(|logged| logged == line) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the supervisor never logged {line:?}: {logged:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// A GPU whose encoder FFmpeg doesn't have: every generation fails as it
 /// starts, as a broken driver does.
 fn broken_gpu() -> GpuInfo {
@@ -493,6 +555,7 @@ fn a_stream_stopping_as_its_network_changes_stays_stopped() {
         set_test_adapters(Some(wifi(false)));
         std::mem::forget(shared.session.lock());
     });
+    capture_supervisor_log();
     // The stream binds this PC only, the network being down, then waits
     // for the session.
     let shown = format!("unknown:{}", host.port);
@@ -508,15 +571,13 @@ fn a_stream_stopping_as_its_network_changes_stays_stopped() {
     unsafe { host.shared.session.force_unlock() };
 
     host.wait_until_stopped();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        assert_eq!(
-            host.shared.session.lock().not_streaming(),
-            Some(NotStreaming::Stopped),
-            "the stopped stream restarted itself"
-        );
-        std::thread::sleep(Duration::from_millis(10));
-    }
+    // The stream asked after Stop, and the supervisor turned it down.
+    wait_for_supervisor_line("A stream that no longer runs asked to start again: left as it is");
+    assert_eq!(
+        host.shared.session.lock().not_streaming(),
+        Some(NotStreaming::Stopped),
+        "the stopped stream restarted itself"
+    );
     assert!(!host.streaming(), "the stopped stream restarted itself");
 }
 

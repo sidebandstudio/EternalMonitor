@@ -124,7 +124,7 @@ fn udp_goodbyes(end: End, stop: Stop, reason: ByeReason) -> usize {
         let (supervisor_tx, _supervisor_rx) = std::sync::mpsc::channel();
         let control = shared.clone();
         let transport = tokio::spawn(async move {
-            transport::start_sender(nal_rx, audio_rx, port, control, supervisor_tx)
+            transport::start_sender(nal_rx, audio_rx, port, control, supervisor_tx, 1)
                 .await
                 .unwrap()
         });
@@ -257,7 +257,7 @@ fn a_stop_during_startup_still_says_goodbye() {
         let control = shared.clone();
         tokio::time::timeout(
             Duration::from_secs(30),
-            transport::start_sender(nal_rx, audio_rx, port, control, supervisor_tx),
+            transport::start_sender(nal_rx, audio_rx, port, control, supervisor_tx, 1),
         )
         .await
         .expect("the transport stops")
@@ -326,7 +326,7 @@ fn usb_goodbye(end: End, reason: ByeReason) {
         let (supervisor_tx, _supervisor_rx) = std::sync::mpsc::channel();
         let control = shared.clone();
         let transport = tokio::spawn(async move {
-            transport::start_sender(nal_rx, audio_rx, port, control, supervisor_tx)
+            transport::start_sender(nal_rx, audio_rx, port, control, supervisor_tx, 1)
                 .await
                 .unwrap()
         });

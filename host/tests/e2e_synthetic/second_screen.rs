@@ -565,7 +565,10 @@ fn a_screen_moved_to_the_other_card_never_traps_the_ipad_on_a_blocked_mirror() {
     let _env = test_env();
     synthetic_env();
     let memory = memory_dir("moved-screen");
-    let display = FakeDisplay::new(Some(Duration::ZERO), Duration::from_secs(10));
+    // It attaches only once the mirror has shown, as below: an instant
+    // attach could switch the stream before the iPad decoded a mirror
+    // picture, and then no picture ever came after the first epoch.
+    let display = FakeDisplay::new(Some(Duration::from_secs(25)), Duration::from_secs(30));
     let host = Host::start(&display, &memory, SystemTime::now());
     // The fake clock skips the waits between display changes and the
     // attach wait; none of it saves a failure at the moved clock.
@@ -577,8 +580,15 @@ fn a_screen_moved_to_the_other_card_never_traps_the_ipad_on_a_blocked_mirror() {
 
     // The second screen works, with the screen on the app's card.
     let mut receiver = host.connect(0x5707_2001);
+    let mut advanced = false;
     let pictures = watch(&mut receiver, Duration::from_secs(40), |pictures| {
-        skip_waits();
+        if !advanced && !pictures.is_empty() && !display.toggles().is_empty() {
+            // Mirroring while the display attaches. Now its 25 s pass.
+            assert_eq!(epochs(pictures).len(), 1);
+            assert_eq!(host.status(), VddStatus::Attaching);
+            display.advance(Duration::from_secs(25));
+            advanced = true;
+        }
         after_first_epoch(pictures) >= 10
     });
     assert_eq!(epochs(&pictures).len(), 2, "mirror, then the second screen");

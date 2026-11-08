@@ -50,6 +50,7 @@ fn start(shared: &SharedControl, port: u16) -> Generation {
                 port,
                 control,
                 supervisor_tx,
+                1,
             ))
             .unwrap();
     });
