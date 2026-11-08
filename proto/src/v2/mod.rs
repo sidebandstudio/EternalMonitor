@@ -57,10 +57,14 @@ pub enum PacketType {
     Nack = 0x19,
     /// Host → client pointer image, in chunks. Sent only to clients with
     /// [`control::FEATURE_DRAWS_POINTER`].
-    PointerShape = 0x1A,
+    PointerShape = 0x1C,
     /// Host → client pointer position and visibility, as for `PointerShape`.
-    PointerState = 0x1B,
+    PointerState = 0x1D,
     InputEvent = 0x20,
+    /// Client → host: prove you are the PC this iPad paired with (0.3.5+).
+    Identify = 0x1A,
+    /// Host → client: the answer to [`PacketType::Identify`].
+    Identity = 0x1B,
     /// Reserved. Not sent in v2.0.
     Error = 0x7F,
 }
@@ -81,9 +85,11 @@ impl PacketType {
             0x17 => Self::Pong,
             0x18 => Self::StreamConfig,
             0x19 => Self::Nack,
-            0x1A => Self::PointerShape,
-            0x1B => Self::PointerState,
+            0x1C => Self::PointerShape,
+            0x1D => Self::PointerState,
             0x20 => Self::InputEvent,
+            0x1A => Self::Identify,
+            0x1B => Self::Identity,
             0x7F => Self::Error,
             _ => return None,
         })

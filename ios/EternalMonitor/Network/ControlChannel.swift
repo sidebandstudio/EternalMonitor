@@ -22,6 +22,9 @@ final class ControlChannel {
 
     var onSessionEstablished: ((SessionInfo) -> Void)?
     var onRejected: ((HelloStatus) -> Void)?
+    /// The PC answered that it isn't streaming, with its reason token. The
+    /// same HELLO2 keeps going out slowly and connects once the PC streams.
+    var onPCNotStreaming: ((HelloStatus, String) -> Void)?
     /// The last refusal's version mismatch, if any. Read inside `onRejected`.
     private(set) var lastMismatch: VersionMismatch?
     /// HELLO2 went unanswered for the whole retry budget.
@@ -49,6 +52,8 @@ final class ControlChannel {
     private var helloBytes = Data()
     private var helloTemplate: Hello2?
     private var helloAttempts = 0
+    /// The PC said it isn't streaming: keep asking, without a retry budget.
+    private var waitingForStream = false
     private var helloTimer: DispatchSourceTimer?
     private var reportTimer: DispatchSourceTimer?
     private var pingTimer: DispatchSourceTimer?
@@ -73,6 +78,10 @@ final class ControlChannel {
 
     private static let maxHelloAttempts = 8
     private static let helloRetryMs = 250
+    /// How often to ask a PC that answered it isn't streaming. A restart
+    /// takes a second or so; Start takes someone at the PC.
+    static let restartingRetryMs = 1000
+    static let stoppedRetryMs = 2000
     private static let pingIntervalMs = 2000
     private static let pingBurstCount = 5
     private static let pingBurstSpacingMs = 200
@@ -125,6 +134,7 @@ final class ControlChannel {
             hostCaps = 0
             msgSeq = 0
             helloAttempts = 0
+            waitingForStream = false
             clientNonce = UInt32.random(in: 1...UInt32.max)
             lastHelloNonce = clientNonce
             let hello = Hello2(
@@ -162,14 +172,15 @@ final class ControlChannel {
             hello.pairingCode = code
             helloTemplate = hello
             helloAttempts = 0
+            waitingForStream = false
             helloBytes = Wire.encodeControl(sessionId: 0, msgSeq: 1, message: .hello2(hello))
             startHelloTimer()
         }
     }
 
-    private func startHelloTimer() {
+    private func startHelloTimer(everyMs: Int = ControlChannel.helloRetryMs, firstAfterMs: Int = 0) {
         let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now(), repeating: .milliseconds(Self.helloRetryMs))
+        timer.schedule(deadline: .now() + .milliseconds(firstAfterMs), repeating: .milliseconds(everyMs))
         timer.setEventHandler { [weak self] in self?.helloTick() }
         helloTimer?.cancel()
         helloTimer = timer
@@ -180,6 +191,10 @@ final class ControlChannel {
         guard sessionId == 0 else {
             helloTimer?.cancel()
             helloTimer = nil
+            return
+        }
+        if waitingForStream {
+            send(helloBytes)
             return
         }
         helloAttempts += 1
@@ -248,6 +263,23 @@ final class ControlChannel {
         helloTimer?.cancel()
         helloTimer = nil
 
+        if ack.status.pcNotStreaming {
+            // The nonce outlives the wait, so a late or reordered copy can
+            // come after the OK. The session is up: it means nothing now.
+            guard sessionId == 0 else {
+                onDiagnostic?("Ignored a late HELLO_ACK (\(ack.status)) for a session already established")
+                return
+            }
+            // Same nonce: the PC answers this HELLO2 with a session once it streams.
+            if !waitingForStream { onDiagnostic?("PC answered that it isn't streaming (\(ack.status))") }
+            waitingForStream = true
+            let everyMs = ack.status == .restarting ? Self.restartingRetryMs : Self.stoppedRetryMs
+            startHelloTimer(everyMs: everyMs, firstAfterMs: everyMs)
+            onPCNotStreaming?(ack.status, ack.reason)
+            return
+        }
+        waitingForStream = false
+
         guard ack.status == .ok else {
             clientNonce = 0
             lastMismatch = helloTemplate.flatMap {
@@ -307,7 +339,10 @@ final class ControlChannel {
         queue.async { [self] in
             guard sessionId != 0 else { return }
             let now = nowUs()
-            if let last = lastKeyframeRequestUs, now &- last < Self.keyframeRequestSpacingUs { return }
+            // Startup comes at most every 2 s, while no frame completes. The
+            // dropped frames' own requests then keep the spacing busy, and
+            // would always hide it from the PC's log.
+            if reason != .startup, let last = lastKeyframeRequestUs, now &- last < Self.keyframeRequestSpacingUs { return }
             lastKeyframeRequestUs = now
             onDiagnostic?("Requesting keyframe (\(reason))")
             sendMessage(.keyframeRequest(KeyframeRequest(
@@ -378,6 +413,7 @@ final class ControlChannel {
             helloTemplate = nil
             helloBytes = Data()
             clientNonce = 0
+            waitingForStream = false
             sessionId = 0
             hostCaps = 0
             estimator.reset()

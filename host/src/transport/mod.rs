@@ -1,12 +1,14 @@
 pub mod abr;
 pub mod apple_usb;
 mod audio;
+pub mod beat;
 pub mod fault;
 pub mod link;
 pub mod pacer;
 pub mod pointer;
 pub mod retransmit;
 pub mod session;
+pub mod standby;
 pub mod usb;
 pub mod usbmuxd;
 
@@ -30,6 +32,7 @@ use crate::control::{CaptureTarget, SharedControl, SupervisorCommand, VddStatus}
 use crate::encoder::NALUnit;
 use crate::stats::PIPELINE_STATS;
 use abr::AbrController;
+use beat::Phase;
 use fault::FaultInjector;
 use link::{LinkId, PeerId};
 use pacer::{Deadline, FramePacer, PacingClock};
@@ -80,11 +83,36 @@ pub mod probe {
     }
 }
 
+/// What an identity proof signs for a socket on `listen`: that address, or
+/// for one on every address, `home()`. None, and no answer, without an
+/// address to sign.
+fn identity_endpoints(
+    listen: SocketAddr,
+    home: impl FnOnce() -> Vec<std::net::Ipv4Addr>,
+) -> Option<(u16, Vec<[u8; 4]>)> {
+    let std::net::IpAddr::V4(ip) = listen.ip() else {
+        return None;
+    };
+    let addresses = if ip.is_unspecified() {
+        home()
+    } else {
+        vec![ip]
+    };
+    (!addresses.is_empty()).then(|| {
+        (
+            listen.port(),
+            addresses.iter().map(|ip| ip.octets()).collect(),
+        )
+    })
+}
+
 /// Stream parameters advertised in HELLO_ACK and heartbeats.
 struct SharedConfigSource<'a> {
     shared: &'a SharedControl,
     stream_epoch: u32,
     pen_available: bool,
+    /// Where the socket receives the stream.
+    listen: SocketAddr,
 }
 
 impl ConfigSource for SharedConfigSource<'_> {
@@ -115,6 +143,14 @@ impl ConfigSource for SharedConfigSource<'_> {
             },
             bitrate_bps: self.shared.abr_current_bps.load(Ordering::SeqCst),
         }
+    }
+
+    fn identity_endpoints(&self) -> Option<(u16, Vec<[u8; 4]>)> {
+        identity_endpoints(self.listen, crate::network::home_addresses)
+    }
+
+    fn notice(&self) -> u8 {
+        crate::capture::recovery::heartbeat_notice(*self.shared.capture_block.lock())
     }
 
     fn host_caps(&self) -> u16 {
@@ -168,42 +204,11 @@ pub async fn start_sender(
         );
     }
     let bind_addr = SocketAddr::from((bind_ip, listen_port));
-    let socket = {
-        let raw = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
-        // A 4 MiB send buffer lets the kernel absorb whatever the pacer's
-        // hard budget doesn't smooth (best effort — some platforms clamp it).
-        let _ = raw.set_send_buffer_size(4 * 1024 * 1024);
-        let _ = raw.set_recv_buffer_size(4 * 1024 * 1024);
-        let _ = raw.set_tos(0xB8);
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::AsRawSocket;
-            use windows::Win32::Networking::WinSock::{
-                WSAGetLastError, WSAIoctl, SIO_UDP_CONNRESET, SOCKET,
-            };
-            let disabled = 0u32;
-            let mut returned = 0;
-            let result = unsafe {
-                WSAIoctl(
-                    SOCKET(raw.as_raw_socket() as usize),
-                    SIO_UDP_CONNRESET,
-                    Some((&disabled as *const u32).cast()),
-                    std::mem::size_of_val(&disabled) as u32,
-                    None,
-                    0,
-                    &mut returned,
-                    None,
-                    None,
-                )
-            };
-            if result != 0 {
-                warn!(error = ?unsafe { WSAGetLastError() }, "Could not disable UDP connection-reset notifications");
-            }
-        }
-        raw.set_nonblocking(true)?;
-        raw.bind(&bind_addr.into())?;
-        UdpSocket::from_std(raw.into())?
+    let socket = match take_stream_socket(&shared, bind_addr) {
+        Some(socket) => socket,
+        None => bind_stream_socket(bind_addr)?,
     };
+    let socket = UdpSocket::from_std(socket)?;
 
     // Never 0 — the receiver treats epoch 0 as invalid. (Wrap after 2^32 runs is
     // harmless: a fresh session id accompanies any host relaunch.)
@@ -213,6 +218,10 @@ pub async fn start_sender(
         .max(1);
 
     let local_addr = socket.local_addr()?;
+    if bind_ip.is_unspecified() {
+        // Lists the home network addresses before anyone asks for them.
+        crate::network::home_addresses();
+    }
     info!(%local_addr, stream_epoch, "UDP transport ready — waiting for a v2 client HELLO");
     // The Address row and QR code follow every bind, so a chosen network
     // that came back shows its address. Resolved before locking: the stats
@@ -228,6 +237,7 @@ pub async fn start_sender(
         shared: &shared,
         stream_epoch,
         pen_available: input_relay.pen_available(),
+        listen: local_addr,
     };
 
     let abr_enabled = !std::env::var("ETERNAL_ABR").is_ok_and(|v| v.trim() == "0");
@@ -266,6 +276,11 @@ pub async fn start_sender(
     // Capture numbers skip the frames the encoder never took, and the iPad
     // held the frame after each skip waiting for one that never existed.
     let mut frame_seq: u32 = 0;
+    // The encoder closes its channel when it exits, before it reports why.
+    // The loop goes on until `running` goes false, so a goodbye the
+    // supervisor leaves on hearing that report (the storm brake) still goes
+    // out.
+    let mut video_open = true;
 
     let mut state = LoopState {
         retransmit_ring: RetransmitRing::default(),
@@ -278,7 +293,20 @@ pub async fn start_sender(
     let pacing_clock = PacingClock::new()?;
 
     let mut links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
-    shared.session.lock().transport_resumed(now());
+    // One lock, with `running` read under it: a stop
+    // (`diagnostics::stop_session`) queues its goodbye and clears `running`
+    // under the same lock, so this either sees that stop and keeps its
+    // goodbye, or comes first and the stop's goodbye is kept anyway.
+    let retired = {
+        let mut session = shared.session.lock();
+        let stopping = !shared.running.load(Ordering::SeqCst);
+        session.transport_resumed(now(), stopping)
+    };
+    if retired {
+        debug!("Dropped a goodbye left while the stream was stopped");
+    }
+    let beat = std::sync::Arc::clone(&shared.transport_beat);
+    let _beat_ends = BeatEnds(&beat);
     let mut deferred_control = VecDeque::new();
     let mut dgram_scratch = [0u8; MAX_DGRAM_SIZE];
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
@@ -303,6 +331,7 @@ pub async fn start_sender(
             .pen_spaced_until()
             .is_some_and(|at| at <= Instant::now())
         {
+            beat.mark(Phase::Input);
             state
                 .input_relay
                 .keep_pen_alive(*shared.capture_geometry.lock());
@@ -320,6 +349,7 @@ pub async fn start_sender(
             ));
             state.pointer.repeat_due(budget)
         };
+        beat.mark(Phase::Waiting);
         tokio::select! {
             // Service timers and queued control before another paced frame.
             // Random branch selection can delay a NACK by multiple frame
@@ -328,9 +358,11 @@ pub async fn start_sender(
             // Not while a backlog is held: its chunk went at the top of
             // this pass, and a second one would leave nothing between them.
             _ = pen_tick.tick(), if state.input_relay.pen_tick_needed() && state.input_relay.pen_spaced_until().is_none() => {
+                beat.mark(Phase::Input);
                 state.input_relay.keep_pen_alive(*shared.capture_geometry.lock());
             }
             _ = tokio::time::sleep_until(state.fault.next_deadline().unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)).into()), if state.fault.enabled() => {
+                beat.mark(Phase::Video);
                 let destination = *shared.target_addr.lock();
                 for datagram in state.fault.drain_due(Instant::now()) {
                     let _ = links.send_to(&datagram, destination).await;
@@ -338,10 +370,12 @@ pub async fn start_sender(
             }
             _ = heartbeat.tick() => {
                 state.pointer.refresh(now());
+                beat.mark(Phase::Tick);
                 let actions = shared.session.lock().tick(&config, true, now());
                 act(actions, &mut state, &links, &shared, &config, &supervisor_tx).await;
             }
             _ = network_check.tick(), if listen_on != crate::network::ListenOn::All => {
+                beat.mark(Phase::Tick);
                 if !shared.client_connected() && crate::network::listen_ip_now(&listen_on) != bind_ip {
                     info!(listen_on = listen_on.label(), "The chosen network changed: restarting the stream to listen on it");
                     shared.stop();
@@ -351,6 +385,7 @@ pub async fn start_sender(
                 }
             }
             _ = liveness_tick.tick() => {
+                beat.mark(Phase::Tick);
                 links.update_stats();
                 if !shared.running.load(Ordering::SeqCst) {
                     info!("Transport loop stopping on running=false");
@@ -361,6 +396,7 @@ pub async fn start_sender(
             }
 
             result = receive_control(&mut links, &mut deferred_control) => {
+                beat.mark(Phase::Control);
                 match result {
                     Ok(LinkEvent::Closed(id)) => {
                         let actions = shared.session.lock().link_lost(id);
@@ -380,6 +416,7 @@ pub async fn start_sender(
                                             src,
                                             &header,
                                             message,
+                                            datagram.len(),
                                             &config,
                                             now(),
                                         );
@@ -404,19 +441,28 @@ pub async fn start_sender(
 
             // Before video: a position is small and the iPad draws it at once.
             _ = shared.pointer.changed() => {
+                beat.mark(Phase::Pointer);
                 send_pointer(&mut state.pointer, &links, &shared).await;
             }
             _ = pointer_budget.wait(), if pointer_budget.armed() => {
+                beat.mark(Phase::Pointer);
                 send_pointer(&mut state.pointer, &links, &shared).await;
             }
             _ = tokio::time::sleep_until(pointer_repeat.unwrap_or_else(Instant::now).into()), if pointer_repeat.is_some() => {
+                beat.mark(Phase::Pointer);
                 send_pointer(&mut state.pointer, &links, &shared).await;
             }
             Some(packet) = audio_rx.recv() => {
+                beat.mark(Phase::Audio);
                 audio_sender.send(packet, &links, &shared, stream_epoch).await;
             }
-            nal_opt = nal_rx.recv() => {
-                let Some(nal) = nal_opt else { break; };
+            nal_opt = nal_rx.recv(), if video_open => {
+                beat.mark(Phase::Video);
+                let Some(nal) = nal_opt else {
+                    info!("The encoder closed its channel; the transport runs until the stream stops");
+                    video_open = false;
+                    continue;
+                };
                 let Some(session_id) = shared.session.lock().session_id() else { continue; };
                 let target_addr = *shared.target_addr.lock();
                 if target_addr.link == LinkId::Udp && target_addr.addr.is_none_or(|a| a.ip().is_unspecified() || a.port() == 0) {
@@ -552,13 +598,85 @@ pub async fn start_sender(
     }
 
     // Every way out of the loop comes here, before the links close: an update
-    // that just stopped the stream must still tell the iPad.
+    // or a Stop that just stopped the stream must still tell the iPad.
+    beat.mark(Phase::Actions);
     let goodbye = shared.session.lock().take_goodbye();
     if let Some(goodbye) = goodbye {
         say_goodbye(&links, goodbye).await;
     }
+    park_stream_socket(&shared, links.into_udp_socket());
     info!("NAL channel closed, transport sender shutting down");
     Ok(())
+}
+
+/// The UDP socket iPads send HELLO2 to and the stream is sent from, bound
+/// to `bind_addr`. The standby responder binds it the same way.
+fn bind_stream_socket(bind_addr: SocketAddr) -> std::io::Result<std::net::UdpSocket> {
+    let raw = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
+    // A 4 MiB send buffer lets the kernel absorb whatever the pacer's
+    // hard budget doesn't smooth (best effort — some platforms clamp it).
+    let _ = raw.set_send_buffer_size(4 * 1024 * 1024);
+    let _ = raw.set_recv_buffer_size(4 * 1024 * 1024);
+    let _ = raw.set_tos(0xB8);
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawSocket;
+        use windows::Win32::Networking::WinSock::{
+            WSAGetLastError, WSAIoctl, SIO_UDP_CONNRESET, SOCKET,
+        };
+        let disabled = 0u32;
+        let mut returned = 0;
+        let result = unsafe {
+            WSAIoctl(
+                SOCKET(raw.as_raw_socket() as usize),
+                SIO_UDP_CONNRESET,
+                Some((&disabled as *const u32).cast()),
+                std::mem::size_of_val(&disabled) as u32,
+                None,
+                0,
+                &mut returned,
+                None,
+                None,
+            )
+        };
+        if result != 0 {
+            warn!(error = ?unsafe { WSAGetLastError() }, "Could not disable UDP connection-reset notifications");
+        }
+    }
+    raw.set_nonblocking(true)?;
+    raw.bind(&bind_addr.into())?;
+    Ok(raw.into())
+}
+
+/// The stream socket the last owner of the port left, if it is bound to
+/// `bind_addr`. One bound elsewhere (the chosen network changed) closes.
+fn take_stream_socket(
+    shared: &SharedControl,
+    bind_addr: SocketAddr,
+) -> Option<std::net::UdpSocket> {
+    shared
+        .stream_socket
+        .lock()
+        .take()
+        .filter(|socket| socket.local_addr().is_ok_and(|addr| addr == bind_addr))
+}
+
+/// Leaves the stream socket, still bound, for the next owner of the port.
+fn park_stream_socket(shared: &SharedControl, socket: UdpSocket) {
+    match socket.into_std() {
+        Ok(socket) => *shared.stream_socket.lock() = Some(socket),
+        Err(error) => debug!(%error, "Closed the stream port between owners"),
+    }
+}
+
+/// Marks the transport ended however `start_sender` stops, so the watch
+/// never reads a finished loop's last mark as a stuck one.
+struct BeatEnds<'a>(&'a beat::Beat);
+
+impl Drop for BeatEnds<'_> {
+    fn drop(&mut self) {
+        self.0.stop();
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -705,7 +823,7 @@ async fn repair_while_pacing(
                     #[cfg(feature = "test-hooks")]
                     probe::taken(peer);
                     let actions = shared.session.lock().handle_datagram(PeerId::udp(peer), &header,
-                        message, config, now());
+                        message, len, config, now());
                     act(actions, state, links, shared, config, supervisor_tx).await;
                     continue;
                 }
@@ -747,6 +865,7 @@ async fn act(
         send_repairs(&links.udp.socket, &mut state.retransmit_ring, shared, &nack).await;
     }
     if let Some((session_id, event)) = actions.input.take() {
+        shared.transport_beat.mark(Phase::Input);
         if let Some(geometry) = *shared.capture_geometry.lock() {
             if actions.input_late {
                 state.input_relay.relay_late(session_id, &event, geometry);
@@ -866,6 +985,7 @@ async fn execute_actions(
     shared: &SharedControl,
     supervisor_tx: &std_mpsc::Sender<SupervisorCommand>,
 ) {
+    shared.transport_beat.mark(Phase::Actions);
     // An ended session's summary waits for this pass's second screen step,
     // which can give the second screen up for it, unless a new session
     // starts now: second screen news from here on is the new one's.
@@ -941,6 +1061,7 @@ async fn execute_actions(
         }
     }
 
+    shared.transport_beat.mark(Phase::SecondScreen);
     let restart = match second_screen::next_step(shared, now()) {
         second_screen::Step::Nothing => false,
         second_screen::Step::Attach => {
@@ -1015,6 +1136,7 @@ mod tests {
         use tracing_subscriber::prelude::*;
         let _slot = crate::diagnostics::tests::FALLBACK_SLOT.lock();
         let summaries = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        crate::logging::prepare_log_capture();
         let _log = tracing::subscriber::set_default(
             tracing_subscriber::registry()
                 .with(crate::diagnostics::FallbackWatch)
@@ -1038,6 +1160,7 @@ mod tests {
                 shared: &shared,
                 stream_epoch: 1,
                 pen_available: false,
+                listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             };
             let peer = PeerId::udp("127.0.0.1:19893".parse().unwrap());
             let hello = ControlMessage::Hello2(Hello2 {
@@ -1090,6 +1213,27 @@ mod tests {
         crate::diagnostics::tests::assert_contract(&summaries[0]);
     }
 
+    /// A socket on one address signs that address; one on every address
+    /// signs the home network addresses. With none to sign, or IPv6, the PC
+    /// answers nothing rather than an empty list.
+    #[test]
+    fn identity_endpoints_need_an_address_to_sign() {
+        let all = SocketAddr::from(([0, 0, 0, 0], 9876));
+        let home = || vec![std::net::Ipv4Addr::new(192, 0, 2, 4)];
+        assert_eq!(
+            identity_endpoints(all, home),
+            Some((9876, vec![[192, 0, 2, 4]]))
+        );
+        assert_eq!(identity_endpoints(all, Vec::new), None);
+        let one = SocketAddr::from(([198, 51, 100, 3], 9876));
+        assert_eq!(
+            identity_endpoints(one, || panic!("lists nothing")),
+            Some((9876, vec![[198, 51, 100, 3]]))
+        );
+        let v6 = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, 9876));
+        assert_eq!(identity_endpoints(v6, home), None);
+    }
+
     #[tokio::test]
     async fn repairs_current_and_previous_frames_before_the_pacing_wait_ends() {
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1102,6 +1246,7 @@ mod tests {
             shared: &shared,
             stream_epoch: 1,
             pen_available: false,
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         };
         let hello = ControlMessage::Hello2(Hello2 {
             proto_min: 2,
@@ -1152,6 +1297,7 @@ mod tests {
                 shared: &shared,
                 stream_epoch: 1,
                 pen_available: false,
+                listen: SocketAddr::from(([127, 0, 0, 1], 0)),
             };
             let links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
             let (supervisor_tx, _supervisor_rx) = std_mpsc::channel();
@@ -1230,11 +1376,16 @@ mod tests {
     /// session, and both go up, as at every other end of a session.
     #[cfg(not(windows))]
     #[tokio::test]
+    // The slot only keeps other tests out; nothing on this test's runtime
+    // takes it.
+    #[allow(clippy::await_holding_lock)]
     async fn a_usb_session_ended_by_its_cable_releases_held_input() {
         use crate::input::{
             recorder, CaptureGeometry, Injection, KIND_KEY, KIND_MOUSE_ABS, PHASE_BEGAN,
         };
         use eternal_wire::v2::control::{InputEvent, FEATURE_WANTS_INPUT};
+        // The session starts and ends through `act`, which uses the fallback slot.
+        let _slot = crate::diagnostics::tests::FALLBACK_SLOT.lock();
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let shared = SharedControl::new(socket.local_addr().unwrap().port(), 15_000_000);
         shared.pairing.lock().required = false;
@@ -1248,6 +1399,7 @@ mod tests {
             shared: &shared,
             stream_epoch: 1,
             pen_available: false,
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         };
         let links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
         let (supervisor_tx, _supervisor_rx) = std_mpsc::channel();
@@ -1354,6 +1506,7 @@ mod tests {
             shared,
             stream_epoch: 1,
             pen_available: false,
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         };
         let hello = ControlMessage::Hello2(Hello2 {
             proto_min: 2,
@@ -1429,6 +1582,7 @@ mod tests {
                     shared: &shared,
                     stream_epoch: 1,
                     pen_available: false,
+                    listen: SocketAddr::from(([127, 0, 0, 1], 0)),
                 };
                 let links =
                     TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
@@ -1492,6 +1646,7 @@ mod tests {
             shared: &shared,
             stream_epoch: 1,
             pen_available: false,
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         };
         let held = shared
             .session
@@ -1509,6 +1664,66 @@ mod tests {
             shared.force_next_idr.load(Ordering::SeqCst),
             "the resume IDR never reached the encoder"
         );
+    }
+
+    /// While the lock screen or a permission prompt keeps Windows from
+    /// letting capture work, every heartbeat tells the iPad the PC is locked.
+    /// Once capture works again, heartbeats say nothing more.
+    #[test]
+    fn heartbeats_say_the_pc_is_locked_while_a_secure_screen_blocks_capture() {
+        use crate::capture::recovery::{
+            note_capture_resumed, run_until_unblocked, CaptureBlock, CaptureUnavailable,
+        };
+        use eternal_wire::v2::control::{NOTICE_NONE, NOTICE_PC_LOCKED};
+        let shared = SharedControl::new(9876, 15_000_000);
+        shared.pairing.lock().required = false;
+        let now = Instant::now();
+        repairable_session(&shared, "127.0.0.1:50000".parse().unwrap(), now);
+        let config = SharedConfigSource {
+            shared: &shared,
+            stream_epoch: 1,
+            pen_available: false,
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+        };
+        let notices = || {
+            let actions = shared.session.lock().tick(&config, true, now);
+            actions
+                .replies
+                .iter()
+                .filter_map(|(_, bytes)| match parse_control(bytes) {
+                    Ok((_, ControlMessage::Heartbeat(heartbeat))) => Some(heartbeat.notice),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(notices(), [NOTICE_NONE]);
+        // Windows answers duplication with E_ACCESSDENIED until the user is
+        // back on the desktop.
+        let mut attempts = 0;
+        let mut while_blocked = Vec::new();
+        let result = run_until_unblocked(
+            &shared,
+            |_| {
+                attempts += 1;
+                if attempts < 3 {
+                    Err(CaptureUnavailable {
+                        block: CaptureBlock::from_hresult(0x8007_0005_u32 as i32).unwrap(),
+                        detail: "Access is denied".into(),
+                    }
+                    .into())
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {
+                while_blocked.extend(notices());
+                true
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(while_blocked, [NOTICE_PC_LOCKED, NOTICE_PC_LOCKED]);
+        note_capture_resumed(&shared);
+        assert_eq!(notices(), [NOTICE_NONE]);
     }
 
     /// A NACK of a session that ended for liveness, while another frame is
@@ -1529,6 +1744,7 @@ mod tests {
             shared: &shared,
             stream_epoch: 1,
             pen_available: false,
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
         };
         let expired = shared
             .session
@@ -1670,6 +1886,7 @@ mod tests {
             .with_writer(move || Sink(std::sync::Arc::clone(&writer)))
             .finish();
         let error = std::io::Error::from(std::io::ErrorKind::ConnectionReset);
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(subscriber, || {
             log_send_failed(LinkId::Usb { device_id: 3 }, &error);
             log_send_failed(LinkId::Usb { device_id: 3 }, &error);

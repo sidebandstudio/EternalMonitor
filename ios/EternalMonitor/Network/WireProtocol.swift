@@ -29,9 +29,11 @@ enum Wire {
         case pong = 0x17
         case streamConfig = 0x18
         case nack = 0x19
-        case pointerShape = 0x1A
-        case pointerState = 0x1B
+        case pointerShape = 0x1C
+        case pointerState = 0x1D
         case inputEvent = 0x20
+        case identify = 0x1A
+        case identity = 0x1B
         case error = 0x7F
     }
 
@@ -255,6 +257,13 @@ struct Hello2: Equatable {
     static let featureWantsInput: UInt16 = 1 << 0
     static let featureWantsAudio: UInt16 = 1 << 1
     static let featureSupportsNack: UInt16 = 1 << 2
+    /// This app understands the stopped, restarting and failed statuses. A PC
+    /// sends them only to an iPad that sets it.
+    static let featureStandbyStatus: UInt16 = 1 << 3
+    /// A HELLO2 that sets `featureStandbyStatus` is padded with zeros to at
+    /// least this many bytes: the longest HELLO_ACK there is. A PC answers
+    /// while it isn't streaming only with no more bytes than it was sent.
+    static let standbyLength = 164
     /// This app checks for its own updates, so the PC need not tell the user. 0.3.1 and older never set it.
     static let featureChecksUpdates: UInt16 = 1 << 4
     /// This app draws the pointer from POINTER_SHAPE and POINTER_STATE, so
@@ -287,6 +296,15 @@ enum HelloStatus: UInt8 {
     case error = 3
     case unauthorized = 4
     case rateLimited = 5
+    /// The PC answered but isn't streaming: someone clicked Stop on it,
+    case stopped = 6
+    /// it is restarting its stream,
+    case restarting = 7
+    /// or it stopped after repeated errors (`HelloAck.reason` says why).
+    case failed = 8
+
+    /// The PC is there and may stream again: keep asking.
+    var pcNotStreaming: Bool { self == .stopped || self == .restarting || self == .failed }
 }
 
 struct HelloAck: Equatable {
@@ -312,11 +330,22 @@ struct HelloAck: Equatable {
     var hostName: String
     var authToken = Data(repeating: 0, count: 16)
     var hostCaps: UInt16 = 0
+    /// Why the PC isn't streaming, for `.failed`: a token such as
+    /// "display_changing". Empty otherwise.
+    var reason = ""
+    static let maxReasonLength = 32
 }
 
 struct Heartbeat: Equatable {
     var hostTimeUs: UInt64
     var streamConfig: StreamConfig
+    /// What to say over the picture, for as long as it lasts. PCs older than
+    /// the field leave it off: `noticeNone`. Unknown values are ignored.
+    var notice: UInt8 = Heartbeat.noticeNone
+
+    static let noticeNone: UInt8 = 0
+    /// The PC is locked or shows a permission prompt, so it can't capture.
+    static let noticePCLocked: UInt8 = 1
 }
 
 enum ByeReason: UInt8 {
@@ -423,6 +452,42 @@ struct WirePong: Equatable {
     var t3Us: UInt64
 }
 
+/// iPad → PC, session 0: before reconnecting to a PC it found at a new
+/// address, the iPad checks that it is the same PC, at that address. The PC
+/// answers with a `WireIdentity`. Reserved bytes keep the request as long as
+/// the answer.
+struct WireIdentify: Equatable {
+    static let version: UInt8 = 1
+    /// What the proof signs after the nonce.
+    static let context = Data("EternalMonitor identify v1".utf8)
+    /// Addresses an answer carries at most.
+    static let maxAddresses = 4
+    /// Both bodies: version, nonce, port, count, address slots and proof.
+    static let bodySize = 1 + 16 + 2 + 1 + 4 * maxAddresses + 32
+    var version = WireIdentify.version
+    var nonce: Data
+}
+
+/// PC → iPad, session 0: the port the PC receives the stream on, its home
+/// network IPv4 addresses (4 bytes each), and HMAC-SHA256 keyed with the
+/// pairing token over `message`.
+struct WireIdentity: Equatable {
+    var version = WireIdentify.version
+    var nonce: Data
+    var port: UInt16
+    var addresses: [Data]
+    var proof: Data
+
+    /// What the proof signs: `nonce ‖ context ‖ port (LE) ‖ count ‖ addresses`.
+    static func message(nonce: Data, port: UInt16, addresses: [Data]) -> Data {
+        var message = nonce + WireIdentify.context
+        message.appendLE(port)
+        message.append(UInt8(addresses.count))
+        for address in addresses { message.append(address) }
+        return message
+    }
+}
+
 struct WireInputEvent: Equatable {
     var inputVer: UInt8 = 1
     var kind: UInt8
@@ -455,6 +520,8 @@ enum ControlMessage: Equatable {
     case inputEvent(WireInputEvent)
     case pointerShape(PointerShapeChunk)
     case pointerState(PointerState)
+    case identify(WireIdentify)
+    case identity(WireIdentity)
 
     var packetType: Wire.PacketType {
         switch self {
@@ -471,6 +538,8 @@ enum ControlMessage: Equatable {
         case .inputEvent: return .inputEvent
         case .pointerShape: return .pointerShape
         case .pointerState: return .pointerState
+        case .identify: return .identify
+        case .identity: return .identity
         }
     }
 }
@@ -502,6 +571,10 @@ extension Wire {
                 body.append(h.authToken)
                 body.appendLE(h.pairingCode)
             }
+            let padded = Hello2.standbyLength - ControlHeader.size
+            if h.featureCaps & Hello2.featureStandbyStatus != 0, body.count < padded {
+                body.append(Data(count: padded - body.count))
+            }
         case .helloAck(let a):
             let name = Data(a.hostName.utf8).prefixOnCharBoundary(a.hostName, max: Hello2.maxNameLength)
             body.append(a.status.rawValue)
@@ -515,13 +588,19 @@ extension Wire {
             body.append(UInt8(name.count))
             body.append(name)
             precondition(a.authToken.count == 16)
-            if a.hostCaps != 0 || a.authToken.contains(where: { $0 != 0 }) {
+            let reason = Data(a.reason.utf8).prefixOnCharBoundary(a.reason, max: HelloAck.maxReasonLength)
+            if a.hostCaps != 0 || a.authToken.contains(where: { $0 != 0 }) || !reason.isEmpty {
                 body.append(a.authToken)
                 body.appendLE(a.hostCaps)
+            }
+            if !reason.isEmpty {
+                body.append(UInt8(reason.count))
+                body.append(reason)
             }
         case .heartbeat(let hb):
             body.appendLE(hb.hostTimeUs)
             hb.streamConfig.encode(into: &body)
+            if hb.notice != Heartbeat.noticeNone { body.append(hb.notice) }
         case .bye(let reason):
             body.append(reason.rawValue)
         case .keyframeRequest(let k):
@@ -566,6 +645,22 @@ extension Wire {
             body.appendLE(p.t3Us)
         case .streamConfig(let cfg):
             cfg.encode(into: &body)
+        case .identify(let i):
+            precondition(i.nonce.count == 16)
+            body.append(i.version)
+            body.append(i.nonce)
+            body.append(Data(repeating: 0, count: WireIdentify.bodySize - 17))
+        case .identity(let i):
+            precondition(i.nonce.count == 16 && i.proof.count == 32 && i.addresses.count <= WireIdentify.maxAddresses
+                         && i.addresses.allSatisfy { $0.count == 4 })
+            body.append(i.version)
+            body.append(i.nonce)
+            body.appendLE(i.port)
+            body.append(UInt8(i.addresses.count))
+            for slot in 0..<WireIdentify.maxAddresses {
+                body.append(slot < i.addresses.count ? i.addresses[slot] : Data(count: 4))
+            }
+            body.append(i.proof)
         case .inputEvent(let e):
             body.append(e.inputVer)
             body.append(e.kind)
@@ -651,7 +746,8 @@ extension Wire {
         case .heartbeat:
             guard let hostTimeUs = r.readU64(),
                   let cfg = StreamConfig.decode(&r) else { return nil }
-            message = .heartbeat(Heartbeat(hostTimeUs: hostTimeUs, streamConfig: cfg))
+            message = .heartbeat(Heartbeat(hostTimeUs: hostTimeUs, streamConfig: cfg,
+                                           notice: r.readU8() ?? Heartbeat.noticeNone))
         case .bye:
             guard let raw = r.readU8(), let reason = ByeReason(rawValue: raw) else { return nil }
             message = .bye(reason)
@@ -697,6 +793,16 @@ extension Wire {
             message = .pointerState(PointerState(
                 flags: flags, shapeId: shapeId, x: Int32(bitPattern: x), y: Int32(bitPattern: y),
                 hostTimeUs: time))
+        case .identify:
+            guard let version = r.readU8(), let nonce = r.take(16), r.take(WireIdentify.bodySize - 17) != nil else { return nil }
+            message = .identify(WireIdentify(version: version, nonce: Data(nonce)))
+        case .identity:
+            guard let version = r.readU8(), let nonce = r.take(16), let port = r.readU16(), let count = r.readU8(),
+                  Int(count) <= WireIdentify.maxAddresses, let slots = r.take(4 * WireIdentify.maxAddresses),
+                  let proof = r.take(32) else { return nil }
+            let addresses = (0..<Int(count)).map { Data(slots.dropFirst($0 * 4).prefix(4)) }
+            message = .identity(WireIdentity(version: version, nonce: Data(nonce), port: port, addresses: addresses,
+                                             proof: Data(proof)))
         case .media, .mediaFec, .audio, .error:
             return nil
         }
@@ -755,6 +861,11 @@ extension Wire {
             guard let token = r.take(16), let caps = r.readU16() else { return nil }
             ack.authToken = Data(token)
             ack.hostCaps = caps
+        }
+        if r.remaining > 0 {
+            guard let length = r.readU8(), Int(length) <= HelloAck.maxReasonLength, let bytes = r.take(Int(length)),
+                  let reason = String(bytes: bytes, encoding: .utf8) else { return nil }
+            ack.reason = reason
         }
         return .helloAck(ack)
     }

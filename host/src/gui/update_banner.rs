@@ -457,6 +457,22 @@ impl AnalyzerApp {
             self.set_check_updates(automatic);
         }
         widgets::divider(ui);
+        if crate::updates::is_beta(env!("CARGO_PKG_VERSION")) {
+            let mut beta = self.settings_beta_updates;
+            widgets::setting_row(
+                ui,
+                "Get Beta updates",
+                "This is a Beta build. Turn this off to be offered only stable releases.",
+                64.0,
+                |ui| {
+                    widgets::toggle(ui, &mut beta, "Get Beta updates");
+                },
+            );
+            if beta != self.settings_beta_updates {
+                self.set_beta_updates(beta);
+            }
+            widgets::divider(ui);
+        }
         let status = self.updates.check_status();
         let available = self.updates.available_version();
         let description = match (status, &available) {

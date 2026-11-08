@@ -87,6 +87,28 @@ final class StreamRecoveryTests: XCTestCase {
         }
     }
 
+    /// The lock screen or a permission prompt holds the picture on the PC.
+    /// Its heartbeats say so, and the iPad says so over the held picture,
+    /// still connected, until a heartbeat says capture works again.
+    func testALockedPCIsShownOverTheHeldPictureUntilItCapturesAgain() async throws {
+        let host = FakeUDPHost()
+        let manager = try await streaming(host)
+        XCTAssertFalse(manager.pcLocked)
+        host.sendHeartbeat(notice: Heartbeat.noticePCLocked)
+        try await until("the PC says it is locked") { manager.pcLocked }
+        XCTAssertEqual(manager.state, .connected)
+        host.sendHeartbeat()
+        try await until("the PC captures again") { !manager.pcLocked }
+        // A notice this iPad doesn't know says nothing.
+        host.sendHeartbeat(notice: 0xC8)
+        try await Task.sleep(nanoseconds: 500_000_000)
+        XCTAssertFalse(manager.pcLocked)
+        host.sendHeartbeat(notice: Heartbeat.noticePCLocked)
+        try await until("locked again") { manager.pcLocked }
+        manager.cancel()
+        XCTAssertFalse(manager.pcLocked, "the next session starts without it")
+    }
+
     func testContiguousNumberingRevealsALostReopenKeyframe() async throws {
         // The PC reopened its encoder and its new keyframe (seq 2) was lost;
         // the new encoder's first P-frame continues the codec's count. A PC
@@ -216,5 +238,35 @@ final class StreamRecoveryTests: XCTestCase {
         XCTAssertEqual(manager.debugState.decodedFrames, 1)
         let after = await Task.detached { host.keyframeRequests(within: 1) }.value
         XCTAssertEqual(after, [])
+    }
+
+    /// Video arrives but no frame ever completes, as when every full-size
+    /// datagram is lost: 2 s on, the iPad logs the missing fragments and
+    /// asks for a fresh keyframe with reason Startup, which the PC logs,
+    /// besides the requests the dropped frames make.
+    func testAFirstFrameThatNeverCompletesAsksForAFreshKeyframe() async throws {
+        let host = FakeUDPHost()
+        let manager = ConnectionManager()
+        addTeardownBlock { await MainActor.run { manager.cancel() } }
+        manager.connect(host: "127.0.0.1", port: host.port)
+        let accepted = await Task.detached { host.acceptSession() }.value
+        XCTAssertTrue(accepted, "the iPad never sent HELLO2")
+        let fragments = Task.detached {
+            for seq in UInt32(1)...80 where !Task.isCancelled {
+                host.sendFirstFragment(Data([0, 0, 0, 1, 0x65]), seq: seq)
+                try? await Task.sleep(nanoseconds: 100_000_000)
+            }
+        }
+        defer { fragments.cancel() }
+        let reasons = await Task.detached { host.keyframeRequests(within: 8) { $0 == .startup } }.value
+        XCTAssertEqual(reasons.last, .startup, "\(reasons)")
+        try await until("logged") {
+            manager.diagnostics.contains { $0.category == "assembly" && $0.message.hasPrefix(
+                "Video arrives but no frame completed in 2 s; asked the PC for a fresh keyframe: seq=") }
+        }
+        let logged = manager.diagnostics.first { $0.message.hasPrefix("Video arrives") }
+        XCTAssertEqual(logged?.level, .warning)
+        XCTAssertTrue(logged?.message.contains(" dropped with 1/2 fragments, missing 1") == true, logged?.message ?? "")
+        XCTAssertEqual(manager.state, .connecting)
     }
 }

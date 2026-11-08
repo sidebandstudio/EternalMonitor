@@ -37,6 +37,10 @@ pub const CAP_DECODE_HEVC_10BIT: u16 = 1 << 2;
 pub const FEATURE_WANTS_INPUT: u16 = 1 << 0;
 pub const FEATURE_WANTS_AUDIO: u16 = 1 << 1;
 pub const FEATURE_SUPPORTS_NACK: u16 = 1 << 2;
+/// The iPad understands [`HelloStatus::Stopped`], [`HelloStatus::Restarting`]
+/// and [`HelloStatus::Failed`] (0.3.5 and later). Older iPads drop an ACK
+/// whose status they don't know, so the host sends them only statuses 0-5.
+pub const FEATURE_STANDBY_STATUS: u16 = 1 << 3;
 /// The iPad app checks for its own updates (0.3.2 and later), so a HELLO2
 /// without it comes from 0.3.1 or older. Older hosts ignore it.
 pub const FEATURE_CHECKS_UPDATES: u16 = 1 << 4;
@@ -143,6 +147,13 @@ pub enum HelloStatus {
     Error = 3,
     Unauthorized = 4,
     RateLimited = 5,
+    /// The PC answered but isn't streaming: someone clicked Stop on it.
+    Stopped = 6,
+    /// The PC is restarting its stream; ask again shortly.
+    Restarting = 7,
+    /// The PC stopped streaming after repeated errors, until someone clicks
+    /// Start. [`HelloAck::reason`] carries a [`FailedReason`] token.
+    Failed = 8,
 }
 
 impl HelloStatus {
@@ -154,6 +165,9 @@ impl HelloStatus {
             3 => Self::Error,
             4 => Self::Unauthorized,
             5 => Self::RateLimited,
+            6 => Self::Stopped,
+            7 => Self::Restarting,
+            8 => Self::Failed,
             _ => return None,
         })
     }
@@ -174,13 +188,93 @@ pub struct HelloAck {
     pub host_name: String,
     pub auth_token: [u8; 16],
     pub host_caps: u16,
+    /// Why the PC isn't streaming, for [`HelloStatus::Failed`]: a
+    /// [`FailedReason`] token, empty otherwise. Appended after `host_caps`
+    /// (0.3.5), at most [`MAX_REASON_LEN`] bytes; older parsers ignore it.
+    pub reason: String,
 }
+
+/// Longest [`HelloAck::reason`] on the wire, in bytes.
+pub const MAX_REASON_LEN: usize = 32;
+
+/// The longest HELLO_ACK datagram: the header, the fixed fields and stream
+/// config, the longest host name, the token and host caps, and the longest
+/// reason.
+pub const MAX_HELLO_ACK_LEN: usize =
+    CONTROL_HEADER_SIZE + 16 + STREAM_CONFIG_SIZE + 1 + MAX_NAME_LEN + 16 + 2 + 1 + MAX_REASON_LEN;
+
+/// A HELLO2 that sets [`FEATURE_STANDBY_STATUS`] is padded with zeros to at
+/// least this size, so any answer to it is no larger than the question. A
+/// PC answers while it isn't streaming only within that bound. Older
+/// parsers ignore the padding, as any trailing body bytes.
+pub const STANDBY_HELLO2_LEN: usize = MAX_HELLO_ACK_LEN;
+
+/// Why a PC stopped streaming after repeated errors, as [`HelloAck::reason`]
+/// carries it. A token, not text: the iPad says it in its own words, and an
+/// iPad that doesn't know a token shows the general advice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailedReason {
+    Capture,
+    Encoder,
+    Transport,
+    SecureDesktop,
+    DisplayChanging,
+    NoDisplay,
+    UnsupportedOnThisGpu,
+    TooManyCaptureApps,
+    SessionDisconnected,
+    DriverNotResponding,
+}
+
+impl FailedReason {
+    pub const ALL: [FailedReason; 10] = [
+        Self::Capture,
+        Self::Encoder,
+        Self::Transport,
+        Self::SecureDesktop,
+        Self::DisplayChanging,
+        Self::NoDisplay,
+        Self::UnsupportedOnThisGpu,
+        Self::TooManyCaptureApps,
+        Self::SessionDisconnected,
+        Self::DriverNotResponding,
+    ];
+
+    pub fn token(self) -> &'static str {
+        match self {
+            Self::Capture => "capture",
+            Self::Encoder => "encoder",
+            Self::Transport => "transport",
+            Self::SecureDesktop => "secure_desktop",
+            Self::DisplayChanging => "display_changing",
+            Self::NoDisplay => "no_display",
+            Self::UnsupportedOnThisGpu => "unsupported_gpu",
+            Self::TooManyCaptureApps => "too_many_capture_apps",
+            Self::SessionDisconnected => "session_disconnected",
+            Self::DriverNotResponding => "driver_not_responding",
+        }
+    }
+
+    pub fn from_token(token: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|reason| reason.token() == token)
+    }
+}
+
+/// [`Heartbeat::notice`] values. A notice is appended to the heartbeat only
+/// when it is not [`NOTICE_NONE`]: iPads older than the field ignore the byte,
+/// and an iPad ignores a value it does not know.
+pub const NOTICE_NONE: u8 = 0;
+/// The PC is locked or shows a permission prompt, so Windows lets nothing
+/// capture its screen and the picture stops until the user returns.
+pub const NOTICE_PC_LOCKED: u8 = 1;
 
 /// Host → client, every heartbeat interval while a session is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Heartbeat {
     pub host_time_us: u64,
     pub stream_config: StreamConfig,
+    /// What the iPad should say over the picture, for as long as it lasts.
+    pub notice: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -325,6 +419,58 @@ pub struct InputEvent {
     pub tilt_y: i16,
 }
 
+/// [`Identify`] and [`Identity`] layout version.
+pub const IDENTIFY_VERSION: u8 = 1;
+/// What an [`Identity`] proof signs after the nonce.
+pub const IDENTIFY_CONTEXT: &[u8] = b"EternalMonitor identify v1";
+
+/// At most this many addresses in an [`Identity`].
+pub const IDENTITY_MAX_ADDRESSES: usize = 4;
+
+/// Client → host, session_id 0: before reconnecting to a PC it found at a new
+/// address, the iPad checks that it is the same PC, at that address. The host
+/// answers with an [`Identity`] whose proof only the PC holding the pairing
+/// token can make. Reserved bytes keep the request as long as the answer.
+/// Hosts before 0.3.5 don't know the type and drop it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Identify {
+    pub version: u8,
+    pub nonce: [u8; 16],
+}
+
+/// Host → client, session_id 0: the port the host receives the stream on and
+/// its home network IPv4 addresses (at most [`IDENTITY_MAX_ADDRESSES`]), and
+/// `proof`, HMAC-SHA256 keyed with the pairing token over
+/// [`identity_message`]. The iPad goes on only when the address it asked at
+/// is one of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Identity {
+    pub version: u8,
+    pub nonce: [u8; 16],
+    pub port: u16,
+    pub addresses: Vec<[u8; 4]>,
+    pub proof: [u8; 32],
+}
+
+/// Both bodies: version, nonce, port, address count, the address slots
+/// (unused ones zero) and the proof.
+pub const IDENTIFY_BODY_SIZE: usize = 1 + 16 + 2 + 1 + 4 * IDENTITY_MAX_ADDRESSES + 32;
+
+/// What an [`Identity`] proof signs: `nonce ‖ IDENTIFY_CONTEXT ‖ port (LE) ‖
+/// count ‖ addresses`. Only the first [`IDENTITY_MAX_ADDRESSES`] count.
+pub fn identity_message(nonce: &[u8; 16], port: u16, addresses: &[[u8; 4]]) -> Vec<u8> {
+    let addresses = &addresses[..addresses.len().min(IDENTITY_MAX_ADDRESSES)];
+    let mut message = Vec::with_capacity(16 + IDENTIFY_CONTEXT.len() + 3 + 4 * addresses.len());
+    message.extend_from_slice(nonce);
+    message.extend_from_slice(IDENTIFY_CONTEXT);
+    message.extend_from_slice(&port.to_le_bytes());
+    message.push(addresses.len() as u8);
+    for address in addresses {
+        message.extend_from_slice(address);
+    }
+    message
+}
+
 pub const INPUT_EVENT_SIZE: usize = 30;
 pub const PEN_INPUT_EVENT_SIZE: usize = INPUT_EVENT_SIZE + 4;
 
@@ -437,6 +583,8 @@ pub enum ControlMessage {
     InputEvent(InputEvent),
     PointerShape(PointerShapeChunk),
     PointerState(PointerState),
+    Identify(Identify),
+    Identity(Identity),
 }
 
 impl ControlMessage {
@@ -455,6 +603,8 @@ impl ControlMessage {
             Self::InputEvent(_) => PacketType::InputEvent,
             Self::PointerShape(_) => PacketType::PointerShape,
             Self::PointerState(_) => PacketType::PointerState,
+            Self::Identify(_) => PacketType::Identify,
+            Self::Identity(_) => PacketType::Identity,
         }
     }
 }
@@ -487,6 +637,9 @@ pub fn encode_control(session_id: u32, msg_seq: u32, message: &ControlMessage) -
                 body.extend_from_slice(&h.auth_token);
                 body.extend_from_slice(&h.pairing_code.to_le_bytes());
             }
+            if h.feature_caps & FEATURE_STANDBY_STATUS != 0 {
+                body.resize(body.len().max(STANDBY_HELLO2_LEN - CONTROL_HEADER_SIZE), 0);
+            }
         }
         ControlMessage::HelloAck(a) => {
             let name = truncated_name(&a.host_name);
@@ -502,9 +655,14 @@ pub fn encode_control(session_id: u32, msg_seq: u32, message: &ControlMessage) -
             body.extend_from_slice(&cfg);
             body.push(name.len() as u8);
             body.extend_from_slice(name.as_bytes());
-            if a.host_caps != 0 || a.auth_token != [0; 16] {
+            let reason = truncated(&a.reason, MAX_REASON_LEN);
+            if a.host_caps != 0 || a.auth_token != [0; 16] || !reason.is_empty() {
                 body.extend_from_slice(&a.auth_token);
                 body.extend_from_slice(&a.host_caps.to_le_bytes());
+            }
+            if !reason.is_empty() {
+                body.push(reason.len() as u8);
+                body.extend_from_slice(reason.as_bytes());
             }
         }
         ControlMessage::Heartbeat(hb) => {
@@ -512,6 +670,9 @@ pub fn encode_control(session_id: u32, msg_seq: u32, message: &ControlMessage) -
             let mut cfg = [0u8; STREAM_CONFIG_SIZE];
             hb.stream_config.encode_into(&mut cfg);
             body.extend_from_slice(&cfg);
+            if hb.notice != NOTICE_NONE {
+                body.push(hb.notice);
+            }
         }
         ControlMessage::Bye(reason) => body.push(*reason as u8),
         ControlMessage::KeyframeRequest(k) => {
@@ -567,6 +728,22 @@ pub fn encode_control(session_id: u32, msg_seq: u32, message: &ControlMessage) -
             let mut block = [0u8; STREAM_CONFIG_SIZE];
             cfg.encode_into(&mut block);
             body.extend_from_slice(&block);
+        }
+        ControlMessage::Identify(i) => {
+            body.push(i.version);
+            body.extend_from_slice(&i.nonce);
+            body.extend_from_slice(&[0; IDENTIFY_BODY_SIZE - 17]);
+        }
+        ControlMessage::Identity(i) => {
+            let count = i.addresses.len().min(IDENTITY_MAX_ADDRESSES);
+            body.push(i.version);
+            body.extend_from_slice(&i.nonce);
+            body.extend_from_slice(&i.port.to_le_bytes());
+            body.push(count as u8);
+            for slot in 0..IDENTITY_MAX_ADDRESSES {
+                body.extend_from_slice(i.addresses.get(slot).unwrap_or(&[0; 4]));
+            }
+            body.extend_from_slice(&i.proof);
         }
         ControlMessage::InputEvent(e) => {
             body.push(e.input_ver);
@@ -699,6 +876,16 @@ pub fn parse_control(datagram: &[u8]) -> Result<(ControlHeader, ControlMessage),
             } else {
                 ([0; 16], 0)
             };
+            let reason = if r.remaining() > 0 {
+                let len = usize::from(r.u8()?);
+                if len > MAX_REASON_LEN {
+                    return Err(WireError::InvalidField("reason_len"));
+                }
+                String::from_utf8(r.take(len)?.to_vec())
+                    .map_err(|_| WireError::InvalidField("reason_utf8"))?
+            } else {
+                String::new()
+            };
             if status == HelloStatus::Ok && session_id == 0 {
                 return Err(WireError::InvalidField("session_id"));
             }
@@ -714,11 +901,17 @@ pub fn parse_control(datagram: &[u8]) -> Result<(ControlHeader, ControlMessage),
                 host_name,
                 auth_token,
                 host_caps,
+                reason,
             })
         }
         PacketType::Heartbeat => ControlMessage::Heartbeat(Heartbeat {
             host_time_us: r.u64()?,
             stream_config: StreamConfig::decode(r.take(STREAM_CONFIG_SIZE)?)?,
+            notice: if r.remaining() >= 1 {
+                r.u8()?
+            } else {
+                NOTICE_NONE
+            },
         }),
         PacketType::Bye => ControlMessage::Bye(
             ByeReason::from_u8(r.u8()?).ok_or(WireError::InvalidField("bye_reason"))?,
@@ -860,6 +1053,30 @@ pub fn parse_control(datagram: &[u8]) -> Result<(ControlHeader, ControlMessage),
                 host_time_us: r.u64()?,
             })
         }
+        PacketType::Identify => {
+            let version = r.u8()?;
+            let nonce = r.take(16)?.try_into().unwrap();
+            r.take(IDENTIFY_BODY_SIZE - 17)?;
+            ControlMessage::Identify(Identify { version, nonce })
+        }
+        PacketType::Identity => {
+            let version = r.u8()?;
+            let nonce = r.take(16)?.try_into().unwrap();
+            let port = r.u16()?;
+            let count = usize::from(r.u8()?);
+            if count > IDENTITY_MAX_ADDRESSES {
+                return Err(WireError::InvalidField("identity_addresses"));
+            }
+            let slots = r.take(4 * IDENTITY_MAX_ADDRESSES)?;
+            let addresses = slots.as_chunks::<4>().0[..count].to_vec();
+            ControlMessage::Identity(Identity {
+                version,
+                nonce,
+                port,
+                addresses,
+                proof: r.take(32)?.try_into().unwrap(),
+            })
+        }
         PacketType::Media | PacketType::MediaFec | PacketType::Audio | PacketType::Error => {
             return Err(WireError::InvalidField("packet_type"));
         }
@@ -878,11 +1095,15 @@ fn pointer_version(version: u8) -> Result<(), WireError> {
 }
 
 fn truncated_name(name: &str) -> &str {
-    if name.len() <= MAX_NAME_LEN {
+    truncated(name, MAX_NAME_LEN)
+}
+
+fn truncated(name: &str, max: usize) -> &str {
+    if name.len() <= max {
         return name;
     }
     // Truncate on a char boundary at or below the cap.
-    let mut end = MAX_NAME_LEN;
+    let mut end = max;
     while end > 0 && !name.is_char_boundary(end) {
         end -= 1;
     }
@@ -1101,10 +1322,12 @@ mod tests {
                 host_name: "ALI-PC".to_string(),
                 auth_token: [0; 16],
                 host_caps: 0,
+                reason: String::new(),
             }),
             ControlMessage::Heartbeat(Heartbeat {
                 host_time_us: 987_654_321,
                 stream_config: sample_config(),
+                notice: NOTICE_NONE,
             }),
             ControlMessage::Bye(ByeReason::AppBackground),
             ControlMessage::KeyframeRequest(KeyframeRequest {
@@ -1134,6 +1357,17 @@ mod tests {
                 t3_us: 44,
             }),
             ControlMessage::StreamConfig(sample_config()),
+            ControlMessage::Identify(Identify {
+                version: IDENTIFY_VERSION,
+                nonce: [7; 16],
+            }),
+            ControlMessage::Identity(Identity {
+                version: IDENTIFY_VERSION,
+                nonce: [7; 16],
+                port: 9876,
+                addresses: vec![[192, 0, 2, 7], [198, 51, 100, 7]],
+                proof: [9; 32],
+            }),
             ControlMessage::InputEvent(InputEvent {
                 input_ver: 1,
                 kind: 0,
@@ -1174,10 +1408,13 @@ mod tests {
     }
 
     fn shape_chunk() -> PointerShapeChunk {
-        let ControlMessage::PointerShape(chunk) = all_messages().remove(10) else {
-            unreachable!()
-        };
-        chunk
+        all_messages()
+            .into_iter()
+            .find_map(|message| match message {
+                ControlMessage::PointerShape(chunk) => Some(chunk),
+                _ => None,
+            })
+            .unwrap()
     }
 
     #[test]
@@ -1306,6 +1543,33 @@ mod tests {
     }
 
     #[test]
+    fn a_heartbeat_notice_is_appended_only_when_there_is_one() {
+        let heartbeat = |notice| {
+            ControlMessage::Heartbeat(Heartbeat {
+                host_time_us: 987_654_321,
+                stream_config: sample_config(),
+                notice,
+            })
+        };
+        // No notice: the bytes every earlier iPad already reads.
+        let plain = encode_control(7, 1, &heartbeat(NOTICE_NONE));
+        assert_eq!(plain.len(), CONTROL_HEADER_SIZE + 8 + STREAM_CONFIG_SIZE);
+        // A notice is one byte more. Such a body, cut back to the old length
+        // as an older iPad reads it, is the plain heartbeat; an unknown value
+        // reaches the iPad as it is, for it to ignore.
+        for notice in [NOTICE_PC_LOCKED, 0xC8] {
+            let datagram = encode_control(7, 1, &heartbeat(notice));
+            assert_eq!(datagram.len(), plain.len() + 1);
+            assert_eq!(datagram[..plain.len()][8..], plain[8..]);
+            assert_eq!(parse_control(&datagram).unwrap().1, heartbeat(notice));
+            for len in 0..datagram.len() {
+                assert!(parse_control(&datagram[..len]).is_err());
+            }
+        }
+        assert_eq!(parse_control(&plain).unwrap().1, heartbeat(NOTICE_NONE));
+    }
+
+    #[test]
     fn trailing_bytes_are_ignored_for_forward_compat() {
         let mut datagram = encode_control(1, 1, &ControlMessage::Ping(Ping { t1_us: 5 }));
         datagram.extend_from_slice(&[0xAA, 0xBB]);
@@ -1339,6 +1603,7 @@ mod tests {
             host_name: String::new(),
             auth_token: [0; 16],
             host_caps: 0,
+            reason: String::new(),
         });
         // encode_control would happily serialize it; the parser must reject.
         let datagram = encode_control(0, 1, &ack);
@@ -1429,5 +1694,137 @@ mod tests {
             let _ = super::super::media::MediaHeader::decode(&bytes);
             let _ = super::super::classify(&bytes);
         }
+    }
+
+    fn standby_ack(status: HelloStatus, reason: &str) -> HelloAck {
+        HelloAck {
+            status,
+            accepted_version: 2,
+            client_nonce: 9,
+            session_id: 0,
+            heartbeat_interval_ms: 1000,
+            report_interval_ms: 500,
+            liveness_timeout_ms: 3000,
+            stream_config: StreamConfig::default(),
+            host_name: "PC".to_string(),
+            auth_token: [0; 16],
+            host_caps: 0,
+            reason: reason.to_string(),
+        }
+    }
+
+    #[test]
+    fn not_streaming_statuses_and_their_reason_round_trip() {
+        for status in [
+            HelloStatus::Stopped,
+            HelloStatus::Restarting,
+            HelloStatus::Failed,
+        ] {
+            for reason in ["", "display_changing"] {
+                let ack = standby_ack(status, reason);
+                let bytes = encode_control(0, 1, &ControlMessage::HelloAck(ack.clone()));
+                assert_eq!(
+                    parse_control(&bytes).unwrap().1,
+                    ControlMessage::HelloAck(ack)
+                );
+            }
+        }
+        // A reason past the cap is cut, so it always parses.
+        let long = "x".repeat(100);
+        let bytes = encode_control(
+            0,
+            1,
+            &ControlMessage::HelloAck(standby_ack(HelloStatus::Failed, &long)),
+        );
+        let Ok((_, ControlMessage::HelloAck(ack))) = parse_control(&bytes) else {
+            panic!("a long reason must still parse");
+        };
+        assert_eq!(ack.reason.len(), MAX_REASON_LEN);
+    }
+
+    /// 0.3.4 and older know statuses 0-5 only and drop the whole ACK for
+    /// any other, like a lost datagram: the host must not send them 6-8.
+    #[test]
+    fn a_status_past_the_known_ones_is_rejected() {
+        let mut bytes = encode_control(
+            0,
+            1,
+            &ControlMessage::HelloAck(standby_ack(HelloStatus::Error, "")),
+        );
+        bytes[CONTROL_HEADER_SIZE] = 9;
+        assert_eq!(
+            parse_control(&bytes),
+            Err(WireError::InvalidField("status"))
+        );
+    }
+
+    #[test]
+    fn failed_reason_tokens_are_short_distinct_and_round_trip() {
+        let mut seen = std::collections::HashSet::new();
+        for reason in FailedReason::ALL {
+            let token = reason.token();
+            assert!(token.len() <= MAX_REASON_LEN && token.is_ascii(), "{token}");
+            assert!(seen.insert(token), "{token} twice");
+            assert_eq!(FailedReason::from_token(token), Some(reason));
+        }
+        assert_eq!(FailedReason::from_token("something new"), None);
+    }
+
+    fn standby_hello2(feature_caps: u16, device_name: &str) -> Vec<u8> {
+        encode_control(
+            0,
+            1,
+            &ControlMessage::Hello2(Hello2 {
+                proto_min: 2,
+                proto_max: 2,
+                client_nonce: 7,
+                listen_port: 0,
+                decoder_caps: CAP_DECODE_H264,
+                feature_caps,
+                screen_px_w: 1,
+                screen_px_h: 1,
+                screen_pt_w: 1,
+                screen_pt_h: 1,
+                refresh_hz: 60,
+                device_name: device_name.into(),
+                device_id: 0,
+                preferred_fps: 0,
+                auth_token: [0; 16],
+                pairing_code: 0,
+            }),
+        )
+    }
+
+    /// Any answer fits in a HELLO2 that asks for standby answers: the
+    /// longest ACK there is, with a 64-byte host name, a token and the
+    /// longest reason, is no larger. The padding parses as the HELLO2 it was.
+    #[test]
+    fn a_hello2_that_asks_for_standby_answers_fits_any_ack() {
+        let mut longest = standby_ack(HelloStatus::Failed, &"r".repeat(MAX_REASON_LEN));
+        longest.host_name = "h".repeat(MAX_NAME_LEN);
+        longest.auth_token = [9; 16];
+        longest.host_caps = 0xFFFF;
+        let ack = encode_control(0, 1, &ControlMessage::HelloAck(longest));
+        assert_eq!(ack.len(), MAX_HELLO_ACK_LEN);
+        for name in ["", "iPad", &"n".repeat(MAX_NAME_LEN)] {
+            let padded = standby_hello2(FEATURE_STANDBY_STATUS, name);
+            assert!(
+                padded.len() >= ack.len(),
+                "{} < {}",
+                padded.len(),
+                ack.len()
+            );
+            let Ok((_, ControlMessage::Hello2(hello))) = parse_control(&padded) else {
+                panic!("a padded HELLO2 must parse");
+            };
+            assert_eq!(hello.device_name, name);
+            assert_eq!((hello.device_id, hello.auth_token), (0, [0; 16]));
+        }
+        assert_eq!(
+            standby_hello2(FEATURE_STANDBY_STATUS, "").len(),
+            STANDBY_HELLO2_LEN
+        );
+        // Without the bit, as from 0.3.4, nothing is added.
+        assert_eq!(standby_hello2(0, "").len(), CONTROL_HEADER_SIZE + 22);
     }
 }
