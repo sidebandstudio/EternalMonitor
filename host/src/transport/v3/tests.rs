@@ -1822,3 +1822,70 @@ fn a_crash_in_the_pairing_write_never_answers_what_isnt_stored() {
         assert!(k < 100, "a write of bounded steps");
     }
 }
+
+/// The store closes while a pairing write is in flight, or while a QR is
+/// open: the window closes, the pairing ends unanswered, and no message 1
+/// gets a message 2 any more.
+#[test]
+fn a_store_that_closes_ends_pairing() {
+    for writing in [true, false] {
+        let mut rig = Rig::new(&world(&[(0x11, 1, None, true, 0)]));
+        rig.hold_jobs = true;
+        let pad = Pad::new(50_000);
+        let at = rig.at();
+        let qr = rig.host.open_pairing(at, host_addr(), "PC").unwrap();
+        let mut ipad = PairingClient::start(
+            &qr,
+            &id(7),
+            "0.4.0",
+            "iPad",
+            pad.addr.port(),
+            &mut SeededRandom::new(5),
+        )
+        .unwrap();
+        if writing {
+            let msg2 = rig.receive(pad.addr, ipad.msg1());
+            ipad.read_msg2(&msg2[0].1).unwrap();
+            let confirm = ipad.confirm(None).unwrap();
+            rig.receive(pad.addr, &confirm);
+            assert!(
+                rig.host.pairing.in_flight(Duration::ZERO),
+                "the write is in flight"
+            );
+        }
+        // Every store step fails from here, the reopen's too.
+        rig.transient = false;
+        let base = rig.live.steps.count.get();
+        rig.live.steps.crash_at.set(Some(base));
+        let sends = if writing {
+            rig.pump()
+        } else {
+            let at = rig.at();
+            let actions = rig
+                .host
+                .remove(&mut rig.session, &[id(0x11)], &TestConfig, at);
+            let mut sends = rig.take(actions);
+            sends.extend(rig.pump());
+            sends
+        };
+        assert!(matches!(rig.host.pairings(), Pairings::Unavailable(_)));
+        assert!(
+            sends.iter().all(|(_, d)| ipad.handle_record(d).is_none()),
+            "no answer for a write that may or may not have landed"
+        );
+        assert!(!rig.host.pairing.is_open());
+        assert_eq!(rig.host.pairing.session_id(), None);
+        // A message 1 now gets nothing.
+        let mut fresh = PairingClient::start(
+            &qr,
+            &id(8),
+            "0.4.0",
+            "iPad",
+            pad.addr.port(),
+            &mut SeededRandom::new(6),
+        )
+        .unwrap();
+        assert!(rig.receive(pad.addr, fresh.msg1()).is_empty());
+        assert!(fresh.read_msg2(&[]).is_err());
+    }
+}

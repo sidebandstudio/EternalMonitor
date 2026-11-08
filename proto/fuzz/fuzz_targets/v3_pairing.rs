@@ -11,8 +11,8 @@
 //! - a replayed message 1 never replaces a pairing in flight;
 //! - `replaces` is set only to the slot's active record, and only when the
 //!   iPad proved it holds that record's key;
-//! - the iPad hears `PairDone` only after the write succeeded, and
-//!   `PairRefused` only after a refusal;
+//! - the iPad hears `PairDone` only after its own pairing's write
+//!   succeeded, and `PairRefused` only after its own write was refused;
 //! - each written record is reported paired once;
 //! - nothing panics.
 #![no_main]
@@ -73,8 +73,11 @@ fuzz_target!(|data: &[u8]| {
     let mut given: Vec<(Id16, Key32, Duration, bool)> = Vec::new();
     // The record in the store's hands, and what the store said.
     let mut storing: Option<PendingPairing> = None;
-    let mut written = false;
-    let mut refused = false;
+    // The dev_ids whose write succeeded, or was refused, and the one the
+    // current iPad was given.
+    let mut written: Vec<Id16> = Vec::new();
+    let mut refused: Vec<Id16> = Vec::new();
+    let mut current: Option<Id16> = None;
     let mut paired: Vec<Id16> = Vec::new();
     // Real datagrams seen, for replays and flips.
     let mut seen: Vec<Vec<u8>> = Vec::new();
@@ -85,8 +88,9 @@ fuzz_target!(|data: &[u8]| {
                    ipad: &mut Option<PairingClient>,
                    given: &mut Vec<(Id16, Key32, Duration, bool)>,
                    storing: &mut Option<PendingPairing>,
-                   written: bool,
-                   refused: bool,
+                   written: &[Id16],
+                   refused: &[Id16],
+                   current: &mut Option<Id16>,
                    paired: &mut Vec<Id16>,
                    seen: &mut Vec<Vec<u8>>,
                    proved: bool,
@@ -98,12 +102,19 @@ fuzz_target!(|data: &[u8]| {
                     if let Some(client) = ipad.as_mut() {
                         if let Ok(accept) = client.read_msg2(&datagram) {
                             given.push((accept.dev_id, *accept.k_new, qr_expires, false));
+                            *current = Some(accept.dev_id);
                         }
                         match client.handle_record(&datagram) {
                             Some(PairResult::Done(_)) => {
-                                assert!(written, "PairDone before the write")
+                                assert!(
+                                    current.is_some_and(|d| written.contains(&d)),
+                                    "PairDone before its own write"
+                                )
                             }
-                            Some(PairResult::Refused(_)) => assert!(refused, "a refusal unasked"),
+                            Some(PairResult::Refused(_)) => assert!(
+                                current.is_some_and(|d| refused.contains(&d)),
+                                "a refusal its own write didn't get"
+                            ),
                             None => {}
                         }
                     }
@@ -146,6 +157,7 @@ fuzz_target!(|data: &[u8]| {
                 let msg1 = client.msg1().to_vec();
                 seen.push(msg1.clone());
                 ipad = Some(client);
+                current = None;
                 deliver(
                     &mut host,
                     now,
@@ -153,8 +165,9 @@ fuzz_target!(|data: &[u8]| {
                     &mut ipad,
                     &mut given,
                     &mut storing,
-                    written,
-                    refused,
+                    &written,
+                    &refused,
+                    &mut current,
                     &mut paired,
                     &mut seen,
                     false,
@@ -171,8 +184,9 @@ fuzz_target!(|data: &[u8]| {
                         &mut ipad,
                         &mut given,
                         &mut storing,
-                        written,
-                        refused,
+                        &written,
+                        &refused,
+                        &mut current,
                         &mut paired,
                         &mut seen,
                         false,
@@ -203,8 +217,9 @@ fuzz_target!(|data: &[u8]| {
                         &mut ipad,
                         &mut given,
                         &mut storing,
-                        written,
-                        refused,
+                        &written,
+                        &refused,
+                        &mut current,
                         &mut paired,
                         &mut seen,
                         proved,
@@ -221,8 +236,9 @@ fuzz_target!(|data: &[u8]| {
                         &mut ipad,
                         &mut given,
                         &mut storing,
-                        written,
-                        refused,
+                        &written,
+                        &refused,
+                        &mut current,
                         &mut paired,
                         &mut seen,
                         false,
@@ -238,15 +254,22 @@ fuzz_target!(|data: &[u8]| {
                         1 => StoreResult::TooMany,
                         _ => StoreResult::Failed,
                     };
-                    written |= result == StoreResult::Stored;
-                    refused |= result == StoreResult::TooMany;
+                    match result {
+                        StoreResult::Stored => written.push(pending.dev_id),
+                        StoreResult::TooMany => refused.push(pending.dev_id),
+                        StoreResult::Failed => {}
+                    }
                     for output in host.stored(now, &pending.dev_id, result, &creds) {
                         match output {
                             PairOutput::Send { datagram, .. } => {
                                 if let Some(client) = ipad.as_mut() {
                                     match client.handle_record(&datagram) {
-                                        Some(PairResult::Done(_)) => assert!(written),
-                                        Some(PairResult::Refused(_)) => assert!(refused),
+                                        Some(PairResult::Done(_)) => {
+                                            assert!(current.is_some_and(|d| written.contains(&d)))
+                                        }
+                                        Some(PairResult::Refused(_)) => {
+                                            assert!(current.is_some_and(|d| refused.contains(&d)))
+                                        }
                                         None => {}
                                     }
                                 }
@@ -278,8 +301,9 @@ fuzz_target!(|data: &[u8]| {
                         &mut ipad,
                         &mut given,
                         &mut storing,
-                        written,
-                        refused,
+                        &written,
+                        &refused,
+                        &mut current,
                         &mut paired,
                         &mut seen,
                         false,

@@ -34,6 +34,7 @@ use snow::HandshakeState;
 
 use super::client::ClientKey;
 use super::handshake::{builder, map_snow, split};
+use super::host::{PeerAddr, SourceLimiter};
 use super::record::{Opener, RecordHeader, Sealer};
 use super::wire::{
     self, PairAccept, PairHello, PairMessage, SlotStatus, V3Kind, MAX_NOISE_MESSAGE,
@@ -77,8 +78,13 @@ impl std::fmt::Debug for QrPayload {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+/// Appends lowercase hex, one character at a time.
+fn push_hex(out: &mut String, bytes: &[u8]) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    for b in bytes {
+        out.push(char::from(DIGITS[usize::from(b >> 4)]));
+        out.push(char::from(DIGITS[usize::from(b & 0x0F)]));
+    }
 }
 
 /// Exactly `N` bytes of lowercase hex.
@@ -104,14 +110,32 @@ impl QrPayload {
     /// with lowercase hex; an IPv6 address is in brackets.
     pub fn encode(&self) -> Zeroizing<String> {
         assert!(wire::valid_version(&self.host_version));
-        Zeroizing::new(format!(
-            "{QR_SCHEME}{}?v={PROTOCOL_VERSION}&h={}&n={}&s={}&hv={}",
-            self.addr,
-            hex(&self.host_id),
-            hex(&self.nonce_r),
-            hex(&*self.secret),
-            self.host_version
-        ))
+        const { assert!(PROTOCOL_VERSION < 10, "one digit") };
+        let addr = self.addr.to_string();
+        let len = QR_SCHEME.len()
+            + addr.len()
+            + "?v=3&h=&n=&s=&hv=".len()
+            + 2 * (16 + 16 + 32)
+            + self.host_version.len();
+        // Written in place at its final size: the secret's hex is never in
+        // memory that isn't wiped.
+        let mut out = Zeroizing::new(String::with_capacity(len));
+        let start = out.as_ptr();
+        out.push_str(QR_SCHEME);
+        out.push_str(&addr);
+        out.push_str("?v=");
+        out.push(char::from(b'0' + PROTOCOL_VERSION));
+        out.push_str("&h=");
+        push_hex(&mut out, &self.host_id);
+        out.push_str("&n=");
+        push_hex(&mut out, &self.nonce_r);
+        out.push_str("&s=");
+        push_hex(&mut out, &*self.secret);
+        out.push_str("&hv=");
+        out.push_str(&self.host_version);
+        debug_assert_eq!(out.len(), len);
+        debug_assert_eq!(out.as_ptr(), start, "never reallocated");
+        out
     }
 
     /// Parses exactly what [`encode`](Self::encode) writes: each field once,
@@ -302,7 +326,13 @@ pub struct PairingConfig {
     pub answered_lifetime: Duration,
     /// Shortest gap between two answers to one pairing's retries.
     pub reanswer_interval: Duration,
-    /// Message 1s read per second, before the QR's PSK authenticates them.
+    /// Message 1s read per second from one source (its
+    /// [`PeerAddr::rate_bucket`]), before the QR's PSK authenticates them.
+    /// Sources beyond the table share one budget of the same size.
+    pub msg1_per_source_per_second: u32,
+    /// Message 1s read per second, host-wide. A read that fails is one AEAD
+    /// attempt and no Diffie-Hellman, so this is large; it bounds the work
+    /// many real senders can cause.
     pub msg1_per_second: u32,
 }
 
@@ -312,7 +342,8 @@ impl Default for PairingConfig {
             confirm_lifetime: Duration::from_secs(5),
             answered_lifetime: Duration::from_secs(30),
             reanswer_interval: Duration::from_millis(50),
-            msg1_per_second: 50,
+            msg1_per_source_per_second: 20,
+            msg1_per_second: 2000,
         }
     }
 }
@@ -379,7 +410,7 @@ impl<A> Attempt<A> {
 /// The host's side of QR pairing, as a sans-IO state machine like
 /// [`super::host::HostSessions`]: one QR window and at most one pairing in
 /// flight.
-pub struct PairingHost<A: Clone> {
+pub struct PairingHost<A: PeerAddr> {
     config: PairingConfig,
     host_id: Id16,
     host_version: String,
@@ -389,11 +420,13 @@ pub struct PairingHost<A: Clone> {
     /// The generation the next window gets.
     next_generation: u64,
     attempt: Option<Attempt<A>>,
-    /// Message 1 reads in the current second: (start, count).
+    /// Message 1 reads in the current second, host-wide: (start, count).
     reads: (Duration, u32),
+    /// Message 1 reads per source.
+    per_source: SourceLimiter<A::Bucket>,
 }
 
-impl<A: Clone> PairingHost<A> {
+impl<A: PeerAddr> PairingHost<A> {
     pub fn new(
         config: PairingConfig,
         host_id: Id16,
@@ -403,6 +436,7 @@ impl<A: Clone> PairingHost<A> {
     ) -> Self {
         assert!(wire::valid_version(host_version));
         Self {
+            per_source: SourceLimiter::new(config.msg1_per_source_per_second),
             config,
             host_id,
             host_version: host_version.to_string(),
@@ -453,6 +487,13 @@ impl<A: Clone> PairingHost<A> {
     pub fn close(&mut self) {
         self.window = None;
         self.attempt.take_if(|a| !a.authorized);
+    }
+
+    /// Ends the pairing in flight, if any, without answering it: for a store
+    /// that can't be used any more, where it's unknown whether a write
+    /// landed.
+    pub fn abandon(&mut self) {
+        self.attempt = None;
     }
 
     /// Whether a QR is open.
@@ -543,6 +584,11 @@ impl<A: Clone> PairingHost<A> {
             .try_into()
             .expect("32 bytes");
         if window.handled.contains(&digest) || window.handled.len() >= MAX_HANDLED_MSG1 {
+            return;
+        }
+        // One source can't use up everyone's reads: its own limit first,
+        // then the host-wide cap.
+        if !self.per_source.allow(now, &from.rate_bucket()) {
             return;
         }
         if now.saturating_sub(self.reads.0) >= Duration::from_secs(1) {
@@ -771,6 +817,7 @@ impl<A: Clone> PairingHost<A> {
         if self.window.as_ref().is_some_and(|w| now >= w.expires) {
             self.window = None;
         }
+        self.per_source.prune(now);
         self.attempt
             .take_if(|a| a.expired(now) || (a.step != Step::Storing && now >= a.deadline));
     }

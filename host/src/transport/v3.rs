@@ -476,14 +476,17 @@ impl V3Host {
             return actions;
         }
         let at = self.at(now);
-        let pairing = match kind {
-            V3Kind::Handshake1 => {
-                eternal_wire::v3::wire::extension_tag(datagram) == Some(EXT_PAIR_QR)
-            }
-            V3Kind::Sealed => eternal_wire::v3::record::RecordHeader::parse(datagram)
-                .is_ok_and(|h| Some(h.session_id) == self.pairing.session_id()),
-            _ => false,
-        };
+        // Pairing only while the store can take its write; otherwise its
+        // datagrams fall through and are dropped.
+        let pairing = self.pairings == Pairings::Ready
+            && match kind {
+                V3Kind::Handshake1 => {
+                    eternal_wire::v3::wire::extension_tag(datagram) == Some(EXT_PAIR_QR)
+                }
+                V3Kind::Sealed => eternal_wire::v3::record::RecordHeader::parse(datagram)
+                    .is_ok_and(|h| Some(h.session_id) == self.pairing.session_id()),
+                _ => false,
+            };
         if pairing {
             let out = self
                 .pairing
@@ -888,6 +891,10 @@ impl V3Host {
                     Pairings::Unavailable("the credential store could not reopen".into());
             }
             self.queued.clear();
+            // No QR stays open, and a pairing in flight ends unanswered: it's
+            // unknown whether its write landed.
+            self.pairing.close();
+            self.pairing.abandon();
             if let Some(streaming) = self.streaming {
                 out.extend(self.end_sessions(session, &streaming.dev_id, now, &mut actions));
             }

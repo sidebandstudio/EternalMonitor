@@ -393,7 +393,8 @@ fn message_1_retries_get_the_same_message_2_and_reads_are_budgeted() {
     let again = sends(&host.handle_datagram(T0 + ms(150), &ADDR, ipad.msg1(), &creds));
     assert_eq!(again, first, "the same message 2");
 
-    // Forged message 1s: 50 reads a second, then nothing is read.
+    // Forged message 1s: 20 reads a second from one source, then nothing
+    // more from it is read.
     let mut host = self::host();
     let qr = host.open(T0, addr());
     let mut forged = qr.clone();
@@ -633,4 +634,47 @@ fn an_older_write_never_uses_up_a_newer_qr() {
     assert!(host
         .handle_datagram(T0 + ms(50), &ADDR, client(&first, 34).msg1(), &creds)
         .is_empty());
+}
+
+/// `hex` for the vectors above.
+fn hex(bytes: &[u8]) -> String {
+    let mut out = String::new();
+    push_hex(&mut out, bytes);
+    out
+}
+
+#[test]
+fn one_sender_flooding_junk_never_blocks_a_pairing_from_another() {
+    let creds = Creds::default();
+    let mut host = host();
+    let qr = host.open(T0, addr());
+    let mut forged = qr.clone();
+    forged.secret = Zeroizing::new([0x03; 32]);
+    let junk = client(&forged, 40).msg1().to_vec();
+    // A thousand a second from one LAN address, with no QR, for two seconds.
+    let mut answered = 0;
+    let ipad = client(&qr, 41);
+    for step in 0..2_000u64 {
+        let at = T0 + Duration::from_millis(step);
+        host.handle_datagram(at, &2, &junk, &creds);
+        // The real iPad retries every 250 ms, well into each second's
+        // flood.
+        if step % 250 == 125 {
+            answered += sends(&host.handle_datagram(at, &ADDR, ipad.msg1(), &creds)).len();
+        }
+    }
+    assert!(answered >= 1, "the genuine iPad got its message 2");
+
+    // The host-wide cap still bounds what many real senders cause.
+    let mut host = self::host();
+    let _qr = host.open(T0, addr());
+    for source in 0..200u32 {
+        for _ in 0..20 {
+            host.handle_datagram(T0, &(100 + source), &junk, &creds);
+        }
+    }
+    assert_eq!(
+        host.reads.1, host.config.msg1_per_second,
+        "capped host-wide"
+    );
 }

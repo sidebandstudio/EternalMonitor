@@ -487,7 +487,7 @@ const MAX_CACHED_STALE: usize = 8;
 /// An unexpired window is never evicted: when the table is full, sources
 /// that don't fit share one overflow budget, so evicting can never reset a
 /// source's count.
-struct SourceLimiter<B> {
+pub(super) struct SourceLimiter<B> {
     windows: HashMap<B, RateWindow>,
     order: VecDeque<(B, Duration)>,
     overflow: RateWindow,
@@ -495,7 +495,7 @@ struct SourceLimiter<B> {
 }
 
 impl<B: Clone + Eq + Hash> SourceLimiter<B> {
-    fn new(limit: u32) -> Self {
+    pub(super) fn new(limit: u32) -> Self {
         Self {
             windows: HashMap::new(),
             order: VecDeque::new(),
@@ -519,7 +519,7 @@ impl<B: Clone + Eq + Hash> SourceLimiter<B> {
         }
     }
 
-    fn allow(&mut self, now: Duration, bucket: &B) -> bool {
+    pub(super) fn allow(&mut self, now: Duration, bucket: &B) -> bool {
         self.expire(now);
         if let Some(window) = self.windows.get_mut(bucket) {
             return window.allow(now, self.limit);
@@ -537,7 +537,7 @@ impl<B: Clone + Eq + Hash> SourceLimiter<B> {
         allowed
     }
 
-    fn prune(&mut self, now: Duration) {
+    pub(super) fn prune(&mut self, now: Duration) {
         self.expire(now);
     }
 }
