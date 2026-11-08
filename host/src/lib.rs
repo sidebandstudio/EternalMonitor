@@ -23,6 +23,7 @@ pub mod logging;
 pub mod network;
 pub mod pairing;
 pub mod pipeline;
+pub mod power;
 pub mod relaunch;
 pub mod remote_config;
 pub mod settings;

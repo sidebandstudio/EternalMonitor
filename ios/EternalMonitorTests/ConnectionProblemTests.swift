@@ -267,7 +267,7 @@ final class ConnectionProblemTests: XCTestCase {
             .noReply(usb: false), .noReply(usb: true), .noReplyAtNewAddress("192.0.2.31"), .noPicture, .receiverNotReady,
             .badAddress("pc"), .noNetwork, .wifiOff, .localNetworkBlocked, .couldNotConnect, .usbFailed, .lost(.pcStoppedResponding), .lost(.cableUnplugged),
             .lost(.usbTurnedOff), .reconnecting(attempt: 2, of: 6), .reconnectFailed, .pcEndedSession,
-            .pcEndedSessionOnError, .pcBusy, .pairingCodeAsAddress, .routerAddress,
+            .pcEndedSessionOnError, .pcAsleep, .pcPoweringOff, .pcBusy, .pairingCodeAsAddress, .routerAddress,
             .pcUpdating(.reconnecting), .pcUpdating(.manual), .pcUpdating(.notBack),
         ]
         for problem in all {
@@ -289,7 +289,7 @@ final class ConnectionProblemTests: XCTestCase {
     /// someone stopped the stream; the other reasons keep saying so.
     func testEachGoodbyeFromThePCMapsToItsProblemAndText() {
         let reasons = (0...UInt8.max).compactMap(ByeReason.init(rawValue:))
-        XCTAssertEqual(reasons.count, 5, "a new goodbye reason needs its card here")
+        XCTAssertEqual(reasons.count, 7, "a new goodbye reason needs its card here")
         let userAction = "Someone clicked Stop on the PC, changed a setting that restarts the stream, or closed EternalMonitor. "
             + "Try again when the PC says Ready for your iPad."
         let expected: [ByeReason: (ConnectionProblem, String)] = [
@@ -300,6 +300,8 @@ final class ConnectionProblemTests: XCTestCase {
                      "The connection to your PC dropped, or the PC ran into a problem. Tap Try again to reconnect."),
             .hostShuttingDown: (.pcUpdating(.reconnecting),
                                 "This iPad reconnects when it's back. If it doesn't, check that EternalMonitor opened again on the PC, then try again."),
+            .hostSleeping: (.pcAsleep, "Wake the PC, then tap Try again."),
+            .hostPoweringOff: (.pcPoweringOff, "Tap Try again once the PC is back on and EternalMonitor is open on it."),
         ]
         for reason in reasons {
             let problem = ConnectionProblem.pcGoodbye(reason)
@@ -316,6 +318,15 @@ final class ConnectionProblemTests: XCTestCase {
         XCTAssertTrue(error.canReport)
         XCTAssertEqual(error.withoutReconnecting, error)
         XCTAssertEqual(error.afterTheCycle, error)
+        // The PC going down is something that happened, not a fault to report.
+        for down: ConnectionProblem in [.pcAsleep, .pcPoweringOff] {
+            XCTAssertEqual(down.actions, [.retry], "\(down)")
+            XCTAssertFalse(down.canReport, "\(down)")
+            XCTAssertEqual(down.withoutReconnecting, down)
+            XCTAssertEqual(down.afterTheCycle, down)
+        }
+        XCTAssertEqual(ConnectionProblem.pcAsleep.title, "Your PC went to sleep")
+        XCTAssertEqual(ConnectionProblem.pcPoweringOff.title, "Your PC is shutting down or signing out")
     }
 
     func testAnUpdateStaysTheReasonWhileThePCRestarts() {

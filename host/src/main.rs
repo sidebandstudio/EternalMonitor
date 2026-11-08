@@ -241,6 +241,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         shared: shared.clone(),
         supervisor_tx: supervisor_tx.clone(),
     };
+    // Sleep, shutdown and sign-out end the iPad's session with a goodbye.
+    #[cfg(windows)]
+    eternal_host::power::watch(shared.clone());
 
     /// Set by the termination-signal handler; the headless loop polls it.
     static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool =

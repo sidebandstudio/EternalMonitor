@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use eternal_wire::v2::control::{
     ByeReason, ControlHeader, ControlMessage, FailedReason, HelloAck, HelloStatus, InputEvent,
-    KeyframeRequest, Nack, ReceiverReport, StreamConfig, FEATURE_MEDIA_SIZE,
+    KeyframeRequest, Nack, ReceiverReport, StreamConfig, FEATURE_MEDIA_SIZE, FEATURE_POWER_BYE,
     FEATURE_STANDBY_STATUS, FEATURE_SUPPORTS_NACK, FEATURE_WANTS_INPUT, HOSTCAP_MEDIA_SIZE,
     HOSTCAP_NACK, MIN_MEDIA_DGRAM,
 };
@@ -32,6 +32,13 @@ pub const LIVENESS_TIMEOUT: Duration = Duration::from_millis(3000);
 /// 10 s is longer than an iPad waits for a silent PC (3 s, then 5 s more)
 /// and than the uplink stalls of a congested Wi-Fi channel.
 pub const HOLD_LIMIT: Duration = Duration::from_secs(10);
+
+/// How long the host stays closed to new clients after Windows said it is
+/// going to sleep or shutting down ([`Session::power_down`]), unless it says
+/// first that it woke or that the shutdown was cancelled. A suspend that
+/// fails without a resume message, or a missed one, can't leave the PC
+/// unreachable for longer.
+pub const POWER_DOWN_HOLD: Duration = Duration::from_secs(30);
 const USB_TAKEOVER_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long the late packets of a session ended for liveness get its
 /// goodbye again, at most one copy per [`ENDED_REPLY_GAP`].
@@ -204,6 +211,36 @@ impl StreamStop {
             Self::Quit | Self::Handoff => EndReason::Shutdown,
             Self::User => EndReason::Stopped,
             Self::GaveUp(stage) => EndReason::Failed(stage),
+        }
+    }
+}
+
+/// What Windows is doing to the PC ([`Session::power_down`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerEvent {
+    /// Sleep or hibernate.
+    Sleep,
+    /// Shut down or restart.
+    Shutdown,
+    /// The user signs out.
+    Logoff,
+}
+
+impl PowerEvent {
+    /// Stable log value.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Sleep => "sleep",
+            Self::Shutdown => "shutdown",
+            Self::Logoff => "logoff",
+        }
+    }
+
+    /// The goodbye for an iPad that understands it ([`FEATURE_POWER_BYE`]).
+    fn bye(self) -> ByeReason {
+        match self {
+            Self::Sleep => ByeReason::HostSleeping,
+            Self::Shutdown | Self::Logoff => ByeReason::HostPoweringOff,
         }
     }
 }
@@ -424,6 +461,8 @@ pub enum NotStreaming {
 enum Closed {
     /// Turned away with Busy, logged with this line.
     Busy(&'static str),
+    /// Not answered at all, logged with this line.
+    Silent(&'static str),
     /// Told why, once it passes the pairing check.
     NotStreaming(NotStreaming),
 }
@@ -463,6 +502,13 @@ pub struct Session {
     /// has resumed since: new clients are turned away, as nothing would
     /// serve them.
     stream_stopped: bool,
+    /// Windows said the PC is going down, and when ([`Self::power_down`]).
+    powering_down: Option<(PowerEvent, Instant)>,
+    /// A session [`Self::power_down`] ended without a goodbye: the next tick
+    /// reports the client lost, as a goodbye would.
+    lost_unsaid: bool,
+    /// The queued goodbye is [`Self::power_down`]'s.
+    power_bye: bool,
     /// No stream runs: HELLO2s are told why instead of starting a session.
     not_streaming: Option<NotStreaming>,
     /// The goodbye for a stream an update or a stop ended, sent by the next
@@ -496,6 +542,9 @@ impl Session {
             last_end: None,
             updating: false,
             stream_stopped: false,
+            powering_down: None,
+            lost_unsaid: false,
+            power_bye: false,
             not_streaming: None,
             goodbye: None,
             stopped: None,
@@ -627,6 +676,7 @@ impl Session {
         let session = self.active.as_ref()?;
         let (peer, session_id) = (session.peer, session.session_id);
         let msg_seq = self.next_msg_seq();
+        self.power_bye = false;
         self.goodbye = Some((
             peer,
             eternal_wire::v2::control::encode_control(
@@ -641,6 +691,7 @@ impl Session {
     /// The goodbye left for a stopped stream ([`Self::begin_update`],
     /// [`Self::shut_down`]), if any.
     pub fn take_goodbye(&mut self) -> Option<(PeerId, Vec<u8>)> {
+        self.power_bye = false;
         self.goodbye.take()
     }
 
@@ -671,13 +722,55 @@ impl Session {
         self.stopped.take().or(active)
     }
 
+    /// Windows said the PC is going to sleep, shutting down or signing out.
+    /// The session ends now, and its summary is returned for the caller to
+    /// write while the PC is still up. An iPad that understands it
+    /// ([`FEATURE_POWER_BYE`]) is told why by the transport's next pass; an
+    /// older one is told nothing, as before, and notices the silence. Until
+    /// [`Self::power_up`] or [`POWER_DOWN_HOLD`], HELLO2s go unanswered, as
+    /// they would a moment later from a PC that is down. The stream keeps
+    /// running, so the PC streams again when it wakes.
+    pub fn power_down(&mut self, now: Instant, event: PowerEvent) -> Option<SessionEnd> {
+        self.powering_down = Some((event, now));
+        let understands =
+            self.active.as_ref()?.accepted_hello.feature_caps & FEATURE_POWER_BYE != 0;
+        if understands {
+            let end = self.end_saying(event.bye(), EndReason::Shutdown, now);
+            self.power_bye = true;
+            end
+        } else {
+            self.lost_unsaid = true;
+            self.end(EndReason::Shutdown, now)
+        }
+    }
+
+    /// A goodbye [`Self::power_down`] left waits for the transport.
+    pub fn power_goodbye_pending(&self) -> bool {
+        self.power_bye
+    }
+
+    /// The PC woke, or the shutdown was called off: clients may connect
+    /// again. A goodbye no transport sent before the PC went down is for a
+    /// session long over, and is dropped.
+    pub fn power_up(&mut self) {
+        self.powering_down = None;
+        if std::mem::take(&mut self.power_bye) {
+            self.goodbye = None;
+        }
+    }
+
     /// Why a HELLO2 can't start a session now, if it can't: an update is
     /// about to close the host, no stream runs (the supervisor says why), or
     /// the stream stopped and its transport is on its way out (the app
     /// quits). The first and last are turned away with Busy before anything
     /// else is looked at; a retry once the stream runs again works.
-    fn closed_to_clients(&self) -> Option<Closed> {
-        if self.updating {
+    fn closed_to_clients(&self, now: Instant) -> Option<Closed> {
+        if self
+            .powering_down
+            .is_some_and(|(_, since)| now.saturating_duration_since(since) < POWER_DOWN_HOLD)
+        {
+            Some(Closed::Silent("Client unanswered while the PC goes down"))
+        } else if self.updating {
             Some(Closed::Busy("Client turned away while an update starts"))
         } else if let Some(state) = self.not_streaming {
             Some(Closed::NotStreaming(state))
@@ -995,7 +1088,11 @@ impl Session {
         }
 
         // Don't start a stream nothing will serve.
-        let closed = self.closed_to_clients();
+        let closed = self.closed_to_clients(now);
+        if let Some(Closed::Silent(why)) = closed {
+            info!(peer = %source, "{why}");
+            return actions;
+        }
         if let Some(Closed::Busy(why)) = closed {
             info!(peer = %source, "{why}");
             return self.refuse(source, HelloStatus::Busy, &hello, hello_len, config, now);
@@ -1389,6 +1486,9 @@ impl Session {
         if let Some(goodbye) = self.take_goodbye() {
             actions.goodbye = Some(goodbye);
             actions.client_lost = self.active.is_none();
+        }
+        if std::mem::take(&mut self.lost_unsaid) {
+            actions.client_lost |= self.active.is_none();
         }
         actions.ended = self.stopped.take();
         let Some(session) = self.active.as_ref() else {
@@ -4147,6 +4247,146 @@ mod tests {
     }
 
     /// The goodbye's destination, session id and reason.
+    fn power_hello(nonce: u32, feature_caps: u16) -> ControlMessage {
+        let ControlMessage::Hello2(mut hello) = hello(nonce, 50000) else {
+            unreachable!()
+        };
+        hello.device_id = 77;
+        hello.feature_caps = feature_caps;
+        ControlMessage::Hello2(hello)
+    }
+
+    /// Windows taking the PC down ends the session at once, with the summary
+    /// a quit writes. An iPad that understands it is told why by the next
+    /// pass; the reason says sleep or power off.
+    #[test]
+    fn the_pc_going_down_tells_an_ipad_that_understands_it() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        for (event, bye) in [
+            (PowerEvent::Sleep, ByeReason::HostSleeping),
+            (PowerEvent::Shutdown, ByeReason::HostPoweringOff),
+            (PowerEvent::Logoff, ByeReason::HostPoweringOff),
+        ] {
+            let mut session = Session::new(500);
+            session.handle_control(peer, 0, power_hello(1, FEATURE_POWER_BYE), &TestConfig, now);
+            let id = session.session_id().unwrap();
+            let end = session.power_down(now, event).expect("the session ended");
+            assert_eq!((end.client_nonce, end.reason), (1, EndReason::Shutdown));
+            assert!(!session.is_active());
+            assert!(session.power_goodbye_pending());
+            let next = session.tick(&TestConfig, false, now);
+            assert_eq!(goodbye_of(&next), (peer, id, bye), "{event:?}");
+            assert!(next.client_lost);
+            assert_eq!(next.ended, None, "the summary was the caller's to write");
+            assert!(!session.power_goodbye_pending());
+        }
+    }
+
+    /// An iPad from before these reasons drops a goodbye it can't read, so
+    /// it gets none, as before. Its session still ends with a summary, and
+    /// the next pass lets the transport forget it.
+    #[test]
+    fn an_older_ipad_gets_no_goodbye_when_the_pc_goes_down() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut session = Session::new(500);
+        session.handle_control(
+            peer,
+            0,
+            power_hello(1, FEATURE_SUPPORTS_NACK),
+            &TestConfig,
+            now,
+        );
+        let end = session.power_down(now, PowerEvent::Sleep).unwrap();
+        assert_eq!(end.reason, EndReason::Shutdown);
+        assert!(!session.power_goodbye_pending());
+        let next = session.tick(&TestConfig, false, now);
+        assert_eq!(next.goodbye, None);
+        assert!(next.client_lost, "the transport forgets it");
+        assert!(!session.tick(&TestConfig, false, now).client_lost, "once");
+    }
+
+    /// While the PC goes down a HELLO2 gets no answer, as it wouldn't a
+    /// moment later: a session started now would be cut without a word.
+    /// Waking opens it again, and so does a cancelled shutdown, or the hold
+    /// running out when Windows never said it woke.
+    #[test]
+    fn a_pc_going_down_answers_no_hello_until_it_is_back() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut session = Session::new(500);
+        assert_eq!(
+            session.power_down(now, PowerEvent::Sleep),
+            None,
+            "nobody streamed"
+        );
+        let unanswered =
+            session.handle_control(peer, 0, power_hello(2, FEATURE_POWER_BYE), &TestConfig, now);
+        assert!(unanswered.replies.is_empty() && unanswered.new_target.is_none());
+        assert!(!session.is_active());
+        session.power_up();
+        let admitted =
+            session.handle_control(peer, 0, power_hello(3, FEATURE_POWER_BYE), &TestConfig, now);
+        assert_eq!(admitted.new_target, Some(peer));
+
+        let mut session = Session::new(500);
+        session.power_down(now, PowerEvent::Shutdown);
+        let later = now + POWER_DOWN_HOLD;
+        let admitted = session.handle_control(
+            peer,
+            0,
+            power_hello(4, FEATURE_POWER_BYE),
+            &TestConfig,
+            later,
+        );
+        assert_eq!(admitted.new_target, Some(peer), "the hold ran out");
+    }
+
+    /// A goodbye no transport sent before the PC slept is for a session
+    /// that is over by the time it wakes: dropped. Any other goodbye stays.
+    #[test]
+    fn waking_drops_only_the_goodbye_the_pc_going_down_left() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut session = Session::new(500);
+        session.handle_control(peer, 0, power_hello(1, FEATURE_POWER_BYE), &TestConfig, now);
+        session.power_down(now, PowerEvent::Sleep).unwrap();
+        session.power_up();
+        assert_eq!(session.take_goodbye(), None);
+
+        let mut session = Session::new(500);
+        session.power_down(now, PowerEvent::Sleep);
+        session.power_up();
+        session.handle_control(peer, 0, power_hello(2, FEATURE_POWER_BYE), &TestConfig, now);
+        session.shut_down(now, StreamStop::Quit).unwrap();
+        session.power_up();
+        assert!(session.take_goodbye().is_some(), "a quit's goodbye stays");
+    }
+
+    /// The PC woke after hours: the session ended when it went to sleep, so
+    /// the first pass after waking ends nothing again. It used to expire the
+    /// session then, as a silence as long as the sleep.
+    #[test]
+    fn waking_ends_nothing_a_second_time() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        for caps in [FEATURE_POWER_BYE, 0] {
+            let mut session = Session::new(500);
+            session.handle_control(peer, 0, power_hello(1, caps), &TestConfig, now);
+            session.power_down(now, PowerEvent::Sleep).unwrap();
+            session.tick(&TestConfig, false, now);
+            let woke = now + Duration::from_secs(3 * 3600);
+            session.power_up();
+            session.transport_resumed(woke, false);
+            let first = session.tick(&TestConfig, true, woke);
+            assert_eq!(
+                (first.ended, first.goodbye, first.client_lost),
+                (None, None, false)
+            );
+        }
+    }
+
     fn goodbye_of(actions: &Actions) -> (PeerId, u32, ByeReason) {
         let (to, bytes) = actions.goodbye.clone().expect("a goodbye");
         let (header, message) = eternal_wire::v2::control::parse_control(&bytes).unwrap();

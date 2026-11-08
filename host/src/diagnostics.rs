@@ -375,6 +375,20 @@ pub fn stop_session(shared: &SharedControl, why: StreamStop) {
     }
 }
 
+/// [`log_session_end`] for a PC about to go down: the line goes straight to
+/// the session log and the upload outbox on disk, so it survives the
+/// process ending a moment later, and the next launch uploads it.
+pub fn log_session_end_now(end: &SessionEnd, shared: &SharedControl) {
+    let second_screen = *shared.capture_target.lock() == CaptureTarget::VirtualExtended;
+    let fallback = end.session_id.and_then(take_fallback);
+    let line =
+        crate::startup::info_line(&session_summary(end, second_screen, fallback, host_facts()));
+    let written = crate::logging::append_now(&line).and(crate::telemetry::queue_now(&line, "info"));
+    if let Err(error) = written {
+        tracing::warn!(%error, "Could not save the session summary before the PC went down");
+    }
+}
+
 /// The `session_summary v=1` line (b-session-summary contract): enumerated
 /// tokens, bounded numbers and the facts above, nothing else.
 pub fn session_summary(

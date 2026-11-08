@@ -53,6 +53,10 @@ pub const FEATURE_DRAWS_POINTER: u16 = 1 << 5;
 /// to tell a PC that sends nothing from video lost on the way (0.3.5 and
 /// later). Bit 5 is [`FEATURE_DRAWS_POINTER`].
 pub const FEATURE_MEDIA_SIZE: u16 = 1 << 6;
+/// The iPad understands [`ByeReason::HostSleeping`] and
+/// [`ByeReason::HostPoweringOff`] (0.3.5 and later). Older iPads drop a
+/// goodbye whose reason they don't know, so the host doesn't send them one.
+pub const FEATURE_POWER_BYE: u16 = 1 << 7;
 pub const HOSTCAP_NACK: u16 = 1 << 0;
 pub const HOSTCAP_AUDIO: u16 = 1 << 1;
 pub const HOSTCAP_USB: u16 = 1 << 2;
@@ -308,6 +312,11 @@ pub enum ByeReason {
     HostShuttingDown = 2,
     Error = 3,
     Superseded = 4,
+    /// The PC is going to sleep. Only to an iPad with [`FEATURE_POWER_BYE`].
+    HostSleeping = 5,
+    /// The PC is shutting down, restarting or signing out. Only to an iPad
+    /// with [`FEATURE_POWER_BYE`].
+    HostPoweringOff = 6,
 }
 
 impl ByeReason {
@@ -318,6 +327,8 @@ impl ByeReason {
             2 => Self::HostShuttingDown,
             3 => Self::Error,
             4 => Self::Superseded,
+            5 => Self::HostSleeping,
+            6 => Self::HostPoweringOff,
             _ => return None,
         })
     }
@@ -1377,6 +1388,8 @@ mod tests {
                 frames_sent: Some(0),
             }),
             ControlMessage::Bye(ByeReason::AppBackground),
+            ControlMessage::Bye(ByeReason::HostSleeping),
+            ControlMessage::Bye(ByeReason::HostPoweringOff),
             ControlMessage::KeyframeRequest(KeyframeRequest {
                 stream_epoch: 3,
                 last_complete_seq: 4111,
