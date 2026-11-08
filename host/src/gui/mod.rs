@@ -1835,6 +1835,7 @@ pub fn run_gui(
         let watch = driver_wait::watch_first_paint(
             prompt,
             probe_limits.limit,
+            driver_wait::PROOF_WITHIN,
             driver_wait::POLL,
             std::time::Instant::now,
             renderer::last_pass,

@@ -646,8 +646,15 @@ fn save_marker(directory: &Path, owner: ProcessId, marker: &Marker) -> bool {
         .is_ok_and(|json| fs::write(marker_path(directory, owner), json).is_ok())
 }
 
-/// Marks the screenshot that proves a frame was presented.
-struct PresentProof;
+/// What a screenshot that proves a frame was presented carries: the span it
+/// was asked in (a new one after each surface error, skipped frame or new
+/// device) and which ask it answers. Only an answer to the current span's
+/// asks counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PresentProof {
+    span: u64,
+    request: u64,
+}
 
 /// Called at the start of each UI pass; clears this launch's marker once the
 /// window has kept drawing without a surface error.
@@ -662,11 +669,19 @@ pub(super) fn frame_started(ctx: &egui::Context) {
     if let Ok(mut last) = LAST_PASS.lock() {
         *last = Some(Instant::now());
     }
-    let proof = ctx.input(|input| {
-        input.events.iter().any(|event| {
-            matches!(event, egui::Event::Screenshot { user_data, .. }
-                if user_data.data.as_ref().is_some_and(|data| data.is::<PresentProof>()))
-        })
+    let proofs: Vec<PresentProof> = ctx.input(|input| {
+        input
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::Screenshot { user_data, .. } => user_data
+                    .data
+                    .as_ref()?
+                    .downcast_ref::<PresentProof>()
+                    .copied(),
+                _ => None,
+            })
+            .collect()
     });
     let Ok(mut tracker) = PRESENT.lock() else {
         return;
@@ -676,15 +691,15 @@ pub(super) fn frame_started(ctx: &egui::Context) {
         failures(),
         visible,
         Instant::now(),
-        proof,
+        &proofs,
     );
     let drawing = tracker.confirmed;
     drop(tracker);
-    if step == Step::Prove {
+    if let Step::Prove(proof) = step {
         // egui-wgpu answers only after it acquired the surface, drew the
         // frame into it and submitted it, right before the present.
         ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(
-            PresentProof,
+            proof,
         )));
     }
     if step == Step::Confirmed {
@@ -910,24 +925,29 @@ fn finish_launch(directory: &Path, marker: &Marker, owner: ProcessId, drew: bool
 struct PresentTracker {
     span: Option<Span>,
     confirmed: bool,
+    /// The id the next span gets, and the next ask.
+    next_span: u64,
+    next_request: u64,
 }
 
 /// Visible frames since the last surface error.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Span {
+    id: u64,
     since: Instant,
     first_frame: u64,
     failures: u64,
-    /// The frame that asked for the proof in this span.
-    asked: Option<u64>,
+    /// The frame that last asked for the proof in this span, and the asks
+    /// made in it.
+    asked: Option<(u64, std::ops::RangeInclusive<u64>)>,
 }
 
 /// What a UI pass does for the confirmation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Step {
     Wait,
-    /// Ask for the proof: a screenshot of this frame.
-    Prove,
+    /// Ask for the proof: a screenshot of this frame, carrying this.
+    Prove(PresentProof),
     /// Confirmed, once.
     Confirmed,
 }
@@ -937,50 +957,63 @@ impl PresentTracker {
         Self {
             span: None,
             confirmed: false,
+            next_span: 0,
+            next_request: 0,
         }
     }
 
     /// After [`CONFIRM_AFTER`] and [`CONFIRM_FRAMES`] of visible frames with
     /// no new surface error, asks for the proof (again after
-    /// [`PROOF_AGAIN_AFTER`] frames without it), and confirms once it came
-    /// (`proof`) in the same span. A surface error or a minimized window
-    /// starts the span again.
+    /// [`PROOF_AGAIN_AFTER`] frames without it), and confirms once an
+    /// answer to one of this span's asks came (`proofs`). A surface error,
+    /// a skipped frame, a new device or a minimized window starts the span
+    /// again, and answers to an earlier span's asks are ignored.
     fn observe(
         &mut self,
         frame: u64,
         failures: u64,
         visible: bool,
         now: Instant,
-        proof: bool,
+        proofs: &[PresentProof],
     ) -> Step {
         if self.confirmed {
             return Step::Wait;
         }
+        let request = self.next_request;
         match self.span.as_mut() {
             Some(span) if visible && span.failures == failures => {
-                if let Some(asked) = span.asked {
-                    if proof {
+                let ask = if let Some((asked, requests)) = &span.asked {
+                    if proofs
+                        .iter()
+                        .any(|proof| proof.span == span.id && requests.contains(&proof.request))
+                    {
                         self.confirmed = true;
                         return Step::Confirmed;
                     }
-                    if frame >= asked + PROOF_AGAIN_AFTER {
-                        span.asked = Some(frame);
-                        return Step::Prove;
-                    }
-                } else if frame >= span.first_frame + CONFIRM_FRAMES
-                    && now.duration_since(span.since) >= CONFIRM_AFTER
-                {
-                    span.asked = Some(frame);
-                    return Step::Prove;
+                    (frame >= asked + PROOF_AGAIN_AFTER).then_some(*requests.start()..=request)
+                } else {
+                    (frame >= span.first_frame + CONFIRM_FRAMES
+                        && now.duration_since(span.since) >= CONFIRM_AFTER)
+                        .then_some(request..=request)
+                };
+                if let Some(requests) = ask {
+                    span.asked = Some((frame, requests));
+                    self.next_request += 1;
+                    return Step::Prove(PresentProof {
+                        span: span.id,
+                        request,
+                    });
                 }
             }
             _ => {
                 self.span = visible.then_some(Span {
+                    id: self.next_span,
                     since: now,
                     first_frame: frame,
                     failures,
                     asked: None,
                 });
+                self.next_span += 1;
             }
         }
         Step::Wait
@@ -2511,6 +2544,16 @@ mod tests {
     }
 
     /// Visible frames every 200 ms, as the GUI repaints, counted from `start`.
+    const NO_PROOF: &[PresentProof] = &[];
+
+    /// The proof a step asks for; panics on any other step.
+    fn ask(step: Step) -> PresentProof {
+        match step {
+            Step::Prove(proof) => proof,
+            other => panic!("{other:?}"),
+        }
+    }
+
     /// Frames `frames` a 200 ms apart, the proof answering the frame after
     /// each ask: whether the window was confirmed.
     fn run(
@@ -2519,16 +2562,19 @@ mod tests {
         frames: std::ops::Range<u64>,
         failures: u64,
     ) -> bool {
-        let mut asked = false;
+        let mut answer = None;
         frames.into_iter().any(|frame| {
+            let proofs: Vec<PresentProof> = answer.take().into_iter().collect();
             let step = tracker.observe(
                 frame,
                 failures,
                 true,
                 start + Duration::from_millis(200 * frame),
-                std::mem::take(&mut asked),
+                &proofs,
             );
-            asked = step == Step::Prove;
+            if let Step::Prove(proof) = step {
+                answer = Some(proof);
+            }
             step == Step::Confirmed
         })
     }
@@ -2539,34 +2585,28 @@ mod tests {
         let mut tracker = PresentTracker::new();
         // Frames alone are not enough: egui may lay out one frame many times.
         for frame in 0..100 {
-            assert_eq!(tracker.observe(frame, 0, true, start, false), Step::Wait);
+            assert_eq!(tracker.observe(frame, 0, true, start, NO_PROOF), Step::Wait);
         }
+        let proof = ask(tracker.observe(100, 0, true, start + CONFIRM_AFTER, NO_PROOF));
         assert_eq!(
-            tracker.observe(100, 0, true, start + CONFIRM_AFTER, false),
-            Step::Prove
-        );
-        assert_eq!(
-            tracker.observe(101, 0, true, start + CONFIRM_AFTER, true),
+            tracker.observe(101, 0, true, start + CONFIRM_AFTER, &[proof]),
             Step::Confirmed
         );
         let mut tracker = PresentTracker::new();
         // Nor is time alone, with one frame laid out repeatedly.
-        assert_eq!(tracker.observe(0, 0, true, start, false), Step::Wait);
+        assert_eq!(tracker.observe(0, 0, true, start, NO_PROOF), Step::Wait);
         assert_eq!(
-            tracker.observe(0, 0, true, start + 10 * CONFIRM_AFTER, false),
+            tracker.observe(0, 0, true, start + 10 * CONFIRM_AFTER, NO_PROOF),
             Step::Wait
         );
+        let proof = ask(tracker.observe(CONFIRM_FRAMES, 0, true, start + CONFIRM_AFTER, NO_PROOF));
         assert_eq!(
-            tracker.observe(CONFIRM_FRAMES, 0, true, start + CONFIRM_AFTER, false),
-            Step::Prove
-        );
-        assert_eq!(
-            tracker.observe(CONFIRM_FRAMES + 1, 0, true, start + CONFIRM_AFTER, true),
+            tracker.observe(CONFIRM_FRAMES + 1, 0, true, start + CONFIRM_AFTER, &[proof]),
             Step::Confirmed
         );
         // Once.
         assert_eq!(
-            tracker.observe(CONFIRM_FRAMES + 2, 0, true, start + CONFIRM_AFTER, true),
+            tracker.observe(CONFIRM_FRAMES + 2, 0, true, start + CONFIRM_AFTER, &[proof]),
             Step::Wait
         );
     }
@@ -2576,35 +2616,91 @@ mod tests {
         let start = Instant::now();
         let later = start + CONFIRM_AFTER;
         let mut tracker = PresentTracker::new();
-        assert_eq!(tracker.observe(0, 0, true, start, false), Step::Wait);
-        assert_eq!(
-            tracker.observe(CONFIRM_FRAMES, 0, true, later, false),
-            Step::Prove
-        );
+        assert_eq!(tracker.observe(0, 0, true, start, NO_PROOF), Step::Wait);
+        let first = ask(tracker.observe(CONFIRM_FRAMES, 0, true, later, NO_PROOF));
         // The surface was removed and its recreation failed: egui-wgpu's
         // paints return before drawing, with no surface error, and the UI
         // passes go on. No screenshot answers, so nothing is confirmed; the
         // ask is repeated now and then.
         for frame in CONFIRM_FRAMES + 1..CONFIRM_FRAMES + PROOF_AGAIN_AFTER {
-            assert_eq!(tracker.observe(frame, 0, true, later, false), Step::Wait);
+            assert_eq!(tracker.observe(frame, 0, true, later, NO_PROOF), Step::Wait);
         }
+        let again =
+            ask(tracker.observe(CONFIRM_FRAMES + PROOF_AGAIN_AFTER, 0, true, later, NO_PROOF));
+        assert_eq!(again.span, first.span);
+        assert_ne!(again.request, first.request);
+        // A late answer to the first ask of this span still proves a frame.
         assert_eq!(
-            tracker.observe(CONFIRM_FRAMES + PROOF_AGAIN_AFTER, 0, true, later, false),
-            Step::Prove
+            tracker.observe(
+                CONFIRM_FRAMES + PROOF_AGAIN_AFTER + 1,
+                0,
+                true,
+                later,
+                &[first]
+            ),
+            Step::Confirmed
         );
-        // A proof after a surface error is not this span's.
+    }
+
+    #[test]
+    fn a_late_answer_from_before_a_surface_error_or_a_new_device_proves_nothing() {
+        let start = Instant::now();
+        let later = start + CONFIRM_AFTER;
+        // `failures` counts surface errors, frames the painter skipped and
+        // devices: a lost device skips frames and its replacement is one more.
+        for (what, after) in [
+            ("a surface error", 1),
+            ("skipped frames and a new device", 4),
+        ] {
+            let mut tracker = PresentTracker::new();
+            tracker.observe(0, 0, true, start, NO_PROOF);
+            let old = ask(tracker.observe(CONFIRM_FRAMES, 0, true, later, NO_PROOF));
+            // The old frame's answer arrives only after the change.
+            let frame = CONFIRM_FRAMES + 1;
+            assert_eq!(
+                tracker.observe(frame, after, true, later, &[old]),
+                Step::Wait,
+                "{what}"
+            );
+            let new_start = later;
+            let new_later = new_start + CONFIRM_AFTER;
+            assert_eq!(
+                tracker.observe(frame + 1, after, true, new_start, &[old]),
+                Step::Wait,
+                "{what}"
+            );
+            let new =
+                ask(tracker.observe(frame + 1 + CONFIRM_FRAMES, after, true, new_later, &[old]));
+            assert_ne!(new.span, old.span, "{what}");
+            // Still only the old answer: nothing.
+            assert_eq!(
+                tracker.observe(frame + 2 + CONFIRM_FRAMES, after, true, new_later, &[old]),
+                Step::Wait,
+                "{what}"
+            );
+            // The new span's own answer confirms.
+            assert_eq!(
+                tracker.observe(
+                    frame + 3 + CONFIRM_FRAMES,
+                    after,
+                    true,
+                    new_later,
+                    &[old, new]
+                ),
+                Step::Confirmed,
+                "{what}"
+            );
+        }
+        // An answer naming this span but an ask it never made proves nothing.
         let mut tracker = PresentTracker::new();
-        tracker.observe(0, 0, true, start, false);
+        tracker.observe(0, 0, true, start, NO_PROOF);
+        let asked = ask(tracker.observe(CONFIRM_FRAMES, 0, true, later, NO_PROOF));
+        let forged = PresentProof {
+            request: asked.request + 7,
+            ..asked
+        };
         assert_eq!(
-            tracker.observe(CONFIRM_FRAMES, 0, true, later, false),
-            Step::Prove
-        );
-        assert_eq!(
-            tracker.observe(CONFIRM_FRAMES + 1, 1, true, later, true),
-            Step::Wait
-        );
-        assert_eq!(
-            tracker.observe(CONFIRM_FRAMES + 2, 1, true, later, true),
+            tracker.observe(CONFIRM_FRAMES + 1, 0, true, later, &[forged]),
             Step::Wait
         );
     }
@@ -2613,12 +2709,12 @@ mod tests {
     fn a_lost_surface_that_is_recreated_late_is_not_a_working_window() {
         let start = Instant::now();
         let mut tracker = PresentTracker::new();
-        assert_eq!(tracker.observe(0, 0, true, start, false), Step::Wait);
+        assert_eq!(tracker.observe(0, 0, true, start, NO_PROOF), Step::Wait);
         // Lost: egui reports it and recreates the surface on the next frame,
         // which can fail without a report and without a present.
         for (frame, ms) in [(1, 16), (2, 32), (3, 48)] {
             assert_eq!(
-                tracker.observe(frame, 1, true, start + Duration::from_millis(ms), false),
+                tracker.observe(frame, 1, true, start + Duration::from_millis(ms), NO_PROOF),
                 Step::Wait
             );
         }
@@ -2706,32 +2802,29 @@ mod tests {
     fn a_minimized_window_is_not_confirmed() {
         let start = Instant::now();
         let mut tracker = PresentTracker::new();
-        assert_eq!(tracker.observe(0, 0, true, start, false), Step::Wait);
+        assert_eq!(tracker.observe(0, 0, true, start, NO_PROOF), Step::Wait);
         assert_eq!(
-            tracker.observe(CONFIRM_FRAMES, 0, false, start + CONFIRM_AFTER, false),
+            tracker.observe(CONFIRM_FRAMES, 0, false, start + CONFIRM_AFTER, NO_PROOF),
             Step::Wait
         );
         assert_eq!(
-            tracker.observe(2 * CONFIRM_FRAMES, 0, true, start + CONFIRM_AFTER, false),
+            tracker.observe(2 * CONFIRM_FRAMES, 0, true, start + CONFIRM_AFTER, NO_PROOF),
             Step::Wait
         );
-        assert_eq!(
-            tracker.observe(
-                3 * CONFIRM_FRAMES,
-                0,
-                true,
-                start + 2 * CONFIRM_AFTER,
-                false
-            ),
-            Step::Prove
-        );
+        let proof = ask(tracker.observe(
+            3 * CONFIRM_FRAMES,
+            0,
+            true,
+            start + 2 * CONFIRM_AFTER,
+            NO_PROOF,
+        ));
         assert_eq!(
             tracker.observe(
                 3 * CONFIRM_FRAMES + 1,
                 0,
                 true,
                 start + 2 * CONFIRM_AFTER,
-                true
+                &[proof]
             ),
             Step::Confirmed
         );

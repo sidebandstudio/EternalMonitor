@@ -38,6 +38,12 @@ pub(super) const POLL: Duration = Duration::from_millis(250);
 /// How long OK hides the notice while the wait goes on.
 pub(super) const REMIND_AFTER: Duration = Duration::from_secs(15);
 
+/// How long the window may run UI passes without being confirmed drawing.
+/// A working one is confirmed about 3.5 s after its first pass (3 s and 10
+/// frames of drawing, then the screenshot that proves a present); one whose
+/// paints return without a surface keeps passing and never is.
+pub(super) const PROOF_WITHIN: Duration = Duration::from_secs(12);
+
 /// How the user closed the notice.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Answer {
@@ -287,27 +293,72 @@ where
     .is_some()
 }
 
+/// What the first-paint watcher has seen, and when it says the window is
+/// stuck. Every look is made from the watcher's thread, in order.
+pub(super) struct Watch {
+    started: Instant,
+    limit: Duration,
+    proof_within: Duration,
+    last_held: Option<Instant>,
+    first_pass: Option<Instant>,
+}
+
+impl Watch {
+    pub(super) fn new(started: Instant, limit: Duration, proof_within: Duration) -> Self {
+        Self {
+            started,
+            limit,
+            proof_within,
+            last_held: None,
+            first_pass: None,
+        }
+    }
+
+    /// Whether the notice should be up at `at`, given the window thread's
+    /// last UI pass and whether the window is held now (minimized, or its
+    /// title bar or system menu held, when a working window runs no UI pass
+    /// either). Counted from the latest of the start and the last time it
+    /// was held: `limit` without a UI pass, or `proof_within` of UI passes
+    /// without the window confirmed drawing.
+    pub(super) fn look(&mut self, at: Instant, last_pass: Option<Instant>, held: bool) -> bool {
+        if held {
+            self.last_held = Some(at);
+            return false;
+        }
+        if let Some(pass) = last_pass {
+            self.first_pass.get_or_insert(pass);
+        }
+        let since = self
+            .last_held
+            .map_or(self.started, |held| held.max(self.started));
+        let quiet = last_pass.map_or(since, |pass| pass.max(since));
+        let silent = at.saturating_duration_since(quiet) >= self.limit;
+        let unproven = self.first_pass.is_some_and(|first| {
+            at.saturating_duration_since(first.max(since)) >= self.proof_within
+        });
+        silent || unproven
+    }
+}
+
 /// Watches the window from another thread until the wait ends
 /// ([`FirstPaintWatch::finisher`], called when the window is confirmed
-/// drawing, or [`FirstPaintWatch::stop`]). The notice goes up once `limit`
-/// has passed since the latest of: the watch's start, the window thread's
-/// last UI pass (`last_pass`), and the last time the watcher saw the window
-/// held (`held`: minimized, or its title bar held, when a working window
-/// runs no UI pass either). Cancel runs `quit`, which ends the process: the
+/// drawing, or [`FirstPaintWatch::stop`]), and raises the notice when
+/// [`Watch::look`] says so. Cancel runs `quit`, which ends the process: the
 /// window's thread may never return.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn watch_first_paint(
     prompt: Prompt,
     limit: Duration,
+    proof_within: Duration,
     poll: Duration,
     now: impl Fn() -> Instant + Send + 'static,
     last_pass: impl Fn() -> Option<Instant> + Send + 'static,
     held: impl Fn() -> bool + Send + 'static,
     quit: impl FnOnce() + Send + 'static,
 ) -> FirstPaintWatch {
-    let started = now();
+    let mut watch = Watch::new(now(), limit, proof_within);
     let watched = prompt.clone();
-    let mut last_held = None;
-    let watch = move || loop {
+    let run = move || loop {
         match watched.phase(now()) {
             Phase::Quit => {
                 info!("Quit while the window waited for the graphics driver");
@@ -318,22 +369,14 @@ pub(super) fn watch_first_paint(
             Phase::Waiting => {}
         }
         let at = now();
-        if held() {
-            last_held = Some(at);
-        }
-        let quiet_since = [Some(started), last_pass(), last_held]
-            .into_iter()
-            .flatten()
-            .max()
-            .unwrap_or(started);
-        if at.saturating_duration_since(quiet_since) >= limit {
+        if watch.look(at, last_pass(), held()) {
             watched.raise(at);
         }
         std::thread::sleep(poll);
     };
     let thread = std::thread::Builder::new()
         .name("first-paint-watch".into())
-        .spawn(watch)
+        .spawn(run)
         .map_err(|error| warn!(%error, "Could not watch the window's first frames"))
         .ok();
     FirstPaintWatch { prompt, thread }
@@ -461,7 +504,7 @@ impl Notice for MessageNotice {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
     use std::sync::mpsc;
 
     /// For a call that hangs until the test releases it.
@@ -829,137 +872,105 @@ mod tests {
         assert_eq!(fake.events.all(), ["shown", "closed"]);
     }
 
-    /// A clock the test moves on by hand, and what the renderer and the live
-    /// window check report, in its time.
-    struct World {
-        start: Instant,
-        ms: Arc<AtomicU64>,
-        last_pass: Arc<Mutex<Option<Instant>>>,
-        held: Arc<AtomicBool>,
+    const LIMIT: Duration = Duration::from_secs(4);
+    const PROOF: Duration = Duration::from_secs(12);
+
+    /// Looks at the window as the watcher does, each at a time in ms from
+    /// the start: (ms, last UI pass in ms, held). The times the notice
+    /// would be raised at.
+    fn looks(script: &[(u64, Option<u64>, bool)]) -> Vec<u64> {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut watch = Watch::new(start, LIMIT, PROOF);
+        script
+            .iter()
+            .filter(|(ms, pass, held)| watch.look(at(*ms), pass.map(at), *held))
+            .map(|(ms, _, _)| *ms)
+            .collect()
     }
 
-    impl World {
-        fn new() -> Self {
-            Self {
-                start: Instant::now(),
-                ms: Arc::default(),
-                last_pass: Arc::default(),
-                held: Arc::default(),
-            }
-        }
-        fn at(&self, ms: u64) {
-            self.ms.store(ms, SeqCst);
-        }
-        fn pass_at(&self, ms: u64) {
-            *self.last_pass.lock() = Some(self.start + Duration::from_millis(ms));
-            self.at(ms);
-        }
-        fn watch(&self, fake: &Fake, quit: impl FnOnce() + Send + 'static) -> FirstPaintWatch {
-            let (start, ms) = (self.start, Arc::clone(&self.ms));
-            let last_pass = Arc::clone(&self.last_pass);
-            let held = Arc::clone(&self.held);
-            watch_first_paint(
-                Prompt::new(fake.clone()),
-                SHORT.limit,
-                SLICE,
-                move || start + Duration::from_millis(ms.load(SeqCst)),
-                move || *last_pass.lock(),
-                move || held.load(SeqCst),
-                quit,
-            )
-        }
-        /// Lets the watcher look a few times.
-        fn settle(&self) {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-
-    fn never_quit() -> impl FnOnce() + Send + 'static {
-        || panic!("quit")
-    }
-
-    const LIMIT_MS: u64 = SHORT.limit.as_millis() as u64;
-
-    #[test]
-    fn a_window_that_draws_in_time_shows_no_notice() {
-        let fake = Fake::default();
-        let world = World::new();
-        let watch = world.watch(&fake, never_quit());
-        // UI passes keep coming; then the window is confirmed drawing.
-        for ms in [100, 300, 500, 700] {
-            world.pass_at(ms);
-            world.settle();
-        }
-        (watch.finisher())();
-        watch.stop().unwrap();
-        assert!(fake.events.all().is_empty(), "{:?}", fake.events.all());
+    /// UI passes every 200 ms from `from` to `to` ms, looked at each 250 ms.
+    fn passing(from: u64, to: u64) -> Vec<(u64, Option<u64>, bool)> {
+        (from..=to)
+            .step_by(250)
+            .map(|ms| (ms, Some(ms / 200 * 200), false))
+            .collect()
     }
 
     #[test]
-    fn a_failed_first_acquire_then_a_stuck_recreation_gets_the_notice_until_the_window_draws() {
-        let fake = Fake::default();
-        let world = World::new();
-        let watch = world.watch(&fake, never_quit());
-        // The first pass ran and its frame's surface acquire failed, so the
-        // renderer did not confirm the window; recreating the surface at the
-        // start of the next paint never returns: no more passes.
-        world.pass_at(200);
-        world.at(200 + LIMIT_MS - 1);
-        world.settle();
-        assert!(fake.events.all().is_empty(), "{:?}", fake.events.all());
-        world.at(200 + LIMIT_MS);
-        fake.events.wait_for("shown", 1);
-        // OK, then the reminder while it is still stuck.
-        *fake.answer.lock() = Some(Answer::Wait);
-        fake.events.wait_for("ok", 1);
-        world.at(200 + LIMIT_MS + REMIND_AFTER.as_millis() as u64 + 1);
-        fake.events.wait_for("shown", 2);
-        // It comes back and is confirmed drawing: the notice goes.
-        (watch.finisher())();
-        watch.stop().unwrap();
-        assert_eq!(fake.events.all(), ["shown", "ok", "shown", "closed"]);
+    fn a_window_that_passes_and_draws_in_time_shows_no_notice() {
+        // Confirmed after about 3.5 s, well before either bound.
+        assert!(looks(&passing(0, 3_500)).is_empty());
     }
 
     #[test]
-    fn a_minimized_window_gets_no_notice_and_is_counted_from_when_it_is_restored() {
-        let fake = Fake::default();
-        let world = World::new();
-        let watch = world.watch(&fake, never_quit());
+    fn a_failed_first_acquire_then_a_stuck_recreation_raises_the_notice_4_s_after_the_last_pass() {
+        // One pass at 200 ms, whose frame's surface acquire failed; the
+        // recreation at the start of the next paint never returns.
+        let script: Vec<_> = (250..=4_500)
+            .step_by(50)
+            .map(|ms| (ms, Some(200), false))
+            .collect();
+        assert_eq!(looks(&script)[0], 4_200);
+    }
+
+    #[test]
+    fn passes_without_a_proof_of_a_presented_frame_raise_the_notice_at_the_bound() {
+        // The surface is gone and every paint returns before drawing: UI
+        // passes go on, the screenshots are never answered.
+        let raised = looks(&passing(0, 12_500));
+        assert_eq!(raised.first(), Some(&12_000), "{raised:?}");
+    }
+
+    #[test]
+    fn held_windows_suspend_both_bounds_and_count_again_from_when_they_are_let_go() {
         // One pass, then minimized: eframe runs no pass for a minimized
-        // window, so nothing reaches the renderer; only the live check sees
-        // it.
-        world.pass_at(100);
-        world.held.store(true, SeqCst);
-        for ms in (200..=100 * LIMIT_MS).step_by(LIMIT_MS as usize) {
-            world.at(ms);
-            world.settle();
-        }
-        assert!(fake.events.all().is_empty(), "{:?}", fake.events.all());
-        // Restored at `back`, and its passes never come.
-        let back = 100 * LIMIT_MS + 1;
-        world.at(back);
-        world.settle();
-        world.held.store(false, SeqCst);
-        world.at(back + LIMIT_MS - 1);
-        world.settle();
-        assert!(fake.events.all().is_empty(), "{:?}", fake.events.all());
-        world.at(back + LIMIT_MS + 1);
-        fake.events.wait_for("shown", 1);
-        watch.stop().unwrap();
-        assert_eq!(fake.events.all(), ["shown", "closed"]);
+        // window, so only the live check sees it. Held for a minute: nothing.
+        let mut script = vec![(100, Some(100), false)];
+        script.extend((250..=60_000).step_by(250).map(|ms| (ms, Some(100), true)));
+        assert!(looks(&script).is_empty());
+        // Restored at 60 s, and no pass comes: the notice 4 s later.
+        let mut stuck = script.clone();
+        stuck.extend(
+            (60_250..=64_500)
+                .step_by(250)
+                .map(|ms| (ms, Some(100), false)),
+        );
+        assert_eq!(looks(&stuck).first(), Some(&64_000));
+        // Restored and passing, but never confirmed: the proof bound counts
+        // from the release, not from the first pass.
+        let mut unproven = script.clone();
+        unproven.extend(passing(60_250, 72_500));
+        assert_eq!(looks(&unproven).first(), Some(&72_000));
+        // The title bar held while passes stop counts the same way.
+        let mut dragged = passing(0, 2_000);
+        dragged.extend(
+            (2_250..=20_000)
+                .step_by(250)
+                .map(|ms| (ms, Some(2_000), true)),
+        );
+        assert!(looks(&dragged).is_empty());
     }
 
     #[test]
     fn cancel_while_the_window_is_stuck_quits_from_the_watcher() {
         let fake = Fake::default();
-        let world = World::new();
         let quits = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&quits);
         *fake.answer.lock() = Some(Answer::Quit);
-        let watch = world.watch(&fake, move || {
-            count.fetch_add(1, SeqCst);
-        });
-        world.at(LIMIT_MS);
+        // Nothing passes: the notice goes up at once with a zero limit.
+        let watch = watch_first_paint(
+            Prompt::new(fake.clone()),
+            Duration::ZERO,
+            PROOF,
+            SLICE,
+            Instant::now,
+            || None,
+            || false,
+            move || {
+                count.fetch_add(1, SeqCst);
+            },
+        );
         watch.thread.unwrap().join().unwrap();
         assert_eq!(quits.load(SeqCst), 1);
         assert_eq!(fake.events.all(), ["shown", "cancel"]);
@@ -979,6 +990,7 @@ mod tests {
         let watch = watch_first_paint(
             prompt,
             REMIND_AFTER,
+            PROOF,
             SLICE,
             Instant::now,
             || None,
@@ -1011,14 +1023,16 @@ mod tests {
             }
             start + SHORT.limit * 2
         };
+        let never_quit = || panic!("quit");
         let watch = watch_first_paint(
             Prompt::new(fake.clone()),
             SHORT.limit,
+            PROOF,
             SLICE,
             now,
             || None,
             || false,
-            never_quit(),
+            never_quit,
         );
         clock_read.recv().unwrap();
         (watch.finisher())();
