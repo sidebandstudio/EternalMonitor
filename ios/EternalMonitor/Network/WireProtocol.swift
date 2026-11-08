@@ -358,6 +358,9 @@ struct Heartbeat: Equatable {
     static let noticePCLocked: UInt8 = 1
     /// No display is on at the PC (a closed lid, screens off or unplugged).
     static let noticeNoDisplay: UInt8 = 2
+    /// Second screen needs Windows 11, so the PC shows its main screen
+    /// instead. Sent for a few seconds, over a picture that works.
+    static let noticeSecondScreenNeedsWindows11: UInt8 = 6
     /// The video frames the PC sent this session, from a PC that offered
     /// `HelloAck.hostCapMediaSize`; nil from others. Appended after
     /// `notice`, which is then always written.

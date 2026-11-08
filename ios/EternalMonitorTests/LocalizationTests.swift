@@ -22,7 +22,9 @@ final class LocalizationTests: XCTestCase {
 
     /// English strings whose translations come in a separate pass. Until
     /// then every language shows them in English.
-    private let awaitingTranslation: Set<String> = []
+    private let awaitingTranslation: Set<String> = [
+        "Second screen needs Windows 11. Showing your PC's screen instead.",
+    ]
 
     /// Every language has exactly English's strings, none empty, each with
     /// the same placeholders.

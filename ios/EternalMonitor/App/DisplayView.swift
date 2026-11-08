@@ -63,6 +63,10 @@ struct DisplayView: View {
                 restoringPill
                     .transition(.opacity)
                     .allowsHitTesting(false)
+            } else if connectionManager.secondScreenNeedsWindows11 {
+                needsWindows11Pill
+                    .transition(.opacity)
+                    .allowsHitTesting(false)
             }
 
             VStack {
@@ -123,6 +127,7 @@ struct DisplayView: View {
         .animation(.easeInOut(duration: 0.25), value: connectionManager.pictureRestoring)
         .animation(.easeInOut(duration: 0.25), value: connectionManager.pcLocked)
         .animation(.easeInOut(duration: 0.25), value: connectionManager.pcNoDisplay)
+        .animation(.easeInOut(duration: 0.25), value: connectionManager.secondScreenNeedsWindows11)
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.35), value: appeared)
         .onAppear {
             appeared = true
@@ -458,6 +463,26 @@ struct DisplayView: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(L("Your PC has no active display. Turn on a screen to continue."))
         .accessibilityIdentifier("display.pcNoDisplay")
+    }
+
+    /// Over the mirrored picture for a few seconds, when the PC chose Second
+    /// screen but its Windows can't run it.
+    private var needsWindows11Pill: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "rectangle.on.rectangle")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Theme.text)
+                .accessibilityHidden(true)
+            Text(L("Second screen needs Windows 11. Showing your PC's screen instead."))
+                .font(.app(15, .semibold, relativeTo: .subheadline))
+                .foregroundStyle(Theme.text)
+        }
+        .padding(.horizontal, 18)
+        .frame(minHeight: 44)
+        .background(glass(Capsule()))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(L("Second screen needs Windows 11. Showing your PC's screen instead."))
+        .accessibilityIdentifier("display.needsWindows11")
     }
 
     /// The PC is still connected but a lost frame left the picture waiting
