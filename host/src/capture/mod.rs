@@ -109,13 +109,34 @@ pub(crate) fn frame_has_image(last_present_time: i64, seen_image: bool) -> bool 
 }
 
 /// Whether Windows draws the pointer into the captured picture: on the
-/// second screen, unless the virtual display driver was given a hardware
-/// cursor (`vdd_settings::hardware_cursor`). Without one, measured on the
-/// reference PC, every pointer move there was a new image and Desktop
-/// Duplication kept reporting the pointer at one stale position.
+/// second screen, unless the virtual display driver runs with a hardware
+/// cursor (`vdd_settings::cursor_in_effect`), and then too for an image
+/// larger than that cursor takes (`vdd_settings::CURSOR_MAX`). Without
+/// one, measured on the reference PC, every pointer move there was a new
+/// image and Desktop Duplication kept reporting the pointer at one stale
+/// position.
 #[cfg(any(windows, test))]
-pub(crate) fn pointer_in_picture(second_screen: bool, driver_cursor: bool) -> bool {
-    second_screen && !driver_cursor
+pub(crate) fn pointer_in_picture(
+    second_screen: bool,
+    driver_cursor: bool,
+    shape: Option<(u32, u32)>,
+) -> bool {
+    let max = crate::vdd_settings::CURSOR_MAX;
+    second_screen && (!driver_cursor || shape.is_some_and(|(w, h)| w > max || h > max))
+}
+
+/// Whether capture draws the pointer into the video: for a client that
+/// doesn't draw it, unless Windows already drew it there. Drawing the
+/// reported pointer over Windows' own put a second, frozen pointer at the
+/// stale position.
+#[cfg(any(windows, test))]
+pub(crate) fn composite_pointer(
+    client_draws_pointer: bool,
+    pointer_in_picture: bool,
+    visible: bool,
+    has_shape: bool,
+) -> bool {
+    !client_draws_pointer && !pointer_in_picture && visible && has_shape
 }
 
 /// Whether the pointer goes apart from the video for this capture: to an
@@ -474,6 +495,11 @@ struct VddRequest {
     mode: Option<crate::vdd_settings::VddMode>,
     /// The adapters' LUIDs before the Enable, to find the driver's own.
     before: Vec<u64>,
+    /// The driver was off, so the Enable that follows starts it with this
+    /// file (see `vdd_settings::cursor_in_effect`).
+    device_off: bool,
+    /// And it will give Windows a hardware cursor when it starts.
+    hardware_cursor: bool,
 }
 
 /// Before each enable: name the main screen's graphics card for the driver
@@ -559,19 +585,29 @@ fn prepare_vdd_settings(shared: &SharedControl, outputs: &[OutputInfo]) -> VddRe
         }
         Err(_) => {}
     }
-    // Whatever wrote it, the file the driver reads next decides whether it
-    // gives Windows a hardware cursor, and so whether the second screen's
-    // pointer is reported apart from its picture.
-    let hardware_cursor =
+    // The driver reads this file when it starts. A driver already on keeps
+    // what it read then; one found off forgets anything this host knew.
+    let device_off = crate::vdd_device::query() == crate::vdd_device::DeviceState::Problem(22);
+    if device_off {
+        shared
+            .vdd_hardware_cursor
+            .store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+    let reads_cursor = owned
+        || crate::vdd_settings::driver_version()
+            .is_some_and(|version| crate::vdd_settings::driver_reads_cursor(&version));
+    let file_cursor =
         std::fs::read_to_string(path).is_ok_and(|xml| crate::vdd_settings::hardware_cursor(&xml));
-    shared
-        .vdd_hardware_cursor
-        .store(hardware_cursor, std::sync::atomic::Ordering::Relaxed);
-    info!(hardware_cursor, "The virtual display's pointer");
+    info!(
+        device_off,
+        reads_cursor, file_cursor, "The virtual display's pointer settings"
+    );
     VddRequest {
         pin: crate::vdd_settings::pin_result(wanted, &applied),
         mode,
         before,
+        device_off,
+        hardware_cursor: reads_cursor && file_cursor,
     }
 }
 
@@ -1199,24 +1235,53 @@ mod tests {
     }
 
     /// #183 is a second screen report: with the driver's hardware cursor
-    /// the second screen sends the pointer apart, as Mirror does. A driver
-    /// file without it keeps the pointer in the picture.
+    /// the second screen sends the pointer apart, as Mirror does. Without
+    /// it, or for an image over the cursor's size, Windows draws the
+    /// pointer into the picture.
     #[test]
     fn the_second_screen_sends_the_pointer_apart_with_the_drivers_cursor() {
-        for (second_screen, driver_cursor, in_picture) in [
-            (false, false, false),
-            (false, true, false),
-            (true, true, false),
-            (true, false, true),
+        let small = Some((32, 32));
+        let large = Some((crate::vdd_settings::CURSOR_MAX + 1, 32));
+        for (second_screen, driver_cursor, shape, in_picture) in [
+            (false, false, small, false),
+            (false, true, large, false),
+            (true, true, small, false),
+            (true, true, None, false),
+            (true, true, large, true),
+            (true, false, small, true),
         ] {
             assert_eq!(
-                pointer_in_picture(second_screen, driver_cursor),
+                pointer_in_picture(second_screen, driver_cursor, shape),
                 in_picture,
-                "second_screen={second_screen} driver_cursor={driver_cursor}"
+                "second_screen={second_screen} driver_cursor={driver_cursor} shape={shape:?}"
             );
             assert_eq!(pointer_apart(true, in_picture), !in_picture);
             assert!(!pointer_apart(false, in_picture), "an older iPad");
         }
+    }
+
+    /// Review r3: with the pointer in the picture Desktop Duplication still
+    /// reports it visible, with a shape, at a stale spot. Drawing that over
+    /// Windows' own pointer left a second, frozen one in every frame.
+    #[test]
+    fn capture_draws_the_pointer_only_when_nobody_else_does() {
+        assert!(
+            composite_pointer(false, false, true, true),
+            "Mirror, an older iPad"
+        );
+        assert!(
+            !composite_pointer(true, false, true, true),
+            "the iPad draws it"
+        );
+        assert!(
+            !composite_pointer(false, true, true, true),
+            "Windows drew it into the picture"
+        );
+        assert!(!composite_pointer(false, false, false, true), "hidden");
+        assert!(
+            !composite_pointer(false, false, true, false),
+            "no shape yet"
+        );
     }
 
     pub(super) fn connect_viewer(shared: &SharedControl) {

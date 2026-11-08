@@ -114,6 +114,9 @@ pub struct SharedControl {
     pub listen_on: Arc<Mutex<crate::network::ListenOn>>,
     /// The pointer for an iPad that draws it (see `capture::pointer`).
     pub pointer: Arc<crate::capture::pointer::PointerFeed>,
+    /// The session whose iPad reported it holds the pointer image whole
+    /// (see [`SharedControl::client_draws_pointer`]).
+    pub(crate) pointer_confirmed: Arc<AtomicU32>,
 }
 
 /// Runtime state of the managed virtual extended display.
@@ -177,6 +180,7 @@ impl SharedControl {
             )),
             listen_on: Arc::new(Mutex::new(Default::default())),
             pointer: Arc::new(Default::default()),
+            pointer_confirmed: Arc::new(AtomicU32::new(0)),
             running: Arc::new(AtomicBool::new(false)),
             bitrate_bps: Arc::new(AtomicU32::new(initial_bitrate_bps)),
             abr_current_bps: Arc::new(AtomicU32::new(initial_bitrate_bps)),
@@ -247,9 +251,23 @@ impl SharedControl {
     /// after a silence counts as gone for the second screen, so its display
     /// still goes the same time after the iPad's last packet.
     /// The connected iPad draws the pointer, so capture leaves it out of
-    /// the video and sends it apart.
+    /// the video. From when its reports say it holds the current pointer
+    /// image whole: until then it has nothing to draw, so the pointer stays
+    /// in the video and the positions sent say hidden.
     pub fn client_draws_pointer(&self) -> bool {
-        self.session.lock().pointer_session_id().is_some()
+        let session = self.session.lock().pointer_session_id();
+        session.is_some_and(|id| self.pointer_confirmed.load(Ordering::Relaxed) == id)
+    }
+
+    /// A receiver report named the pointer image its iPad holds.
+    pub(crate) fn note_pointer_report(&self, shape_id: u32) {
+        let Some(session) = self.session.lock().pointer_session_id() else {
+            return;
+        };
+        let current = self.pointer.latest().0.map(|shape| shape.id);
+        if shape_id != 0 && current == Some(shape_id) {
+            self.pointer_confirmed.store(session, Ordering::Relaxed);
+        }
     }
 
     pub(crate) fn client_heard(&self) -> bool {
@@ -391,6 +409,24 @@ mod tests {
                 &Config,
                 std::time::Instant::now(),
             );
+            assert!(
+                !shared.client_draws_pointer(),
+                "not before it holds the image"
+            );
+            shared
+                .pointer
+                .set_shape(crate::capture::pointer::PointerImage {
+                    source_type: 2,
+                    flags: 0,
+                    width: 1,
+                    height: 1,
+                    hot: (0, 0),
+                    bytes: vec![nonce as u8; 4],
+                });
+            let current = shared.pointer.latest().0.unwrap().id;
+            shared.note_pointer_report(current + 1);
+            assert!(!shared.client_draws_pointer(), "another image");
+            shared.note_pointer_report(current);
             assert_eq!(shared.client_draws_pointer(), draws, "caps {caps:#x}");
         }
     }

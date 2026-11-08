@@ -16,10 +16,10 @@ use super::recovery::{
     LossStep, OpenStep, LOSS_GIVE_UP,
 };
 use super::{
-    acquired, client_connected, frame_budget_for, frame_buffer, heartbeat, idle_heartbeat,
-    keepalive_allowed, keepalive_due, pointer_apart, pointer_in_picture, read_back_image,
-    reconcile_virtual_display, recovery_poll, resolve_target, Acquired, FrameSlot, FrameUse,
-    IdleGate, OutputInfo, RawFrame, ACQUIRE_TIMEOUT_MS, FPS_WINDOW, FRAME_PADDING,
+    acquired, client_connected, composite_pointer, frame_budget_for, frame_buffer, heartbeat,
+    idle_heartbeat, keepalive_allowed, keepalive_due, pointer_apart, pointer_in_picture,
+    read_back_image, reconcile_virtual_display, recovery_poll, resolve_target, Acquired, FrameSlot,
+    FrameUse, IdleGate, OutputInfo, RawFrame, ACQUIRE_TIMEOUT_MS, FPS_WINDOW, FRAME_PADDING,
 };
 use crate::control::{CaptureTarget, SharedControl};
 use crate::gpu_preference::Outcome;
@@ -319,10 +319,17 @@ pub fn run_capture_loop(
     // Whether `last_frame` has the pointer drawn in: it has unless the
     // client draws the pointer itself (`SharedControl::client_draws_pointer`).
     let mut last_frame_has_pointer = true;
-    let pointer_in_image = pointer_in_picture(
-        second_screen,
-        shared.vdd_hardware_cursor.load(Ordering::Relaxed),
-    );
+    // Windows draws the pointer into the picture itself: on the second
+    // screen without the driver's hardware cursor, or for an image too
+    // large for it. Then nothing else draws one (`composite_pointer`).
+    let in_picture = |cursor: &CursorState| {
+        pointer_in_picture(
+            second_screen,
+            shared.vdd_hardware_cursor.load(Ordering::Relaxed),
+            cursor.size(),
+        )
+    };
+    let mut pointer_in_image = in_picture(&cursor);
     if pointer_in_image {
         // A position from a mirror before this one would stay drawn.
         shared.pointer.set_position(super::pointer::Position {
@@ -366,6 +373,7 @@ pub fn run_capture_loop(
         // other client, or none, one with it. The staging texture still
         // holds the last desktop image, so the cached frame is redrawn from
         // it when the connected client's answer differs from the cache's.
+        pointer_in_image = in_picture(&cursor);
         let draws_pointer = pointer_apart(shared.client_draws_pointer(), pointer_in_image);
         if seen_image && last_frame_has_pointer == draws_pointer {
             let mut pixel_buf = frame_buffer(frame_bytes);
@@ -376,7 +384,12 @@ pub fn run_capture_loop(
                 row_bytes,
                 &mut pixel_buf,
             )?;
-            if !draws_pointer && cursor_visible && cursor.has_shape {
+            if composite_pointer(
+                draws_pointer,
+                pointer_in_image,
+                cursor_visible,
+                cursor.has_shape,
+            ) {
                 draw_cursor(
                     &mut pixel_buf,
                     tex_width,
@@ -448,23 +461,13 @@ pub fn run_capture_loop(
                     super::second_screen::note_image(&shared, generation);
                 }
 
-                // --- Track cursor position/shape (must read shape before ReleaseFrame) ---
-                if frame_info.LastMouseUpdateTime != 0 {
-                    cursor_visible = frame_info.PointerPosition.Visible.as_bool();
-                    cursor_x = frame_info.PointerPosition.Position.x;
-                    cursor_y = frame_info.PointerPosition.Position.y;
-                    shared.pointer.set_position(super::pointer::Position {
-                        // A picture with the pointer in it has none apart.
-                        visible: cursor_visible && !pointer_in_image,
-                        x: cursor_x,
-                        y: cursor_y,
-                        host_time_us: crate::clock::host_now_us(),
-                    });
-                }
-                if frame_info.PointerShapeBufferSize > 0
-                    && cursor.update_shape(dupl, frame_info.PointerShapeBufferSize)
-                    && !pointer_in_image
-                {
+                // --- Track cursor shape/position (must read shape before ReleaseFrame) ---
+                // The shape is always read: its size decides whether Windows
+                // draws it into the picture.
+                let new_shape = frame_info.PointerShapeBufferSize > 0
+                    && cursor.update_shape(dupl, frame_info.PointerShapeBufferSize);
+                pointer_in_image = in_picture(&cursor);
+                if new_shape && !pointer_in_image {
                     if let Some(image) = super::pointer::convert_shape(
                         cursor.shape_type,
                         cursor.width,
@@ -475,6 +478,20 @@ pub fn run_capture_loop(
                     ) {
                         shared.pointer.set_shape(image);
                     }
+                }
+                if frame_info.LastMouseUpdateTime != 0 || new_shape {
+                    if frame_info.LastMouseUpdateTime != 0 {
+                        cursor_visible = frame_info.PointerPosition.Visible.as_bool();
+                        cursor_x = frame_info.PointerPosition.Position.x;
+                        cursor_y = frame_info.PointerPosition.Position.y;
+                    }
+                    shared.pointer.set_position(super::pointer::Position {
+                        // A picture with the pointer in it has none apart.
+                        visible: cursor_visible && !pointer_in_image,
+                        x: cursor_x,
+                        y: cursor_y,
+                        host_time_us: crate::clock::host_now_us(),
+                    });
                 }
 
                 // --- Get dirty rect count ---
@@ -572,7 +589,12 @@ pub fn run_capture_loop(
                                 )?;
 
                                 // Composite the mouse cursor into the BGRA frame.
-                                if !draws_pointer && cursor_visible && cursor.has_shape {
+                                if composite_pointer(
+                                    draws_pointer,
+                                    pointer_in_image,
+                                    cursor_visible,
+                                    cursor.has_shape,
+                                ) {
                                     draw_cursor(
                                         &mut pixel_buf,
                                         tex_width,
@@ -1075,6 +1097,15 @@ struct CursorState {
 }
 
 impl CursorState {
+    /// The pointer image's size in pixels, once there is one. A monochrome
+    /// shape's buffer stacks two masks.
+    fn size(&self) -> Option<(u32, u32)> {
+        self.has_shape.then(|| match self.shape_type {
+            DXGI_POINTER_SHAPE_MONOCHROME => (self.width, self.height / 2),
+            _ => (self.width, self.height),
+        })
+    }
+
     /// Fetch the current pointer shape. Must be called while a frame is acquired
     /// (before `ReleaseFrame`). On failure the previous shape is kept and
     /// this returns false.

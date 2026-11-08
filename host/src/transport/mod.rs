@@ -340,7 +340,7 @@ pub async fn start_sender(
         // Tokio's timer can wake 15 ms late on Windows, longer than a frame
         // budget: the budget's end waits on a high-resolution timer.
         let pointer_repeat = {
-            let (shape, position) = shared.pointer.latest();
+            let (shape, position) = pointer_latest(&shared);
             let budget = crate::capture::frame_budget_for(shared.effective_fps());
             pointer_budget.arm(state.pointer.budget_end(
                 budget,
@@ -888,6 +888,7 @@ async fn act(
     }
     if let Some(report) = actions.report.as_ref() {
         state.pointer.report(report.pointer_shape_id, now());
+        shared.note_pointer_report(report.pointer_shape_id);
     }
     if let Some(report) = actions.report.take() {
         // A slow log sink must not hold the capture/encode stats lock.
@@ -938,6 +939,23 @@ async fn act(
     send_pointer(&mut state.pointer, links, shared).await;
 }
 
+/// The pointer to send: hidden until the iPad holds its image, while
+/// capture still draws it into the video (`client_draws_pointer`).
+fn pointer_latest(
+    shared: &SharedControl,
+) -> (
+    Option<std::sync::Arc<crate::capture::pointer::Shape>>,
+    Option<crate::capture::pointer::Position>,
+) {
+    let (shape, position) = shared.pointer.latest();
+    let shown = shared.client_draws_pointer();
+    let position = position.map(|position| crate::capture::pointer::Position {
+        visible: position.visible && shown,
+        ..position
+    });
+    (shape, position)
+}
+
 /// Sends what [`pointer::PointerSender`] says is due, to a client that
 /// draws the pointer.
 async fn send_pointer(
@@ -957,7 +975,7 @@ async fn send_pointer(
         return;
     }
     let budget = crate::capture::frame_budget_for(shared.effective_fps());
-    for send in sender.poll(now(), budget, shared.pointer.latest()) {
+    for send in sender.poll(now(), budget, pointer_latest(shared)) {
         match send {
             pointer::Send::Shape(shape, from) => {
                 let image = &shape.image;

@@ -142,17 +142,73 @@ const CURSOR: &str = "    <cursor>\n        <HardwareCursor>true</HardwareCursor
                       <AlphaCursorSupport>true</AlphaCursorSupport>\n        \
                       <XorCursorSupportLevel>2</XorCursorSupportLevel>\n    </cursor>\n";
 
-/// Whether a settings document turns the driver's hardware cursor on, as
-/// the driver reads it: the text of `<HardwareCursor>`, `true` or `1`.
+/// The largest pointer image, in pixels a side, the cursor block lets the
+/// driver take as a hardware cursor. Windows draws a larger one into the
+/// picture itself.
+pub const CURSOR_MAX: u32 = 128;
+
+/// Whether a settings document turns the driver's hardware cursor on, read
+/// as the driver reads it (`EnabledQuery` in its `Driver.cpp`): the first
+/// `<HardwareCursor>` element whose first child is text decides, and only
+/// the exact text `true` turns it on. Comments are not elements. Stricter
+/// than the driver, a document that is not well-formed counts as off, so
+/// the pointer is taken to be in the picture.
 pub fn hardware_cursor(xml: &str) -> bool {
-    let Some(start) = xml.find("<HardwareCursor>") else {
-        return false;
-    };
-    let rest = &xml[start + "<HardwareCursor>".len()..];
-    let Some(end) = rest.find("</HardwareCursor>") else {
-        return false;
-    };
-    matches!(rest[..end].trim(), "true" | "1")
+    use quick_xml::events::Event;
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let (mut in_element, mut on) = (false, None);
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(tag)) => in_element = tag.local_name().as_ref() == b"HardwareCursor",
+            Ok(Event::Text(text)) if in_element && on.is_none() => {
+                on = Some(text.as_ref() == b"true");
+                in_element = false;
+            }
+            // The whole document must be well-formed for the answer to count.
+            Ok(Event::Eof) => return on.unwrap_or(false),
+            Err(_) => return false,
+            Ok(_) => in_element = false,
+        }
+    }
+}
+
+/// Whether the running driver gives Windows a hardware cursor, after this
+/// host turned the driver on (`enabled`) or off, and the change is `done`.
+/// Only an Enable that started the driver from off (`device_off`) made it
+/// read the file just written, which turns the cursor on
+/// (`file_cursor`: the file says so and the driver reads `<cursor>`). An
+/// Enable that found it on changes nothing it read, and a driver turned off
+/// has no cursor. When unsure, the answer is no: the pointer is then taken
+/// to be in the picture and left there.
+pub fn cursor_in_effect(
+    before: bool,
+    enabled: bool,
+    done: bool,
+    device_off: bool,
+    file_cursor: bool,
+) -> bool {
+    match (enabled, done) {
+        (false, true) => false,
+        (true, true) if device_off => file_cursor,
+        (true, true) => before,
+        (_, false) => before && !device_off,
+    }
+}
+
+/// Whether the installed driver reads `<cursor>` at all: releases from
+/// 24.10.27 on do. `version` is its installer's display version, such as
+/// `25.05.03`.
+pub fn driver_reads_cursor(version: &str) -> bool {
+    let parts: Option<Vec<u32>> = version
+        .trim()
+        .split('.')
+        .map(|part| part.parse().ok())
+        .collect();
+    match parts.as_deref() {
+        Some([year, month, day, ..]) => (*year, *month, *day) >= (24, 10, 27),
+        _ => false,
+    }
 }
 
 fn escape(text: &str) -> String {
@@ -831,7 +887,8 @@ mod tests {
 
     /// The driver turns its hardware cursor on only when the file says so;
     /// a file from before this version, or the vendor's with it off, keeps
-    /// the pointer in the second screen's picture.
+    /// the pointer in the second screen's picture. Read as the driver reads
+    /// it: comments don't count, and only the text `true` does.
     #[test]
     fn the_hardware_cursor_is_read_as_the_driver_reads_it() {
         assert!(!hardware_cursor(VENDOR));
@@ -839,17 +896,67 @@ mod tests {
         assert!(!hardware_cursor(&v032));
         for (text, on) in [
             ("true", true),
-            (" 1 ", true),
+            (" true", false),
+            ("1", false),
             ("false", false),
-            ("0", false),
-            ("", false),
+            ("TRUE", false),
         ] {
             let xml = format!("<vdd_settings><cursor><HardwareCursor>{text}</HardwareCursor></cursor></vdd_settings>");
             assert_eq!(hardware_cursor(&xml), on, "{text:?}");
         }
-        assert!(!hardware_cursor(
-            "<vdd_settings><HardwareCursor>true</vdd_settings>"
-        ));
+        let commented = "<vdd_settings><!-- <HardwareCursor>true</HardwareCursor> --><cursor><HardwareCursor>false</HardwareCursor></cursor></vdd_settings>";
+        assert!(
+            !hardware_cursor(commented),
+            "a commented-out line is not a setting"
+        );
+        let first_wins = "<vdd_settings><HardwareCursor>false</HardwareCursor><HardwareCursor>true</HardwareCursor></vdd_settings>";
+        assert!(!hardware_cursor(first_wins));
+        assert!(
+            !hardware_cursor("<vdd_settings><HardwareCursor>true</vdd_settings>"),
+            "not well-formed"
+        );
+    }
+
+    /// Review r3: the flag comes from what the driver read when it last
+    /// started, not from the file alone.
+    #[test]
+    fn the_cursor_counts_only_when_an_enable_started_the_driver_with_it() {
+        // An Enable that started the driver from off: the file decides.
+        assert!(cursor_in_effect(false, true, true, true, true));
+        assert!(!cursor_in_effect(true, true, true, true, false));
+        // The driver was already on (AlreadyDone, or the task found it on):
+        // it keeps what it read when it started.
+        assert!(
+            !cursor_in_effect(false, true, true, false, true),
+            "never started with it"
+        );
+        assert!(
+            cursor_in_effect(true, true, true, false, true),
+            "a quick reconnect"
+        );
+        // Turned off, or a failed Enable from off: no cursor.
+        assert!(!cursor_in_effect(true, false, true, false, true));
+        assert!(!cursor_in_effect(true, true, false, true, true));
+        assert!(
+            cursor_in_effect(true, true, false, false, true),
+            "a failed Enable that found it on"
+        );
+    }
+
+    #[test]
+    fn only_drivers_that_read_the_cursor_block_are_trusted_with_it() {
+        for (version, reads) in [
+            ("25.05.03", true),
+            ("24.10.27", true),
+            ("24.12.24", true),
+            ("24.10.16", false),
+            ("23.12.2", false),
+            ("24.10", false),
+            ("", false),
+            ("beta", false),
+        ] {
+            assert_eq!(driver_reads_cursor(version), reads, "{version:?}");
+        }
     }
 
     #[test]

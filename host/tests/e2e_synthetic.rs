@@ -3794,17 +3794,26 @@ fn the_pointer_moves_without_video_frames_for_an_ipad_that_draws_it() {
                         Instant::now(),
                     );
                     if matches!(done, AddOutcome::Completed(_)) {
-                        // The window starts after the session's first frame.
+                        // The window starts after the session's first frame,
+                        // or, for an iPad that draws the pointer, its first
+                        // shown position: until its report names the image,
+                        // the pointer stays in the video.
                         if window_start.is_some() {
                             frames += 1;
+                        } else if !draws {
+                            window_start = Some(Instant::now());
                         }
-                        window_start.get_or_insert_with(Instant::now);
                     }
                 }
                 Classified::Control(_) => match parse_control(bytes).map(|(_, m)| m) {
-                    Ok(ControlMessage::PointerState(state)) if window_start.is_some() => {
-                        assert_ne!(state.flags & POINTER_VISIBLE, 0);
-                        states.push((state.x, state.y));
+                    Ok(ControlMessage::PointerState(state))
+                        if state.flags & POINTER_VISIBLE != 0 =>
+                    {
+                        assert!(held_shape != 0, "shown before the iPad held the image");
+                        if window_start.is_some() {
+                            states.push((state.x, state.y));
+                        }
+                        window_start.get_or_insert_with(Instant::now);
                     }
                     Ok(ControlMessage::PointerState(_)) => {}
                     Ok(ControlMessage::PointerShape(chunk)) => {
@@ -3956,11 +3965,24 @@ fn pointer_messages_start_once_the_ipad_has_answered() {
         "capture keeps the pointer in its video"
     );
 
+    // Answered, without the image yet: messages start, and the pointer
+    // stays in the video until a report names the image.
     receiver.send(&ControlMessage::ReceiverReport(ReceiverReport::default()));
+    let (pointer, _) = count(&mut receiver, &mut datagram, Duration::from_millis(1500));
+    assert!(pointer > 0, "no pointer messages after it answered");
+    assert!(
+        !shared.client_draws_pointer(),
+        "not before it holds the image"
+    );
+    let shape_id = shared.pointer.latest().0.unwrap().id;
+    receiver.send(&ControlMessage::ReceiverReport(ReceiverReport {
+        pointer_shape_id: shape_id,
+        ..Default::default()
+    }));
     let (pointer, _) = count(&mut receiver, &mut datagram, Duration::from_millis(1500));
     assert!(
         pointer > 10,
-        "only {pointer} pointer messages after it answered"
+        "only {pointer} pointer messages once it held the image"
     );
     assert!(shared.client_draws_pointer());
 

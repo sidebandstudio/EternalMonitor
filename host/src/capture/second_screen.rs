@@ -1669,6 +1669,27 @@ struct WindowsDriver<'a> {
 }
 
 #[cfg(windows)]
+impl WindowsDriver<'_> {
+    /// Whether the running driver gives Windows a hardware cursor, after a
+    /// driver change (`vdd_settings::cursor_in_effect`).
+    fn note_cursor(&self, enabled: bool, done: bool) {
+        let request = self.request.borrow();
+        let request = request.as_ref();
+        let flag = &self.shared.vdd_hardware_cursor;
+        let now = flag.load(std::sync::atomic::Ordering::Relaxed);
+        let in_effect = crate::vdd_settings::cursor_in_effect(
+            now,
+            enabled,
+            done,
+            request.is_some_and(|request| request.device_off),
+            request.is_some_and(|request| request.hardware_cursor),
+        );
+        flag.store(in_effect, std::sync::atomic::Ordering::Relaxed);
+        info!(hardware_cursor = in_effect, "The virtual display's pointer");
+    }
+}
+
+#[cfg(windows)]
 impl Driver for WindowsDriver<'_> {
     fn outputs(&self) -> Vec<OutputInfo> {
         super::enumerate_outputs()
@@ -1679,11 +1700,15 @@ impl Driver for WindowsDriver<'_> {
     }
 
     fn set_enabled(&self, enabled: bool) -> bool {
-        crate::vdd::set_enabled(enabled, || {})
+        let done = crate::vdd::set_enabled(enabled, || {});
+        self.note_cursor(enabled, done);
+        done
     }
 
     fn enable(&self) -> Result<(), EnableReport> {
-        crate::vdd::enable(|| {})
+        let result = crate::vdd::enable(|| {});
+        self.note_cursor(true, result.is_ok());
+        result
     }
 
     fn settle(&self, chosen: OutputInfo) -> OutputInfo {
