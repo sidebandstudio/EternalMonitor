@@ -657,10 +657,8 @@ impl Msg2Payload {
     }
 }
 
-/// Inner types of the session messages sealed in records. Values below 0x40
-/// are the v2 [`PacketType`] of the message carried (its v2 body follows).
-/// Values at 0x40 and above are the protocol's own; one either side doesn't
-/// know is dropped, and never counts as application data.
+/// The first inner type of the protocol's own messages; one either side
+/// doesn't know is dropped, and never counts as application data.
 pub const FIRST_PROTOCOL_INNER_TYPE: u8 = 0x40;
 
 /// Whether `inner_type` carries an application message (a v2 control
@@ -669,6 +667,9 @@ pub fn is_application(inner_type: u8) -> bool {
     inner_type < FIRST_PROTOCOL_INNER_TYPE
 }
 
+/// Inner types of the session messages sealed in records: 0x50-0x53, and
+/// v2's Bye (0x13). Values below 0x40 are the v2 [`PacketType`] of the
+/// message carried (its v2 body follows).
 pub const INNER_SESSION_CONFIRM: u8 = 0x50;
 pub const INNER_SESSION_CONFIRM_ACK: u8 = 0x51;
 pub const INNER_SESSION_REFUSED: u8 = 0x52;
@@ -713,7 +714,8 @@ impl SessionMessage {
     }
 
     /// Parses a session message, or returns `Ok(None)` for any other inner
-    /// type, which the caller passes on to the application.
+    /// type. Callers deliver one of those to the application only when
+    /// [`is_application`] is true for it, and drop it otherwise.
     pub fn parse(inner_type: u8, body: &[u8]) -> Result<Option<Self>, WireError> {
         let mut r = Reader::new(body);
         Ok(Some(match inner_type {

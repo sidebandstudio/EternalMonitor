@@ -738,8 +738,10 @@ fn behind_many_senders(cookies: CookieMode) {
         }
         answered += usize::from(pair_msg2(&mut host, at, &mut ipad, &creds).is_some());
     }
-    assert!(
-        answered >= 1,
+    // Every retry, the first included. (More senders than the source
+    // table holds is left to the cookie: they're load.)
+    assert_eq!(
+        answered, 8,
         "message 2 on {answered} of 8 retries: {cookies:?}"
     );
     assert_eq!(host.cookie_replies() > 0, cookies != CookieMode::Off);

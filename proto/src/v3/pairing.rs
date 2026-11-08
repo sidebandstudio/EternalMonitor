@@ -333,8 +333,11 @@ pub struct PairingConfig {
     /// no host-wide limit before authentication, as on the session path: one
     /// would let many senders inside their own limits starve a genuine iPad.
     /// A read that fails is one AEAD attempt and no Diffie-Hellman (about
-    /// 10 µs), so the most the table admits, (1,024 + 1) × 20 a second, is
-    /// about a fifth of one core.
+    /// 10 µs, measured on an M1), so the most the table admits, (1,024 + 1)
+    /// × 20 a second on average (up to twice that across a window
+    /// boundary), is about a fifth of one core. Message 1s with a valid
+    /// cookie are read on a lane of their own, per exact address, that only
+    /// the QR's holder can reach.
     pub msg1_per_source_per_second: u32,
     /// When message 1 must carry a valid cookie for its source, as on the
     /// session path ([`super::host::HostConfig::cookies`]).

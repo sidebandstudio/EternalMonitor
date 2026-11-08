@@ -1138,12 +1138,39 @@ mod tests {
             .iter()
             .any(|o| matches!(o, ClientOutput::Deliver { inner_type, .. } if *inner_type == PacketType::Ping as u8)));
 
-        // Live: an unknown type isn't delivered.
+        // Live: an unknown type isn't delivered, but it's still liveness.
+        let at = T0 + Duration::from_secs(5);
         let record = host.seal(0x60, &[9]).unwrap();
         assert!(!ipad
-            .handle_datagram(T0, &record, 1_000)
+            .handle_datagram(at, &record, 1_000)
             .iter()
             .any(|o| matches!(o, ClientOutput::Deliver { .. })));
+        assert_eq!(ipad.live.as_ref().unwrap().last_rx, at);
+
+        // Draining: once a newer session takes over, the old one delivers
+        // application types only.
+        let mut newer = confirming_client(&mut ipad, at, 6_000, 83);
+        let record = newer.seal(PacketType::Ping as u8, &[0; 8]).unwrap();
+        ipad.handle_datagram(at, &record, 6_000);
+        assert_eq!(ipad.live_session(), Some(83));
+        assert_eq!(ipad.draining_session(), Some(81));
+        let record = host.seal(0x5F, &[]).unwrap();
+        assert!(!ipad
+            .handle_datagram(at, &record, 6_000)
+            .iter()
+            .any(|o| matches!(o, ClientOutput::Deliver { .. })));
+        let record = host.seal(PacketType::Ping as u8, &[0; 8]).unwrap();
+        assert!(ipad
+            .handle_datagram(at, &record, 6_000)
+            .iter()
+            .any(|o| matches!(
+                o,
+                ClientOutput::Deliver {
+                    session_id: 81,
+                    draining: true,
+                    ..
+                }
+            )));
 
         // Abandoned: an unknown type doesn't promote it either.
         let mut ipad = client();
