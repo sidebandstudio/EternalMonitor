@@ -129,6 +129,27 @@ pub const UNANSWERED_MEDIA_BUDGET: usize = 512 * 1024;
 const UNANSWERED_KEPT: usize = 64;
 const UNANSWERED_FOR: Duration = Duration::from_secs(60);
 
+/// How long a session is kept alive through restarts with no picture. Past
+/// this, its iPad is told to connect again: it shows why while the PC
+/// keeps restarting, instead of a frozen picture. Restarts that fail
+/// quickly end sooner, at the storm brake.
+pub const RESTART_HOLD_LIMIT: Duration = Duration::from_secs(20);
+
+/// Lets integration tests reach [`RESTART_HOLD_LIMIT`] in milliseconds.
+#[cfg(feature = "test-hooks")]
+pub static TEST_RESTART_HOLD_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(RESTART_HOLD_LIMIT.as_millis() as u64);
+
+#[cfg(feature = "test-hooks")]
+fn restart_hold_limit() -> Duration {
+    Duration::from_millis(TEST_RESTART_HOLD_MS.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn restart_hold_limit() -> Duration {
+    RESTART_HOLD_LIMIT
+}
+
 /// What the transport must do after feeding the session an event.
 #[derive(Debug, Default)]
 pub struct Actions {
@@ -305,6 +326,15 @@ struct ActiveSession {
     unanswered_sent: usize,
     /// A frame was held back for the budget: the answer asks for a keyframe.
     withheld: bool,
+    /// The stream config its last heartbeat carried, which heartbeats sent
+    /// while the PC restarts carry again.
+    last_stream_config: Option<StreamConfig>,
+    /// Since when it has been kept alive through restarts without a frame
+    /// ([`RESTART_HOLD_LIMIT`]): its last frame, or the restart if none.
+    /// Cleared by the next frame.
+    restart_held_since: Option<Instant>,
+    /// When the last frame was let through to it.
+    last_frame_at: Option<Instant>,
 }
 
 /// What a client sent last, for the liveness log lines.
@@ -562,6 +592,8 @@ impl Session {
         };
         if session.answered {
             session.frames_sent = session.frames_sent.saturating_add(1);
+            session.restart_held_since = None;
+            session.last_frame_at = Some(now);
             return true;
         }
         if session.withheld
@@ -571,6 +603,9 @@ impl Session {
             session.withheld = true;
             return false;
         }
+        // Only a frame that goes out ends a hold through a restart.
+        session.restart_held_since = None;
+        session.last_frame_at = Some(now);
         session.unanswered_sent += bytes;
         session.frames_sent = session.frames_sent.saturating_add(1);
         self.unanswered_media = (host_spent + bytes, now);
@@ -1164,6 +1199,9 @@ impl Session {
             answered,
             unanswered_sent,
             withheld: false,
+            last_stream_config: None,
+            restart_held_since: None,
+            last_frame_at: None,
         });
 
         // Only a new pairing carries the token. iPads keep the token they
@@ -1406,6 +1444,30 @@ impl Session {
             return actions;
         }
 
+        // Kept alive through a restart and no frame since: past the limit,
+        // even once the next generation runs, tell the iPad to connect again.
+        // Not one that said goodbye to hand over to the cable: its takeover
+        // deadline below ends it as it said.
+        if let Some(since) = session
+            .restart_held_since
+            .filter(|since| now.saturating_duration_since(*since) >= restart_hold_limit())
+            .filter(|_| session.bye.is_none())
+        {
+            info!(
+                session_id = session.session_id,
+                held_ms = now.saturating_duration_since(since).as_millis() as u64,
+                "The stream is taking too long to restart: telling the iPad to connect again"
+            );
+            actions.ended = self.end_saying(
+                ByeReason::Error,
+                EndReason::Failed(StageFailure::Other),
+                now,
+            );
+            actions.goodbye = self.take_goodbye();
+            actions.client_lost = true;
+            return actions;
+        }
+
         if now >= session.liveness_deadline {
             // A client that had a picture may only have lost its uplink: it
             // keeps the session, on hold, until the hold limit. One that
@@ -1445,10 +1507,20 @@ impl Session {
             let session_id = session.session_id;
             let frames_sent = (session.info.feature_caps & FEATURE_MEDIA_SIZE != 0)
                 .then_some(session.frames_sent);
+            let stream_config = match self.not_streaming {
+                // No stream: the config of the one the iPad last had.
+                Some(_) => session
+                    .last_stream_config
+                    .unwrap_or_else(|| self.negotiated_config(config)),
+                None => self.negotiated_config(config),
+            };
+            if let Some(session) = self.active.as_mut() {
+                session.last_stream_config = Some(stream_config);
+            }
             let msg_seq = self.next_msg_seq();
             let heartbeat = ControlMessage::Heartbeat(eternal_wire::v2::control::Heartbeat {
                 host_time_us: crate::clock::host_now_us(),
-                stream_config: self.negotiated_config(config),
+                stream_config,
                 notice: config.notice(),
                 frames_sent,
             });
@@ -1458,6 +1530,29 @@ impl Session {
             ));
         }
         actions
+    }
+
+    /// One heartbeat interval while the PC restarts its stream and the
+    /// standby responder holds the port. A session kept across the restart
+    /// stays alive: its iPad gets heartbeats as from a running stream, so it
+    /// holds its last picture instead of losing the signal, and its silence
+    /// still expires it. Only an iPad that has answered gets them. Once
+    /// [`RESTART_HOLD_LIMIT`] has passed since its last frame, the session
+    /// ends with the goodbye that tells its iPad to connect again, on this
+    /// tick or the next stream's ([`Self::tick`]) until a frame goes out.
+    /// Does nothing unless the PC is restarting.
+    pub fn restart_tick(&mut self, config: &impl ConfigSource, now: Instant) -> Actions {
+        if self.not_streaming != Some(NotStreaming::Restarting) {
+            return Actions::default();
+        }
+        let Some(session) = self.active.as_mut() else {
+            return self.tick(config, false, now);
+        };
+        // Counted from the last frame, so a restart ladder keeps counting.
+        let last_frame = session.last_frame_at.unwrap_or(now);
+        session.restart_held_since.get_or_insert(last_frame);
+        let answered = session.answered;
+        self.tick(config, answered, now)
     }
 
     /// Ends the active session for liveness, with the goodbye that tells its
@@ -5485,5 +5580,256 @@ mod tests {
             (stopped.status, stopped.host_name.as_str()),
             (HelloStatus::Error, "TEST-HOST")
         );
+    }
+
+    /// The standby responder's config: no stream, epoch 0.
+    struct RestartConfig;
+    impl ConfigSource for RestartConfig {
+        fn stream_config(&self) -> StreamConfig {
+            StreamConfig::default()
+        }
+        fn host_name(&self) -> String {
+            "TEST-HOST".to_string()
+        }
+    }
+
+    fn heartbeats(actions: &Actions, peer: PeerId, session_id: u32) -> Vec<StreamConfig> {
+        actions
+            .replies
+            .iter()
+            .filter(|(to, _)| *to == peer)
+            .filter_map(
+                |(_, bytes)| match eternal_wire::v2::control::parse_control(bytes) {
+                    Ok((header, ControlMessage::Heartbeat(hb)))
+                        if header.session_id == session_id =>
+                    {
+                        Some(hb.stream_config)
+                    }
+                    _ => None,
+                },
+            )
+            .collect()
+    }
+
+    /// A streaming session whose iPad has answered, then the PC restarts.
+    fn restarting_session(peer: PeerId, now: Instant) -> (Session, u32) {
+        let mut session = Session::new(1234);
+        session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
+        session.handle_control_authed(peer, report(10), &TestConfig, now);
+        let id = session.session_id().unwrap();
+        assert_eq!(
+            heartbeats(&session.tick(&TestConfig, true, now), peer, id).len(),
+            1
+        );
+        session.set_not_streaming(Some(NotStreaming::Restarting));
+        (session, id)
+    }
+
+    /// While the PC restarts, the kept session gets a heartbeat each
+    /// interval, with the stream config it last had, and stays alive for as
+    /// long as its iPad keeps reporting: longer than the iPad's liveness.
+    #[test]
+    fn a_restart_keeps_the_ipads_session_alive_with_heartbeats() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let (mut session, id) = restarting_session(peer, now);
+        for second in 1..=12 {
+            let at = now + Duration::from_secs(second);
+            session.handle_control_authed(peer, report(10), &RestartConfig, at);
+            let actions = session.restart_tick(&RestartConfig, at);
+            assert!(
+                !actions.client_lost && actions.goodbye.is_none(),
+                "second {second}"
+            );
+            let configs = heartbeats(&actions, peer, id);
+            assert_eq!(configs.len(), 1, "second {second}");
+            assert_eq!(
+                configs[0].stream_epoch, 7,
+                "the last stream's config, not epoch 0"
+            );
+        }
+        assert_eq!(session.session_id(), Some(id));
+    }
+
+    /// Only an iPad that answered its session gets them, and only while the
+    /// PC restarts: not after Stop or the storm brake, nor while streaming.
+    #[test]
+    fn restart_heartbeats_go_only_to_an_answered_session_while_restarting() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut session = Session::new(1234);
+        session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
+        let id = session.session_id().unwrap();
+        session.set_not_streaming(Some(NotStreaming::Restarting));
+        let actions = session.restart_tick(&RestartConfig, now + Duration::from_millis(500));
+        assert!(heartbeats(&actions, peer, id).is_empty(), "never answered");
+
+        let (mut session, id) = restarting_session(peer, now);
+        for state in [
+            None,
+            Some(NotStreaming::Stopped),
+            Some(NotStreaming::Failed(FailedReason::Encoder)),
+        ] {
+            session.set_not_streaming(state);
+            let actions = session.restart_tick(&RestartConfig, now + Duration::from_secs(1));
+            assert!(actions.replies.is_empty(), "{state:?}");
+        }
+        assert!(session.session_id() == Some(id));
+        let mut empty = Session::new(1);
+        empty.set_not_streaming(Some(NotStreaming::Restarting));
+        assert!(empty.restart_tick(&RestartConfig, now).replies.is_empty());
+    }
+
+    /// An iPad that goes silent during the restart is still expired, with
+    /// the goodbye that tells it to connect again.
+    #[test]
+    fn a_silent_ipad_still_expires_during_a_restart() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let (mut session, _) = restarting_session(peer, now);
+        let mut lost = false;
+        for second in 1..=12 {
+            let actions = session.restart_tick(&RestartConfig, now + Duration::from_secs(second));
+            lost |= actions.client_lost;
+        }
+        assert!(lost && !session.is_active());
+    }
+
+    /// Past the hold limit without a frame, the session ends with the
+    /// goodbye that tells its iPad to connect again, and its HELLO2 then
+    /// hears that the PC is restarting. A frame resets the limit.
+    #[test]
+    fn a_restart_that_outlasts_the_hold_limit_ends_the_session() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let (mut session, id) = restarting_session(peer, now);
+        session.restart_tick(&RestartConfig, now);
+        // A frame went out in between (a generation streamed briefly).
+        let half = now + restart_hold_limit() / 2;
+        session.set_not_streaming(None);
+        assert!(session.may_send_media(id, 1000, half));
+        session.set_not_streaming(Some(NotStreaming::Restarting));
+        session.handle_control_authed(peer, report(10), &RestartConfig, half);
+        session.restart_tick(&RestartConfig, half);
+        let before = half + restart_hold_limit() - Duration::from_millis(1);
+        session.handle_control_authed(peer, report(10), &RestartConfig, before);
+        assert!(
+            !session.restart_tick(&RestartConfig, before).client_lost,
+            "the frame reset it"
+        );
+
+        let past = half + restart_hold_limit();
+        let actions = session.restart_tick(&RestartConfig, past);
+        assert!(actions.client_lost && !session.is_active());
+        assert_eq!(
+            actions.ended.unwrap().reason,
+            EndReason::Failed(StageFailure::Other)
+        );
+        let (to, bytes) = actions.goodbye.expect("a goodbye");
+        assert_eq!(to, peer);
+        assert!(matches!(
+            eternal_wire::v2::control::parse_control(&bytes),
+            Ok((header, ControlMessage::Bye(ByeReason::Error))) if header.session_id == id
+        ));
+        let mut again = match hello(2, 50000) {
+            ControlMessage::Hello2(hello) => hello,
+            _ => unreachable!(),
+        };
+        again.feature_caps |= FEATURE_STANDBY_STATUS;
+        let answer =
+            session.handle_control(peer, 0, ControlMessage::Hello2(again), &RestartConfig, past);
+        assert_eq!(
+            parse_ack(&answer.replies[0].1).status,
+            HelloStatus::Restarting
+        );
+    }
+
+    /// The supervisor clears the restart before the new generation sends a
+    /// frame. A slow start still ends at the hold limit, counted from the
+    /// last frame, on the stream's own tick.
+    #[test]
+    fn the_hold_limit_holds_after_the_stream_resumes_without_a_frame() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let (mut session, id) = restarting_session(peer, now);
+        assert!(session.may_send_media(id, 1000, now));
+        session.restart_tick(&RestartConfig, now + Duration::from_secs(1));
+        // The next generation starts; it hasn't sent a frame yet.
+        session.set_not_streaming(None);
+        session.transport_resumed(now + Duration::from_secs(2), false);
+        let before = now + restart_hold_limit() - Duration::from_millis(1);
+        session.handle_control_authed(peer, report(10), &TestConfig, before);
+        assert!(!session.tick(&TestConfig, true, before).client_lost);
+        let at = now + restart_hold_limit();
+        session.handle_control_authed(peer, report(10), &TestConfig, at);
+        let actions = session.tick(&TestConfig, true, at);
+        assert!(
+            actions.client_lost && !session.is_active(),
+            "still held past the limit"
+        );
+        assert!(matches!(
+            eternal_wire::v2::control::parse_control(&actions.goodbye.expect("a goodbye").1),
+            Ok((_, ControlMessage::Bye(ByeReason::Error)))
+        ));
+    }
+
+    /// A frame held back for an iPad that hasn't answered never went out,
+    /// so it neither resets the hold limit nor counts as the last frame.
+    #[test]
+    fn a_held_back_frame_does_not_reset_the_hold_limit() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut session = Session::new(1234);
+        session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
+        let id = session.session_id().unwrap();
+        session.set_not_streaming(Some(NotStreaming::Restarting));
+        session.restart_tick(&RestartConfig, now);
+        let held = |session: &Session| {
+            let active = session.active.as_ref().unwrap();
+            (active.restart_held_since, active.last_frame_at)
+        };
+        let before = held(&session);
+        assert!(before.0.is_some());
+        let later = now + Duration::from_millis(500);
+        assert!(!session.may_send_media(id, UNANSWERED_MEDIA_BUDGET + 1, later));
+        assert_eq!(
+            held(&session),
+            before,
+            "a frame that never went out counted"
+        );
+    }
+
+    /// An iPad that said goodbye to hand over to the cable during the pause
+    /// ends as it said, on its takeover deadline, not with the hold limit's
+    /// goodbye.
+    #[test]
+    fn an_ipads_own_goodbye_during_the_pause_ends_its_session_as_it_said() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut session = Session::new(1234);
+        session.handle_control_authed(peer, identified_hello(1, 77), &TestConfig, now);
+        session.handle_control_authed(peer, report(10), &TestConfig, now);
+        session.set_not_streaming(Some(NotStreaming::Restarting));
+        session.restart_tick(&RestartConfig, now);
+        let limit = now + restart_hold_limit();
+        let bye_at = limit - Duration::from_millis(500);
+        session.handle_control_authed(peer, report(10), &RestartConfig, bye_at);
+        session.handle_control_authed(
+            peer,
+            ControlMessage::Bye(ByeReason::Superseded),
+            &RestartConfig,
+            bye_at,
+        );
+        let mut ended = None;
+        for step in 0..20 {
+            let at = limit + Duration::from_millis(100 * step);
+            let actions = session.restart_tick(&RestartConfig, at);
+            assert!(actions.goodbye.is_none(), "told to connect again at {step}");
+            if let Some(end) = actions.ended {
+                ended = Some(end.reason);
+                break;
+            }
+        }
+        assert_eq!(ended, Some(EndReason::Goodbye(ByeReason::Superseded)));
     }
 }
