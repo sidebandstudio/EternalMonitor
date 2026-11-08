@@ -288,7 +288,10 @@ pub(crate) fn mirror(shared: &SharedControl) -> Result<(), CaptureUnavailable> {
 }
 
 /// The installed fake display's outputs, beside the primary one.
-pub(crate) fn outputs(shared: &SharedControl) -> Option<Vec<OutputInfo>> {
+pub(in crate::capture) fn outputs(
+    shared: &SharedControl,
+    _: crate::capture::listing::Judged,
+) -> Option<Vec<OutputInfo>> {
     installed(shared).map(|display| display.outputs())
 }
 

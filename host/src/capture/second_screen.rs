@@ -822,7 +822,7 @@ pub fn note_detached(shared: &SharedControl) {
 /// output it does not show as it was (absent, or its name under another
 /// adapter) proves itself again when it is back, as after
 /// [`note_detached`].
-pub(crate) fn observe_listing(shared: &SharedControl, outputs: &[OutputInfo]) {
+pub(crate) fn observe_listing(shared: &SharedControl, outputs: &[super::OutputInfo]) {
     let shows = |(adapter, name): &ProofOutput| {
         outputs
             .iter()

@@ -420,7 +420,7 @@ mod tests {
         let state = query();
         println!("vdd_device={state} problem={:?}", state.problem());
         // DXGI lists a virtual display under the adapter that renders it.
-        for output in crate::capture::listing::outputs_before_the_host_starts() {
+        for output in crate::capture::listing::outputs(&crate::control::SharedControl::new(0, 1)) {
             println!(
                 "output {} {}x{} at {},{} on {}",
                 output.device_name,
