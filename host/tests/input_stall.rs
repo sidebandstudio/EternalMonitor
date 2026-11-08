@@ -222,7 +222,9 @@ fn input_windows_holds_never_stops_the_transport_loop() {
     assert!(answered, "the other iPad's HELLO went unanswered");
     assert_eq!(verdicts, []);
 
-    // A stream stopped meanwhile ends at once, and frees its port.
+    // A stream stopped meanwhile ends at once, and hands its port on: the
+    // socket stays bound for the next generation or the responder that
+    // answers while nothing streams, not with a loop waiting for Windows.
     shared.stop();
     drop(nal_tx);
     let stopping = Instant::now();
@@ -234,19 +236,12 @@ fn input_windows_holds_never_stops_the_transport_loop() {
         std::thread::sleep(Duration::from_millis(10));
     }
     transport.join().unwrap();
-    // On the address the transport bound, the wildcard by default: a
-    // narrower bind can clash with a socket the wildcard one left closing.
-    let ip = eternal_host::network::listen_ip_now(&shared.listen_on.lock());
-    let freeing = Instant::now();
-    let freed = loop {
-        match UdpSocket::bind((ip, port)) {
-            Ok(_) => break Ok(()),
-            Err(error) if freeing.elapsed() >= Duration::from_secs(3) => break Err(error),
-            Err(_) => std::thread::sleep(Duration::from_millis(20)),
-        }
-    };
-    if let Err(error) = freed {
-        panic!("the stopped stream's port {ip}:{port} is still held 3 s after it ended: {error}");
-    }
+    let parked = shared
+        .stream_socket
+        .lock()
+        .as_ref()
+        .and_then(|socket| socket.local_addr().ok())
+        .map(|addr| addr.port());
+    assert_eq!(parked, Some(port), "the stopped loop handed its port on");
     hold::release();
 }
