@@ -249,6 +249,7 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
                 host_time_us: 987_654_321,
                 stream_config: stream_config(),
                 notice: NOTICE_NONE,
+                frames_sent: None,
             }),
         ),
         (
@@ -259,6 +260,7 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
                 host_time_us: 987_654_321,
                 stream_config: stream_config(),
                 notice: NOTICE_PC_LOCKED,
+                frames_sent: None,
             }),
         ),
         (
@@ -275,6 +277,29 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
                 stream_epoch: 3,
                 last_complete_seq: 4111,
                 reason: KeyframeReason::GapLoss,
+                max_media_dgram: 0,
+            }),
+        ),
+        (
+            "keyframe_request_media_size",
+            0x1234_5678,
+            51,
+            ControlMessage::KeyframeRequest(KeyframeRequest {
+                stream_epoch: 3,
+                last_complete_seq: 0,
+                reason: KeyframeReason::Startup,
+                max_media_dgram: 1200,
+            }),
+        ),
+        (
+            "heartbeat_frames_sent",
+            0x1234_5678,
+            52,
+            ControlMessage::Heartbeat(Heartbeat {
+                host_time_us: 987_654_321,
+                stream_config: stream_config(),
+                notice: NOTICE_NONE,
+                frames_sent: Some(1234),
             }),
         ),
         (
@@ -398,7 +423,12 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
     ack.host_caps = HOSTCAP_NACK | HOSTCAP_CONTIGUOUS_FRAME_SEQ;
     vectors.push((
         "hello_ack_contiguous_seq",
-        encode_control(0, 5, &ControlMessage::HelloAck(ack)),
+        encode_control(0, 5, &ControlMessage::HelloAck(ack.clone())),
+    ));
+    ack.host_caps = HOSTCAP_NACK | HOSTCAP_CONTIGUOUS_FRAME_SEQ | HOSTCAP_MEDIA_SIZE;
+    vectors.push((
+        "hello_ack_media_size",
+        encode_control(0, 6, &ControlMessage::HelloAck(ack)),
     ));
     let (_, ControlMessage::Hello2(mut hello)) = parse_control(
         &vectors
@@ -703,4 +733,42 @@ fn contiguous_frame_seq_capability_round_trips() {
     );
     assert_eq!(caps("hello_ack_paired") & HOSTCAP_CONTIGUOUS_FRAME_SEQ, 0);
     assert_eq!(HOSTCAP_CONTIGUOUS_FRAME_SEQ, 0x0020);
+}
+
+/// A host that takes smaller media datagrams says so; the request and the
+/// heartbeat count are appended to the bodies earlier versions read.
+#[test]
+fn media_size_vectors_round_trip_and_extend_the_old_bodies() {
+    let vectors: BTreeMap<_, _> = canonical_vectors().into_iter().collect();
+    let message = |name: &str| parse_control(&vectors[name]).unwrap().1;
+    let ControlMessage::HelloAck(ack) = message("hello_ack_media_size") else {
+        panic!("hello_ack_media_size")
+    };
+    assert_eq!(
+        ack.host_caps,
+        HOSTCAP_NACK | HOSTCAP_CONTIGUOUS_FRAME_SEQ | HOSTCAP_MEDIA_SIZE
+    );
+    assert_eq!(HOSTCAP_MEDIA_SIZE, 0x0080);
+    assert_eq!(FEATURE_MEDIA_SIZE, 0x0040);
+    assert_eq!(MIN_MEDIA_DGRAM, 576);
+
+    let ControlMessage::KeyframeRequest(request) = message("keyframe_request_media_size") else {
+        panic!("keyframe_request_media_size")
+    };
+    assert_eq!(request.max_media_dgram, 1200);
+    assert_eq!(request.reason, KeyframeReason::Startup);
+    let sized = &vectors["keyframe_request_media_size"];
+    let plain = &vectors["keyframe_request"];
+    assert_eq!(sized.len(), plain.len() + 2);
+
+    let ControlMessage::Heartbeat(heartbeat) = message("heartbeat_frames_sent") else {
+        panic!("heartbeat_frames_sent")
+    };
+    assert_eq!(heartbeat.frames_sent, Some(1234));
+    assert_eq!(heartbeat.notice, NOTICE_NONE);
+    let counted = &vectors["heartbeat_frames_sent"];
+    let plain = &vectors["heartbeat"];
+    assert_eq!(counted.len(), plain.len() + 5);
+    // Past the msg_seq, the old heartbeat is a prefix of the new one.
+    assert_eq!(counted[16..plain.len()], plain[16..]);
 }

@@ -85,10 +85,22 @@ enum MovedPC {
             guard text.split(separator: ".").count == 4, let bytes = IPv4Address(text)?.rawValue, bytes.count == 4 else { return nil }
             return bytes.reduce(0) { $0 << 8 | UInt32($1) }
         }
-        guard route.direct, !tunnels.contains(where: route.interface.hasPrefix),
-              let address = ipv4(route.address), let mask = ipv4(route.netmask), let candidate = ipv4(host),
+        guard isDirect(route), let address = ipv4(route.address), let mask = ipv4(route.netmask), let candidate = ipv4(host),
               mask != 0, mask != .max else { return false }
         return address & mask == candidate & mask
+    }
+
+    /// Whether `route` is a direct Wi-Fi or Ethernet path, not a tunnel.
+    static func isDirect(_ route: Route) -> Bool {
+        route.direct && !tunnels.contains(where: route.interface.hasPrefix)
+    }
+
+    /// The other home network addresses `identity` signed, in the PC's
+    /// order (those with a default gateway first), without `asked`.
+    static func otherAddresses(_ identity: WireIdentity, asked: String,
+                               homeAddress: (String) -> Bool = isHomeAddress) -> [String] {
+        identity.addresses.map { $0.map(String.init).joined(separator: ".") }
+            .filter { $0 != asked && homeAddress($0) }
     }
 
     /// How this iPad reaches `host:port` now, from a UDP path to it that
@@ -161,6 +173,13 @@ enum MovedPC {
     /// wrong proof. The token itself is never sent.
     static func confirm(host: String, port: UInt16, token: Data, link: any MediaLink, attempts: Int = 8,
                         interval: Double = 0.25) async -> Bool {
+        await identify(host: host, port: port, token: token, link: link, attempts: attempts, interval: interval) != nil
+    }
+
+    /// As `confirm`, with the PC's signed answer: the port it receives the
+    /// stream on and its home network addresses, one of them `host`.
+    static func identify(host: String, port: UInt16, token: Data, link: any MediaLink, attempts: Int = 8,
+                         interval: Double = 0.25) async -> WireIdentity? {
         var generator = SystemRandomNumberGenerator()
         let nonce = Data((0..<16).map { _ in UInt8.random(in: .min ... .max, using: &generator) })
         let request = Wire.encodeControl(sessionId: 0, msgSeq: 1, message: .identify(WireIdentify(nonce: nonce)))
@@ -169,7 +188,7 @@ enum MovedPC {
         let box = LinkBox(link)
         return await withCheckedContinuation { continuation in
             let done = OSAllocatedUnfairLock(initialState: false)
-            let finish: @Sendable (Bool) -> Void = { result in
+            let finish: @Sendable (WireIdentity?) -> Void = { result in
                 guard done.withLock({ finished in defer { finished = true }; return !finished }) else { return }
                 box.link.controlQueue.async {
                     box.link.onControlDatagram = nil
@@ -184,13 +203,13 @@ enum MovedPC {
                       identity.version == WireIdentify.version, identity.nonce == nonce else { return }
                 let signed = WireIdentity.message(nonce: nonce, port: identity.port, addresses: identity.addresses)
                 guard HMAC<SHA256>.isValidAuthenticationCode(identity.proof, authenticating: signed, using: key) else {
-                    return finish(false)
+                    return finish(nil)
                 }
                 // The PC signs where it receives the stream. An answer for
                 // another address isn't the saved PC at this one.
-                if identity.port == port, let asked, identity.addresses.contains(asked) { finish(true) }
+                if identity.port == port, let asked, identity.addresses.contains(asked) { finish(identity) }
             }
-            link.onError = { _ in finish(false) }
+            link.onError = { _ in finish(nil) }
             link.onListenerReady = { _ in
                 for attempt in 0..<attempts {
                     box.link.controlQueue.asyncAfter(deadline: .now() + interval * Double(attempt)) {
@@ -199,8 +218,8 @@ enum MovedPC {
                 }
             }
             // A link that never gets ready ends here too.
-            DispatchQueue.global().asyncAfter(deadline: .now() + interval * Double(attempts) + 0.5) { finish(false) }
-            if !link.start(host: host) { finish(false) }
+            DispatchQueue.global().asyncAfter(deadline: .now() + interval * Double(attempts) + 0.5) { finish(nil) }
+            if !link.start(host: host) { finish(nil) }
         }
     }
 

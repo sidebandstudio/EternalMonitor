@@ -30,9 +30,14 @@ enum AttemptEnd: Equatable {
     /// iPadOS found no usable network for the path: Wi-Fi is off or
     /// joined to none (`ConnectionProblem.wifiOff`).
     case noNetwork
-    /// No answer at the saved address, and Bonjour found the same PC at
-    /// another: a new attempt goes there.
+    /// No answer at the address tried, and the same PC is known at another:
+    /// Bonjour found it there, or its video arrived there before. A new
+    /// attempt goes there.
     case pcMoved
+    /// The PC sent video that gave no picture at this address, even in
+    /// small datagrams, and showed it is the same PC at another: a new
+    /// attempt goes there.
+    case noVideoPath
     /// The PC found at a saved PC's new address turned out to be another PC.
     case otherPC
     case receiverFailed
@@ -102,7 +107,7 @@ struct SessionSummary: Equatable {
         case .appBackground, .superseded, .pcGoodbye: return "app_ended"
         case .connectTimeout: return sessionId == nil ? "no_reply" : "no_picture"
         case .pcMoved: return "no_reply"
-        case .closedBeforePicture: return "no_picture"
+        case .closedBeforePicture, .noVideoPath: return "no_picture"
         default: return "error"
         }
     }
@@ -111,6 +116,7 @@ struct SessionSummary: Equatable {
         switch end {
         case .connectTimeout where sessionId == nil, .pcMoved: return "no_reply"
         case .connectTimeout: return datagramsReceived == 0 ? "no_video" : "no_frame"
+        case .noVideoPath: return "no_video"
         case .pcStoppedResponding: return "signal_lost"
         case .cableUnplugged, .usbLinkFailed, .closedBeforePicture: return "usb_lost"
         case .noNetwork: return "no_network"
@@ -123,7 +129,7 @@ struct SessionSummary: Equatable {
         switch end {
         case .userDisconnect, .usbTurnedOff: return "user"
         case .appBackground: return "background"
-        case .superseded, .retriedWithCode, .pcMoved: return "superseded"
+        case .superseded, .retriedWithCode, .pcMoved, .noVideoPath: return "superseded"
         case .pcGoodbye: return "goodbye"
         case .connectTimeout: return "timeout"
         case .pcStoppedResponding: return "liveness"

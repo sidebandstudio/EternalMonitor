@@ -14,8 +14,9 @@ use std::time::{Duration, Instant};
 
 use eternal_wire::v2::control::{
     ByeReason, ControlHeader, ControlMessage, FailedReason, HelloAck, HelloStatus, InputEvent,
-    KeyframeRequest, Nack, ReceiverReport, StreamConfig, FEATURE_STANDBY_STATUS,
-    FEATURE_SUPPORTS_NACK, FEATURE_WANTS_INPUT, HOSTCAP_NACK,
+    KeyframeRequest, Nack, ReceiverReport, StreamConfig, FEATURE_MEDIA_SIZE,
+    FEATURE_STANDBY_STATUS, FEATURE_SUPPORTS_NACK, FEATURE_WANTS_INPUT, HOSTCAP_MEDIA_SIZE,
+    HOSTCAP_NACK, MIN_MEDIA_DGRAM,
 };
 use tracing::{info, warn};
 
@@ -216,6 +217,8 @@ pub struct SessionEnd {
     pub first_video: Option<Duration>,
     /// The client's receiver reports counted complete frames.
     pub frames_received: bool,
+    /// The client's receiver reports counted any video fragment.
+    pub frags_received: bool,
     pub duration: Duration,
 }
 
@@ -278,6 +281,13 @@ struct ActiveSession {
     first_video_at: Option<Instant>,
     /// A receiver report counted complete frames.
     frames_received: bool,
+    /// A receiver report counted any video fragment.
+    frags_received: bool,
+    /// Video frames let through to this session ([`Session::may_send_media`]).
+    frames_sent: u32,
+    /// The largest media datagram the client asked for in this session
+    /// ([`KeyframeRequest::max_media_dgram`]).
+    max_media_dgram: Option<u16>,
     /// A Wi-Fi goodbye while the cable takes over.
     bye: Option<ByeReason>,
     /// The msg_seq of input packets taken in this session.
@@ -540,10 +550,14 @@ impl Session {
         let Some(session) = self
             .active
             .as_mut()
-            .filter(|session| session.session_id == session_id && !session.answered)
+            .filter(|session| session.session_id == session_id)
         else {
             return true;
         };
+        if session.answered {
+            session.frames_sent = session.frames_sent.saturating_add(1);
+            return true;
+        }
         if session.withheld
             || session.unanswered_sent + bytes > UNANSWERED_MEDIA_BUDGET
             || host_spent + bytes > UNANSWERED_MEDIA_BUDGET
@@ -552,8 +566,18 @@ impl Session {
             return false;
         }
         session.unanswered_sent += bytes;
+        session.frames_sent = session.frames_sent.saturating_add(1);
         self.unanswered_media = (host_spent + bytes, now);
         true
+    }
+
+    /// The largest media datagram `session_id`'s client asked for, if it
+    /// asked for one.
+    pub fn max_media_dgram(&self, session_id: u32) -> Option<u16> {
+        self.active
+            .as_ref()
+            .filter(|session| session.session_id == session_id)
+            .and_then(|session| session.max_media_dgram)
     }
 
     /// The host-wide media to clients not yet heard that still counts at
@@ -1094,6 +1118,9 @@ impl Session {
             msg_seq_out: 0,
             first_video_at: None,
             frames_received: false,
+            frags_received: false,
+            frames_sent: 0,
+            max_media_dgram: None,
             bye: None,
             input_seqs: SeqWindow::default(),
             answered,
@@ -1163,6 +1190,24 @@ impl Session {
         }
         actions.force_idr = session.heard(Heard::Keyframe, now);
         info!(reason = ?request.reason, "Keyframe request received");
+        // Only a client that was told the host takes it asks; anything else
+        // is ignored, as before. Each smaller size restarts the picture at
+        // once: the frames sent so far gave the client no picture.
+        let asked = request.max_media_dgram;
+        if asked != 0 && session.info.feature_caps & FEATURE_MEDIA_SIZE != 0 {
+            let size = asked.clamp(MIN_MEDIA_DGRAM, eternal_wire::v2::MAX_DGRAM_SIZE as u16);
+            if session.max_media_dgram.is_none_or(|current| size < current) {
+                session.max_media_dgram = Some(size);
+                session.last_keyframe_grant = Some(now);
+                info!(
+                    max_dgram = size,
+                    frames_sent = session.frames_sent,
+                    "Media packet size lowered for this session"
+                );
+                actions.force_idr = true;
+                return actions;
+            }
+        }
 
         if session.grant_keyframe(now) {
             info!(reason = ?request.reason, "Keyframe requested by client — forcing IDR");
@@ -1178,6 +1223,7 @@ impl Session {
                 actions.force_idr = session.heard(Heard::Report, now);
                 session.last_report = Some(report);
                 session.frames_received |= report.frames_complete > 0;
+                session.frags_received |= report.frags_received > 0;
                 actions.report = Some(report);
             }
         }
@@ -1356,11 +1402,14 @@ impl Session {
         if send_heartbeat {
             let peer = session.peer;
             let session_id = session.session_id;
+            let frames_sent = (session.info.feature_caps & FEATURE_MEDIA_SIZE != 0)
+                .then_some(session.frames_sent);
             let msg_seq = self.next_msg_seq();
             let heartbeat = ControlMessage::Heartbeat(eternal_wire::v2::control::Heartbeat {
                 host_time_us: crate::clock::host_now_us(),
                 stream_config: self.negotiated_config(config),
                 notice: config.notice(),
+                frames_sent,
             });
             actions.replies.push((
                 peer,
@@ -1563,6 +1612,7 @@ impl Session {
                 reason: EndReason::Refused(status),
                 first_video: None,
                 frames_received: false,
+                frags_received: false,
                 duration: Duration::ZERO,
             }),
             ..Actions::default()
@@ -1638,6 +1688,13 @@ impl Session {
         auth_token: [u8; 16],
         reason: &str,
     ) -> HelloAck {
+        // Only the client that asks hears that the host takes smaller media
+        // datagrams; older iPads get the reply they always did.
+        let media_size = status == HelloStatus::Ok
+            && self.active.as_ref().is_some_and(|session| {
+                session.session_id == session_id
+                    && session.info.feature_caps & FEATURE_MEDIA_SIZE != 0
+            });
         HelloAck {
             status,
             accepted_version: 2,
@@ -1649,7 +1706,9 @@ impl Session {
             stream_config: self.negotiated_config(config),
             host_name: config.host_name(),
             auth_token,
-            host_caps: HOSTCAP_NACK | config.host_caps(),
+            host_caps: HOSTCAP_NACK
+                | config.host_caps()
+                | if media_size { HOSTCAP_MEDIA_SIZE } else { 0 },
             reason: reason.to_string(),
         }
     }
@@ -1805,6 +1864,7 @@ impl ActiveSession {
                 .first_video_at
                 .map(|at| at.saturating_duration_since(start)),
             frames_received: self.frames_received,
+            frags_received: self.frags_received,
             duration: now.saturating_duration_since(start),
         }
     }
@@ -2418,6 +2478,7 @@ mod tests {
             stream_epoch: 7,
             last_complete_seq: 10,
             reason: KeyframeReason::GapLoss,
+            max_media_dgram: 0,
         });
 
         let first = session.handle_control_authed(peer, request.clone(), &TestConfig, now);
@@ -2458,6 +2519,7 @@ mod tests {
                 stream_epoch: 7,
                 last_complete_seq: 10,
                 reason,
+                max_media_dgram: 0,
             })
         };
 
@@ -2756,6 +2818,164 @@ mod tests {
         assert_eq!(ticked.replies.len(), 1);
         let (_, message) = eternal_wire::v2::control::parse_control(&ticked.replies[0].1).unwrap();
         assert!(matches!(message, ControlMessage::Heartbeat(_)));
+    }
+
+    fn media_size_hello(nonce: u32, feature_caps: u16) -> ControlMessage {
+        let ControlMessage::Hello2(mut hello) = hello(nonce, 50000) else {
+            unreachable!()
+        };
+        hello.feature_caps = feature_caps;
+        ControlMessage::Hello2(hello)
+    }
+
+    fn sized_request(max_media_dgram: u16) -> ControlMessage {
+        ControlMessage::KeyframeRequest(KeyframeRequest {
+            stream_epoch: 7,
+            last_complete_seq: 0,
+            reason: KeyframeReason::Startup,
+            max_media_dgram,
+        })
+    }
+
+    fn heartbeat_of(actions: &Actions) -> eternal_wire::v2::control::Heartbeat {
+        match eternal_wire::v2::control::parse_control(&actions.replies[0].1)
+            .unwrap()
+            .1
+        {
+            ControlMessage::Heartbeat(heartbeat) => heartbeat,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Only an iPad that says it may ask for smaller media datagrams hears
+    /// that the host takes them, and gets the frame count in heartbeats.
+    /// Any other iPad gets the reply and heartbeats it always did.
+    #[test]
+    fn media_size_is_offered_only_to_an_ipad_that_asks() {
+        let peer = addr([10, 0, 0, 5], 50000);
+        let now = Instant::now();
+        for (feature_caps, offered) in [(FEATURE_MEDIA_SIZE, true), (0, false)] {
+            let mut session = Session::new(1234);
+            let accepted = session.handle_control(
+                peer,
+                0,
+                media_size_hello(1, feature_caps),
+                &TestConfig,
+                now,
+            );
+            let ack = parse_ack(&accepted.replies[0].1);
+            assert_eq!(ack.host_caps & HOSTCAP_MEDIA_SIZE != 0, offered);
+            assert_eq!(ack.host_caps & !HOSTCAP_MEDIA_SIZE, HOSTCAP_NACK);
+            let id = session.session_id().unwrap();
+            for _ in 0..3 {
+                assert!(session.may_send_media(id, 1000, now));
+            }
+            let ticked = session.tick(&TestConfig, true, now + Duration::from_millis(100));
+            assert_eq!(
+                heartbeat_of(&ticked).frames_sent,
+                offered.then_some(3),
+                "{feature_caps}"
+            );
+            // The heartbeat an older iPad gets is the plain one.
+            if !offered {
+                assert_eq!(
+                    ticked.replies[0].1.len(),
+                    eternal_wire::v2::control::CONTROL_HEADER_SIZE
+                        + 8
+                        + eternal_wire::v2::control::STREAM_CONFIG_SIZE
+                );
+            }
+        }
+        // A refusal never offers it.
+        let mut busy = Session::new(1234);
+        busy.handle_control(
+            peer,
+            0,
+            media_size_hello(1, FEATURE_MEDIA_SIZE),
+            &TestConfig,
+            now,
+        );
+        let refused = busy.handle_control(
+            addr([10, 0, 0, 6], 50000),
+            0,
+            media_size_hello(2, FEATURE_MEDIA_SIZE),
+            &TestConfig,
+            now,
+        );
+        let ack = parse_ack(&refused.replies[0].1);
+        assert_eq!(ack.status, HelloStatus::Busy);
+        assert_eq!(ack.host_caps & HOSTCAP_MEDIA_SIZE, 0);
+    }
+
+    /// A smaller size restarts the picture at once, inside the keyframe
+    /// rate limit, and holds for the rest of the session: never larger,
+    /// never under the minimum. A new session starts at the PC's size.
+    #[test]
+    fn a_smaller_media_size_lowers_only_this_session_and_forces_an_idr() {
+        let peer = addr([10, 0, 0, 5], 50000);
+        let now = Instant::now();
+        let mut session = Session::new(1234);
+        session.handle_control(
+            peer,
+            0,
+            media_size_hello(1, FEATURE_MEDIA_SIZE),
+            &TestConfig,
+            now,
+        );
+        let id = session.session_id().unwrap();
+        assert_eq!(session.max_media_dgram(id), None);
+
+        let plain = session.handle_control_authed(peer, sized_request(0), &TestConfig, now);
+        assert!(plain.force_idr);
+        assert_eq!(session.max_media_dgram(id), None);
+
+        let at = |millis| now + Duration::from_millis(millis);
+        for (millis, asked, size, idr) in [
+            (100, 1200, 1200, true),
+            (200, 1200, 1200, false),
+            (300, 1300, 1200, false),
+            (400, 576, 576, true),
+            (450, 100, 576, false),
+        ] {
+            let actions =
+                session.handle_control_authed(peer, sized_request(asked), &TestConfig, at(millis));
+            assert_eq!(session.max_media_dgram(id), Some(size), "{asked}");
+            assert_eq!(actions.force_idr, idr, "{asked}");
+            assert!(actions.replies.is_empty() && actions.new_target.is_none());
+        }
+        assert_eq!(session.max_media_dgram(id.wrapping_add(1)), None);
+
+        session.handle_control(
+            peer,
+            0,
+            media_size_hello(2, FEATURE_MEDIA_SIZE),
+            &TestConfig,
+            at(500),
+        );
+        let next = session.session_id().unwrap();
+        assert_ne!(next, id);
+        assert_eq!(session.max_media_dgram(next), None);
+    }
+
+    /// An iPad that didn't say it may ask has its request read as the
+    /// keyframe request it always was.
+    #[test]
+    fn a_media_size_from_an_ipad_that_did_not_offer_is_ignored() {
+        let peer = addr([10, 0, 0, 5], 50000);
+        let now = Instant::now();
+        let mut session = Session::new(1234);
+        session.handle_control(peer, 0, media_size_hello(1, 0), &TestConfig, now);
+        let id = session.session_id().unwrap();
+        let first = session.handle_control_authed(peer, sized_request(576), &TestConfig, now);
+        assert!(first.force_idr);
+        let second = session.handle_control_authed(
+            peer,
+            sized_request(576),
+            &TestConfig,
+            now + Duration::from_millis(100),
+        );
+        assert!(!second.force_idr, "rate limited as any keyframe request");
+        assert_eq!(session.max_media_dgram(id), None);
     }
 
     struct PairConfig(parking_lot::Mutex<crate::pairing::Pairing>);
@@ -3418,6 +3638,7 @@ mod tests {
                 reason: EndReason::Goodbye(ByeReason::UserDisconnect),
                 first_video: Some(Duration::from_millis(40)),
                 frames_received: true,
+                frags_received: false,
                 duration: Duration::from_secs(2),
             }
         );
@@ -3668,6 +3889,7 @@ mod tests {
                 reason: EndReason::Refused(HelloStatus::VersionUnsupported),
                 first_video: None,
                 frames_received: false,
+                frags_received: false,
                 duration: Duration::ZERO,
             }
         );
@@ -3890,6 +4112,7 @@ mod tests {
             stream_epoch: 7,
             last_complete_seq: 10,
             reason: KeyframeReason::GapLoss,
+            max_media_dgram: 0,
         });
         let ping = ControlMessage::Ping(eternal_wire::v2::control::Ping { t1_us: 1 });
         let nack = ControlMessage::Nack(Nack {
@@ -4368,6 +4591,7 @@ mod tests {
                 stream_epoch: 7,
                 last_complete_seq: 0,
                 reason: KeyframeReason::Startup,
+                max_media_dgram: 0,
             }),
             ControlMessage::Nack(Nack {
                 stream_epoch: 7,

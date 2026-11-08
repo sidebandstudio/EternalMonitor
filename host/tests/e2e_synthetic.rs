@@ -707,6 +707,7 @@ fn run_slow_usb(bytes_per_sec: f64, run_for: Duration) -> SlowUsbRun {
                             stream_epoch: epoch,
                             last_complete_seq: seq,
                             reason: KeyframeReason::GapLoss,
+                            max_media_dgram: 0,
                         });
                         write_datagram(&mut stream, &encode_control(session_id, msg_seq, &request))
                             .await
@@ -913,6 +914,7 @@ fn lossy_wifi_recovery_measurement() {
                     stream_epoch: c.stream_epoch,
                     last_complete_seq: assembler.latest_completed_seq(),
                     reason: KeyframeReason::GapLoss,
+                    max_media_dgram: 0,
                 }));
             }
         }
@@ -1584,6 +1586,123 @@ fn audio_stream_end_to_end() {
     }
 }
 
+/// What one fake iPad saw for `window`: the largest media datagram, whether
+/// a keyframe came, and the latest heartbeat frame count.
+fn media_seen(receiver: &mut FakeReceiver, window: Duration) -> (usize, bool, Option<u32>) {
+    let started = Instant::now();
+    let mut buffer = [0; 2048];
+    let (mut largest, mut keyframe, mut frames_sent) = (0, false, None);
+    while started.elapsed() < window {
+        receiver.maybe_report(0, 0);
+        let Ok((len, _)) = receiver.socket.recv_from(&mut buffer) else {
+            continue;
+        };
+        match classify(&buffer[..len]) {
+            Classified::Media { flags } => {
+                largest = largest.max(len);
+                keyframe |= flags & 1 != 0;
+            }
+            Classified::Control(_) => {
+                if let Ok((_, ControlMessage::Heartbeat(heartbeat))) = parse_control(&buffer[..len])
+                {
+                    frames_sent = heartbeat.frames_sent;
+                }
+            }
+            _ => {}
+        }
+    }
+    (largest, keyframe, frames_sent)
+}
+
+/// An iPad that said it may ask for smaller media datagrams gets them for
+/// the rest of its session, starting with a keyframe, and heartbeats that
+/// count the frames sent. An iPad that didn't say so gets neither, and its
+/// request is the keyframe request it always was.
+#[test]
+fn an_ipad_gets_the_smaller_media_datagrams_it_asks_for() {
+    use eternal_wire::v2::control::{FEATURE_MEDIA_SIZE, HOSTCAP_MEDIA_SIZE};
+    let _env = test_env();
+    init_test_tracing();
+    ffmpeg_next::init().unwrap();
+    std::env::set_var("ETERNAL_CAPTURE", "synthetic");
+    std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
+    for name in ["ETERNAL_DROP", "ETERNAL_REORDER", "ETERNAL_JITTER_MS"] {
+        std::env::remove_var(name);
+    }
+    let listen_port = free_udp_port();
+    let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
+    shared.pairing.lock().required = false;
+    *shared.encoder_override.lock() = Some("libx264".into());
+    let (supervisor_tx, supervisor_rx) = mpsc::channel();
+    let supervisor_shared = shared.clone();
+    let supervisor_sender = supervisor_tx.clone();
+    let supervisor = std::thread::spawn(move || {
+        eternal_host::supervisor::run(
+            listen_port,
+            supervisor_shared,
+            GpuInfo::software_fallback(),
+            supervisor_sender,
+            supervisor_rx,
+        )
+    });
+
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let sized = |max_media_dgram| {
+            ControlMessage::KeyframeRequest(KeyframeRequest {
+                stream_epoch: 0,
+                last_complete_seq: 0,
+                reason: KeyframeReason::Startup,
+                max_media_dgram,
+            })
+        };
+        for offered in [true, false] {
+            let features = if offered { FEATURE_MEDIA_SIZE } else { 0 };
+            let mut receiver = FakeReceiver::connect_full(listen_port, CAP_DECODE_H264, features);
+            assert_eq!(receiver.host_caps & HOSTCAP_MEDIA_SIZE != 0, offered);
+            let (largest, _, frames_sent) = media_seen(&mut receiver, Duration::from_secs(2));
+            assert!(
+                largest > 1000,
+                "{offered}: the keyframe goes in full-size datagrams ({largest})"
+            );
+            assert_eq!(
+                frames_sent.is_some_and(|frames| frames > 0),
+                offered,
+                "{frames_sent:?}"
+            );
+            if !offered {
+                assert_eq!(frames_sent, None);
+            }
+
+            receiver.send(&sized(576));
+            // Frames already queued may still be large; what follows isn't.
+            let (_, queued_keyframe, _) = media_seen(&mut receiver, Duration::from_millis(500));
+            let (largest, keyframe, _) = media_seen(&mut receiver, Duration::from_secs(2));
+            if offered {
+                assert!(
+                    queued_keyframe || keyframe,
+                    "the smaller size starts with a keyframe"
+                );
+                assert!(largest > 0 && largest <= 576, "{largest}");
+            } else {
+                assert!(largest > 576, "{largest}");
+            }
+            receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        // The size was this session's: the next one starts at the PC's.
+        let mut receiver =
+            FakeReceiver::connect_full(listen_port, CAP_DECODE_H264, FEATURE_MEDIA_SIZE);
+        let (largest, _, _) = media_seen(&mut receiver, Duration::from_secs(2));
+        assert!(largest > 1000, "{largest}");
+        receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
+    }));
+    let _ = supervisor_tx.send(SupervisorCommand::Shutdown);
+    supervisor.join().unwrap();
+    if let Err(panic) = outcome {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 /// Native first-second audio measurement across repeated connects with the
 /// PC's real WASAPI loopback (inaudible: it only reads the mix).
 #[cfg(windows)]
@@ -1789,6 +1908,7 @@ fn synthetic_stream_end_to_end_v2() {
                         stream_epoch: header.stream_epoch,
                         last_complete_seq: header.frame_seq,
                         reason: KeyframeReason::GapLoss,
+                        max_media_dgram: 0,
                     }));
                 }
                 if let Some(at) = keyframe_requested_at {
@@ -2210,6 +2330,7 @@ fn lossy_stream_recovers_and_adapts() {
                 stream_epoch: epoch,
                 last_complete_seq: seq,
                 reason: KeyframeReason::GapLoss,
+                max_media_dgram: 0,
             }));
         }
         for frame in assembler.take_ready() {
@@ -2379,6 +2500,7 @@ fn lossy_legacy_stream_uses_keyframe_recovery() {
                 stream_epoch: current_epoch,
                 last_complete_seq: highest_seq,
                 reason: KeyframeReason::GapLoss,
+                max_media_dgram: 0,
             }));
         }
 

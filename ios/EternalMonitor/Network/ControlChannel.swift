@@ -324,7 +324,10 @@ final class ControlChannel {
         timer.resume()
     }
 
-    func sendKeyframeRequest(streamEpoch: UInt32, lastCompleteSeq: UInt32, reason: KeyframeReason) {
+    /// `maxMediaDgram` asks the PC for media datagrams no larger, for the
+    /// rest of the session; only a PC with `HelloAck.hostCapMediaSize` gets it.
+    func sendKeyframeRequest(streamEpoch: UInt32, lastCompleteSeq: UInt32, reason: KeyframeReason,
+                             maxMediaDgram: UInt16 = 0) {
         queue.async { [self] in
             guard sessionId != 0 else { return }
             let now = nowUs()
@@ -332,12 +335,14 @@ final class ControlChannel {
             // dropped frames' own requests then keep the spacing busy, and
             // would always hide it from the PC's log.
             if reason != .startup, let last = lastKeyframeRequestUs, now &- last < Self.keyframeRequestSpacingUs { return }
+            let maxMediaDgram = hostCaps & HelloAck.hostCapMediaSize != 0 ? maxMediaDgram : 0
             lastKeyframeRequestUs = now
-            onDiagnostic?("Requesting keyframe (\(reason))")
+            onDiagnostic?("Requesting keyframe (\(reason))" + (maxMediaDgram == 0 ? "" : " with media datagrams up to \(maxMediaDgram) bytes"))
             sendMessage(.keyframeRequest(KeyframeRequest(
                 streamEpoch: streamEpoch,
                 lastCompleteSeq: lastCompleteSeq,
-                reason: reason
+                reason: reason,
+                maxMediaDgram: maxMediaDgram
             )))
         }
     }

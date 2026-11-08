@@ -285,6 +285,78 @@ final class FakeUDPHost: @unchecked Sendable {
         return requests
     }
 
+    /// What `servePath` saw the iPad do.
+    struct PathRun {
+        /// The media datagram sizes the iPad asked for, in turn.
+        var sizesAsked: [UInt16] = []
+        /// Keyframe requests that asked for no size.
+        var plainKeyframeRequests = 0
+        var identifyAnswers = 0
+    }
+
+    /// Plays a PC whose media reaches the iPad only in datagrams of at most
+    /// `limit` bytes (0: none at all), as over a path that drops larger ones.
+    /// Accepts the next HELLO2 with `hostCaps`, then until `stop` says so,
+    /// about every 100 ms, sends a heartbeat (counting the frames sent when
+    /// `countFrames`) and `frame` as the next keyframe, cut at the size the
+    /// iPad asked for. Answers identify requests as the PC holding `token`
+    /// receiving on `addresses`, to whichever socket asks.
+    func servePath(limit: Int, frame: Data, hostCaps: UInt16, countFrames: Bool = true, token: Data = Data(17...32),
+                   addresses: [Data] = [Data([127, 0, 0, 1])], until stop: () -> Bool) -> PathRun {
+        var run = PathRun()
+        var size = Wire.maxDatagramSize
+        var framesSent: UInt32 = 0
+        var lastSent = Date.distantPast
+        let deadline = Date().addingTimeInterval(60)
+        while !stop(), Date() < deadline {
+            if let (data, from, length) = receive() {
+                switch Wire.parseControl(data)?.message {
+                case .hello2(let hello)? where client == nil:
+                    client = (from, length)
+                    lastNonce = hello.clientNonce
+                    send(Self.ack(nonce: hello.clientNonce, authToken: token, hostCaps: hostCaps))
+                case .keyframeRequest(let request)?:
+                    if request.maxMediaDgram == 0 {
+                        run.plainKeyframeRequests += 1
+                    } else {
+                        run.sizesAsked.append(request.maxMediaDgram)
+                        size = min(size, Int(request.maxMediaDgram))
+                    }
+                case .identify(let request)?:
+                    run.identifyAnswers += 1
+                    let answer = Wire.encodeControl(sessionId: 0, msgSeq: 1, message: .identity(WireIdentity(
+                        nonce: request.nonce, port: port, addresses: addresses,
+                        proof: MovedPC.proof(token: token, nonce: request.nonce, port: port, addresses: addresses))))
+                    var to = from
+                    _ = answer.withUnsafeBytes { bytes in
+                        withUnsafePointer(to: &to) { pointer in
+                            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                                sendto(fd, bytes.baseAddress, bytes.count, 0, $0, length)
+                            }
+                        }
+                    }
+                default:
+                    break
+                }
+            }
+            guard client != nil, Date().timeIntervalSince(lastSent) >= 0.1 else { continue }
+            lastSent = Date()
+            framesSent += 1
+            let payload = size - MediaHeader.size
+            let count = (frame.count + payload - 1) / payload
+            for index in 0..<count {
+                let part = Data(frame[(frame.startIndex + index * payload)..<min(frame.endIndex, frame.startIndex + (index + 1) * payload)])
+                let datagram = MediaHeader(sessionId: 41, streamEpoch: 1, frameSeq: framesSent, fragIndex: UInt16(index),
+                    fragCount: UInt16(count), isKeyframe: true, captureTimestampUs: UInt64(framesSent) * 16_667,
+                    payloadLen: UInt16(part.count)).encode(payload: part)
+                if datagram.count <= limit { send(datagram) }
+            }
+            send(Wire.encodeControl(sessionId: 41, msgSeq: 3 + framesSent, message: .heartbeat(
+                Heartbeat(hostTimeUs: 0, streamConfig: StreamConfig(), framesSent: countFrames ? framesSent : nil))))
+        }
+        return run
+    }
+
     /// The BYE reasons received until the iPad has been quiet for 300 ms.
     /// Unanswered HELLO2 attempts (distinct client nonces) received within
     /// `seconds`.

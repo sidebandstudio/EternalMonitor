@@ -44,6 +44,11 @@ pub const FEATURE_STANDBY_STATUS: u16 = 1 << 3;
 /// The iPad app checks for its own updates (0.3.2 and later), so a HELLO2
 /// without it comes from 0.3.1 or older. Older hosts ignore it.
 pub const FEATURE_CHECKS_UPDATES: u16 = 1 << 4;
+/// The iPad may ask for smaller media datagrams in a
+/// [`KeyframeRequest::max_media_dgram`], and wants [`Heartbeat::frames_sent`]
+/// to tell a PC that sends nothing from video lost on the way (0.3.5 and
+/// later). Bit 5 is taken by another change in flight.
+pub const FEATURE_MEDIA_SIZE: u16 = 1 << 6;
 pub const HOSTCAP_NACK: u16 = 1 << 0;
 pub const HOSTCAP_AUDIO: u16 = 1 << 1;
 pub const HOSTCAP_USB: u16 = 1 << 2;
@@ -57,6 +62,14 @@ pub const HOSTCAP_PEN: u16 = 1 << 4;
 /// session, and iPads read an accepted reply without it as a PC to update,
 /// so it stays set there.
 pub const HOSTCAP_CONTIGUOUS_FRAME_SEQ: u16 = 1 << 5;
+/// The host honours [`KeyframeRequest::max_media_dgram`] for the rest of the
+/// session and puts [`Heartbeat::frames_sent`] in its heartbeats. Set only
+/// for an iPad whose HELLO2 has [`FEATURE_MEDIA_SIZE`], so an older iPad
+/// gets the same bytes as before. Bit 6 is taken by another change in flight.
+pub const HOSTCAP_MEDIA_SIZE: u16 = 1 << 7;
+/// The smallest media datagram an iPad may ask for: the IPv4 minimum
+/// reassembly size, also the smallest packet size the PC's own setting takes.
+pub const MIN_MEDIA_DGRAM: u16 = 576;
 
 /// [`StreamConfig::flags`] bits.
 pub const STREAM_FLAG_SOFTWARE_ENCODER: u8 = 1 << 0;
@@ -271,6 +284,10 @@ pub struct Heartbeat {
     pub stream_config: StreamConfig,
     /// What the iPad should say over the picture, for as long as it lasts.
     pub notice: u8,
+    /// Video frames sent to this session so far, for an iPad that set
+    /// [`FEATURE_MEDIA_SIZE`]; `None` for others. Appended after `notice`,
+    /// which is then always written.
+    pub frames_sent: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -323,6 +340,11 @@ pub struct KeyframeRequest {
     pub stream_epoch: u32,
     pub last_complete_seq: u32,
     pub reason: KeyframeReason,
+    /// The largest media datagram the client asks for from now on in this
+    /// session, at least [`MIN_MEDIA_DGRAM`]; 0 asks nothing. Appended
+    /// (0.3.5): sent only to a host with [`HOSTCAP_MEDIA_SIZE`], and older
+    /// hosts ignore it as any trailing body bytes.
+    pub max_media_dgram: u16,
 }
 
 /// Requests missing fragments from one frame. Indices are unique and sorted.
@@ -566,8 +588,11 @@ pub fn encode_control(session_id: u32, msg_seq: u32, message: &ControlMessage) -
             let mut cfg = [0u8; STREAM_CONFIG_SIZE];
             hb.stream_config.encode_into(&mut cfg);
             body.extend_from_slice(&cfg);
-            if hb.notice != NOTICE_NONE {
+            if hb.notice != NOTICE_NONE || hb.frames_sent.is_some() {
                 body.push(hb.notice);
+            }
+            if let Some(frames) = hb.frames_sent {
+                body.extend_from_slice(&frames.to_le_bytes());
             }
         }
         ControlMessage::Bye(reason) => body.push(*reason as u8),
@@ -575,6 +600,9 @@ pub fn encode_control(session_id: u32, msg_seq: u32, message: &ControlMessage) -
             body.extend_from_slice(&k.stream_epoch.to_le_bytes());
             body.extend_from_slice(&k.last_complete_seq.to_le_bytes());
             body.push(k.reason as u8);
+            if k.max_media_dgram != 0 {
+                body.extend_from_slice(&k.max_media_dgram.to_le_bytes());
+            }
         }
         ControlMessage::Nack(n) => {
             n.validate().expect("invalid outgoing NACK");
@@ -785,6 +813,11 @@ pub fn parse_control(datagram: &[u8]) -> Result<(ControlHeader, ControlMessage),
             } else {
                 NOTICE_NONE
             },
+            frames_sent: if r.remaining() >= 4 {
+                Some(r.u32()?)
+            } else {
+                None
+            },
         }),
         PacketType::Bye => ControlMessage::Bye(
             ByeReason::from_u8(r.u8()?).ok_or(WireError::InvalidField("bye_reason"))?,
@@ -794,6 +827,7 @@ pub fn parse_control(datagram: &[u8]) -> Result<(ControlHeader, ControlMessage),
             last_complete_seq: r.u32()?,
             reason: KeyframeReason::from_u8(r.u8()?)
                 .ok_or(WireError::InvalidField("keyframe_reason"))?,
+            max_media_dgram: if r.remaining() >= 2 { r.u16()? } else { 0 },
         }),
         PacketType::Nack => {
             let stream_epoch = r.u32()?;
@@ -1134,12 +1168,26 @@ mod tests {
                 host_time_us: 987_654_321,
                 stream_config: sample_config(),
                 notice: NOTICE_NONE,
+                frames_sent: None,
+            }),
+            ControlMessage::Heartbeat(Heartbeat {
+                host_time_us: 987_654_321,
+                stream_config: sample_config(),
+                notice: NOTICE_NONE,
+                frames_sent: Some(0),
             }),
             ControlMessage::Bye(ByeReason::AppBackground),
             ControlMessage::KeyframeRequest(KeyframeRequest {
                 stream_epoch: 3,
                 last_complete_seq: 4111,
                 reason: KeyframeReason::GapLoss,
+                max_media_dgram: 0,
+            }),
+            ControlMessage::KeyframeRequest(KeyframeRequest {
+                stream_epoch: 3,
+                last_complete_seq: 0,
+                reason: KeyframeReason::Startup,
+                max_media_dgram: 1200,
             }),
             ControlMessage::ReceiverReport(ReceiverReport {
                 stream_epoch: 3,
@@ -1232,6 +1280,7 @@ mod tests {
                 host_time_us: 987_654_321,
                 stream_config: sample_config(),
                 notice,
+                frames_sent: None,
             })
         };
         // No notice: the bytes every earlier iPad already reads.
@@ -1250,6 +1299,53 @@ mod tests {
             }
         }
         assert_eq!(parse_control(&plain).unwrap().1, heartbeat(NOTICE_NONE));
+    }
+
+    /// The media size fields are appended: without them the bytes are the
+    /// ones every earlier PC and iPad reads, and a body cut back to the old
+    /// length, as an older parser reads it, is the request without them.
+    #[test]
+    fn the_media_size_fields_are_appended_only_when_set() {
+        let request = |max_media_dgram| {
+            ControlMessage::KeyframeRequest(KeyframeRequest {
+                stream_epoch: 3,
+                last_complete_seq: 0,
+                reason: KeyframeReason::Startup,
+                max_media_dgram,
+            })
+        };
+        let plain = encode_control(7, 1, &request(0));
+        assert_eq!(plain.len(), CONTROL_HEADER_SIZE + 9);
+        let sized = encode_control(7, 1, &request(576));
+        assert_eq!(sized.len(), plain.len() + 2);
+        assert_eq!(sized[8..plain.len()], plain[8..]);
+        assert_eq!(&sized[plain.len()..], &576u16.to_le_bytes());
+        assert_eq!(parse_control(&sized).unwrap().1, request(576));
+        assert_eq!(parse_control(&plain).unwrap().1, request(0));
+
+        let heartbeat = |notice, frames_sent| {
+            ControlMessage::Heartbeat(Heartbeat {
+                host_time_us: 987_654_321,
+                stream_config: sample_config(),
+                notice,
+                frames_sent,
+            })
+        };
+        let plain = encode_control(7, 1, &heartbeat(NOTICE_NONE, None));
+        // The count needs the notice byte before it, even with no notice.
+        let counted = encode_control(7, 1, &heartbeat(NOTICE_NONE, Some(0x0102_0304)));
+        assert_eq!(counted.len(), plain.len() + 5);
+        assert_eq!(counted[8..plain.len()], plain[8..]);
+        assert_eq!(&counted[plain.len()..], &[NOTICE_NONE, 4, 3, 2, 1]);
+        assert_eq!(
+            parse_control(&counted).unwrap().1,
+            heartbeat(NOTICE_NONE, Some(0x0102_0304))
+        );
+        let locked = encode_control(7, 1, &heartbeat(NOTICE_PC_LOCKED, Some(9)));
+        assert_eq!(
+            parse_control(&locked).unwrap().1,
+            heartbeat(NOTICE_PC_LOCKED, Some(9))
+        );
     }
 
     #[test]
