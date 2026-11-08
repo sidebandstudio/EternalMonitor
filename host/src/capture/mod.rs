@@ -1103,6 +1103,27 @@ impl Picture {
     }
 }
 
+/// Naps up to `total` in slices of at most 50 ms, calling `heartbeat` before
+/// each, and stops as soon as `wake` says to: a viewer that connected during
+/// the idle throttle's 250 ms nap waited out the rest of it before capture
+/// resent the picture.
+#[cfg(any(windows, test))]
+pub(crate) fn nap_unless(
+    total: Duration,
+    mut wake: impl FnMut() -> bool,
+    mut heartbeat: impl FnMut(),
+    mut sleep: impl FnMut(Duration),
+) {
+    const SLICE: Duration = Duration::from_millis(50);
+    let mut left = total;
+    while !left.is_zero() && !wake() {
+        heartbeat();
+        let nap = left.min(SLICE);
+        sleep(nap);
+        left -= nap;
+    }
+}
+
 /// How long a mirror's new duplication may go without an image before its
 /// start picture is read through GDI instead (see [`StartPicture`]).
 #[cfg(any(windows, test))]
@@ -1449,6 +1470,42 @@ mod tests {
         let taken = consumer.take_within(Duration::from_secs(1), &mut kept);
         assert!(matches!(taken, super::Taken::Frame(frame) if frame.frame_number == 1));
         assert!(kept.is_none());
+    }
+
+    #[test]
+    fn the_idle_nap_ends_when_a_viewer_connects() {
+        let slept = std::cell::RefCell::new(Vec::new());
+        let checks = std::cell::Cell::new(0);
+        super::nap_unless(
+            Duration::from_millis(250),
+            || {
+                checks.set(checks.get() + 1);
+                checks.get() > 2
+            },
+            || {},
+            |nap| slept.borrow_mut().push(nap),
+        );
+        let total: Duration = slept.borrow().iter().sum();
+        assert!(
+            total <= Duration::from_millis(100),
+            "napped {total:?} after the viewer connected"
+        );
+        assert!(slept
+            .borrow()
+            .iter()
+            .all(|nap| *nap <= Duration::from_millis(50)));
+        // Nobody connects: the whole nap.
+        let slept = std::cell::RefCell::new(Vec::new());
+        super::nap_unless(
+            Duration::from_millis(250),
+            || false,
+            || {},
+            |nap| slept.borrow_mut().push(nap),
+        );
+        assert_eq!(
+            slept.borrow().iter().sum::<Duration>(),
+            Duration::from_millis(250)
+        );
     }
 
     #[test]

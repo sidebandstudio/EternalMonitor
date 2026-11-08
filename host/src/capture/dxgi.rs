@@ -18,7 +18,7 @@ use super::recovery::{
 };
 use super::{
     acquired, client_connected, composite_pointer, frame_budget_for, frame_buffer, heartbeat,
-    idle_heartbeat, keepalive_allowed, keepalive_due, pointer_apart, pointer_place,
+    idle_heartbeat, keepalive_allowed, keepalive_due, nap_unless, pointer_apart, pointer_place,
     read_back_image, reconcile_virtual_display, recovery_poll, redraw_cached, resolve_target,
     Acquired, FrameSlot, FrameUse, IdleGate, OutputInfo, Picture, PointerPlace, RawFrame, Redraw,
     StartPicture, ACQUIRE_TIMEOUT_MS, FPS_WINDOW, FRAME_PADDING, PICTURE_HOLD,
@@ -750,13 +750,21 @@ pub fn run_capture_loop(
                     && last_send.elapsed() >= Duration::from_secs(2)
                 {
                     // Idle throttle: nobody is watching and the desktop is
-                    // static — stop spinning at capture rate. 4 Hz polling
-                    // still notices a client promptly (registration also
-                    // restarts the pipeline for virtual-display targets).
-                    // The 250 ms naps stay far under the supervisor's 3 s
-                    // loop-heartbeat wedge threshold.
-                    idle_heartbeat(&shared, crate::clock::host_now_us() / 1000);
-                    std::thread::sleep(Duration::from_millis(250));
+                    // static — stop spinning at capture rate. 4 Hz polling,
+                    // whose nap ends within 50 ms of a client connecting
+                    // (registration also restarts the pipeline for
+                    // virtual-display targets). The 250 ms naps stay far
+                    // under the supervisor's 3 s loop-heartbeat wedge
+                    // threshold.
+                    nap_unless(
+                        Duration::from_millis(250),
+                        || {
+                            client_connected(&shared)
+                                || !super::capture_is_current(&shared, generation)
+                        },
+                        || idle_heartbeat(&shared, crate::clock::host_now_us() / 1000),
+                        std::thread::sleep,
+                    );
                 }
                 continue;
             }
