@@ -205,6 +205,7 @@ final class OldPCTests: XCTestCase {
 
         // An old PC was found at 192.0.2.40 earlier and left.
         PCVersions.record("0.3.2", name: "EternalMonitor (Gone)", address: "192.0.2.40")
+        addTeardownBlock { await MainActor.run { PCVersions.forget(name: "EternalMonitor (Gone)", address: "192.0.2.40") } }
         let scanner = NetworkScanner()
         scanner.resolveIPv4 = { _ in "192.0.2.40" }
         let beta = DiscoveredHost.resolved(name: "EternalMonitor (New)", port: 9876, addresses: [ipv6],
@@ -214,6 +215,7 @@ final class OldPCTests: XCTestCase {
         scanner.lookUpIPv4(hostName: "new.local.", service: beta)
         let deadline = Date().addingTimeInterval(10)
         while scanner.hosts.first?.address == nil, Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertNotNil(scanner.hosts.first?.address, "the IPv4 lookup didn't answer")
         XCTAssertEqual(scanner.hosts.map(\.address), ["192.0.2.40"])
         XCTAssertEqual(scanner.hosts.first?.version, "0.3.4-beta.20261107.1")
 
@@ -230,7 +232,8 @@ final class OldPCTests: XCTestCase {
         scanner.resolveIPv4 = { _ in "192.0.2.41" }
         scanner.merge(old)
         scanner.lookUpIPv4(hostName: "old.local.", service: old)
-        while scanner.hosts.first(where: { $0.name == old.name })?.address == nil, Date() < deadline {
+        let oldDeadline = Date().addingTimeInterval(10)
+        while scanner.hosts.first(where: { $0.name == old.name })?.address == nil, Date() < oldDeadline {
             try await Task.sleep(nanoseconds: 10_000_000)
         }
         prompt.discovered(scanner.hosts)
@@ -287,7 +290,7 @@ final class OldPCTests: XCTestCase {
         var lines: [String] = []
         let prompt = OldPCPrompt(defaults: defaults(), now: { Date() }, log: { lines.append($0) })
         prompt.discovered([service("Studio", at: "192.0.2.10", version: "0.3.4")])
-        prompt.answered(hostName: "Office", pairingToken: tokenB, hostCaps: currentCaps, address: nil)
+        prompt.answered(hostName: "Den", pairingToken: tokenC, hostCaps: currentCaps, address: nil)
         prompt.show()
         XCTAssertNil(prompt.card)
 
@@ -303,6 +306,55 @@ final class OldPCTests: XCTestCase {
         prompt.answered(hostName: "Office", pairingToken: tokenB, hostCaps: currentCaps, address: "192.0.2.20")
         XCTAssertNil(prompt.card)
         XCTAssertEqual(lines, ["old_pc_prompt shown=true version=0.3.2"])
+    }
+
+    /// r2: a PC streaming over USB has no address to link, so its session
+    /// links the service every PC registers, "EternalMonitor (<its name>)".
+    /// The same PC over USB and in the search gets one card, in either
+    /// order, and a proof over USB holds against its stale TXT record.
+    func testAUSBSessionAndItsOwnServiceAreOnePC() {
+        for usbFirst in [true, false] {
+            var lines: [String] = []
+            let prompt = OldPCPrompt(defaults: defaults(), now: { Date() }, log: { lines.append($0) })
+            let steps: [() -> Void] = [
+                { prompt.answered(hostName: "Studio", pairingToken: self.tokenA, hostCaps: self.oldCaps, address: nil) },
+                { prompt.discovered([self.service("Studio", at: "192.0.2.10", version: "0.3.3")]) },
+            ]
+            for step in usbFirst ? steps : steps.reversed() {
+                step()
+                prompt.show()
+                prompt.close()
+            }
+            XCTAssertEqual(lines.count, 1, "usbFirst \(usbFirst): \(lines)")
+        }
+
+        let prompt = OldPCPrompt(defaults: defaults(), now: { Date() }, log: { _ in })
+        prompt.answered(hostName: "Studio", pairingToken: tokenA, hostCaps: currentCaps, address: nil)
+        prompt.discovered([service("Studio", at: "192.0.2.10", version: "0.3.3")])
+        prompt.show()
+        XCTAssertNil(prompt.card, "proved current over USB")
+    }
+
+    /// r2: a link never takes a service, or a proof, from another PC. Here
+    /// the search still lists A at an address B answers at now.
+    func testALinkNeverTakesAnotherPCsProof() {
+        let prompt = OldPCPrompt(defaults: defaults(), now: { Date() }, log: { _ in })
+        let a = service("A", at: "192.0.2.60", version: nil)
+        prompt.discovered([a])
+        prompt.answered(hostName: "A", pairingToken: Data(count: 16), hostCaps: currentCaps, address: "192.0.2.60")
+        let proof = OldPCPrompt.serviceKey(a.name)
+        XCTAssertEqual(prompt.memory.pcs[proof]?.current, true)
+
+        prompt.answered(hostName: "B", pairingToken: tokenB, hostCaps: oldCaps, address: "192.0.2.60")
+        let memory = prompt.memory
+        XCTAssertEqual(memory.pcs[proof]?.current, true, "A's proof stays")
+        XCTAssertNil(memory.services[a.name], "A's service isn't B's")
+        prompt.show()
+        XCTAssertEqual(prompt.card?.pc, "B", "B is old")
+        prompt.close()
+        prompt.discovered([service("A", at: "192.0.2.61", version: "0.3.3")])
+        prompt.show()
+        XCTAssertNil(prompt.card, "A proved current")
     }
 
     /// Only the last few PCs are kept, with their links.
@@ -322,6 +374,13 @@ final class OldPCTests: XCTestCase {
         XCTAssertEqual(memory.services.count, OldPCPrompt.kept)
         XCTAssertNil(memory.services["EternalMonitor (PC 0)"])
         XCTAssertNotNil(memory.services["EternalMonitor (PC \(OldPCPrompt.kept + 3))"])
+
+        // One PC found under many names keeps a few links.
+        for index in 0..<(OldPCPrompt.kept * 3) {
+            prompt.connecting(service: "EternalMonitor (Alias \(index))", address: "198.51.100.\(index)")
+            prompt.answered(hostName: "Alias", pairingToken: tokenA, hostCaps: oldCaps, address: "198.51.100.\(index)")
+        }
+        XCTAssertEqual(prompt.memory.services.count, OldPCPrompt.kept * 2)
     }
 
     /// One session with `host`, answered with `status` and `caps`.

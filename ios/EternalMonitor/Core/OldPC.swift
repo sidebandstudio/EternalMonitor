@@ -38,11 +38,12 @@ enum OldPC {
 ///
 /// A PC is known by its pairing token (hashed) when it has one, otherwise by
 /// its Bonjour service name, which is unique on a network, and last by the
-/// name it answers with. A service the user tapped, or the one the search
-/// lists at the session's address right now, is linked to the PC that
-/// answered there. What a session showed about a PC outlasts the session:
-/// a PC that proved current gets no card from a later Bonjour record. Links
-/// only ever keep a card away.
+/// name it answers with. A session links one service to the PC that
+/// answered: the one the user tapped, the one the search lists at the
+/// session's address right now, or else the PC's own. What a session showed
+/// about a PC outlasts the session: a PC that proved current gets no card
+/// from a later Bonjour record. Links only ever keep a card away, and never
+/// take a service, or a proof, from another PC.
 @MainActor
 final class OldPCPrompt: ObservableObject {
     static let shared = OldPCPrompt()
@@ -99,7 +100,10 @@ final class OldPCPrompt: ObservableObject {
         var memory = memory
         let dropped = memory.pcs.sorted { $0.value.seenAt > $1.value.seenAt }.dropFirst(Self.kept).map(\.key)
         for key in dropped { memory.pcs[key] = nil }
-        memory.services = memory.services.filter { memory.pcs[$0.value] != nil }
+        // Links to the PCs seen last, a few per PC at most.
+        let linked = memory.services.filter { memory.pcs[$0.value] != nil }
+            .sorted { (memory.pcs[$0.value]!.seenAt, $1.key) > (memory.pcs[$1.value]!.seenAt, $0.key) }
+        memory.services = Dictionary(uniqueKeysWithValues: linked.prefix(Self.kept * 2).map { ($0.key, $0.value) })
         defaults.set(try? JSONEncoder().encode(memory), forKey: Self.defaultsKey)
     }
 
@@ -135,29 +139,41 @@ final class OldPCPrompt: ObservableObject {
 
     /// A PC accepted a session. `hostCaps` is from that accepted HELLO_ACK;
     /// `address` is nil over USB.
+    ///
+    /// The session's service is the one the user tapped at that address,
+    /// else the one the search lists there, else the PC's own: every PC
+    /// registers "EternalMonitor (<its name>)". A service already linked to
+    /// a PC with a proof of its own stays with it.
     func answered(hostName: String, pairingToken: Data, hostCaps: UInt16, address: String?) {
         var memory = self.memory
-        let service = address.flatMap { address in
+        let found = address.flatMap { address in
             tapped.flatMap { $0.address == address ? $0.service : nil }
                 ?? listed.first { $0.address == address }?.name
         }
         tapped = nil
+        var service = found ?? (hostName.isEmpty ? nil : "EternalMonitor (\(hostName))")
+        var linkedTo: String?
+        if let candidate = service {
+            let key = Self.key(hostName: hostName, pairingToken: pairingToken, service: candidate)
+            let target = memory.services[candidate] ?? Self.serviceKey(candidate)
+            if target == key || memory.pcs[target]?.current == nil {
+                linkedTo = target
+            } else {
+                service = nil
+            }
+        }
         let key = Self.key(hostName: hostName, pairingToken: pairingToken, service: service)
         var pc = memory.pcs[key] ?? Memory.PC(seenAt: now())
-        if let service {
+        if let service, let old = linkedTo {
             let serviceKey = Self.serviceKey(service)
-            let before = [memory.services[service], serviceKey].compactMap { $0 }.filter { $0 != key }
-            for old in before {
+            if old != key {
                 if let shown = memory.pcs[old]?.shownAt { pc.shownAt = max(pc.shownAt ?? shown, shown) }
                 if waiting?.key == old { waiting = nil }
                 if let shown = card, shown.key == old { card = Card(key: key, pc: shown.pc, version: shown.version) }
+                // Only a record without a proof of its own goes.
+                if old == serviceKey { memory.pcs[old] = nil }
             }
-            if key == serviceKey {
-                memory.services[service] = nil
-            } else {
-                memory.pcs[serviceKey] = nil
-                memory.services[service] = key
-            }
+            memory.services[service] = key == serviceKey ? nil : key
         }
         let old = OldPC.isOld(announced: nil, hostCaps: hostCaps) == true
         pc.current = !old
