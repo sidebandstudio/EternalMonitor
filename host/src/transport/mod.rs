@@ -2155,6 +2155,8 @@ mod tests {
     fn a_pen_refresh_windows_holds_never_stops_the_loop() {
         use crate::input::{CaptureGeometry, InputThread, Sink, KIND_KEY, PHASE_BEGAN};
         use eternal_wire::v2::control::{HelloStatus, InputEvent, FEATURE_WANTS_INPUT};
+        // The loop's session starts through `act`, which uses the fallback slot.
+        let _slot = crate::diagnostics::tests::FALLBACK_SLOT.lock();
 
         /// Holds the first refresh until told to go on.
         struct StuckRefresh {

@@ -248,6 +248,13 @@ static SESSION_FALLBACK: parking_lot::Mutex<SessionFallback> =
 
 /// `session_id` started: fallbacks logged from now on are its own.
 pub fn note_session_start(session_id: u32, shared: &SharedControl) {
+    // The slot is the process's, so a test that starts a session would
+    // replace another test's.
+    #[cfg(test)]
+    assert!(
+        tests::FALLBACK_SLOT.is_locked(),
+        "a test that starts a session holds diagnostics::tests::FALLBACK_SLOT"
+    );
     *SESSION_FALLBACK.lock() = SessionFallback {
         session_id: Some(session_id),
         mode: Some(Arc::clone(&shared.capture_target)),
@@ -1091,6 +1098,7 @@ pub(crate) mod tests {
             .with(SummaryCapture(summaries.clone()));
         let shared = SharedControl::new(9876, 15_000_000);
         *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(subscriber, || {
             for (id, reason) in [(1, "vdd_only"), (2, "panel_lost")] {
                 note_session_start(id, &shared);
