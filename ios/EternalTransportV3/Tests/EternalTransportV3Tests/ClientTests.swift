@@ -177,20 +177,52 @@ final class ClientTests: XCTestCase {
         XCTAssertNil(client.liveSession)
     }
 
-    func testAnUnknownSessionTypeIsNeverProofOfCommit() throws {
-        let msg1 = try XCTUnwrap(client.connect(now: t0, key: keyA, clockUs: 1_000).sent.first)
-        let (msg2, sealer, _) = try answer(msg1, accept(77))
+    /// The reference client's `only_application_types_count_as_proof_of_a_commit`,
+    /// plus the drain and the liveness refresh.
+    func testOnlyApplicationTypesCountAsProofOfACommit() throws {
+        XCTAssertTrue(V3.isApplication(0x3F))
+        XCTAssertFalse(V3.isApplication(0x40))
+
+        // Confirming: an unknown protocol type changes nothing. 0x53 is a
+        // newer host's busy answer, unknown to this client.
+        var msg1 = try XCTUnwrap(client.connect(now: t0, key: keyA, clockUs: 1_000).sent.first)
+        var (msg2, sealer, _) = try answer(msg1, accept(81))
         _ = handle(msg2, at: t0)
-        // 0x53 is a newer host's busy answer; 0x7F anything else unknown.
-        for inner: UInt8 in [0x53, 0x57, 0x7F, 0xFF] {
-            XCTAssertEqual(handle(try sealer!.seal(innerType: inner, body: []), at: t0), [], "inner type \(inner)")
+        for unknown: UInt8 in [0x40, 0x53, 0x5F, 0xFF] {
+            XCTAssertEqual(handle(try sealer!.seal(innerType: unknown, body: [1, 2, 3]), at: t0), [], "type \(unknown)")
+            XCTAssertTrue(client.isConfirming)
+            XCTAssertNil(client.liveSession)
         }
-        XCTAssertTrue(client.isConfirming)
-        XCTAssertEqual(handle(sealed(sealer!, .confirmAck(SlotStatus())), at: t0).count, 2)
-        // Live: not delivered, but it still shows the host holds the keys.
-        _ = handle(try sealer!.seal(innerType: 0x53, body: []), at: t0 + ms(2900))
+        // An application record is proof.
+        let out = handle(try sealer!.seal(innerType: V2.pingType, body: [UInt8](repeating: 0, count: 8)), at: t0)
+        XCTAssertEqual(client.liveSession, 81)
+        guard case .deliver(81, _, V2.pingType, _, false)? = out.last else { return XCTFail("\(out)") }
+
+        // Live: an unknown type isn't delivered, but it is genuine traffic
+        // under the session's keys, so it keeps the session alive.
+        XCTAssertEqual(handle(try sealer!.seal(innerType: 0x60, body: [9]), at: t0 + ms(2900)), [])
         XCTAssertEqual(client.poll(now: t0 + ms(3000), clockUs: 1_000), [])
-        XCTAssertEqual(client.liveSession, 77)
+        XCTAssertEqual(client.liveSession, 81)
+        XCTAssertEqual(client.poll(now: t0 + ms(5900), clockUs: 1_000).first, .closed(sessionId: 81, reason: .liveness))
+
+        // Draining: an unknown type isn't delivered either.
+        setUp()
+        let (old, _) = try goLive(77)
+        try goLive(78, at: t0 + ms(100))
+        XCTAssertEqual(client.drainingSession, 77)
+        XCTAssertEqual(handle(try old.seal(innerType: 0x60, body: [9]), at: t0 + ms(150)), [])
+        guard case .deliver(77, _, _, _, true)? = handle(heartbeat(old), at: t0 + ms(160)).first else { return XCTFail() }
+
+        // Abandoned: an unknown type doesn't promote it.
+        setUp()
+        msg1 = try XCTUnwrap(client.connect(now: t0, key: keyA, clockUs: 1_000).sent.first)
+        (msg2, sealer, _) = try answer(msg1, accept(82))
+        _ = handle(msg2, at: t0)
+        _ = client.poll(now: t0 + ms(2000), clockUs: 3_000)
+        XCTAssertEqual(client.abandonedCount, 1)
+        XCTAssertEqual(handle(try sealer!.seal(innerType: 0x5F, body: []), at: t0 + ms(2000)), [])
+        XCTAssertNil(client.liveSession)
+        XCTAssertEqual(client.abandonedCount, 1)
     }
 
     func testAMessage2ForAnEarlierAttemptIsDropped() throws {

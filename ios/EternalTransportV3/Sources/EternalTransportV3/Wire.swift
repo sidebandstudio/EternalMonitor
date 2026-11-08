@@ -24,6 +24,16 @@ public enum V3 {
     public static let handshake2Type: UInt8 = 0x41
     /// Extension tag of the reconnect handshake.
     public static let extSession: UInt16 = 0x0001
+    /// Sealed inner types below this are v2 messages, the application's;
+    /// from here up they are the protocol's own, and one this side doesn't
+    /// know is dropped, never counted as application data.
+    public static let firstProtocolInnerType: UInt8 = 0x40
+
+    /// Whether a sealed record's inner type carries an application (v2)
+    /// message.
+    public static func isApplication(_ innerType: UInt8) -> Bool {
+        innerType < firstProtocolInnerType
+    }
     /// Sealed records per direction before a fresh handshake is required.
     public static let maxRecordsPerDirection: UInt64 = 1 << 32
     /// The largest message 1 timestamp either side uses or accepts, in µs.

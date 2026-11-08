@@ -404,14 +404,13 @@ public final class Client {
 
     /// Nil for a record the state machine doesn't act on: a session message
     /// that doesn't parse, or an inner type of 0x40 and up that it doesn't
-    /// know. Stricter than the reference client, which passes every unknown
-    /// type on: application records are always v2 messages, so an unknown
-    /// session-range type (such as a busy answer from a newer host) is
-    /// never taken as proof that a session committed.
+    /// know. Such a record never promotes an attempt and is never
+    /// delivered; on a live session it still counts for liveness, being
+    /// genuine traffic under its keys. As the reference client does.
     private static func content(_ opened: Opened) -> Content? {
         switch Result(catching: { try SessionMessage.parse(innerType: opened.innerType, body: opened.body) }) {
         case .success(.some(let message)): return .session(message)
-        case .success(.none): return opened.innerType < V3.sealedType ? .application : nil
+        case .success(.none): return V3.isApplication(opened.innerType) ? .application : nil
         case .failure: return nil
         }
     }
