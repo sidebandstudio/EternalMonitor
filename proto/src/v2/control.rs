@@ -286,6 +286,18 @@ pub const NOTICE_PC_LOCKED: u8 = 1;
 /// No display is attached to the PC's desktop (a closed lid, screens off or
 /// unplugged), so there is nothing to capture until one comes back.
 pub const NOTICE_NO_DISPLAY: u8 = 2;
+/// Windows won't let EternalMonitor capture the screen from the graphics
+/// card it runs on, as on a laptop whose screen is wired to its other card.
+/// The PC's window says how to switch; nothing changes until someone does.
+pub const NOTICE_UNSUPPORTED_GPU: u8 = 3;
+/// [`NOTICE_UNSUPPORTED_GPU`] in Second screen mode, once the second screen
+/// failed to start: the main screen it fell back to can't be captured either.
+pub const NOTICE_SECOND_SCREEN_UNSUPPORTED_GPU: u8 = 4;
+/// The PC is restarting its stream and keeps the session meanwhile: the
+/// picture comes back by itself. Sent only to iPads that set
+/// [`FEATURE_STANDBY_STATUS`]. (3 and 4 are taken by the graphics card
+/// notices.)
+pub const NOTICE_RESTARTING: u8 = 5;
 
 /// Host → client, every heartbeat interval while a session is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1612,7 +1624,13 @@ mod tests {
         // A notice is one byte more. Such a body, cut back to the old length
         // as an older iPad reads it, is the plain heartbeat; an unknown value
         // reaches the iPad as it is, for it to ignore.
-        for notice in [NOTICE_PC_LOCKED, NOTICE_NO_DISPLAY, 0xC8] {
+        for notice in [
+            NOTICE_PC_LOCKED,
+            NOTICE_NO_DISPLAY,
+            NOTICE_UNSUPPORTED_GPU,
+            NOTICE_SECOND_SCREEN_UNSUPPORTED_GPU,
+            0xC8,
+        ] {
             let datagram = encode_control(7, 1, &heartbeat(notice));
             assert_eq!(datagram.len(), plain.len() + 1);
             assert_eq!(datagram[..plain.len()][8..], plain[8..]);

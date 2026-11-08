@@ -358,6 +358,16 @@ struct Heartbeat: Equatable {
     static let noticePCLocked: UInt8 = 1
     /// No display is on at the PC (a closed lid, screens off or unplugged).
     static let noticeNoDisplay: UInt8 = 2
+    /// Windows won't let EternalMonitor capture the PC's screen from the
+    /// graphics card it runs on. The PC's window says how to switch.
+    static let noticeUnsupportedGPU: UInt8 = 3
+    /// The same in Second screen mode, after the second screen failed to
+    /// start: the main screen it fell back to can't be captured either.
+    static let noticeSecondScreenUnsupportedGPU: UInt8 = 4
+    /// The PC is restarting its stream and keeps this session: the picture
+    /// comes back by itself. Sent only to an iPad that sets
+    /// `Hello2.featureStandbyStatus`. (3 and 4 are the graphics card notices.)
+    static let noticeRestarting: UInt8 = 5
     /// The video frames the PC sent this session, from a PC that offered
     /// `HelloAck.hostCapMediaSize`; nil from others. Appended after
     /// `notice`, which is then always written.

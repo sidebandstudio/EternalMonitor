@@ -47,6 +47,7 @@ fn notice_after_stage(gpu: GpuInfo, chosen: Option<&str>) -> (bool, bool) {
             data: Arc::new(data),
             width,
             height,
+            cached: false,
         });
         std::thread::sleep(Duration::from_millis(20));
     }

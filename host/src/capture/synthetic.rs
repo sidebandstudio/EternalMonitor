@@ -57,9 +57,17 @@ fn still_desktop() -> bool {
     std::env::var("ETERNAL_SYNTH_STILL").is_ok_and(|v| v.trim() == "1")
 }
 
+/// `ETERNAL_SYNTH_REFUSE_GPU=1`, debug builds only: Windows refuses the
+/// screen from the graphics card EternalMonitor runs on, as on the hybrid
+/// laptops, for as long as it is set. Each attempt reads it again.
+#[cfg(debug_assertions)]
+fn gpu_refused() -> bool {
+    std::env::var("ETERNAL_SYNTH_REFUSE_GPU").is_ok_and(|v| v.trim() == "1")
+}
+
 /// Produce frames until `shared.running` clears or the channel closes.
 /// Mirrors the DXGI loop's contract: paced by `target_fps`, records capture
-/// stats, ships BGRA `RawFrame`s.
+/// stats, ships BGRA `RawFrame`s, and clears a block with its first one.
 pub fn run_capture_loop(
     slot: &FrameSlot,
     shared: SharedControl,
@@ -76,8 +84,16 @@ pub fn run_capture_loop(
     if !proving {
         super::second_screen::fake::mirror(&shared)?;
     }
+    #[cfg(debug_assertions)]
+    if gpu_refused() {
+        return Err(Box::new(super::recovery::CaptureUnavailable {
+            block: super::recovery::CaptureBlock::UnsupportedOnThisGpu,
+            detail: "simulated: DXGI_ERROR_UNSUPPORTED (0x887A0004)".into(),
+        }));
+    }
     let (width, height) = synthetic_size();
     let mut buffers = capture_buffers(width, height);
+    let mut resumed = false;
 
     info!(width, height, "Synthetic capture source active");
     *shared.capture_geometry.lock() = Some(crate::input::CaptureGeometry {
@@ -113,7 +129,10 @@ pub fn run_capture_loop(
 
         heartbeat(&shared.hb_capture_loop_ms);
 
+        // A still picture sent again, as DXGI capture marks its resends.
+        let mut cached = false;
         let data = if let Some(scene) = pointer.as_mut() {
+            cached = shared.client_draws_pointer();
             scene.tick(&shared, &mut buffers, frame_start, frame_number)
         } else {
             let data = match still.as_ref() {
@@ -125,6 +144,7 @@ pub fn run_capture_loop(
                             true,
                         ) =>
                 {
+                    cached = true;
                     Arc::clone(picture)
                 }
                 Some(_) => {
@@ -151,7 +171,11 @@ pub fn run_capture_loop(
                 data,
                 width,
                 height,
+                cached,
             });
+            if !std::mem::replace(&mut resumed, true) {
+                super::recovery::note_capture_resumed(&shared);
+            }
             #[cfg(debug_assertions)]
             if std::mem::take(&mut proving) {
                 super::second_screen::note_image(&shared, generation);
