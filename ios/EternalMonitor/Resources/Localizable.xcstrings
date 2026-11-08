@@ -8548,10 +8548,70 @@
       "comment" : "Connect screen card under \"Your PC app is out of date\". The value is the PC's name. Keep eternalmonitor.dev as is",
       "extractionState" : "manual",
       "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "حدّث EternalMonitor على %@ لبث أسرع وأكثر استقرارًا. نزّله على PC من eternalmonitor.dev."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aktualisiere EternalMonitor auf %@ für schnelleres, stabileres Streaming. Lade es auf dem PC von eternalmonitor.dev herunter."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Update EternalMonitor on %@ for faster, steadier streaming. Download it on the PC from eternalmonitor.dev."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Actualiza EternalMonitor en %@ para una transmisión más rápida y estable. Descárgalo en el PC desde eternalmonitor.dev."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mettez à jour EternalMonitor sur %@ pour une diffusion plus rapide et stable. Téléchargez-le sur le PC depuis eternalmonitor.dev."
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "तेज़ और स्थिर स्ट्रीमिंग के लिए %@ पर EternalMonitor अपडेट करें। इसे PC पर eternalmonitor.dev से डाउनलोड करें।"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "より速く安定したストリーミングのために、%@ の EternalMonitor をアップデートしてください。PC で eternalmonitor.dev からダウンロードできます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "더 빠르고 안정적인 스트리밍을 위해 %@에서 EternalMonitor를 업데이트하세요. PC에서 eternalmonitor.dev를 통해 다운로드하세요."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Atualize o EternalMonitor em %@ para uma transmissão mais rápida e estável. Baixe-o no PC em eternalmonitor.dev."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Обновите EternalMonitor на %@ для более быстрой и стабильной трансляции. Скачайте его на PC с eternalmonitor.dev."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "更新 %@ 上的 EternalMonitor，让串流更快更稳定。在 PC 上从 eternalmonitor.dev 下载。"
           }
         }
       }
@@ -9059,10 +9119,70 @@
       "comment" : "Title of the Connect screen card shown when the PC runs an EternalMonitor older than 0.3.4",
       "extractionState" : "manual",
       "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "تطبيق PC لديك قديم"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Deine PC-App ist veraltet"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Your PC app is out of date"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La app de tu PC está desactualizada"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "L’application sur votre PC n’est pas à jour"
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "आपके PC का ऐप पुराना है"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PC アプリが古くなっています"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PC 앱이 오래되었습니다"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "O app do seu PC está desatualizado"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Приложение на PC устарело"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PC 应用已过期"
           }
         }
       }
@@ -9071,10 +9191,70 @@
       "comment" : "Over the held picture while the PC shows its lock screen or a permission prompt",
       "extractionState" : "manual",
       "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PC مقفل. افتح قفله للمتابعة."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dein PC ist gesperrt. Entsperre ihn, um fortzufahren."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Your PC is locked. Unlock it to continue."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tu PC está bloqueado. Desbloquéalo para continuar."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Votre PC est verrouillé. Déverrouillez-le pour continuer."
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "आपका PC लॉक है। जारी रखने के लिए उसे अनलॉक करें।"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PC がロックされています。続行するにはロックを解除してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PC가 잠겨 있습니다. 계속하려면 잠금을 해제하세요."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Seu PC está bloqueado. Desbloqueie-o para continuar."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PC заблокирован. Разблокируйте его, чтобы продолжить."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PC 已锁定。解锁后即可继续。"
           }
         }
       }
