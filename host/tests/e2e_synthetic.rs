@@ -26,7 +26,7 @@ use eternal_wire::h264::contains_nal_type;
 use eternal_wire::reassembly::{AddOutcome, Reassembler, MAX_STALL_ALLOWANCE};
 use eternal_wire::v2::control::{
     encode_control, parse_control, ByeReason, ControlMessage, Hello2, HelloAck, HelloStatus,
-    KeyframeReason, KeyframeRequest, ReceiverReport, CAP_DECODE_H264,
+    KeyframeReason, KeyframeRequest, Ping, ReceiverReport, CAP_DECODE_H264,
 };
 use eternal_wire::v2::media::MediaHeader;
 use eternal_wire::v2::{classify, Classified};
@@ -789,6 +789,201 @@ fn slow_usb_link_measurement() {
     assert!(run.tunnel_open, "the tunnel must stay open");
 }
 
+/// Measures recovery from lossy WiFi through the real encoder and transport:
+/// how long the picture stands still and how many keyframes reach the fake
+/// iPad whole. `ETERNAL_TEST_LOSS` (default 0.10) is the loss each way.
+/// The host's fault injection drops first transmissions only, so this
+/// receiver also loses that share of the repairs and of its own requests,
+/// as WiFi does. `ETERNAL_TEST_ENCODER` picks the encoder (default libx264),
+/// `ETERNAL_TEST_SECONDS` the length (default 30). Timing on a busy machine
+/// changes the numbers, so this only reports them; `wifi_repair_sim.rs`
+/// holds the assertions.
+#[test]
+#[ignore = "measurement; run with --ignored --nocapture"]
+fn lossy_wifi_recovery_measurement() {
+    let _env = test_env();
+    init_test_tracing();
+    let _ = ffmpeg_next::init();
+    let env = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    let loss: f64 = env("ETERNAL_TEST_LOSS").map_or(0.10, |v| v.parse().unwrap());
+    let seconds: u64 = env("ETERNAL_TEST_SECONDS").map_or(30, |v| v.parse().unwrap());
+    let encoder = env("ETERNAL_TEST_ENCODER").unwrap_or_else(|| "libx264".into());
+    if env("ETERNAL_SYNTH_SIZE").is_none() {
+        std::env::set_var("ETERNAL_SYNTH_SIZE", "1920x1080");
+    }
+    std::env::set_var("ETERNAL_CAPTURE", "synthetic");
+    std::env::set_var("ETERNAL_DROP", loss.to_string());
+    if env("ETERNAL_REORDER").is_none() {
+        std::env::set_var("ETERNAL_REORDER", "0.02");
+    }
+    if env("ETERNAL_JITTER_MS").is_none() {
+        std::env::set_var("ETERNAL_JITTER_MS", "4");
+    }
+    let port = free_udp_port();
+    let shared = SharedControl::new(port, pipeline::DEFAULT_BITRATE_BPS);
+    shared.pairing.lock().required = false;
+    *shared.encoder_override.lock() = Some(encoder.clone());
+    let (tx, rx) = mpsc::channel();
+    let pipeline_shared = shared.clone();
+    let pipeline_tx = tx.clone();
+    let gpu = if encoder == "libx264" {
+        GpuInfo::software_fallback()
+    } else {
+        GpuInfo::detect()
+    };
+    let supervisor = std::thread::spawn(move || {
+        eternal_host::supervisor::run(port, pipeline_shared, gpu, pipeline_tx, rx);
+    });
+    let mut receiver = FakeReceiver::connect_full(
+        port,
+        CAP_DECODE_H264,
+        eternal_wire::v2::control::FEATURE_SUPPORTS_NACK,
+    );
+    receiver
+        .socket
+        .set_read_timeout(Some(Duration::from_millis(1)))
+        .unwrap();
+    let mut assembler = Reassembler::new();
+    assembler.configure_repair(
+        true,
+        Duration::from_micros(16_667),
+        Duration::from_millis(5),
+    );
+    // The iPad's clock, as in `lossy_stream_recovers_and_adapts`: a pass
+    // counts at most MAX_PASS, so a descheduled test thread expires nothing.
+    const MAX_PASS: Duration = Duration::from_millis(20);
+    let mut ipad_now = Instant::now();
+    let mut pass_started = ipad_now;
+    let mut rng = 0x2545_F491_4F6C_DD1Du64;
+    let mut lost = move || {
+        rng ^= rng << 13;
+        rng ^= rng >> 7;
+        rng ^= rng << 17;
+        ((rng >> 11) as f64 / (1u64 << 53) as f64) < loss
+    };
+    // The app's request spacing: the control channel sends one keyframe
+    // request per 500 ms, and a held picture asks again every 600 ms.
+    let mut last_request: Option<Instant> = None;
+    let mut wants_keyframe = false;
+    let mut keyframes_seen = std::collections::HashSet::new();
+    let mut keyframes_complete = 0u64;
+    let mut previous: Option<(u32, u32, bool)> = None;
+    let mut last_decodable: Option<Instant> = None;
+    let mut freezes = Vec::new();
+    let mut decodable = 0u64;
+    let mut delivered = 0u64;
+    let mut requests = 0u64;
+    let mut bitrate = 0;
+    let mut bytes = [0; 2048];
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(seconds) {
+        let woke = Instant::now();
+        ipad_now += (woke - pass_started).min(MAX_PASS);
+        pass_started = woke;
+        if let Ok((len, _)) = receiver.socket.recv_from(&mut bytes) {
+            if let Ok((header, payload)) = MediaHeader::decode(&bytes[..len]) {
+                if header.session_id == receiver.session_id && !(header.is_retransmit && lost()) {
+                    if header.is_keyframe {
+                        keyframes_seen.insert((header.stream_epoch, header.frame_seq));
+                    }
+                    assembler.add_media(header, payload, ipad_now);
+                }
+            } else if let Ok((_, ControlMessage::Heartbeat(hb))) = parse_control(&bytes[..len]) {
+                bitrate = hb.stream_config.bitrate_bps;
+            }
+        }
+        assembler.tick(ipad_now);
+        for nack in assembler.take_nacks() {
+            if !lost() {
+                receiver.send(&ControlMessage::Nack(nack));
+            }
+        }
+        wants_keyframe |= assembler.take_keyframe_request().is_some();
+        let held = last_decodable.is_some_and(|at| ipad_now - at >= Duration::from_millis(600));
+        let spacing = if wants_keyframe { 500 } else { 600 };
+        if (wants_keyframe || held)
+            && last_request.is_none_or(|at| ipad_now - at >= Duration::from_millis(spacing))
+        {
+            wants_keyframe = false;
+            last_request = Some(ipad_now);
+            requests += 1;
+            let c = assembler.counters();
+            if !lost() {
+                receiver.send(&ControlMessage::KeyframeRequest(KeyframeRequest {
+                    stream_epoch: c.stream_epoch,
+                    last_complete_seq: assembler.latest_completed_seq(),
+                    reason: KeyframeReason::GapLoss,
+                }));
+            }
+        }
+        for frame in assembler.take_ready() {
+            delivered += 1;
+            keyframes_complete += u64::from(frame.is_keyframe);
+            let epoch = assembler.counters().stream_epoch;
+            // The host numbers sent frames contiguously per epoch, so a
+            // delta decodes only right after the frame before it decoded.
+            let decodes = frame.is_keyframe
+                || previous.is_some_and(|(e, seq, ok)| ok && e == epoch && seq + 1 == frame.seq);
+            previous = Some((epoch, frame.seq, decodes));
+            if decodes {
+                decodable += 1;
+                if let Some(at) = last_decodable {
+                    freezes.push(ipad_now - at);
+                }
+                last_decodable = Some(ipad_now);
+            }
+        }
+        if receiver.last_report.elapsed() >= Duration::from_millis(500) {
+            receiver.last_report = Instant::now();
+            let c = assembler.counters();
+            receiver.send(&ControlMessage::ReceiverReport(ReceiverReport {
+                stream_epoch: c.stream_epoch,
+                highest_seq: c.highest_seq,
+                frames_complete: c.frames_complete as u32,
+                frames_dropped: c.frames_dropped as u32,
+                frags_received: c.frags_received as u32,
+                frags_lost: c.frags_lost as u32,
+                frags_repaired: c.frags_repaired as u32,
+                nacks_sent: c.nacks_sent as u32,
+                assembler_depth: c.assembler_depth,
+                jitter_us: c.jitter_us,
+                ..Default::default()
+            }));
+        }
+    }
+    let (sent, retransmits) = {
+        let stats = eternal_host::stats::PIPELINE_STATS.lock();
+        (stats.transport_packets_sent, stats.transport_retransmits)
+    };
+    shared.stop();
+    tx.send(SupervisorCommand::Shutdown).unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = supervisor.join();
+        let _ = done_tx.send(());
+    });
+    let _ = done_rx.recv_timeout(Duration::from_secs(5));
+    freezes.sort();
+    let over = |ms: u64| {
+        freezes
+            .iter()
+            .filter(|f| **f > Duration::from_millis(ms))
+            .count()
+    };
+    let longest = freezes.last().copied().unwrap_or_default();
+    eprintln!(
+        "LOSSY_E2E encoder={encoder} loss={loss} seconds={seconds} keyframes={keyframes_complete}/{} \
+         decodable={decodable}/{delivered} sent={sent} retransmits={retransmits} requests={requests} \
+         longest_freeze_ms={} freezes_over_250ms={} freezes_over_1s={} end_bitrate={bitrate} counters={:?}",
+        keyframes_seen.len(),
+        longest.as_millis(),
+        over(250),
+        over(1000),
+        assembler.counters()
+    );
+    assert!(delivered > 0, "the stream must deliver frames");
+}
+
 /// Accepts the host's USB tunnel on `listener` within `within`, past its
 /// EMLINK preamble, as `read_preamble` reads it. Other programs dial a
 /// test's loopback listener too: a development tool that probes each new
@@ -1015,7 +1210,29 @@ impl FakeReceiver {
         )
     }
 
+    /// The handshake, then a ping, as every iPad since 0.3.0 sends the
+    /// moment its HELLO_ACK lands.
     fn connect_as(
+        host_port: u16,
+        decoder_caps: u16,
+        feature_caps: u16,
+        preferred_fps: u8,
+        client_nonce: u32,
+    ) -> Self {
+        let mut receiver = Self::handshake(
+            host_port,
+            decoder_caps,
+            feature_caps,
+            preferred_fps,
+            client_nonce,
+        );
+        receiver.send(&ControlMessage::Ping(Ping { t1_us: 1 }));
+        receiver
+    }
+
+    /// The handshake alone: the first report, 400 ms later, is the first
+    /// thing the PC hears from this receiver.
+    fn handshake(
         host_port: u16,
         decoder_caps: u16,
         feature_caps: u16,

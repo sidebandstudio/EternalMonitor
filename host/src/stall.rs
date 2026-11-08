@@ -1123,7 +1123,9 @@ mod tests {
         // Waited for until 3 s, then parked: no stall line, and the lane
         // counts it.
         ms.store(3_000, SeqCst);
-        assert!(pending.wait_up_to(Duration::from_secs(3), &mut || {}).is_none());
+        assert!(pending
+            .wait_up_to(Duration::from_secs(3), &mut || {})
+            .is_none());
         assert!(pending.park().is_none());
         assert_eq!(lanes.abandoned(Call::EncoderOpen), 1);
         assert_eq!(pending.running_for(), Duration::from_secs(3));
@@ -1183,10 +1185,7 @@ mod tests {
         let Some(Err(Stall::TimedOut { call, after })) = pending.poll() else {
             panic!("not given up on at the limit")
         };
-        assert_eq!(
-            (call, after),
-            (Call::EncoderOpen, Duration::from_secs(15))
-        );
+        assert_eq!((call, after), (Call::EncoderOpen, Duration::from_secs(15)));
         // Counted once, from the park, until it returns; then released on
         // its own thread.
         assert_eq!(lanes.abandoned(Call::EncoderOpen), 1);
@@ -1294,6 +1293,7 @@ mod tests {
             .with_ansi(false)
             .with_writer(move || Sink(Arc::clone(&writer)))
             .finish();
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(subscriber, || {
             log_timed_out(
                 Call::D3d11CreateDevice,
@@ -1308,6 +1308,7 @@ mod tests {
         );
         // An encoder's line gives that encoder's own limit.
         out.lock().clear();
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(
             tracing_subscriber::fmt()
                 .with_ansi(false)

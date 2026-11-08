@@ -261,6 +261,7 @@ try fewer words. If your problem isn't here, see [Known issues](https://eternalm
 | **That looks like the pairing code, not the PC's address** | A six-digit number was typed where the address goes. | Type the **Address** from the PC window, for example 192.168.1.20. The iPad asks for the code after it connects. |
 | **That looks like your router's address, not your PC's** | Nothing answered at an address ending in .1, which is usually the Wi-Fi router. | Type the **Address** shown in the PC window. |
 | **That address doesn't look right** | The iPad couldn't find anything by that name. | Type the **Address** exactly as the PC window shows it. |
+| **Wi-Fi is off** | iPadOS has no network for the connection: Wi-Fi is off on the iPad, or it hasn't joined a network. | Turn on Wi-Fi and join the same network as the PC, or use a USB cable. |
 | **This iPad isn't connected to a network** | Wi-Fi is off on the iPad, or it hasn't joined a network. | Turn on Wi-Fi and join the same network as the PC, or use a USB cable. |
 | **Local Network is turned off for EternalMonitor** | Local Network access is off for EternalMonitor on the iPad, so it can't reach the PC over Wi-Fi. | Tap **Open Settings** and turn on **Local Network**, or go to **Settings > Privacy & Security > Local Network** and turn on **EternalMonitor**. Then tap **Try again**. A USB cable works without this setting. |
 | **Couldn't connect to your PC** | The connection failed for another reason. | Check that both are on the same Wi-Fi and that EternalMonitor is open on the PC, then tap **Try again**. |
@@ -274,7 +275,8 @@ try fewer words. If your problem isn't here, see [Known issues](https://eternalm
 | **The connection over the cable stopped** | The USB connection broke after it had started. | Keep EternalMonitor and Apple Devices open on the PC, unlock the iPad, then unplug the cable and plug it in again. |
 | **The USB cable was disconnected** | The cable came out, or the PC lost it. | Plug the cable back in. The iPad reconnects by itself. |
 | **USB connections were turned off** | **Allow USB connections** is off in the iPad app's settings. | Turn on **Allow USB connections** to use the cable again. |
-| **Your PC ended the session** | Someone clicked **Stop** on the PC, changed a setting that restarts the stream, or closed EternalMonitor. Or the connection dropped, for example in a Wi-Fi stall, or the PC ran into a problem. | Tap **Try again** when the PC says **Ready for your iPad**. |
+| **Your PC ended the session** | Someone clicked **Stop** on the PC, changed a setting that restarts the stream, or closed EternalMonitor. | Tap **Try again** when the PC says **Ready for your iPad**. |
+| **The connection to your PC ended** | The connection dropped, for example in a Wi-Fi stall, the PC ran into a problem, or EternalMonitor restarted itself on the PC. | Tap **Try again**. With **Reconnect automatically** on, the iPad tries again by itself first. |
 | **Your PC is already streaming to another device** | Only one iPad can connect at a time. | Disconnect the other iPad first, then tap **Try again**. |
 | **Your PC is updating EternalMonitor** | The PC is installing a new version. | Wait. With **Reconnect automatically** on, the iPad connects again by itself. Otherwise tap **Try again** once EternalMonitor has opened on the PC. |
 | **Your PC hasn't come back from its update yet** | The update is taking longer than expected. | Check that EternalMonitor opened again on the PC. Windows may be waiting for you to click **Yes** there. Then tap **Try again**. |

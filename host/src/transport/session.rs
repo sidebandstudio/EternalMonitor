@@ -13,8 +13,9 @@ use super::link::{LinkId, PeerId};
 use std::time::{Duration, Instant};
 
 use eternal_wire::v2::control::{
-    ByeReason, ControlHeader, ControlMessage, HelloAck, HelloStatus, InputEvent, KeyframeRequest,
-    Nack, ReceiverReport, StreamConfig, FEATURE_SUPPORTS_NACK, FEATURE_WANTS_INPUT, HOSTCAP_NACK,
+    ByeReason, ControlHeader, ControlMessage, FailedReason, HelloAck, HelloStatus, InputEvent,
+    KeyframeRequest, Nack, ReceiverReport, StreamConfig, FEATURE_STANDBY_STATUS,
+    FEATURE_SUPPORTS_NACK, FEATURE_WANTS_INPUT, HOSTCAP_NACK,
 };
 use tracing::{info, warn};
 
@@ -53,6 +54,50 @@ const REFUSED_FOR: Duration = Duration::from_secs(60);
 const REFUSED_SUMMARIES: u32 = 20;
 const REFUSAL_MINUTE: Duration = Duration::from_secs(60);
 
+/// IDENTIFY answers per window: for one asking address, and in all. An
+/// iPad's check sends at most 8 and stops at the first answer.
+const IDENTIFY_WINDOW: Duration = Duration::from_secs(10);
+const IDENTIFY_PER_SOURCE: u32 = 8;
+const IDENTIFY_OVERALL: u32 = 32;
+/// Asking addresses tracked in a window; more get no answer until it ends.
+const IDENTIFY_SOURCES: usize = 16;
+
+/// Bounds what IDENTIFY costs: each answer is an HMAC, an address listing
+/// and a datagram, and anyone on the network may ask.
+#[derive(Debug, Default)]
+struct IdentifyLimiter {
+    overall: Option<(Instant, u32)>,
+    sources: Vec<(std::net::IpAddr, Instant, u32)>,
+}
+
+impl IdentifyLimiter {
+    /// Whether `ip` may be answered now, counting the answer if so.
+    fn allow(&mut self, ip: std::net::IpAddr, now: Instant) -> bool {
+        let over = |since: Instant| now.saturating_duration_since(since) >= IDENTIFY_WINDOW;
+        self.overall.take_if(|(since, _)| over(*since));
+        self.sources.retain(|(_, since, _)| !over(*since));
+        let overall = self.overall.get_or_insert((now, 0));
+        if overall.1 >= IDENTIFY_OVERALL {
+            return false;
+        }
+        let index = match self.sources.iter().position(|(source, ..)| *source == ip) {
+            Some(index) => index,
+            None if self.sources.len() < IDENTIFY_SOURCES => {
+                self.sources.push((ip, now, 0));
+                self.sources.len() - 1
+            }
+            None => return false,
+        };
+        let source = &mut self.sources[index];
+        if source.2 >= IDENTIFY_PER_SOURCE {
+            return false;
+        }
+        source.2 += 1;
+        overall.1 += 1;
+        true
+    }
+}
+
 /// The refused attempts of the current minute.
 #[derive(Debug, Clone, Copy)]
 struct RefusalMinute {
@@ -62,6 +107,21 @@ struct RefusalMinute {
 }
 /// Honor at most one keyframe request per this window (PLI storm guard).
 pub const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(500);
+
+/// Media bytes, headers included, a Wi-Fi client's address gets before
+/// anything of its session comes back from it: room for the first picture,
+/// even a large keyframe of a high-resolution stream. Heartbeats go on. An
+/// iPad pings the moment its HELLO_ACK lands, so it answers long before
+/// this runs out.
+pub const UNANSWERED_MEDIA_BUDGET: usize = 512 * 1024;
+/// Media to every client not yet heard counts against one host-wide budget
+/// of the same size, which comes back over [`UNANSWERED_FOR`]: a client
+/// that moves to another address, or many addresses in turn, get no more.
+///
+/// Addresses whose session ended before they answered, and for how long a
+/// new session there starts with its budget spent.
+const UNANSWERED_KEPT: usize = 64;
+const UNANSWERED_FOR: Duration = Duration::from_secs(60);
 
 /// What the transport must do after feeding the session an event.
 #[derive(Debug, Default)]
@@ -101,6 +161,47 @@ pub struct Actions {
     pub ended: Option<SessionEnd>,
 }
 
+/// The stage whose failures made the PC give up, as far as the summary's
+/// `failure=` names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StageFailure {
+    Capture,
+    Encoder,
+    Other,
+}
+
+/// Why the stream stops for good ([`Session::shut_down`]): what the iPad is
+/// told, and how the session's summary ends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamStop {
+    /// The app quits. The iPad hears that the PC ended the session.
+    Quit,
+    /// The app quits for a restart or an update that hands over to a new
+    /// copy: the iPad is told to connect again.
+    Handoff,
+    /// Stop on the PC.
+    User,
+    /// The PC gave up after repeated failures; the iPad may try again.
+    GaveUp(StageFailure),
+}
+
+impl StreamStop {
+    fn bye(self) -> ByeReason {
+        match self {
+            Self::Quit | Self::User => ByeReason::UserDisconnect,
+            Self::Handoff | Self::GaveUp(_) => ByeReason::Error,
+        }
+    }
+
+    fn reason(self) -> EndReason {
+        match self {
+            Self::Quit | Self::Handoff => EndReason::Shutdown,
+            Self::User => EndReason::Stopped,
+            Self::GaveUp(stage) => EndReason::Failed(stage),
+        }
+    }
+}
+
 /// How far a session got and how it ended, for its support summary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SessionEnd {
@@ -129,6 +230,10 @@ pub enum EndReason {
     Superseded,
     /// An update stopped the stream, or the app quit.
     Shutdown,
+    /// Stop on the PC.
+    Stopped,
+    /// The PC gave up restarting a stage that kept failing.
+    Failed(StageFailure),
     /// The session's link (the USB tunnel) closed.
     LinkLost,
     /// The pairing credentials changed.
@@ -176,6 +281,13 @@ struct ActiveSession {
     bye: Option<ByeReason>,
     /// The msg_seq of input packets taken in this session.
     input_seqs: SeqWindow,
+    /// Something of this session came back from the client after its
+    /// HELLO2. Always for USB, where the PC dials the iPad on the cable.
+    answered: bool,
+    /// Media bytes sent before it answered (see [`UNANSWERED_MEDIA_BUDGET`]).
+    unanswered_sent: usize,
+    /// A frame was held back for the budget: the answer asks for a keyframe.
+    withheld: bool,
 }
 
 /// What a client sent last, for the liveness log lines.
@@ -277,6 +389,28 @@ impl SeqWindow {
     }
 }
 
+/// Why no stream runs, for an iPad that asks meanwhile. The supervisor sets
+/// it whenever no pipeline generation streams (see
+/// [`Session::set_not_streaming`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NotStreaming {
+    /// Someone clicked Stop: only Start on the PC streams again.
+    Stopped,
+    /// The supervisor is waiting out the pause before a restart.
+    Restarting,
+    /// The storm brake gave up after repeated errors, until Start.
+    Failed(FailedReason),
+}
+
+/// Why a HELLO2 can't start a session ([`Session::closed_to_clients`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Closed {
+    /// Turned away with Busy, logged with this line.
+    Busy(&'static str),
+    /// Told why, once it passes the pairing check.
+    NotStreaming(NotStreaming),
+}
+
 /// Provides the current stream parameters for HELLO_ACK/heartbeats.
 pub trait ConfigSource {
     fn pairing(&self) -> Option<&parking_lot::Mutex<crate::pairing::Pairing>> {
@@ -288,6 +422,16 @@ pub trait ConfigSource {
     fn host_caps(&self) -> u16 {
         0
     }
+    /// The port this host receives the stream on and its home network
+    /// addresses, which an identity proof signs. None answers no IDENTIFY.
+    fn identity_endpoints(&self) -> Option<(u16, Vec<[u8; 4]>)> {
+        None
+    }
+
+    /// The heartbeat's notice for the iPad (`NOTICE_*` in the wire crate).
+    fn notice(&self) -> u8 {
+        eternal_wire::v2::control::NOTICE_NONE
+    }
 }
 
 pub struct Session {
@@ -298,7 +442,14 @@ pub struct Session {
     /// either closes the host or gives up. Changed only under the session lock,
     /// together with the check that nobody is streaming.
     updating: bool,
-    /// The goodbye for a stream an update stopped, sent by the next tick.
+    /// The stream stopped for good ([`Self::shut_down`]) and no transport
+    /// has resumed since: new clients are turned away, as nothing would
+    /// serve them.
+    stream_stopped: bool,
+    /// No stream runs: HELLO2s are told why instead of starting a session.
+    not_streaming: Option<NotStreaming>,
+    /// The goodbye for a stream an update or a stop ended, sent by the next
+    /// tick or by the transport on its way out.
     goodbye: Option<(PeerId, Vec<u8>)>,
     /// That stream's end, reported by the next tick or [`Self::shut_down`].
     stopped: Option<SessionEnd>,
@@ -307,9 +458,17 @@ pub struct Session {
     /// Recently refused HELLO2 nonces: a retransmit is the same attempt.
     refused: std::collections::VecDeque<(u32, Instant)>,
     refusal_minute: Option<RefusalMinute>,
-    /// Injected so tests control randomness; production passes a seeded value
-    /// derived from process entropy.
+    /// Wi-Fi addresses whose session ended before they answered (see
+    /// [`UNANSWERED_FOR`]).
+    unanswered: std::collections::VecDeque<(std::net::IpAddr, Instant)>,
+    /// The host-wide media sent to clients before they answered, as of when
+    /// it was last counted (see [`UNANSWERED_MEDIA_BUDGET`]).
+    unanswered_media: (usize, Instant),
+    identify_limiter: IdentifyLimiter,
+    /// Counts the sessions. Session ids come from a per-launch keyed hash
+    /// of this count ([`Self::session_id_keys`]).
     next_session_id: u32,
+    session_id_keys: std::collections::hash_map::RandomState,
     legacy_client_warned: bool,
 }
 
@@ -319,12 +478,18 @@ impl Session {
             active: None,
             last_end: None,
             updating: false,
+            stream_stopped: false,
+            not_streaming: None,
             goodbye: None,
             stopped: None,
             ended_for_liveness: None,
             refused: std::collections::VecDeque::new(),
             refusal_minute: None,
-            next_session_id: session_id_seed.max(1),
+            unanswered: std::collections::VecDeque::new(),
+            unanswered_media: (0, Instant::now()),
+            identify_limiter: IdentifyLimiter::default(),
+            next_session_id: session_id_seed,
+            session_id_keys: std::collections::hash_map::RandomState::new(),
             legacy_client_warned: false,
         }
     }
@@ -351,7 +516,52 @@ impl Session {
     fn end(&mut self, reason: EndReason, now: Instant) -> Option<SessionEnd> {
         let session = self.active.take()?;
         self.last_end = Some((session.session_id, reason));
+        // One entry per address, its time refreshed. Once the memory is
+        // full the oldest goes; the host-wide budget still counts it.
+        if let Some(addr) = session.peer.addr.filter(|_| !session.answered) {
+            self.unanswered.retain(|(ip, at)| {
+                *ip != addr.ip() && now.saturating_duration_since(*at) < UNANSWERED_FOR
+            });
+            if self.unanswered.len() == UNANSWERED_KEPT {
+                self.unanswered.pop_front();
+            }
+            self.unanswered.push_back((addr.ip(), now));
+        }
         Some(session.end(reason, now))
+    }
+
+    /// Whether a frame of `bytes` may go to `session_id`'s client now. Until
+    /// it answers, frames go while they fit in its budget; the first that
+    /// doesn't is held back, and so is every later one until it answers,
+    /// which asks for a keyframe to start the picture again.
+    pub fn may_send_media(&mut self, session_id: u32, bytes: usize, now: Instant) -> bool {
+        let host_spent = self.unanswered_media_at(now);
+        let Some(session) = self
+            .active
+            .as_mut()
+            .filter(|session| session.session_id == session_id && !session.answered)
+        else {
+            return true;
+        };
+        if session.withheld
+            || session.unanswered_sent + bytes > UNANSWERED_MEDIA_BUDGET
+            || host_spent + bytes > UNANSWERED_MEDIA_BUDGET
+        {
+            session.withheld = true;
+            return false;
+        }
+        session.unanswered_sent += bytes;
+        self.unanswered_media = (host_spent + bytes, now);
+        true
+    }
+
+    /// The host-wide media to clients not yet heard that still counts at
+    /// `now`.
+    fn unanswered_media_at(&self, now: Instant) -> usize {
+        let (spent, at) = self.unanswered_media;
+        let back = UNANSWERED_MEDIA_BUDGET as u128 * now.saturating_duration_since(at).as_millis()
+            / UNANSWERED_FOR.as_millis();
+        spent.saturating_sub(usize::try_from(back).unwrap_or(usize::MAX))
     }
 
     /// Starts an update handoff. Atomic with admission: call with the session
@@ -364,23 +574,54 @@ impl Session {
             if !stop_stream {
                 return false;
             }
-            let (peer, session_id) = (session.peer, session.session_id);
-            info!(%peer, "Stopping the stream for an update");
-            let msg_seq = self.next_msg_seq();
-            let bye = ControlMessage::Bye(ByeReason::HostShuttingDown);
-            self.goodbye = Some((
-                peer,
-                eternal_wire::v2::control::encode_control(session_id, msg_seq, &bye),
-            ));
-            self.stopped = self.end(EndReason::Shutdown, Instant::now());
+            info!(peer = %session.peer, "Stopping the stream for an update");
+            self.stopped = self.end_saying(
+                ByeReason::HostShuttingDown,
+                EndReason::Shutdown,
+                Instant::now(),
+            );
         }
         self.updating = true;
         true
     }
 
-    /// The goodbye [`Self::begin_update`] left for a stopped stream, if any.
+    /// Ends the active session for `reason` and leaves `bye` for the
+    /// transport to send before its links close.
+    fn end_saying(
+        &mut self,
+        bye: ByeReason,
+        reason: EndReason,
+        now: Instant,
+    ) -> Option<SessionEnd> {
+        let session = self.active.as_ref()?;
+        let (peer, session_id) = (session.peer, session.session_id);
+        let msg_seq = self.next_msg_seq();
+        self.goodbye = Some((
+            peer,
+            eternal_wire::v2::control::encode_control(
+                session_id,
+                msg_seq,
+                &ControlMessage::Bye(bye),
+            ),
+        ));
+        self.end(reason, now)
+    }
+
+    /// The goodbye left for a stopped stream ([`Self::begin_update`],
+    /// [`Self::shut_down`]), if any.
     pub fn take_goodbye(&mut self) -> Option<(PeerId, Vec<u8>)> {
         self.goodbye.take()
+    }
+
+    /// Whether a stream runs, and why not. While it is set, a HELLO2 that
+    /// passes the version, update and pairing checks is told why, and no
+    /// session starts. A session the stream keeps across a restart stays.
+    pub fn set_not_streaming(&mut self, state: Option<NotStreaming>) {
+        self.not_streaming = state;
+    }
+
+    pub fn not_streaming(&self) -> Option<NotStreaming> {
+        self.not_streaming
     }
 
     /// The update handoff failed; clients may connect again.
@@ -388,11 +629,32 @@ impl Session {
         self.updating = false;
     }
 
-    /// The app is quitting: the end of the stream it stops, or of one an
-    /// update stopped that no tick reported yet.
-    pub fn shut_down(&mut self, now: Instant) -> Option<SessionEnd> {
-        let active = self.end(EndReason::Shutdown, now);
+    /// The stream stops for good, for `why`: the end of the session it
+    /// stops, or of one an update stopped that no tick reported yet. A
+    /// session it stops is told why by the transport on its way out; the
+    /// iPad used to hear nothing, and showed a lost signal or an unplugged
+    /// cable. Until a transport resumes, new clients are turned away.
+    pub fn shut_down(&mut self, now: Instant, why: StreamStop) -> Option<SessionEnd> {
+        self.stream_stopped = true;
+        let active = self.end_saying(why.bye(), why.reason(), now);
         self.stopped.take().or(active)
+    }
+
+    /// Why a HELLO2 can't start a session now, if it can't: an update is
+    /// about to close the host, no stream runs (the supervisor says why), or
+    /// the stream stopped and its transport is on its way out (the app
+    /// quits). The first and last are turned away with Busy before anything
+    /// else is looked at; a retry once the stream runs again works.
+    fn closed_to_clients(&self) -> Option<Closed> {
+        if self.updating {
+            Some(Closed::Busy("Client turned away while an update starts"))
+        } else if let Some(state) = self.not_streaming {
+            Some(Closed::NotStreaming(state))
+        } else if self.stream_stopped {
+            Some(Closed::Busy("Client turned away while the stream stops"))
+        } else {
+            None
+        }
     }
 
     /// The first video went to `session_id`. Later calls change nothing.
@@ -452,6 +714,7 @@ impl Session {
             .as_ref()
             .filter(|session| {
                 !session.awaiting_takeover
+                    && session.answered
                     && session.info.feature_caps & eternal_wire::v2::control::FEATURE_WANTS_AUDIO
                         != 0
             })
@@ -463,9 +726,21 @@ impl Session {
     }
 
     fn allocate_session_id(&mut self) -> u32 {
-        let id = self.next_session_id;
-        self.next_session_id = self.next_session_id.wrapping_add(0x9E37_79B9).max(1);
-        id
+        use std::hash::BuildHasher;
+        let taken = [
+            self.session_id(),
+            self.last_end.map(|(id, _)| id),
+            self.ended_for_liveness
+                .as_ref()
+                .map(|ended| ended.session_id),
+        ];
+        loop {
+            self.next_session_id = self.next_session_id.wrapping_add(1);
+            let id = self.session_id_keys.hash_one(self.next_session_id) as u32;
+            if id != 0 && !taken.contains(&Some(id)) {
+                return id;
+            }
+        }
     }
 
     fn next_msg_seq(&mut self) -> u32 {
@@ -480,18 +755,23 @@ impl Session {
 
     /// Feed one control datagram off a link, with its header. Input whose
     /// msg_seq this session took already, or that is too old, is dropped.
+    ///
+    /// `datagram_len` is the datagram's size: over Wi-Fi, a refused HELLO2,
+    /// or one the PC answers while it isn't streaming, gets no answer larger
+    /// than itself.
     pub fn handle_datagram(
         &mut self,
         source: PeerId,
         header: &ControlHeader,
         message: ControlMessage,
+        datagram_len: usize,
         config: &impl ConfigSource,
         now: Instant,
     ) -> Actions {
         self.handle(
             source,
             header.session_id,
-            Some(header.msg_seq),
+            Some((header.msg_seq, datagram_len)),
             message,
             config,
             now,
@@ -519,7 +799,8 @@ impl Session {
         &mut self,
         source: PeerId,
         header_session_id: u32,
-        msg_seq: Option<u32>,
+        // The datagram's msg_seq and size, when it came off a link.
+        datagram: Option<(u32, usize)>,
         message: ControlMessage,
         config: &impl ConfigSource,
         now: Instant,
@@ -532,7 +813,10 @@ impl Session {
         // INPUT_EVENT moved the mouse and clicked, a stray RECEIVER_REPORT
         // steered the bitrate, and a late BYE from a superseded session tore
         // down the one that replaced it.
-        if !matches!(message, ControlMessage::Hello2(_)) {
+        if !matches!(
+            message,
+            ControlMessage::Hello2(_) | ControlMessage::Identify(_)
+        ) {
             match self.active.as_ref() {
                 Some(session)
                     if session.session_id == header_session_id && !session.awaiting_takeover => {}
@@ -540,13 +824,22 @@ impl Session {
                 _ => return self.answer_ended(source, header_session_id, now),
             }
         }
+        // Answers over USB stay whole.
+        let hello_len = datagram
+            .map(|(_, len)| len)
+            .filter(|_| source.link == LinkId::Udp);
         match message {
-            ControlMessage::Hello2(hello) => self.handle_hello(source, hello, config, now),
+            ControlMessage::Hello2(hello) => {
+                self.handle_hello(source, hello, hello_len, config, now)
+            }
+            ControlMessage::Identify(request) => self.answer_identify(source, request, config, now),
             ControlMessage::Bye(reason) => self.handle_bye(source, reason, now),
             ControlMessage::KeyframeRequest(request) => self.handle_keyframe(source, request, now),
             ControlMessage::ReceiverReport(report) => self.handle_report(source, report, now),
             ControlMessage::Ping(ping) => self.handle_ping(source, ping, now),
-            ControlMessage::InputEvent(event) => self.handle_input(source, event, msg_seq, now),
+            ControlMessage::InputEvent(event) => {
+                self.handle_input(source, event, datagram.map(|(seq, _)| seq), now)
+            }
             ControlMessage::Nack(nack) => self.handle_nack(source, nack, now),
             // Host-outbound types arriving inbound: ignore.
             _ => Actions::default(),
@@ -620,6 +913,7 @@ impl Session {
         &mut self,
         source: PeerId,
         hello: eternal_wire::v2::control::Hello2,
+        hello_len: Option<usize>,
         config: &impl ConfigSource,
         now: Instant,
     ) -> Actions {
@@ -628,14 +922,21 @@ impl Session {
         // Version gate first.
         if hello.proto_min > 2 || hello.proto_max < 2 {
             crate::updates::note_ipad_protocol(hello.proto_min, hello.proto_max);
-            return self.refuse(source, HelloStatus::VersionUnsupported, &hello, config, now);
+            return self.refuse(
+                source,
+                HelloStatus::VersionUnsupported,
+                &hello,
+                hello_len,
+                config,
+                now,
+            );
         }
 
-        // An update is about to close the host: don't start a stream it would cut.
-        // The iPad shows Busy ("already streaming"); a retry after the restart works.
-        if self.updating {
-            info!(peer = %source, "Client turned away while an update starts");
-            return self.refuse(source, HelloStatus::Busy, &hello, config, now);
+        // Don't start a stream nothing will serve.
+        let closed = self.closed_to_clients();
+        if let Some(Closed::Busy(why)) = closed {
+            info!(peer = %source, "{why}");
+            return self.refuse(source, HelloStatus::Busy, &hello, hello_len, config, now);
         }
 
         // Keep credentials locked through authorization, rotation and ACK creation:
@@ -649,6 +950,11 @@ impl Session {
             {
                 // Exact replay of an accepted handshake. In particular, losing the
                 // first code-based ACK must not require the now-rotated code.
+                if let Some(Closed::NotStreaming(state)) = closed {
+                    drop(pairing);
+                    return self
+                        .answer_not_streaming(source, state, &hello, hello_len, config, now);
+                }
                 actions.replies.push((source, session.ack.clone()));
                 return actions;
             }
@@ -659,7 +965,7 @@ impl Session {
         {
             Some(Ok(grant)) => grant,
             Some(Err(status)) => {
-                return self.refuse(source, status, &hello, config, now);
+                return self.refuse(source, status, &hello, hello_len, config, now);
             }
             None => crate::pairing::Grant {
                 token: [0; 16],
@@ -667,6 +973,12 @@ impl Session {
                 new_pairing: false,
             },
         };
+        // Only an iPad that may connect learns why the PC isn't streaming.
+        // A right pairing code isn't spent: it still works after Start.
+        if let Some(Closed::NotStreaming(state)) = closed {
+            drop(pairing);
+            return self.answer_not_streaming(source, state, &hello, hello_len, config, now);
+        }
 
         // The media target: the client's advertised listen port at its source IP
         // (normally identical to the source port; 0 = malformed, use the source).
@@ -687,7 +999,7 @@ impl Session {
         if let Some(session) = self.active.as_ref() {
             if session.same_device(source, hello.device_id) {
                 if matches!(session.peer.link, LinkId::Usb { .. }) && source.link == LinkId::Udp {
-                    return self.refuse(source, HelloStatus::Busy, &hello, config, now);
+                    return self.refuse(source, HelloStatus::Busy, &hello, hello_len, config, now);
                 }
                 // Same device, new connect attempt: supersede in place.
                 info!(peer = %source, "Client reconnected — superseding session in place");
@@ -697,7 +1009,7 @@ impl Session {
             } else {
                 // A different device while one is streaming: reject.
                 info!(peer = %source, "Second client rejected while a session is active");
-                return self.refuse(source, HelloStatus::Busy, &hello, config, now);
+                return self.refuse(source, HelloStatus::Busy, &hello, hello_len, config, now);
             }
         }
 
@@ -708,10 +1020,16 @@ impl Session {
                 .rotate_code()
             {
                 warn!(%error, "Pairing code rotation failed");
-                return self.refuse(source, HelloStatus::Error, &hello, config, now);
+                return self.refuse(source, HelloStatus::Error, &hello, hello_len, config, now);
             }
         }
 
+        // A session taken over before it was heard passes on what it spent.
+        let inherited = self
+            .active
+            .as_ref()
+            .filter(|session| !session.answered)
+            .map_or(0, |session| session.unanswered_sent);
         let silent_taken_over = self
             .active
             .as_ref()
@@ -724,6 +1042,17 @@ impl Session {
             actions.ended = self.end(EndReason::Superseded, now);
         }
         let session_id = self.allocate_session_id();
+        // An address whose last session ended before it answered (this
+        // HELLO2 may have just superseded it) gets no media until it does.
+        self.unanswered
+            .retain(|(_, at)| now.saturating_duration_since(*at) < UNANSWERED_FOR);
+        let answered = source.link != LinkId::Udp;
+        let unanswered_sent = match source.addr {
+            Some(addr) if self.unanswered.iter().any(|(ip, _)| *ip == addr.ip()) => {
+                UNANSWERED_MEDIA_BUDGET
+            }
+            _ => inherited,
+        };
         crate::telemetry::note_client_device(&hello.device_name);
         info!(
             peer = %source,
@@ -766,6 +1095,9 @@ impl Session {
             frames_received: false,
             bye: None,
             input_seqs: SeqWindow::default(),
+            answered,
+            unanswered_sent,
+            withheld: false,
         });
 
         // Only a new pairing carries the token. iPads keep the token they
@@ -851,6 +1183,52 @@ impl Session {
         actions
     }
 
+    /// An iPad checking that this is the PC it paired with, at the address
+    /// it asked, before it reconnects there. It starts no session and works
+    /// while another device streams. Only Wi-Fi asks, within
+    /// [`IdentifyLimiter`]'s bounds.
+    fn answer_identify(
+        &mut self,
+        source: PeerId,
+        request: eternal_wire::v2::control::Identify,
+        config: &impl ConfigSource,
+        now: Instant,
+    ) -> Actions {
+        let mut actions = Actions::default();
+        let (LinkId::Udp, Some(asker)) = (source.link, source.addr) else {
+            return actions;
+        };
+        let Some(pairing) = config.pairing() else {
+            return actions;
+        };
+        if request.version != eternal_wire::v2::control::IDENTIFY_VERSION
+            || !self.identify_limiter.allow(asker.ip(), now)
+        {
+            return actions;
+        }
+        let Some((port, addresses)) = config.identity_endpoints() else {
+            return actions;
+        };
+        let addresses: Vec<[u8; 4]> = addresses
+            .into_iter()
+            .take(eternal_wire::v2::control::IDENTITY_MAX_ADDRESSES)
+            .collect();
+        let identity = ControlMessage::Identity(eternal_wire::v2::control::Identity {
+            version: eternal_wire::v2::control::IDENTIFY_VERSION,
+            nonce: request.nonce,
+            port,
+            proof: pairing
+                .lock()
+                .identity_proof(&request.nonce, port, &addresses),
+            addresses,
+        });
+        actions.replies.push((
+            source,
+            eternal_wire::v2::control::encode_control(0, 1, &identity),
+        ));
+        actions
+    }
+
     fn handle_ping(
         &mut self,
         source: PeerId,
@@ -886,10 +1264,25 @@ impl Session {
     /// and reports during the restart gap went unheard, so the gap must not
     /// count against it: 0.3.1 expired live iPads the moment a slow restart
     /// finished and made them reconnect.
-    pub fn transport_resumed(&mut self, now: Instant) {
+    ///
+    /// `stopping`: the stream was stopped for good (`running` false, read
+    /// under the session lock, which [`Self::shut_down`]'s caller holds while
+    /// it clears it) before this transport got going. Its goodbye is
+    /// current, and this transport sends it on its way out; clients stay
+    /// turned away. Otherwise the stream runs again: clients are let in, and
+    /// a goodbye a stop left while no transport ran is retired, as its
+    /// session is long over. Both happen in this one call, so a stop that
+    /// comes after it keeps its goodbye. Returns whether one was retired.
+    pub fn transport_resumed(&mut self, now: Instant, stopping: bool) -> bool {
         if let Some(session) = self.active.as_mut() {
             session.liveness_deadline = session.liveness_deadline.max(now + LIVENESS_TIMEOUT);
         }
+        if stopping {
+            return false;
+        }
+        let stale = self.stream_stopped && self.goodbye.take().is_some();
+        self.stream_stopped = false;
+        stale
     }
 
     /// Periodic tick: expire the session when the client has been silent past
@@ -964,6 +1357,7 @@ impl Session {
             let heartbeat = ControlMessage::Heartbeat(eternal_wire::v2::control::Heartbeat {
                 host_time_us: crate::clock::host_now_us(),
                 stream_config: self.negotiated_config(config),
+                notice: config.notice(),
             });
             actions.replies.push((
                 peer,
@@ -1053,15 +1447,97 @@ impl Session {
 
     /// Answers `hello` with a refusal. The first refusal of a nonce ends
     /// that attempt; a retransmit of it gets the answer again.
+    /// Tells an iPad the PC isn't streaming, in the words it understands.
+    /// 0.3.4 and older drop an ACK whose status they don't know. A restart
+    /// is short and their HELLO2 retries outlast it, so they hear nothing,
+    /// as before. A stopped or failed PC waits for someone at the PC, so it
+    /// turns them down with Error: "Your PC turned down the connection",
+    /// which also ends their reconnect cycle.
+    ///
+    /// Over Wi-Fi the answer is never larger than the HELLO2: iPads that
+    /// understand these answers pad theirs so every answer fits whole. A
+    /// stopping stream answers here too, until its transport ends, so the
+    /// bound is here as well as in the standby responder.
+    fn answer_not_streaming(
+        &mut self,
+        source: PeerId,
+        state: NotStreaming,
+        hello: &eternal_wire::v2::control::Hello2,
+        hello_len: Option<usize>,
+        config: &impl ConfigSource,
+        now: Instant,
+    ) -> Actions {
+        let (status, reason) = if hello.feature_caps & FEATURE_STANDBY_STATUS == 0 {
+            match state {
+                NotStreaming::Restarting => return Actions::default(),
+                NotStreaming::Stopped | NotStreaming::Failed(_) => (HelloStatus::Error, ""),
+            }
+        } else {
+            match state {
+                NotStreaming::Stopped => (HelloStatus::Stopped, ""),
+                NotStreaming::Restarting => (HelloStatus::Restarting, ""),
+                NotStreaming::Failed(reason) => (HelloStatus::Failed, reason.token()),
+            }
+        };
+        let actions =
+            self.refuse_with_reason(source, status, reason, hello, hello_len, config, now);
+        if actions.ended.is_some() && !actions.replies.is_empty() {
+            info!(peer = %source, ?status, reason, "Told an iPad the PC isn't streaming");
+        }
+        actions
+    }
+
+    /// Answers `hello` with a refusal. The first refusal of a nonce ends
+    /// that attempt; a retransmit of it gets the answer again.
+    ///
+    /// With `hello_len`, the answer is no larger than the HELLO2: without
+    /// the PC name and host caps if need be, which iPads read only from an
+    /// accepted HELLO2, or not sent at all. A not-streaming reason stays.
+    /// Every iPad's HELLO2 fits the bare answer.
     fn refuse(
         &mut self,
         source: PeerId,
         status: HelloStatus,
         hello: &eternal_wire::v2::control::Hello2,
+        hello_len: Option<usize>,
         config: &impl ConfigSource,
         now: Instant,
     ) -> Actions {
-        let ack = self.make_ack(status, hello.client_nonce, 0, config);
+        self.refuse_with_reason(source, status, "", hello, hello_len, config, now)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn refuse_with_reason(
+        &mut self,
+        source: PeerId,
+        status: HelloStatus,
+        reason: &str,
+        hello: &eternal_wire::v2::control::Hello2,
+        hello_len: Option<usize>,
+        config: &impl ConfigSource,
+        now: Instant,
+    ) -> Actions {
+        let msg_seq = self.next_msg_seq();
+        let mut answer = self.hello_ack(status, hello.client_nonce, 0, config, [0; 16], reason);
+        let encode = |answer: &HelloAck| {
+            eternal_wire::v2::control::encode_control(
+                0,
+                msg_seq,
+                &ControlMessage::HelloAck(answer.clone()),
+            )
+        };
+        let mut ack = encode(&answer);
+        let fits = |ack: &[u8]| hello_len.is_none_or(|len| ack.len() <= len);
+        if !fits(&ack) {
+            answer.host_name.clear();
+            answer.host_caps = 0;
+            ack = encode(&answer);
+        }
+        let replies = if fits(&ack) {
+            vec![(source, ack)]
+        } else {
+            Vec::new()
+        };
         self.refused
             .retain(|(_, at)| now.saturating_duration_since(*at) < REFUSED_FOR);
         let first = !self
@@ -1076,7 +1552,7 @@ impl Session {
         }
         let summarized = first && self.summarize_refusal(now);
         Actions {
-            replies: vec![(source, ack)],
+            replies,
             ended: summarized.then_some(SessionEnd {
                 session_id: None,
                 client_nonce: hello.client_nonce,
@@ -1121,16 +1597,6 @@ impl Session {
         }
     }
 
-    fn make_ack(
-        &mut self,
-        status: HelloStatus,
-        client_nonce: u32,
-        session_id: u32,
-        config: &impl ConfigSource,
-    ) -> Vec<u8> {
-        self.make_ack_with_token(status, client_nonce, session_id, config, [0; 16])
-    }
-
     fn make_ack_with_token(
         &mut self,
         status: HelloStatus,
@@ -1139,8 +1605,37 @@ impl Session {
         config: &impl ConfigSource,
         auth_token: [u8; 16],
     ) -> Vec<u8> {
+        self.make_reply(status, client_nonce, session_id, config, auth_token, "")
+    }
+
+    fn make_reply(
+        &mut self,
+        status: HelloStatus,
+        client_nonce: u32,
+        session_id: u32,
+        config: &impl ConfigSource,
+        auth_token: [u8; 16],
+        reason: &str,
+    ) -> Vec<u8> {
         let msg_seq = self.next_msg_seq();
-        let ack = ControlMessage::HelloAck(HelloAck {
+        let ack = self.hello_ack(status, client_nonce, session_id, config, auth_token, reason);
+        eternal_wire::v2::control::encode_control(
+            session_id,
+            msg_seq,
+            &ControlMessage::HelloAck(ack),
+        )
+    }
+
+    fn hello_ack(
+        &self,
+        status: HelloStatus,
+        client_nonce: u32,
+        session_id: u32,
+        config: &impl ConfigSource,
+        auth_token: [u8; 16],
+        reason: &str,
+    ) -> HelloAck {
+        HelloAck {
             status,
             accepted_version: 2,
             client_nonce,
@@ -1152,8 +1647,8 @@ impl Session {
             host_name: config.host_name(),
             auth_token,
             host_caps: HOSTCAP_NACK | config.host_caps(),
-        });
-        eternal_wire::v2::control::encode_control(session_id, msg_seq, &ack)
+            reason: reason.to_string(),
+        }
     }
 
     fn negotiated_config(&self, source: &impl ConfigSource) -> StreamConfig {
@@ -1232,11 +1727,28 @@ impl ActiveSession {
 
     /// The client was heard: it gets a full liveness window again, and a
     /// session on hold carries on. Returns whether to force an IDR: reports
-    /// and keyframe requests sent during the silence may not have arrived.
+    /// and keyframe requests sent during the silence may not have arrived,
+    /// and a client that answers after frames were held back from it needs
+    /// a keyframe to start its picture.
     fn heard(&mut self, kind: Heard, now: Instant) -> bool {
         let silent = now.saturating_duration_since(self.heard.0);
         self.heard = (now, kind);
         self.liveness_deadline = now + LIVENESS_TIMEOUT;
+        if !self.answered {
+            self.answered = true;
+            info!(
+                session_id = self.session_id,
+                answered_ms = now
+                    .saturating_duration_since(self.info.connected_at)
+                    .as_millis() as u64,
+                heard = kind.as_str(),
+                withheld = self.withheld,
+                "Client answered"
+            );
+            if self.withheld {
+                return self.grant_keyframe(now);
+            }
+        }
         let Some(since) = self.held_since.take() else {
             return false;
         };
@@ -1853,7 +2365,7 @@ mod tests {
         session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
         // The transport was down for 11 s (a capture restart with backoff).
         let resumed = now + Duration::from_secs(11);
-        session.transport_resumed(resumed);
+        session.transport_resumed(resumed, false);
         assert!(!session.tick(&TestConfig, false, resumed).client_lost);
         assert!(session.is_active());
         // A client that stays silent after the restart still expires.
@@ -2131,7 +2643,9 @@ mod tests {
                 msg_seq,
             };
             let message = ControlMessage::InputEvent(event);
-            let actions = session.handle_datagram(peer, &header, message, &TestConfig, now);
+            let len =
+                eternal_wire::v2::control::encode_control(session_id, msg_seq, &message).len();
+            let actions = session.handle_datagram(peer, &header, message, len, &TestConfig, now);
             actions
                 .input
                 .map(|(_, event)| event)
@@ -2253,6 +2767,298 @@ mod tests {
             Some(&self.0)
         }
     }
+    fn identity_reply(actions: &Actions) -> eternal_wire::v2::control::Identity {
+        assert_eq!(actions.replies.len(), 1);
+        let (header, ControlMessage::Identity(identity)) =
+            eternal_wire::v2::control::parse_control(&actions.replies[0].1).unwrap()
+        else {
+            panic!("expected IDENTITY")
+        };
+        assert_eq!(header.session_id, 0);
+        identity
+    }
+
+    fn identify(version: u8, nonce: [u8; 16]) -> ControlMessage {
+        ControlMessage::Identify(eternal_wire::v2::control::Identify { version, nonce })
+    }
+
+    /// A paired host on port 9876 with the home network addresses given.
+    struct IdentifyConfig(PairConfig, Vec<[u8; 4]>);
+    impl ConfigSource for IdentifyConfig {
+        fn stream_config(&self) -> StreamConfig {
+            TestConfig.stream_config()
+        }
+        fn host_name(&self) -> String {
+            TestConfig.host_name()
+        }
+        fn pairing(&self) -> Option<&parking_lot::Mutex<crate::pairing::Pairing>> {
+            self.0.pairing()
+        }
+        fn identity_endpoints(&self) -> Option<(u16, Vec<[u8; 4]>)> {
+            Some((9876, self.1.clone()))
+        }
+    }
+
+    /// A paired host on every address whose home network addresses come
+    /// from `HomeCache`, listed by `held_home`.
+    struct ListedConfig(PairConfig, crate::network::HomeCache);
+    impl ConfigSource for ListedConfig {
+        fn stream_config(&self) -> StreamConfig {
+            TestConfig.stream_config()
+        }
+        fn host_name(&self) -> String {
+            TestConfig.host_name()
+        }
+        fn pairing(&self) -> Option<&parking_lot::Mutex<crate::pairing::Pairing>> {
+            self.0.pairing()
+        }
+        fn identity_endpoints(&self) -> Option<(u16, Vec<[u8; 4]>)> {
+            super::super::identity_endpoints(SocketAddr::from(([0, 0, 0, 0], 9876)), || {
+                self.1.get()
+            })
+        }
+    }
+
+    /// Held while the test keeps the PC's adapters from being listed.
+    static HOME_HELD: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    fn held_home() -> Option<Vec<crate::network::Adapter>> {
+        let _open = HOME_HELD.lock();
+        Some(vec![crate::network::Adapter {
+            name: String::new(),
+            kind: crate::network::Kind::Wifi,
+            up: true,
+            gateway: true,
+            ipv4: vec![std::net::Ipv4Addr::new(192, 168, 1, 20)],
+        }])
+    }
+
+    /// Once the last listing of the PC's addresses has expired, IDENTIFY gets
+    /// no answer until a new listing comes, however long that takes: the PC
+    /// never signs an address it may no longer have.
+    #[test]
+    fn identify_signs_no_expired_listing() {
+        let lifetime = Duration::from_secs(1);
+        let config = ListedConfig(
+            pair_config(true),
+            crate::network::HomeCache::with(held_home, lifetime),
+        );
+        let mut session = Session::new(100);
+        let start = Instant::now();
+        // A new asker and a new limiter window each time, so only the
+        // listing decides.
+        let mut asked = 0u32;
+        let mut ask = |session: &mut Session| {
+            asked += 1;
+            let asker = addr([192, 0, 2, (asked % 250) as u8 + 1], 50100);
+            answered(session, asker, &config, start + IDENTIFY_WINDOW * asked)
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ask(&mut session) {
+            assert!(Instant::now() < deadline, "the addresses were never listed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let held = HOME_HELD.lock();
+        std::thread::sleep(lifetime + Duration::from_millis(100));
+        for _ in 0..30 {
+            assert!(!ask(&mut session), "signed an expired listing");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        drop(held);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !ask(&mut session) {
+            assert!(Instant::now() < deadline, "a fresh listing never came");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    fn identify_config(required: bool) -> IdentifyConfig {
+        IdentifyConfig(
+            pair_config(required),
+            vec![[192, 0, 2, 1], [198, 51, 100, 1]],
+        )
+    }
+
+    fn answered(
+        session: &mut Session,
+        asker: PeerId,
+        config: &impl ConfigSource,
+        now: Instant,
+    ) -> bool {
+        !session
+            .handle_control(asker, 0, identify(1, [3; 16]), config, now)
+            .replies
+            .is_empty()
+    }
+
+    /// The PC proves it holds its pairing token at its own port and
+    /// addresses, with pairing on or off, without starting a session.
+    #[test]
+    fn identify_is_answered_with_the_token_proof_and_starts_nothing() {
+        let config = identify_config(true);
+        let mut session = Session::new(100);
+        let now = Instant::now();
+        let asker = addr([192, 0, 2, 9], 50100);
+        let actions = session.handle_control(asker, 0, identify(1, [3; 16]), &config, now);
+        let identity = identity_reply(&actions);
+        assert_eq!(actions.replies[0].0, asker);
+        assert_eq!(identity.nonce, [3; 16]);
+        assert_eq!(identity.port, 9876);
+        assert_eq!(identity.addresses, config.1);
+        let proof =
+            |pairing: &crate::pairing::Pairing| pairing.identity_proof(&[3; 16], 9876, &config.1);
+        assert_eq!(identity.proof, proof(&config.0 .0.lock()));
+        assert_ne!(
+            identity.proof,
+            proof(&crate::pairing::Pairing::new(true, [8; 16]).unwrap())
+        );
+        assert!(session.session_id().is_none());
+        assert!(actions.new_target.is_none());
+
+        // At most four addresses go out, and the proof signs those four.
+        let many = IdentifyConfig(
+            pair_config(false),
+            (1..=6).map(|last| [192, 0, 2, last]).collect(),
+        );
+        let identity =
+            identity_reply(&session.handle_control(asker, 0, identify(1, [3; 16]), &many, now));
+        assert_eq!(identity.addresses, many.1[..4]);
+        assert_eq!(
+            identity.proof,
+            many.0
+                 .0
+                .lock()
+                .identity_proof(&[3; 16], 9876, &many.1[..4])
+        );
+    }
+
+    /// A layout this PC doesn't know gets no answer, as from a PC before
+    /// 0.3.5; so does a host without pairing state or addresses to sign,
+    /// and a request over a cable.
+    #[test]
+    fn identify_of_another_version_is_not_answered() {
+        let mut session = Session::new(100);
+        let now = Instant::now();
+        let asker = addr([192, 0, 2, 9], 50100);
+        let actions =
+            session.handle_control(asker, 0, identify(2, [3; 16]), &identify_config(true), now);
+        assert!(actions.replies.is_empty());
+        assert!(!answered(&mut session, asker, &TestConfig, now));
+        assert!(!answered(&mut session, asker, &pair_config(true), now));
+        assert!(!answered(
+            &mut session,
+            PeerId::usb(1),
+            &identify_config(true),
+            now
+        ));
+        assert!(answered(&mut session, asker, &identify_config(true), now));
+    }
+
+    /// A burst from one address gets 8 answers in 10 s, and the PC 32 in
+    /// all from at most 16 addresses; each count starts over when its
+    /// window ends.
+    #[test]
+    fn identify_answers_are_bounded_per_asker_and_in_all() {
+        let config = identify_config(true);
+        let mut session = Session::new(100);
+        let start = Instant::now();
+        let asker = addr([192, 0, 2, 9], 50100);
+        let burst = (0..20)
+            .filter(|_| answered(&mut session, asker, &config, start))
+            .count();
+        assert_eq!(burst, IDENTIFY_PER_SOURCE as usize);
+        // Another port on the same address shares its count.
+        assert!(!answered(
+            &mut session,
+            addr([192, 0, 2, 9], 50101),
+            &config,
+            start
+        ));
+        // Others still get theirs, up to the PC's 32.
+        let others: usize = (10..13)
+            .map(|last| {
+                (0..20)
+                    .filter(|_| {
+                        answered(&mut session, addr([192, 0, 2, last], 50100), &config, start)
+                    })
+                    .count()
+            })
+            .sum();
+        assert_eq!(others, (IDENTIFY_OVERALL - IDENTIFY_PER_SOURCE) as usize);
+        assert!(!answered(
+            &mut session,
+            addr([192, 0, 2, 40], 50100),
+            &config,
+            start
+        ));
+
+        let later = start + IDENTIFY_WINDOW - Duration::from_millis(1);
+        assert!(!answered(&mut session, asker, &config, later));
+        let next = start + IDENTIFY_WINDOW;
+        assert!(answered(&mut session, asker, &config, next));
+        assert!(answered(
+            &mut session,
+            addr([192, 0, 2, 40], 50100),
+            &config,
+            next
+        ));
+
+        // Past 16 addresses in a window, a new one waits for the next.
+        let mut session = Session::new(100);
+        for last in 0..IDENTIFY_SOURCES as u8 {
+            assert!(answered(
+                &mut session,
+                addr([198, 51, 100, last], 50100),
+                &config,
+                start
+            ));
+        }
+        assert!(!answered(&mut session, asker, &config, start));
+        assert!(answered(&mut session, asker, &config, next));
+    }
+
+    /// While another iPad streams, IDENTIFY is answered within the same
+    /// bounds, and the stream goes on whatever arrives.
+    #[test]
+    fn identify_while_streaming_is_bounded_and_leaves_the_stream() {
+        let mut session = Session::new(100);
+        let now = Instant::now();
+        let streaming = addr([192, 0, 2, 5], 50000);
+        session.handle_control(
+            streaming,
+            0,
+            ControlMessage::Hello2(pair_hello(1)),
+            &pair_config(false),
+            now,
+        );
+        let live = session.session_id();
+        assert!(live.is_some());
+
+        let config = identify_config(false);
+        let asker = addr([192, 0, 2, 9], 50100);
+        let mut answers = 0;
+        for index in 0..40u8 {
+            let actions = session.handle_control(asker, 0, identify(1, [index; 16]), &config, now);
+            assert!(
+                actions.new_target.is_none() && !actions.client_lost && actions.goodbye.is_none()
+            );
+            if !actions.replies.is_empty() {
+                let identity = identity_reply(&actions);
+                assert_eq!(identity.nonce, [index; 16]);
+                assert_eq!(actions.replies[0].0, asker, "never to the streaming iPad");
+                answers += 1;
+            }
+        }
+        assert_eq!(answers, IDENTIFY_PER_SOURCE);
+        // The streaming iPad's own IDENTIFY counts on its own address.
+        assert!(answered(&mut session, streaming, &config, now));
+        assert_eq!(session.session_id(), live, "the stream goes on");
+        let actions = session.tick(&config, true, now + Duration::from_millis(100));
+        assert!(!actions.client_lost);
+        assert_eq!(session.session_id(), live);
+    }
+
     fn pair_config(required: bool) -> PairConfig {
         PairConfig(parking_lot::Mutex::new(
             crate::pairing::Pairing::new(required, [7; 16]).unwrap(),
@@ -2648,14 +3454,134 @@ mod tests {
             (ended(&stopped).client_nonce, ended(&stopped).reason),
             (4, EndReason::Shutdown)
         );
-        assert_eq!(session.shut_down(now), None, "reported once");
+        assert_eq!(
+            session.shut_down(now, StreamStop::Quit),
+            None,
+            "reported once"
+        );
+        assert_eq!(session.take_goodbye(), None, "nobody left to tell");
 
         session.end_update();
+        // The stream runs again: clients are let in.
+        session.transport_resumed(now, false);
         session.handle_control(usb, 0, identified_hello(5, 77), &TestConfig, now);
-        let quit = session.shut_down(now + Duration::from_secs(3)).unwrap();
+        let quit = session
+            .shut_down(now + Duration::from_secs(3), StreamStop::Quit)
+            .unwrap();
         assert_eq!((quit.client_nonce, quit.reason), (5, EndReason::Shutdown));
         assert_eq!(quit.duration, Duration::from_secs(3));
         assert!(!session.is_active());
+    }
+
+    /// A HELLO2 that arrives after the stream stopped, before its transport
+    /// noticed (up to a liveness tick), used to open a session nothing would
+    /// serve: no heartbeats, and the PC counted it as connected. It is turned
+    /// away until a transport resumes.
+    #[test]
+    fn a_hello_after_the_stream_stopped_is_turned_away_until_it_runs_again() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut session = Session::new(500);
+        assert_eq!(session.shut_down(now, StreamStop::User), None);
+        let refused = session.handle_control(peer, 0, identified_hello(7, 77), &TestConfig, now);
+        assert_eq!(parse_ack(&refused.replies[0].1).status, HelloStatus::Busy);
+        assert!(!session.is_active());
+
+        session.transport_resumed(now, false);
+        let admitted = session.handle_control(peer, 0, identified_hello(8, 77), &TestConfig, now);
+        assert_eq!(admitted.new_target, Some(peer));
+        assert!(session.is_active());
+    }
+
+    /// A transport starting after a stop retires the stop's goodbye only if
+    /// the stream runs again; one starting while the stream is stopping keeps
+    /// it, and keeps clients out. A stop after the start keeps its goodbye.
+    #[test]
+    fn a_starting_transport_retires_only_a_goodbye_from_before_the_stream_ran_again() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let admit = |session: &mut Session, nonce| {
+            session.handle_control(peer, 0, identified_hello(nonce, 77), &TestConfig, now)
+        };
+
+        // Stopped while no transport ran; Start brought the stream back.
+        let mut session = Session::new(500);
+        admit(&mut session, 1);
+        session.shut_down(now, StreamStop::User).unwrap();
+        assert!(
+            session.transport_resumed(now, false),
+            "a stale goodbye is retired"
+        );
+        assert_eq!(session.take_goodbye(), None);
+        assert_eq!(admit(&mut session, 2).new_target, Some(peer));
+
+        // Stopped while this transport was starting: the goodbye is current.
+        let mut session = Session::new(500);
+        admit(&mut session, 3);
+        session.shut_down(now, StreamStop::User).unwrap();
+        assert!(!session.transport_resumed(now, true));
+        assert!(
+            session.take_goodbye().is_some(),
+            "the current goodbye is kept"
+        );
+        let refused = admit(&mut session, 4);
+        assert_eq!(parse_ack(&refused.replies[0].1).status, HelloStatus::Busy);
+
+        // Stopped once the transport ran: kept, for the transport to send.
+        let mut session = Session::new(500);
+        admit(&mut session, 5);
+        assert!(!session.transport_resumed(now, false), "nothing to retire");
+        session.shut_down(now, StreamStop::User).unwrap();
+        assert!(session.take_goodbye().is_some());
+    }
+
+    /// Quitting or Stop ends the stream for good: the iPad hears why, from
+    /// the transport on its way out, instead of waiting out a lost signal.
+    /// A restart tells it to connect again.
+    #[test]
+    fn a_stopped_stream_tells_its_ipad() {
+        let now = Instant::now();
+        let usb = PeerId::usb(17);
+        let wifi = addr([10, 0, 0, 5], 50000);
+        for (peer, why, bye, reason) in [
+            (
+                usb,
+                StreamStop::Quit,
+                ByeReason::UserDisconnect,
+                EndReason::Shutdown,
+            ),
+            (
+                wifi,
+                StreamStop::Handoff,
+                ByeReason::Error,
+                EndReason::Shutdown,
+            ),
+            (
+                wifi,
+                StreamStop::User,
+                ByeReason::UserDisconnect,
+                EndReason::Stopped,
+            ),
+            (
+                usb,
+                StreamStop::GaveUp(StageFailure::Encoder),
+                ByeReason::Error,
+                EndReason::Failed(StageFailure::Encoder),
+            ),
+        ] {
+            let mut session = Session::new(500);
+            session.handle_control(peer, 0, identified_hello(6, 77), &TestConfig, now);
+            let id = session.session_id().unwrap();
+            let end = session.shut_down(now, why).unwrap();
+            assert_eq!(end.reason, reason);
+            let (to, bytes) = session.take_goodbye().expect("a goodbye");
+            let (header, message) = eternal_wire::v2::control::parse_control(&bytes).unwrap();
+            assert_eq!(
+                (to, header.session_id, message),
+                (peer, id, ControlMessage::Bye(bye))
+            );
+            assert_eq!(session.take_goodbye(), None, "sent once");
+        }
     }
 
     #[test]
@@ -2775,6 +3701,7 @@ mod tests {
         use tracing_subscriber::prelude::*;
         let counts = LeftOut::default();
         let seen = counts.0.clone();
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(tracing_subscriber::registry().with(counts), || {
             session.tick(&config, false, now + Duration::from_secs(30));
             session.tick(&config, false, now + REFUSAL_MINUTE);
@@ -3311,5 +4238,845 @@ mod tests {
             }
             assert_eq!(late, 0, "{ppm} ppm");
         }
+    }
+
+    /// Feeds `message` as the datagram a Wi-Fi or USB link delivers.
+    fn datagram(
+        session: &mut Session,
+        peer: PeerId,
+        session_id: u32,
+        message: ControlMessage,
+        now: Instant,
+    ) -> Actions {
+        let bytes = eternal_wire::v2::control::encode_control(session_id, 1, &message);
+        let (header, message) = eternal_wire::v2::control::parse_control(&bytes).unwrap();
+        session.handle_datagram(peer, &header, message, bytes.len(), &TestConfig, now)
+    }
+
+    fn ping() -> ControlMessage {
+        ControlMessage::Ping(eternal_wire::v2::control::Ping { t1_us: 1 })
+    }
+
+    /// Until something of its session comes back, a Wi-Fi client gets its
+    /// first picture and heartbeats, but no more media. Its answer asks for
+    /// a keyframe, as frames were held back, and the stream goes on.
+    #[test]
+    fn a_wifi_client_gets_its_first_picture_then_waits_to_be_heard() {
+        let mut session = Session::new(1234);
+        let now = Instant::now();
+        let ipad = addr([10, 0, 0, 5], 50000);
+        session.handle_control(ipad, 0, identified_hello(1, 77), &TestConfig, now);
+        let id = session.session_id().unwrap();
+
+        assert!(
+            session.may_send_media(id, 300 * 1024, now),
+            "the first keyframe"
+        );
+        assert!(session.may_send_media(id, UNANSWERED_MEDIA_BUDGET - 300 * 1024, now));
+        assert!(!session.may_send_media(id, 1, now), "the budget is spent");
+        let heartbeat = session.tick(&TestConfig, true, now + Duration::from_secs(1));
+        assert_eq!(heartbeat.replies.len(), 1, "heartbeats go on");
+
+        let answer = datagram(&mut session, ipad, id, ping(), now + Duration::from_secs(1));
+        assert!(answer.force_idr, "a keyframe starts the picture again");
+        assert!(session.may_send_media(id, 4 * UNANSWERED_MEDIA_BUDGET, now));
+    }
+
+    /// A frame that doesn't fit is held back, and so is every one after it
+    /// until the client answers, even one that would fit: a frame after a
+    /// gap can't be decoded.
+    #[test]
+    fn nothing_follows_a_held_back_frame_until_the_answer() {
+        let mut session = Session::new(1234);
+        let now = Instant::now();
+        let ipad = addr([10, 0, 0, 5], 50000);
+        session.handle_control(ipad, 0, identified_hello(1, 77), &TestConfig, now);
+        let id = session.session_id().unwrap();
+        assert!(!session.may_send_media(id, UNANSWERED_MEDIA_BUDGET + 1, now));
+        assert!(!session.may_send_media(id, 100, now));
+        datagram(&mut session, ipad, id, ping(), now);
+        assert!(session.may_send_media(id, 100, now));
+    }
+
+    /// Whatever the iPad sends first counts, and an answer before the
+    /// budget ran out needs no keyframe. A packet with another session's
+    /// id, from another address, or a repeat of the HELLO2 is no answer.
+    #[test]
+    fn any_packet_of_the_session_from_its_address_is_its_answer() {
+        let answers = [
+            ping(),
+            ControlMessage::ReceiverReport(ReceiverReport::default()),
+            ControlMessage::KeyframeRequest(KeyframeRequest {
+                stream_epoch: 7,
+                last_complete_seq: 0,
+                reason: KeyframeReason::Startup,
+            }),
+            ControlMessage::Nack(Nack {
+                stream_epoch: 7,
+                frame_seq: 1,
+                frag_count: 2,
+                missing: vec![1],
+            }),
+        ];
+        for answer in answers {
+            let mut session = Session::new(1234);
+            let now = Instant::now();
+            let ipad = addr([10, 0, 0, 5], 50000);
+            session.handle_control(ipad, 0, identified_hello(1, 77), &TestConfig, now);
+            let id = session.session_id().unwrap();
+            datagram(&mut session, ipad, id, identified_hello(1, 77), now);
+            datagram(&mut session, ipad, id.wrapping_add(1), ping(), now);
+            datagram(&mut session, addr([10, 0, 0, 6], 50000), id, ping(), now);
+            assert!(!session.may_send_media(id, UNANSWERED_MEDIA_BUDGET + 1, now));
+            let heard = datagram(&mut session, ipad, id, answer.clone(), now);
+            assert!(
+                session.may_send_media(id, UNANSWERED_MEDIA_BUDGET + 1, now),
+                "{answer:?}"
+            );
+
+            let mut early = Session::new(1234);
+            early.handle_control(ipad, 0, identified_hello(1, 77), &TestConfig, now);
+            let id = early.session_id().unwrap();
+            assert!(early.may_send_media(id, 1000, now));
+            let heard_early = datagram(&mut early, ipad, id, answer.clone(), now);
+            assert_eq!(
+                heard_early.force_idr,
+                heard.force_idr && matches!(answer, ControlMessage::KeyframeRequest(_)),
+                "{answer:?}"
+            );
+            assert!(heard.force_idr, "{answer:?}");
+        }
+    }
+
+    /// The PC opens USB tunnels itself, to an iPad on the cable: they
+    /// stream from the start.
+    #[test]
+    fn usb_streams_before_the_ipad_is_heard() {
+        let mut session = Session::new(1234);
+        let usb = PeerId::usb(17);
+        let actions = datagram(
+            &mut session,
+            usb,
+            0,
+            identified_hello(1, 77),
+            Instant::now(),
+        );
+        let id = session.session_id().unwrap();
+        assert_eq!(actions.new_target, Some(usb));
+        assert!(session.may_send_media(id, 10 * UNANSWERED_MEDIA_BUDGET, Instant::now()));
+    }
+
+    /// A new session from an address whose last one ended before it was
+    /// heard, by a new HELLO2 or the liveness timeout, gets no media until
+    /// it is, for a minute. An address that was heard starts afresh.
+    #[test]
+    fn an_address_that_was_never_heard_gets_no_new_budget_for_a_minute() {
+        let mut session = Session::new(1234);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let ipad = addr([10, 0, 0, 5], 50000);
+        datagram(&mut session, ipad, 0, identified_hello(1, 77), at(0));
+        let first = session.session_id().unwrap();
+        datagram(&mut session, ipad, 0, identified_hello(2, 77), at(100));
+        let second = session.session_id().unwrap();
+        assert_ne!(first, second);
+        assert!(
+            !session.may_send_media(second, 1, at(100)),
+            "superseded unheard"
+        );
+
+        let expired = session.tick(&TestConfig, false, at(3200));
+        assert_eq!(expired.ended.unwrap().reason, EndReason::Liveness);
+        datagram(&mut session, ipad, 0, identified_hello(3, 77), at(5000));
+        let third = session.session_id().unwrap();
+        assert!(
+            !session.may_send_media(third, 1, at(5000)),
+            "expired unheard"
+        );
+        session.tick(&TestConfig, false, at(8200));
+        assert_eq!(session.last_end(), Some((third, EndReason::Liveness)));
+
+        datagram(&mut session, ipad, 0, identified_hello(4, 77), at(68_000));
+        let early = session.session_id().unwrap();
+        assert!(
+            !session.may_send_media(early, 1, at(68_000)),
+            "not yet a minute"
+        );
+        session.tick(&TestConfig, false, at(71_200));
+
+        datagram(&mut session, ipad, 0, identified_hello(5, 77), at(132_000));
+        let fresh = session.session_id().unwrap();
+        assert!(
+            session.may_send_media(fresh, 1000, at(132_000)),
+            "a minute later"
+        );
+
+        datagram(&mut session, ipad, fresh, ping(), at(132_010));
+        datagram(&mut session, ipad, 0, identified_hello(6, 77), at(133_000));
+        let reconnect = session.session_id().unwrap();
+        assert!(
+            session.may_send_media(reconnect, 1000, at(133_000)),
+            "it was heard"
+        );
+    }
+
+    /// A HELLO2 with the same device id from another address takes over a
+    /// session that was never heard, with what it already spent.
+    #[test]
+    fn an_address_change_with_the_same_device_id_brings_no_new_budget() {
+        let mut session = Session::new(1234);
+        let now = Instant::now();
+        datagram(
+            &mut session,
+            addr([10, 0, 0, 5], 50000),
+            0,
+            identified_hello(1, 77),
+            now,
+        );
+        let first = session.session_id().unwrap();
+        assert!(session.may_send_media(first, UNANSWERED_MEDIA_BUDGET, now));
+
+        let later = now + Duration::from_millis(50);
+        let moved = addr([10, 0, 0, 9], 50000);
+        let actions = datagram(&mut session, moved, 0, identified_hello(2, 77), later);
+        assert_eq!(actions.new_target, Some(moved));
+        let second = session.session_id().unwrap();
+        assert_ne!(first, second);
+        assert!(!session.may_send_media(second, 1, later));
+    }
+
+    /// Media to clients not yet heard counts against one host-wide budget,
+    /// whatever their address, which comes back over a minute. It still
+    /// holds once more addresses than the memory keeps have come and gone.
+    #[test]
+    fn the_host_budget_covers_every_address_even_with_the_memory_full() {
+        let mut session = Session::new(1234);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let first = addr([10, 0, 0, 5], 50000);
+        datagram(&mut session, first, 0, identified_hello(1, 77), at(0));
+        let id = session.session_id().unwrap();
+        assert!(session.may_send_media(id, UNANSWERED_MEDIA_BUDGET, at(0)));
+        session.tick(&TestConfig, false, at(3200));
+        assert_eq!(session.last_end(), Some((id, EndReason::Liveness)));
+
+        // Every slot of the memory taken by other addresses.
+        for host in 0..UNANSWERED_KEPT as u8 {
+            let other = addr([10, 0, 1, host], 50000);
+            datagram(
+                &mut session,
+                other,
+                0,
+                identified_hello(10 + u32::from(host), 88),
+                at(4000 + u64::from(host)),
+            );
+        }
+        session.tick(&TestConfig, false, at(7200));
+        assert!(session.session_id().is_none());
+
+        datagram(&mut session, first, 0, identified_hello(2, 77), at(9000));
+        let back = session.session_id().unwrap();
+        assert!(!session.may_send_media(back, 200 * 1024, at(9000)));
+        session.tick(&TestConfig, false, at(12_200));
+
+        let fresh = addr([10, 0, 2, 1], 50000);
+        datagram(&mut session, fresh, 0, identified_hello(3, 99), at(13_000));
+        let other = session.session_id().unwrap();
+        assert!(
+            !session.may_send_media(other, 200 * 1024, at(13_000)),
+            "another address"
+        );
+        session.tick(&TestConfig, false, at(16_200));
+
+        datagram(&mut session, fresh, 0, identified_hello(4, 99), at(80_000));
+        let refilled = session.session_id().unwrap();
+        assert!(
+            session.may_send_media(refilled, UNANSWERED_MEDIA_BUDGET, at(80_000)),
+            "a minute after the last spend"
+        );
+    }
+
+    /// An address that keeps ending sessions before it is heard holds one
+    /// entry in the memory, refreshed in place, and can't push another
+    /// address out of it.
+    #[test]
+    fn a_churning_address_keeps_one_entry_in_the_memory() {
+        let mut session = Session::new(1234);
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let first = addr([10, 0, 0, 5], 50000);
+        datagram(&mut session, first, 0, identified_hello(1, 77), at(0));
+        session.tick(&TestConfig, false, at(3200));
+
+        let churn = addr([10, 0, 0, 6], 50000);
+        for nonce in 0..2 * UNANSWERED_KEPT as u32 {
+            datagram(
+                &mut session,
+                churn,
+                0,
+                identified_hello(10 + nonce, 88),
+                at(4000 + u64::from(nonce)),
+            );
+        }
+        session.tick(&TestConfig, false, at(7200));
+        assert_eq!(session.unanswered.len(), 2);
+
+        datagram(&mut session, first, 0, identified_hello(2, 77), at(8000));
+        let back = session.session_id().unwrap();
+        assert!(!session.may_send_media(back, 1000, at(8000)));
+    }
+
+    /// An iPad's HELLO2 as shipped since 0.3.0: the generic "iPad" name and
+    /// its device id.
+    fn shipped_hello(nonce: u32, device_id: u64) -> ControlMessage {
+        let ControlMessage::Hello2(mut hello) = identified_hello(nonce, device_id) else {
+            unreachable!()
+        };
+        hello.device_name = "iPad".to_string();
+        ControlMessage::Hello2(hello)
+    }
+
+    /// A refusal over Wi-Fi is never larger than the HELLO2 it answers. It
+    /// leaves out the PC name and host caps when they don't fit (iPads read
+    /// only the status and version of a refusal), and a HELLO2 too small
+    /// for even that gets no answer. USB answers stay whole.
+    #[test]
+    fn a_refusal_is_never_larger_than_its_hello() {
+        let mut session = Session::new(1234);
+        let now = Instant::now();
+        datagram(
+            &mut session,
+            addr([10, 0, 0, 5], 50000),
+            0,
+            shipped_hello(1, 77),
+            now,
+        );
+
+        let other = addr([10, 0, 0, 6], 50000);
+        let shipped = shipped_hello(2, 88);
+        let shipped_len = eternal_wire::v2::control::encode_control(0, 1, &shipped).len();
+        assert_eq!(shipped_len, 71);
+        let busy = datagram(&mut session, other, 0, shipped, now);
+        let (to, reply) = &busy.replies[0];
+        assert_eq!(*to, other);
+        assert!(
+            reply.len() <= shipped_len,
+            "{} > {shipped_len}",
+            reply.len()
+        );
+        let ack = parse_ack(reply);
+        assert_eq!(
+            (ack.status, ack.client_nonce, ack.accepted_version),
+            (HelloStatus::Busy, 2, 2)
+        );
+        assert_eq!((ack.host_name.as_str(), ack.host_caps), ("", 0));
+
+        let ControlMessage::Hello2(mut named) = shipped_hello(3, 88) else {
+            unreachable!()
+        };
+        named.device_name = "A much longer iPad name here".to_string();
+        let named = ControlMessage::Hello2(named);
+        let named_len = eternal_wire::v2::control::encode_control(0, 1, &named).len();
+        let busy = datagram(&mut session, other, 0, named, now);
+        let reply = &busy.replies[0].1;
+        assert!(reply.len() <= named_len);
+        assert_eq!(parse_ack(reply).host_name, "TEST-HOST", "it fits whole");
+
+        let ControlMessage::Hello2(mut bare) = hello(4, 50000) else {
+            unreachable!()
+        };
+        bare.device_name.clear();
+        let bare = ControlMessage::Hello2(bare);
+        assert_eq!(
+            eternal_wire::v2::control::encode_control(0, 1, &bare).len(),
+            38
+        );
+        let unanswered = datagram(&mut session, other, 0, bare.clone(), now);
+        assert!(unanswered.replies.is_empty());
+        assert_eq!(
+            unanswered.ended.unwrap().reason,
+            EndReason::Refused(HelloStatus::Busy),
+            "still one refused attempt"
+        );
+
+        let usb = datagram(&mut session, PeerId::usb(17), 0, bare, now);
+        assert_eq!(parse_ack(&usb.replies[0].1).host_name, "TEST-HOST");
+    }
+
+    /// The golden HELLO2 of a 0.3.0 iPad, byte for byte, as the second
+    /// device: a refusal that fits it, which that iPad's parser reads (the
+    /// `hello_ack_busy_bare` vector). As the only one: a session that
+    /// streams once its first ping arrives.
+    #[test]
+    fn a_shipped_ipads_golden_hello_is_answered_within_its_size() {
+        let golden = include_str!("../../../proto/testdata/v2_vectors.txt")
+            .lines()
+            .find_map(|line| line.strip_prefix("hello2_v030 "))
+            .unwrap();
+        let bytes: Vec<u8> = (0..golden.len())
+            .step_by(2)
+            .map(|at| u8::from_str_radix(&golden[at..at + 2], 16).unwrap())
+            .collect();
+        let feed = |session: &mut Session, peer: PeerId, now: Instant| {
+            let (header, message) = eternal_wire::v2::control::parse_control(&bytes).unwrap();
+            session.handle_datagram(peer, &header, message, bytes.len(), &TestConfig, now)
+        };
+        let now = Instant::now();
+        let ipad = addr([10, 0, 0, 6], 50000);
+
+        let mut session = Session::new(1234);
+        datagram(
+            &mut session,
+            addr([10, 0, 0, 5], 50000),
+            0,
+            shipped_hello(1, 77),
+            now,
+        );
+        let busy = feed(&mut session, ipad, now);
+        let reply = &busy.replies[0].1;
+        assert!(
+            reply.len() <= bytes.len(),
+            "{} > {}",
+            reply.len(),
+            bytes.len()
+        );
+        assert_eq!(parse_ack(reply).status, HelloStatus::Busy);
+
+        let mut session = Session::new(1234);
+        let accepted = feed(&mut session, ipad, now);
+        let ack = parse_ack(&accepted.replies[0].1);
+        assert_eq!(
+            (ack.status, ack.host_name.as_str()),
+            (HelloStatus::Ok, "TEST-HOST")
+        );
+        datagram(&mut session, ipad, ack.session_id, ping(), now);
+        assert!(session.may_send_media(ack.session_id, 10 * UNANSWERED_MEDIA_BUDGET, now));
+    }
+
+    /// Session ids come from a keyed hash, so two instances with the same
+    /// seed hand out different ids.
+    #[test]
+    fn session_ids_differ_between_instances() {
+        let ipad = addr([10, 0, 0, 5], 50000);
+        let ids = |session: &mut Session| -> Vec<u32> {
+            (1..=4)
+                .map(|nonce| {
+                    session.handle_control(
+                        ipad,
+                        0,
+                        identified_hello(nonce, 77),
+                        &TestConfig,
+                        Instant::now(),
+                    );
+                    session.session_id().unwrap()
+                })
+                .collect()
+        };
+        let first = ids(&mut Session::new(1234));
+        let steps: Vec<u32> = first.windows(2).map(|p| p[1].wrapping_sub(p[0])).collect();
+        assert!(steps.windows(2).any(|p| p[0] != p[1]), "{first:?}");
+        assert_ne!(first, ids(&mut Session::new(1234)), "same seed, other ids");
+    }
+
+    fn paired_hello(nonce: u32, feature_caps: u16) -> Hello2 {
+        let mut hello = pair_hello(nonce);
+        hello.auth_token = [7; 16];
+        hello.feature_caps = feature_caps;
+        hello
+    }
+
+    fn ask_while(
+        session: &mut Session,
+        config: &PairConfig,
+        state: NotStreaming,
+        hello: Hello2,
+    ) -> Actions {
+        session.set_not_streaming(Some(state));
+        pair_send(
+            session,
+            config,
+            addr([192, 0, 2, 1], 50000),
+            hello,
+            Instant::now(),
+        )
+    }
+
+    /// A paired iPad that asks while no stream runs hears why, and nothing
+    /// starts: no session, no media target, no pairing token.
+    #[test]
+    fn a_new_ipad_hears_why_the_pc_is_not_streaming() {
+        let config = pair_config(true);
+        let mut session = Session::new(10);
+        for (state, status, reason) in [
+            (NotStreaming::Stopped, HelloStatus::Stopped, ""),
+            (NotStreaming::Restarting, HelloStatus::Restarting, ""),
+            (
+                NotStreaming::Failed(FailedReason::DisplayChanging),
+                HelloStatus::Failed,
+                "display_changing",
+            ),
+        ] {
+            let actions = ask_while(
+                &mut session,
+                &config,
+                state,
+                paired_hello(1, FEATURE_STANDBY_STATUS),
+            );
+            let ack = pair_ack(&actions);
+            assert_eq!((ack.status, ack.reason.as_str()), (status, reason));
+            assert_eq!((ack.session_id, ack.auth_token), (0, [0; 16]));
+            assert!(actions.new_target.is_none() && !actions.force_idr);
+            assert!(!session.is_active());
+        }
+        // Streaming again: the same HELLO2 connects.
+        session.set_not_streaming(None);
+        let actions = pair_send(
+            &mut session,
+            &config,
+            addr([192, 0, 2, 1], 50000),
+            paired_hello(1, FEATURE_STANDBY_STATUS),
+            Instant::now(),
+        );
+        assert_eq!(pair_ack(&actions).status, HelloStatus::Ok);
+        assert!(session.is_active());
+    }
+
+    /// 0.3.4 and older drop statuses past RateLimited. While the PC restarts
+    /// they hear nothing and keep retrying, as before; a stopped or failed
+    /// PC turns them down with Error, a card they have.
+    #[test]
+    fn an_old_ipad_gets_only_statuses_it_knows() {
+        let config = pair_config(true);
+        let mut session = Session::new(10);
+        let restarting = ask_while(
+            &mut session,
+            &config,
+            NotStreaming::Restarting,
+            paired_hello(1, 0),
+        );
+        assert!(restarting.replies.is_empty() && restarting.ended.is_none());
+        for state in [
+            NotStreaming::Stopped,
+            NotStreaming::Failed(FailedReason::Encoder),
+        ] {
+            let ack = pair_ack(&ask_while(&mut session, &config, state, paired_hello(2, 0)));
+            assert_eq!(ack.status, HelloStatus::Error);
+            assert!(ack.reason.is_empty());
+        }
+        assert!(!session.is_active());
+    }
+
+    /// Only an iPad that may connect learns the stream state. Wrong codes
+    /// count toward the rate limit here too, and the right code is not
+    /// spent, so it still works once the stream starts.
+    #[test]
+    fn pairing_still_decides_who_hears_it() {
+        let config = pair_config(true);
+        let mut session = Session::new(10);
+        let mut unpaired = pair_hello(1);
+        unpaired.feature_caps = FEATURE_STANDBY_STATUS;
+        for state in [
+            NotStreaming::Stopped,
+            NotStreaming::Restarting,
+            NotStreaming::Failed(FailedReason::Capture),
+        ] {
+            let ack = pair_ack(&ask_while(&mut session, &config, state, unpaired.clone()));
+            assert_eq!(ack.status, HelloStatus::Unauthorized);
+            assert!(ack.reason.is_empty());
+        }
+        let mut statuses = Vec::new();
+        for attempt in 1..=5 {
+            let mut guess = unpaired.clone();
+            guess.client_nonce = 10 + attempt;
+            guess.pairing_code = 1_000_000 + attempt;
+            statuses.push(
+                pair_ack(&ask_while(
+                    &mut session,
+                    &config,
+                    NotStreaming::Stopped,
+                    guess,
+                ))
+                .status,
+            );
+        }
+        assert_eq!(statuses.last(), Some(&HelloStatus::RateLimited));
+
+        let config = pair_config(true);
+        let code = config.0.lock().code();
+        let mut right = unpaired;
+        right.client_nonce = 20;
+        right.pairing_code = code;
+        let ack = pair_ack(&ask_while(
+            &mut session,
+            &config,
+            NotStreaming::Stopped,
+            right.clone(),
+        ));
+        assert_eq!(
+            (ack.status, ack.auth_token),
+            (HelloStatus::Stopped, [0; 16])
+        );
+        assert_eq!(config.0.lock().code(), code, "the code stays valid");
+        session.set_not_streaming(None);
+        let accepted = pair_send(
+            &mut session,
+            &config,
+            addr([192, 0, 2, 1], 50000),
+            right,
+            Instant::now(),
+        );
+        assert_eq!(pair_ack(&accepted).status, HelloStatus::Ok);
+    }
+
+    /// Stop ends the session and closes the PC to clients; the supervisor
+    /// then says why, and a HELLO2 hears it instead of Busy. A quit, which
+    /// no supervisor state follows, still turns it away with Busy.
+    #[test]
+    fn a_stop_is_answered_with_why_not_busy() {
+        let config = pair_config(true);
+        let mut session = Session::new(10);
+        let now = Instant::now();
+        session.shut_down(now, StreamStop::Quit);
+        let busy = pair_send(
+            &mut session,
+            &config,
+            addr([192, 0, 2, 1], 50000),
+            paired_hello(1, FEATURE_STANDBY_STATUS),
+            now,
+        );
+        assert_eq!(pair_ack(&busy).status, HelloStatus::Busy);
+        session.shut_down(now, StreamStop::User);
+        let ack = pair_ack(&ask_while(
+            &mut session,
+            &config,
+            NotStreaming::Stopped,
+            paired_hello(2, FEATURE_STANDBY_STATUS),
+        ));
+        assert_eq!(ack.status, HelloStatus::Stopped);
+    }
+
+    #[test]
+    fn the_version_and_update_refusals_come_first() {
+        let config = pair_config(true);
+        let mut session = Session::new(10);
+        let mut old = paired_hello(1, FEATURE_STANDBY_STATUS);
+        old.proto_min = 1;
+        old.proto_max = 1;
+        let ack = pair_ack(&ask_while(
+            &mut session,
+            &config,
+            NotStreaming::Stopped,
+            old,
+        ));
+        assert_eq!(ack.status, HelloStatus::VersionUnsupported);
+        assert!(session.begin_update(false));
+        let ack = pair_ack(&ask_while(
+            &mut session,
+            &config,
+            NotStreaming::Stopped,
+            paired_hello(2, FEATURE_STANDBY_STATUS),
+        ));
+        assert_eq!(ack.status, HelloStatus::Busy);
+    }
+
+    /// A session kept across a restart stays, and its iPad's repeated
+    /// HELLO2 hears that the PC is restarting instead of the old OK.
+    #[test]
+    fn a_session_kept_across_a_restart_stays() {
+        let config = pair_config(true);
+        let mut session = Session::new(10);
+        let hello = paired_hello(1, FEATURE_STANDBY_STATUS);
+        let peer = addr([192, 0, 2, 1], 50000);
+        let accepted = pair_send(&mut session, &config, peer, hello.clone(), Instant::now());
+        assert_eq!(pair_ack(&accepted).status, HelloStatus::Ok);
+        let ack = pair_ack(&ask_while(
+            &mut session,
+            &config,
+            NotStreaming::Restarting,
+            hello,
+        ));
+        assert_eq!(ack.status, HelloStatus::Restarting);
+        assert!(session.is_active());
+    }
+
+    /// The stream that is stopping still takes HELLO2s until its transport
+    /// ends. Its not-streaming answers are never larger than the HELLO2
+    /// either, as the standby's aren't.
+    #[test]
+    fn a_not_streaming_answer_is_never_larger_than_the_hello() {
+        let config = pair_config(false);
+        let mut session = Session::new(10);
+        let peer = addr([192, 0, 2, 1], 50000);
+        let mut small = pair_hello(1);
+        small.device_name = String::new();
+        small.device_id = 0;
+        let unpadded =
+            eternal_wire::v2::control::encode_control(0, 1, &ControlMessage::Hello2(small.clone()));
+        // The same small HELLO2 claiming the bit, without its padding.
+        let mut claimed = unpadded.clone();
+        claimed[26..28].copy_from_slice(&FEATURE_STANDBY_STATUS.to_le_bytes());
+        let mut padded_hello = small;
+        padded_hello.client_nonce = 2;
+        padded_hello.feature_caps = FEATURE_STANDBY_STATUS;
+        let padded =
+            eternal_wire::v2::control::encode_control(0, 2, &ControlMessage::Hello2(padded_hello));
+        session.set_not_streaming(Some(NotStreaming::Failed(FailedReason::Encoder)));
+        let mut answer = |datagram: &[u8]| {
+            let (header, message) = eternal_wire::v2::control::parse_control(datagram).unwrap();
+            session.handle_datagram(
+                peer,
+                &header,
+                message,
+                datagram.len(),
+                &config,
+                Instant::now(),
+            )
+        };
+        for small in [&unpadded, &claimed] {
+            assert_eq!(small.len(), 38);
+            let actions = answer(small);
+            assert!(
+                actions.replies.is_empty(),
+                "{} bytes answered",
+                actions.replies[0].1.len()
+            );
+        }
+        let actions = answer(&padded);
+        let (_, reply) = &actions.replies[0];
+        assert!(reply.len() <= padded.len());
+        let (_, ControlMessage::HelloAck(ack)) =
+            eternal_wire::v2::control::parse_control(reply).unwrap()
+        else {
+            panic!("expected an ACK");
+        };
+        assert_eq!(
+            (ack.status, ack.reason.as_str()),
+            (HelloStatus::Failed, "encoder")
+        );
+    }
+
+    /// Every answer to a Wi-Fi HELLO2 is bounded by its size, the version
+    /// and pairing refusals too, while no stream runs and while one does. A
+    /// guess at the code carries the HELLO2's extension, so it hears the
+    /// short refusal; a padded HELLO2 hears whole answers. Over USB the
+    /// answers stay whole.
+    #[test]
+    fn every_hello_answer_is_bounded_while_not_streaming() {
+        use eternal_wire::v2::control::{encode_control, parse_control};
+        let peer = addr([192, 0, 2, 1], 50000);
+        let send = |session: &mut Session, config: &PairConfig, hello: &Hello2| {
+            let datagram = encode_control(0, 1, &ControlMessage::Hello2(hello.clone()));
+            let (header, message) = parse_control(&datagram).unwrap();
+            let actions = session.handle_datagram(
+                peer,
+                &header,
+                message,
+                datagram.len(),
+                config,
+                Instant::now(),
+            );
+            for (_, reply) in &actions.replies {
+                assert!(
+                    reply.len() <= datagram.len(),
+                    "{} > {}",
+                    reply.len(),
+                    datagram.len()
+                );
+            }
+            actions
+                .replies
+                .first()
+                .map(|(_, reply)| match parse_control(reply) {
+                    Ok((_, ControlMessage::HelloAck(ack))) => ack.status,
+                    other => panic!("not an ACK: {other:?}"),
+                })
+        };
+        let small = |nonce: u32, caps: u16| {
+            let mut hello = pair_hello(nonce);
+            hello.device_name = String::new();
+            hello.device_id = 0;
+            hello.feature_caps = caps;
+            hello
+        };
+
+        let config = pair_config(true);
+        let mut session = Session::new(10);
+        session.set_not_streaming(Some(NotStreaming::Stopped));
+        // The version check.
+        let mut old_version = small(1, 0);
+        old_version.proto_min = 1;
+        old_version.proto_max = 1;
+        assert_eq!(send(&mut session, &config, &old_version), None);
+        old_version.feature_caps = FEATURE_STANDBY_STATUS;
+        assert_eq!(
+            send(&mut session, &config, &old_version),
+            Some(HelloStatus::VersionUnsupported)
+        );
+        // The pairing checks: no code, then wrong codes until rate limited.
+        assert_eq!(send(&mut session, &config, &small(2, 0)), None);
+        for attempt in 0..6 {
+            let mut guess = small(10 + attempt, 0);
+            guess.pairing_code = 1_000_000 + attempt;
+            let expected = if attempt < 3 {
+                HelloStatus::Unauthorized
+            } else {
+                HelloStatus::RateLimited
+            };
+            assert_eq!(
+                send(&mut session, &config, &guess),
+                Some(expected),
+                "attempt {attempt}"
+            );
+        }
+        let mut padded = small(20, FEATURE_STANDBY_STATUS);
+        padded.pairing_code = 1_000_020;
+        assert_eq!(
+            send(&mut session, &config, &padded),
+            Some(HelloStatus::RateLimited)
+        );
+
+        // Streaming: the same bound, and an attempt with no answer that
+        // fits is still one refused attempt.
+        let config = pair_config(true);
+        let mut session = Session::new(10);
+        assert_eq!(send(&mut session, &config, &small(30, 0)), None);
+        let mut guess = small(31, 0);
+        guess.pairing_code = 1_000_031;
+        assert_eq!(
+            send(&mut session, &config, &guess),
+            Some(HelloStatus::Unauthorized)
+        );
+
+        // Over USB, stopped or streaming, the answers stay whole.
+        let usb = PeerId::usb(17);
+        let over_usb = |session: &mut Session, hello: &Hello2| {
+            let datagram = encode_control(0, 1, &ControlMessage::Hello2(hello.clone()));
+            let (header, message) = parse_control(&datagram).unwrap();
+            let actions = session.handle_datagram(
+                usb,
+                &header,
+                message,
+                datagram.len(),
+                &config,
+                Instant::now(),
+            );
+            assert!(actions.replies[0].1.len() > datagram.len());
+            pair_ack(&actions)
+        };
+        let mut session = Session::new(10);
+        let mut old_version = small(40, 0);
+        old_version.proto_min = 1;
+        old_version.proto_max = 1;
+        let refused = over_usb(&mut session, &old_version);
+        assert_eq!(refused.status, HelloStatus::VersionUnsupported);
+        assert_eq!(refused.host_name, "TEST-HOST");
+        let mut paired = small(41, 0);
+        paired.auth_token = [7; 16];
+        session.set_not_streaming(Some(NotStreaming::Stopped));
+        let stopped = over_usb(&mut session, &paired);
+        assert_eq!(
+            (stopped.status, stopped.host_name.as_str()),
+            (HelloStatus::Error, "TEST-HOST")
+        );
     }
 }

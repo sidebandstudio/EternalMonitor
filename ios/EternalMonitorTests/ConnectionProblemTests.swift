@@ -14,6 +14,34 @@ final class ConnectionProblemTests: XCTestCase {
         XCTAssertEqual(ConnectionProblem.timeout(listenerReady: true, helloAttempts: 1, handshakeDone: true, datagramsReceived: 0, isUSB: true), .noPicture)
     }
 
+    /// The PC's not-streaming answers, in plain words. None offers Try
+    /// again: the iPad is already asking again by itself.
+    func testNotStreamingAnswersSayWhatToDo() {
+        typealias Wait = ConnectionProblem.StreamWait
+        XCTAssertEqual(Wait(.stopped, reason: ""), .stopped)
+        XCTAssertEqual(Wait(.restarting, reason: "ignored"), .restarting)
+        XCTAssertEqual(Wait(.failed, reason: "encoder"), .failed("encoder"))
+        for status: HelloStatus in [.ok, .busy, .versionUnsupported, .error, .unauthorized, .rateLimited] {
+            XCTAssertNil(Wait(status, reason: ""), "\(status)")
+        }
+        XCTAssertEqual(ConnectionProblem.pcNotStreaming(.restarting).detail, "This iPad connects as soon as it's back.")
+        XCTAssertEqual(ConnectionProblem.pcNotStreaming(.failed("encoder")).detail,
+            "Encoding the video kept failing. Click Start streaming in EternalMonitor on the PC to try again. "
+                + "This iPad connects as soon as it starts.")
+        // Every token the PC sends has words here.
+        for token in ["capture", "encoder", "transport", "secure_desktop", "display_changing", "no_display",
+                      "unsupported_gpu", "too_many_capture_apps", "session_disconnected", "driver_not_responding"] {
+            XCTAssertNotNil(Wait.failedReason(token), token)
+        }
+        for wait: Wait in [.stopped, .restarting, .failed("encoder")] {
+            XCTAssertEqual(ConnectionProblem.pcNotStreaming(wait).actions, [])
+        }
+        // Only a PC that ran into errors offers Report this problem.
+        XCTAssertFalse(ConnectionProblem.pcNotStreaming(.stopped).canReport)
+        XCTAssertFalse(ConnectionProblem.pcNotStreaming(.restarting).canReport)
+        XCTAssertTrue(ConnectionProblem.pcNotStreaming(.failed("")).canReport)
+    }
+
     /// PCs on 0.3.1 and 0.3.2 answer but send no picture in Second screen
     /// mode. The card says to mirror, naming the choice as both versions do.
     func testNoPictureSaysToMirrorTheScreen() {
@@ -162,6 +190,9 @@ final class ConnectionProblemTests: XCTestCase {
         XCTAssertEqual(wifi(LinkError(.connectionFailed, "UDP connection failed: PolicyDenied", underlying: NWError.dns(-65570))), .localNetworkBlocked)
         // Offline.
         XCTAssertEqual(wifi(LinkError(.pathUnavailable, "UDP path not ready: Network is down", underlying: NWError.posix(.ENETDOWN))), .noNetwork)
+        XCTAssertEqual(ConnectionProblem.noNetwork.title, "This iPad isn't connected to a network")
+        XCTAssertEqual(ConnectionProblem.wifiOff.title, "Wi-Fi is off")
+        XCTAssertTrue(ConnectionProblem.wifiOff.detail.contains("Turn on Wi-Fi"), ConnectionProblem.wifiOff.detail)
         // Unknown failures get general advice, never the raw error.
         let unknown = LinkError(.connectionFailed, "UDP socket failed: Address already in use", underlying: POSIXError(.EADDRINUSE))
         XCTAssertEqual(wifi(unknown), .couldNotConnect)
@@ -191,10 +222,38 @@ final class ConnectionProblemTests: XCTestCase {
         }
     }
 
+    /// A connection waiting for its path. Only a path iPadOS calls
+    /// unsatisfied with no usable network is "Wi-Fi is off". No route to
+    /// the PC or its network, on a path that is up or not yet known, keeps
+    /// the advice it had before.
+    func testOnlyAnUnsatisfiedPathIsWiFiOff() {
+        let wifi = { (error: LinkError) in ConnectionProblem.linkFailure(error, isUSB: false, host: "studio-pc") }
+        let off = UDPReceiver.waitingError(.posix(.ENETDOWN), status: .unsatisfied, reason: .notAvailable)
+        XCTAssertEqual(off.kind, .pathUnavailable)
+        XCTAssertTrue(off.pathUnsatisfied)
+        XCTAssertEqual(wifi(off), .wifiOff)
+        for code: POSIXErrorCode in [.EHOSTUNREACH, .ENETUNREACH] {
+            for status: NWPath.Status? in [.satisfied, .requiresConnection, nil] {
+                let waiting = UDPReceiver.waitingError(.posix(code), status: status, reason: .notAvailable)
+                XCTAssertFalse(waiting.pathUnsatisfied, "\(code) \(String(describing: status))")
+                XCTAssertNotEqual(wifi(waiting), .wifiOff, "\(code) \(String(describing: status))")
+                XCTAssertEqual(wifi(waiting), .noNetwork, "unchanged: \(code) \(String(describing: status))")
+            }
+        }
+        // Unsatisfied for a reason other than no network: not Wi-Fi off.
+        XCTAssertFalse(UDPReceiver.waitingError(.posix(.ENETDOWN), status: .unsatisfied, reason: .wifiDenied).pathUnsatisfied)
+        let denied = UDPReceiver.waitingError(.posix(.EPERM), status: .unsatisfied, reason: .localNetworkDenied)
+        XCTAssertEqual(denied.kind, .localNetworkDenied)
+        XCTAssertFalse(denied.pathUnsatisfied)
+        XCTAssertEqual(wifi(denied), .localNetworkBlocked)
+        // Over the cable it is always the cable.
+        XCTAssertEqual(ConnectionProblem.linkFailure(off, isUSB: true, host: "USB"), .usbFailed)
+    }
+
     func testGivingUpOnReconnectingKeepsASpecificLastFailure() {
         // A classified failure in the last attempt is more useful than
         // "Couldn't reconnect"; a PC that just never answered is not.
-        for specific: ConnectionProblem in [.localNetworkBlocked, .noNetwork, .badAddress("pc"), .usbFailed, .noPicture,
+        for specific: ConnectionProblem in [.localNetworkBlocked, .noNetwork, .wifiOff, .badAddress("pc"), .usbFailed, .noPicture,
                                              .pcBusy, .pcEndedSession, .pcEndedSessionOnError] {
             XCTAssertEqual(ConnectionProblem.afterReconnecting(lastAttempt: specific), specific)
         }
@@ -205,8 +264,8 @@ final class ConnectionProblemTests: XCTestCase {
 
     func testEveryProblemSaysWhatToDoWithoutTransportJargon() {
         let all: [ConnectionProblem] = [
-            .noReply(usb: false), .noReply(usb: true), .noPicture, .receiverNotReady, .badAddress("pc"),
-            .noNetwork, .localNetworkBlocked, .couldNotConnect, .usbFailed, .lost(.pcStoppedResponding), .lost(.cableUnplugged),
+            .noReply(usb: false), .noReply(usb: true), .noReplyAtNewAddress("192.0.2.31"), .noPicture, .receiverNotReady,
+            .badAddress("pc"), .noNetwork, .wifiOff, .localNetworkBlocked, .couldNotConnect, .usbFailed, .lost(.pcStoppedResponding), .lost(.cableUnplugged),
             .lost(.usbTurnedOff), .reconnecting(attempt: 2, of: 6), .reconnectFailed, .pcEndedSession,
             .pcEndedSessionOnError, .pcBusy, .pairingCodeAsAddress, .routerAddress,
             .pcUpdating(.reconnecting), .pcUpdating(.manual), .pcUpdating(.notBack),
@@ -248,7 +307,10 @@ final class ConnectionProblemTests: XCTestCase {
             XCTAssertEqual(problem.detail, expected[reason]?.1, "\(reason)")
         }
         let error = ConnectionProblem.pcEndedSessionOnError
-        XCTAssertEqual(error.title, ConnectionProblem.pcEndedSession.title, "one title, as SETUP.md lists it")
+        // A PC that restarts by itself also says error: the title must be
+        // true for a restart as well as a fault, and never blame the PC's user.
+        XCTAssertEqual(error.title, "The connection to your PC ended")
+        XCTAssertEqual(ConnectionProblem.pcEndedSession.title, "Your PC ended the session")
         XCTAssertFalse(error.detail.contains("Stop") || error.detail.contains("setting"), error.detail)
         XCTAssertEqual(error.actions, [.retry])
         XCTAssertTrue(error.canReport)
@@ -298,6 +360,19 @@ final class ConnectionProblemTests: XCTestCase {
         XCTAssertTrue(USBStatusText.describe("USB: disconnected").contains("Connect USB"))
         for status in ["USB: off", "USB: waiting for a cable", "USB: disconnected", "USB: connecting", "USB: unavailable", "USB: connected to PC"] {
             XCTAssertFalse(USBStatusText.describe(status).hasPrefix("USB:"), status)
+        }
+    }
+
+    /// The PC's last session said it can't reach Apple's USB service: the
+    /// waiting card says why the cable won't connect. Other states don't
+    /// change, and a cable session (which reaches it) clears the flag.
+    func testUSBCardSaysWhenThePCLacksAppleDevices() {
+        let waiting = USBStatusText.describe("USB: waiting for a cable", appleDevicesUnreachable: true)
+        XCTAssertEqual(waiting, "Last time this iPad connected, your PC couldn't reach Apple Devices. If the cable doesn't connect, "
+            + "open Apple Devices on the PC, or install it from the Microsoft Store. Wi-Fi still works.")
+        XCTAssertNotEqual(waiting, USBStatusText.describe("USB: waiting for a cable"))
+        for status in ["USB: off", "USB: disconnected", "USB: connecting", "USB: unavailable", "USB: connected to PC"] {
+            XCTAssertEqual(USBStatusText.describe(status, appleDevicesUnreachable: true), USBStatusText.describe(status), status)
         }
     }
 
