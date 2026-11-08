@@ -27,10 +27,13 @@
 //!   old base's file is removed.
 //!
 //! The database header records the newest committed generation its contents
-//! need. Every write after a commit records at least that generation, so a
-//! file whose head is older than the keyring's committed generation is a
-//! restored copy from before a rotation: it's never used, and with no other
-//! file the open discards. If instead the keyring that survived is older
+//! need, with a fingerprint of that generation's key. Every write after a
+//! commit records at least that generation, so a file whose head is older
+//! than the keyring's committed generation, or names the committed (or
+//! staged) generation with another key's fingerprint, isn't from this
+//! keyring's history: a restored copy. It's never used, and with no other
+//! file the open discards. A rotation goes past every generation the
+//! keyring or the database names, so no generation number names two keys. If instead the keyring that survived is older
 //! (its rotation's stores were lost), the open rotates again, so the
 //! invalidation still gets a new key.
 //!
@@ -60,8 +63,8 @@ use eternal_wire::v3::{Id16, Key32, Random, Zeroizing};
 use crate::disk::Disk;
 pub use crate::format::MAX_PENDING_PER_SLOT;
 use crate::format::{
-    encode_db, encode_keyring, parse_db, parse_keyring, valid_generation, DbFile, DiskRecord,
-    FormatError, GenerationKeys, Intent, KeyringState, MAX_BOOT_ID_LEN, MAX_GENERATION,
+    encode_db, encode_keyring, key_fingerprint, parse_db, parse_keyring, valid_generation, DbFile,
+    DiskRecord, FormatError, GenerationKeys, Intent, KeyringState, MAX_BOOT_ID_LEN, MAX_GENERATION,
     MAX_NAME_LEN, MAX_RECORDS, MAX_TOMBSTONES_PER_SLOT, MAX_TOMBSTONE_SLOTS,
 };
 use crate::keyring::{Durability, Keyring};
@@ -217,9 +220,12 @@ pub struct CredentialStore<D: Disk, K: Keyring> {
     base: (u64, Zeroizing<Key32>),
     /// The newest committed generation and key.
     committed: (u64, Zeroizing<Key32>),
-    /// The newest committed generation the database's contents need (its
-    /// header's head).
-    need: u64,
+    /// The newest committed generation the database's contents need, and
+    /// that generation's key fingerprint (its header's head).
+    need: (u64, [u8; 16]),
+    /// A staged generation the keyring holds: a new rotation goes past it
+    /// too, so no generation number ever names two keys.
+    staged_floor: u64,
     /// This boot's id, recorded in every keyring blob stored (macOS); empty
     /// where stores are durable at once, or when it can't be read.
     boot: Vec<u8>,
@@ -258,7 +264,8 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
             rng,
             base: (0, Zeroizing::new([0; 32])),
             committed: (0, Zeroizing::new([0; 32])),
-            need: 0,
+            need: (0, [0; 16]),
+            staged_floor: 0,
             boot: Vec::new(),
             records: Vec::new(),
             tombstones: VecDeque::new(),
@@ -317,6 +324,7 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
             flushed || (!self.boot.is_empty() && !state.boot.is_empty() && state.boot != self.boot);
         self.base = (state.base.0, state.base.1.clone());
         self.committed = (state.committed.0, state.committed.1.clone());
+        self.staged_floor = state.staged.as_ref().map_or(0, |(g, _, _)| *g);
 
         // The committed generation's file (a promotion got that far) is
         // newer than the base's, if both open. Nothing else is read.
@@ -338,10 +346,19 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
                 continue;
             };
             if let Some(h) = self.load_verified(&bytes, &GenerationKeys::new(&w, g)) {
-                if h < self.committed.0 {
-                    // Every write after a commit records it, so this file
-                    // predates the committed rotation: a restored copy. It
-                    // isn't used; with nothing else, it's discarded below.
+                // Every write after a commit records it (and its key's
+                // fingerprint), so a file whose head is older, or names the
+                // committed or staged generation with another key, isn't from
+                // this keyring's history: a restored copy. It isn't used; with
+                // nothing else, it's discarded below.
+                let foreign = |g: u64, w: &Key32| h.0 == g && h.1 != key_fingerprint(w, g);
+                let stale = h.0 < self.committed.0
+                    || foreign(self.committed.0, &self.committed.1)
+                    || state
+                        .staged
+                        .as_ref()
+                        .is_some_and(|(sg, sw, _)| foreign(*sg, sw));
+                if stale {
                     self.records.clear();
                     self.tombstones.clear();
                     continue;
@@ -363,6 +380,7 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
         if let Some(h) = head {
             self.need = h;
         }
+        let head = head.map(|h| h.0);
         if confirmed {
             // The visible blob is durable: so is its committed key.
             if self.base.0 < self.committed.0 {
@@ -419,9 +437,9 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
 
     /// Parses and authenticates `bytes` under `keys`, then loads it.
     /// Returns its head.
-    fn load_verified(&mut self, bytes: &[u8], keys: &GenerationKeys) -> Option<u64> {
+    fn load_verified(&mut self, bytes: &[u8], keys: &GenerationKeys) -> Option<(u64, [u8; 16])> {
         let db = parse_db(bytes).ok()?;
-        (keys.verify(bytes) && self.load(&db, keys)).then_some(db.head)
+        (keys.verify(bytes) && self.load(&db, keys)).then_some((db.head, db.head_fp))
     }
 
     /// Loads an authenticated database into memory. False, with nothing
@@ -531,7 +549,7 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
     /// Steps 2 and 3 of the procedure, from what's in memory. Promotes at
     /// once if the keyring says its stores are durable (Windows).
     fn finish_rotation(&mut self, next_g: u64, next_w: Zeroizing<Key32>) -> Result<(), StoreError> {
-        self.write_base(next_g)?;
+        self.write_base(next_g, &next_w)?;
         self.keyring.store(&encode_keyring(&KeyringState {
             committed: (next_g, next_w.clone()),
             base: (self.base.0, self.base.1.clone()),
@@ -539,7 +557,9 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
             staged: None,
         }))?;
         self.committed = (next_g, next_w);
-        if self.keyring.flush()? == Durability::Durable {
+        // Only a flush known to be durable promotes; on macOS this is where
+        // the boot id is read, and a failure there just waits.
+        if matches!(self.keyring.flush(), Ok(Durability::Durable)) {
             let target = (self.committed.0, self.committed.1.clone());
             self.promote(target, None)?;
         }
@@ -569,8 +589,11 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
             r.wrapped = None;
         }
         let keys = GenerationKeys::new(&target.1, target.0);
-        let head = self.committed.0.max(self.need);
-        self.need = head;
+        let committed = (
+            self.committed.0,
+            key_fingerprint(&self.committed.1, self.committed.0),
+        );
+        let head = self.raise_need(committed);
         let bytes = self.encode(&keys, target.0, head);
         self.write_db(&db_file(target.0), &bytes)?;
         self.base = target;
@@ -585,10 +608,11 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
         Ok(())
     }
 
-    /// The generation a rotation moves to: past the committed one and past
-    /// every generation the database already needs.
+    /// The generation a rotation moves to: past the committed one, past any
+    /// staged one the keyring holds, and past every generation the database
+    /// already needs.
     fn next_generation(&self) -> Result<u64, StoreError> {
-        let next = self.committed.0.max(self.need) + 1;
+        let next = self.committed.0.max(self.need.0).max(self.staged_floor) + 1;
         if valid_generation(next) {
             Ok(next)
         } else {
@@ -609,13 +633,22 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
         Ok(())
     }
 
-    /// Writes memory to the base's file, recording `head` (or a newer one
-    /// it already needs) as the newest committed generation it needs.
-    fn write_base(&mut self, head: u64) -> io::Result<()> {
+    /// Raises what the database needs to `head` (a generation and its key's
+    /// fingerprint) if that's newer, and returns what it needs.
+    fn raise_need(&mut self, head: (u64, [u8; 16])) -> (u64, [u8; 16]) {
+        if head.0 > self.need.0 {
+            self.need = head;
+        }
+        self.need
+    }
+
+    /// Writes memory to the base's file, recording the generation `head_g`
+    /// with key `head_w` (or a newer one it already needs) as the newest
+    /// committed generation it needs.
+    fn write_base(&mut self, head_g: u64, head_w: &Key32) -> io::Result<()> {
         let keys = GenerationKeys::new(&self.base.1, self.base.0);
         let g = self.base.0;
-        let head = head.max(self.need);
-        self.need = head;
+        let head = self.raise_need((head_g, key_fingerprint(head_w, head_g)));
         let bytes = self.encode(&keys, g, head);
         self.write_db(&db_file(g), &bytes)
     }
@@ -628,7 +661,7 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
 
     /// Encodes memory as a database at `generation`, wrapping any record
     /// that has no wrap for it yet.
-    fn encode(&mut self, keys: &GenerationKeys, generation: u64, head: u64) -> Vec<u8> {
+    fn encode(&mut self, keys: &GenerationKeys, generation: u64, head: (u64, [u8; 16])) -> Vec<u8> {
         let mut disk_records = Vec::with_capacity(self.records.len());
         for r in &mut self.records {
             let (nonce, wrapped) = match r.wrapped {
@@ -655,7 +688,8 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
         }
         let db = DbFile {
             generation,
-            head,
+            head: head.0,
+            head_fp: head.1,
             records: disk_records,
             tombstones: self
                 .tombstones
@@ -736,7 +770,8 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
     /// `undo` puts memory back: the change is simply not stored.
     fn plain_write(&mut self, undo: impl FnOnce(&mut Self)) -> Result<(), StoreError> {
         let need = self.need;
-        if let Err(e) = self.write_base(self.committed.0) {
+        let committed = (self.committed.0, self.committed.1.clone());
+        if let Err(e) = self.write_base(committed.0, &committed.1) {
             self.need = need;
             undo(self);
             return Err(e.into());

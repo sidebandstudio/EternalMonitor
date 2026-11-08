@@ -4,7 +4,8 @@ mod common;
 
 use common::*;
 use eternal_credstore::format::{
-    encode_db, encode_keyring, DbFile, GenerationKeys, KeyringState, MAX_GENERATION,
+    encode_db, encode_keyring, key_fingerprint, DbFile, GenerationKeys, KeyringState,
+    MAX_GENERATION,
 };
 use eternal_credstore::format::{parse_db, parse_keyring};
 use eternal_credstore::store::{db_file, DB_TMP};
@@ -515,6 +516,48 @@ fn an_unreadable_boot_id_confirms_nothing() {
     }
 }
 
+/// With this boot's id unreadable, every procedure still completes: a
+/// Remove returns Ok, an open that finishes a staged rotation succeeds, and
+/// an open that has to discard succeeds. Nothing is promoted.
+#[test]
+fn an_unreadable_boot_id_never_fails_a_procedure() {
+    // A Remove.
+    let mut world = base_world();
+    world.keyring.set_boot_unreadable(true);
+    let (mut store, _, live) = world.open();
+    let base_g = store.base_generation();
+    store.remove(&[id(0x21)]).unwrap();
+    assert_eq!(store.base_generation(), base_g);
+    drop(store);
+    // A staged rotation, finished at the next open.
+    let live = {
+        let (mut s, _, l) = live.same_boot().open();
+        l.steps.crash_at.set(Some(l.steps.count.get() + 1));
+        assert!(s.remove(&[id(0x11)]).is_err());
+        drop(s);
+        l
+    };
+    let mut staged = live.same_boot();
+    assert!(parse_keyring(staged.keyring.get().unwrap())
+        .unwrap()
+        .staged
+        .is_some());
+    staged.keyring.set_boot_unreadable(true);
+    let (store, report, live) = staged.open();
+    assert!(report.recovery.contains(&Recovery::FinishedRotation));
+    assert!(store.snapshot().key(&id(0x11)).is_none());
+    drop(store);
+    // A discard.
+    let mut damaged = live.same_boot();
+    for g in db_generations(&damaged) {
+        damaged.disk.put(&db_file(g), b"unreadable".to_vec());
+    }
+    damaged.keyring.set_boot_unreadable(true);
+    let (store, report, _) = damaged.open();
+    assert!(report.recovery.contains(&Recovery::Discarded));
+    assert!(store.records().is_empty());
+}
+
 /// A database file restored from before a rotation (its head predates the
 /// committed generation) is never used: in the same boot, or after a
 /// reboot before the first open, the removed record doesn't come back, the
@@ -565,6 +608,41 @@ fn a_discard_leaves_only_its_own_file() {
     assert!(report.recovery.contains(&Recovery::Discarded));
     drop(store);
     assert_eq!(db_generations(&live.same_boot()), vec![g]);
+}
+
+/// Generation numbers can repeat across keyring histories (after a keyring
+/// rollback and a deleted database, the next rotations reuse them). A
+/// database file from the other history then has the same head, but not the
+/// same key fingerprint, and is never used: the removed record stays gone.
+#[test]
+fn a_file_from_another_keyring_history_is_never_used() {
+    let base = base_world();
+    let (mut store, _, live) = base.open();
+    let old_blob = live.keyring.borrow().get().cloned();
+    let base_g = store.base_generation();
+    store.remove(&[id(0x21)]).unwrap();
+    let reused = store.generation();
+    let backup = live.disk.borrow().get(&db_file(base_g)).unwrap().clone();
+    assert!(store.snapshot().key(&id(0x11)).is_some());
+    store.remove(&[id(0x11)]).unwrap();
+    drop(store);
+    // Roll the keyring back and delete the database.
+    let mut restored = live.same_boot();
+    restored.keyring.put(old_blob);
+    for g in db_generations(&restored) {
+        restored.disk.remove_now(&db_file(g));
+    }
+    let (mut store, _, live) = restored.open();
+    store.add_pending(new_record(0x61, 6, None), NOW).unwrap();
+    store.remove(&[id(0x61)]).unwrap();
+    assert_eq!(store.generation(), reused, "the same generation number");
+    drop(store);
+    // Put back the file from the other history.
+    let mut restored = live.same_boot();
+    restored.disk.put(&db_file(base_g), backup);
+    let (store, report, _) = restored.open();
+    assert!(report.recovery.contains(&Recovery::Discarded));
+    assert!(store.snapshot().key(&id(0x11)).is_none());
 }
 
 /// A promotion interrupted after its file and keyring store, before the old
@@ -738,6 +816,7 @@ fn world_at(generation: u64) -> World {
     let db = DbFile {
         generation,
         head: generation,
+        head_fp: key_fingerprint(&w, generation),
         records: Vec::new(),
         tombstones: Vec::new(),
     };

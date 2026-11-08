@@ -8,7 +8,8 @@
 //! # Database file (`credentials-<generation>.db`)
 //!
 //! ```text
-//! magic "EMV3CRED", version u8 = 1, generation u64, head u64 (≥ generation)
+//! magic "EMV3CRED", version u8 = 1, generation u64, head u64 (≥ generation),
+//!   head fingerprint 16
 //! record count u16 (≤ MAX_RECORDS), then each record:
 //!   dev_id 16, slot_id 16, state u8 (0 pending, 1 active),
 //!   flags u8 (bit 0: replaces present), [replaces 16],
@@ -22,7 +23,10 @@
 //!
 //! Integers are little-endian. `generation` is the generation whose key `W`
 //! the file is under; `head` is the newest committed generation its contents
-//! need (above `generation` while a rotation isn't confirmed durable yet).
+//! need (above `generation` while a rotation isn't confirmed durable yet),
+//! and the head fingerprint is [`key_fingerprint`] of that generation's key:
+//! it ties the file to one keyring history, so a file from another history
+//! with the same generation numbers is told apart.
 //! The wrap key and the MAC key are derived from `W` with HKDF-SHA-256; each
 //! wrap binds `(dev_id, generation)` as associated data. `dev_id`s, slots and tombstones
 //! are readable without `W`, so records that can't be opened can still be
@@ -138,6 +142,8 @@ pub struct DbFile {
     pub generation: u64,
     /// The newest committed generation the contents need.
     pub head: u64,
+    /// [`key_fingerprint`] of the head generation's committed key.
+    pub head_fp: [u8; 16],
     pub records: Vec<DiskRecord>,
     /// Per slot, oldest first.
     pub tombstones: Vec<(Id16, Vec<Id16>)>,
@@ -188,6 +194,18 @@ impl hkdf::KeyType for Len32 {
     fn len(&self) -> usize {
         32
     }
+}
+
+/// A short public label of a generation's key, recorded in the database
+/// header: HKDF-SHA-256 of `W` with its own label and the generation, never
+/// the key itself.
+pub fn key_fingerprint(w: &Key32, generation: u64) -> [u8; 16] {
+    let mut info = b"key fingerprint ".to_vec();
+    info.extend_from_slice(&generation.to_le_bytes());
+    let full = derive(w, &info);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&full[..16]);
+    out
 }
 
 fn derive(w: &Key32, info: &[u8]) -> Zeroizing<Key32> {
@@ -289,6 +307,7 @@ pub fn encode_db(db: &DbFile, keys: &GenerationKeys) -> Vec<u8> {
     out.extend_from_slice(&db.generation.to_le_bytes());
     assert!(db.head >= db.generation && valid_generation(db.head));
     out.extend_from_slice(&db.head.to_le_bytes());
+    out.extend_from_slice(&db.head_fp);
     out.extend_from_slice(&(db.records.len() as u16).to_le_bytes());
     for r in &db.records {
         assert!(r.device_name.len() <= MAX_NAME_LEN);
@@ -346,6 +365,7 @@ pub fn parse_db(file: &[u8]) -> Result<DbFile, FormatError> {
     if !valid_generation(head) || head < generation {
         return Err(FormatError::InvalidField("head"));
     }
+    let head_fp: [u8; 16] = r.take(16)?.try_into().unwrap();
     let count = usize::from(r.u16()?);
     if count > MAX_RECORDS {
         return Err(FormatError::InvalidField("record_count"));
@@ -410,6 +430,7 @@ pub fn parse_db(file: &[u8]) -> Result<DbFile, FormatError> {
     let db = DbFile {
         generation,
         head,
+        head_fp,
         records,
         tombstones,
     };
@@ -694,6 +715,7 @@ mod tests {
         DbFile {
             generation: 3,
             head: 3,
+            head_fp: [0; 16],
             records: vec![
                 record(1, 9, RecordState::Active, keys),
                 record(2, 9, RecordState::Pending, keys),
@@ -827,6 +849,7 @@ mod tests {
             &DbFile {
                 generation: 5,
                 head: 5,
+                head_fp: [0; 16],
                 records: Vec::new(),
                 tombstones: Vec::new(),
             },
@@ -927,6 +950,22 @@ mod tests {
         assert_eq!(parse_db(&db), Err(FormatError::InvalidField("head")));
         db[17..25].copy_from_slice(&9u64.to_le_bytes());
         assert_eq!(parse_db(&db).unwrap().head, 9);
+    }
+
+    #[test]
+    fn the_head_fingerprint_names_one_key_and_generation() {
+        let a = key_fingerprint(&[1; 32], 3);
+        assert_eq!(a, key_fingerprint(&[1; 32], 3));
+        assert_ne!(a, key_fingerprint(&[2; 32], 3), "another key");
+        assert_ne!(a, key_fingerprint(&[1; 32], 4), "another generation");
+        assert!(
+            !a.windows(16).any(|w| w == &[1u8; 16][..]),
+            "not the key itself"
+        );
+        let keys = GenerationKeys::new(&[0x11; 32], 3);
+        let mut db = sample(&keys);
+        db.head_fp = a;
+        assert_eq!(parse_db(&encode_db(&db, &keys)).unwrap().head_fp, a);
     }
 
     #[test]

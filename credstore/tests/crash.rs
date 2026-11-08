@@ -443,6 +443,35 @@ fn a_stale_staged_intent_is_not_replayed() {
     assert_eq!(logical(&store), after);
 }
 
+/// A staged rotation's blob is durable, the database is then damaged, and
+/// the startup discard starts its own rotation: it goes past the staged
+/// generation, so a power cut that keeps only the staged blob still opens
+/// the discard's database, with every write acknowledged after it.
+#[test]
+fn a_discard_never_reuses_a_staged_generation() {
+    let base = base_world();
+    let (mut store, _, live) = base.open();
+    // Stop a Remove right after step 1; the next boot keeps its blob.
+    live.steps.crash_at.set(Some(live.steps.count.get() + 1));
+    assert!(store.remove(&[id(0x21)]).is_err());
+    drop(store);
+    let mut world = live.after_crash(false, usize::MAX);
+    for g in db_generations(&world) {
+        world
+            .disk
+            .put(&format!("credentials-{g}.db"), b"unreadable".to_vec());
+    }
+    let (mut store, report, live) = world.open();
+    assert!(report.recovery.contains(&Recovery::Discarded));
+    store.add_pending(new_record(0x51, 5, None), NOW).unwrap();
+    let after = logical(&store);
+    drop(store);
+    for choice in 0..live.keyring_choices() {
+        let (store, _, _) = live.after_crash(false, choice).open();
+        assert_eq!(logical(&store), after, "keyring choice {choice}");
+    }
+}
+
 /// A database that can't be opened is discarded through the full
 /// procedure. Killed anywhere, the next restart finishes the same discard
 /// and never loads a record from it.
