@@ -301,6 +301,12 @@ final class FakeUDPHost: @unchecked Sendable {
     /// `countFrames`) and `frame` as the next keyframe, cut at the size the
     /// iPad asked for. Answers identify requests as the PC holding `token`
     /// receiving on `addresses`, to whichever socket asks.
+    /// Takes the next HELLO2 as a new client's, as a PC does for the iPad's
+    /// next session.
+    func forgetClient() {
+        client = nil
+    }
+
     func servePath(limit: Int, frame: Data, hostCaps: UInt16, countFrames: Bool = true, token: Data = Data(17...32),
                    addresses: [Data] = [Data([127, 0, 0, 1])], until stop: () -> Bool) -> PathRun {
         var run = PathRun()

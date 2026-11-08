@@ -293,6 +293,12 @@ final class ConnectionManager: ObservableObject {
     /// the step whose result isn't known yet, as its log line names it.
     private var noVideoFallback: NoVideoFallback?
     private var noVideoStep: String?
+    /// The media size the current session runs at, when smaller than the
+    /// PC's own; whether a step this session asked for it, rather than the
+    /// size kept for this path; and where it is kept (see `NoVideoSizes`).
+    private var sessionMediaSize: UInt16?
+    private var mediaSizeFromStep = false
+    private var mediaSizeKey: NoVideoSizes.Key?
 
     init(timing: Timing = Timing(), udpReceiver: @escaping (UInt16) -> any MediaLink = { UDPReceiver(port: $0) },
          pairingStore: PairingStore? = nil) {
@@ -481,6 +487,7 @@ final class ConnectionManager: ObservableObject {
         do { try pairingStore.forgetAll() }
         catch { connectionError = "Could not remove saved pairings from this iPad." }
         NoVideoPaths.forgetAll()
+        NoVideoSizes.forgetAll()
     }
 
     /// A connection the user or a cable starts. It replaces any automatic
@@ -538,6 +545,9 @@ final class ConnectionManager: ObservableObject {
         pendingRedirect = nil
         noVideoFallback = nil
         noVideoStep = nil
+        sessionMediaSize = nil
+        mediaSizeFromStep = false
+        mediaSizeKey = nil
         let connectionID = UUID()
         currentAttempt.withLock { $0 = connectionID }
         transportMode = isUSB ? "USB" : "WiFi"
@@ -628,6 +638,7 @@ final class ConnectionManager: ObservableObject {
                     self.record(.info, "decode", "First frame decoded successfully" + self.attemptTimings)
                     self.endNoVideoStep("video")
                     self.noVideoFallback = nil
+                    self.settleMediaSize()
                     self.timeoutTask?.cancel()
                     self.noPictureStreak = NoPictureStreak()
                     self.state = .connected
@@ -797,6 +808,11 @@ final class ConnectionManager: ObservableObject {
                 self.sessionAcceptedAt = acceptedAt
                 self.noVideoFallback = !isUSB && info.hostCaps & HelloAck.hostCapMediaSize != 0
                     ? NoVideoFallback(wait: self.timing.noVideoStepSeconds) : nil
+                let sessionToken = PairingStore.valid(info.authToken) ? info.authToken : pairingToken
+                if self.noVideoFallback != nil, PairingStore.valid(sessionToken) {
+                    self.startWithRememberedSize(connectionID, address: .init(host: normalizedHost, port: port),
+                                                 pairing: sessionToken)
+                }
                 self.acceptedAddresses.insert("\(normalizedHost):\(port)")
                 self.noPictureStreak.answered(by: info.hostName, pairingToken: info.authToken,
                                               at: isUSB ? nil : "\(normalizedHost):\(port)")
@@ -1364,9 +1380,43 @@ final class ConnectionManager: ObservableObject {
                 armConnectTimeout(seconds: timing.connectTimeoutSeconds)
             }
             noVideoStep = "step=smaller_packets size=\(size)"
+            sessionMediaSize = size
+            mediaSizeFromStep = true
             controlChannel?.sendKeyframeRequest(streamEpoch: 0, lastCompleteSeq: 0, reason: .startup, maxMediaDgram: size)
         case .otherAddress:
             tryOtherAddress()
+        }
+    }
+
+    /// A session at an address where the PC's video needed a smaller media
+    /// size before, over the same network, asks for it at once instead of
+    /// waiting through the steps again (see `NoVideoSizes`).
+    private func startWithRememberedSize(_ connectionID: UUID, address: NoVideoPaths.Address, pairing: Data) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let route = await self.localRoute(address.host, address.port)
+            guard self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+            let key = NoVideoSizes.Key(address: address, pairing: pairing, network: NoVideoSizes.network(route))
+            self.mediaSizeKey = key
+            // A picture came first, at the PC's size or after a step.
+            guard self.state == .connecting else { return self.settleMediaSize() }
+            guard self.sessionMediaSize == nil, let size = NoVideoSizes.size(for: key, now: self.now()) else { return }
+            self.sessionMediaSize = size
+            self.noVideoFallback?.skipSizes(downTo: size)
+            self.controlChannel?.sendKeyframeRequest(streamEpoch: 0, lastCompleteSeq: 0, reason: .startup, maxMediaDgram: size)
+            self.record(.info, "connection", "no_video_fallback step=remembered_size size=\(size) result=asked")
+        }
+    }
+
+    /// The session shows a picture: keep the smaller size a step found, or
+    /// forget the size kept for this address once the PC's own size works,
+    /// as after a change of network.
+    private func settleMediaSize() {
+        guard let key = mediaSizeKey else { return }
+        if let size = sessionMediaSize {
+            if mediaSizeFromStep { NoVideoSizes.remember(size, for: key, now: now()) }
+        } else if NoVideoSizes.forget(key) {
+            record(.info, "connection", "no_video_fallback step=remembered_size result=forgotten")
         }
     }
 
