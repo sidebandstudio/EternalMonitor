@@ -348,6 +348,8 @@ struct Heartbeat: Equatable {
     static let noticeNone: UInt8 = 0
     /// The PC is locked or shows a permission prompt, so it can't capture.
     static let noticePCLocked: UInt8 = 1
+    /// No display is on at the PC (a closed lid, screens off or unplugged).
+    static let noticeNoDisplay: UInt8 = 2
     /// The video frames the PC sent this session, from a PC that offered
     /// `HelloAck.hostCapMediaSize`; nil from others. Appended after
     /// `notice`, which is then always written.

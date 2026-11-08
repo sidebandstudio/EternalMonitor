@@ -72,6 +72,18 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const STORM_WINDOW: Duration = Duration::from_secs(60);
 const STORM_LIMIT: usize = 6;
 
+/// The supervisor looks at the stage heartbeats every 250 ms. A longer gap
+/// between two looks means this process did not run in between: the PC
+/// slept or hibernated (Windows' monotonic clock counts the time asleep), or
+/// the whole host was starved. Heartbeats stamped before such a gap say
+/// nothing about whether a stage is wedged.
+const WATCH_GAP_MS: u64 = 2_000;
+
+/// After such a gap the stages get this long before the watchdog judges
+/// them. Waking displays and drivers can hold capture for seconds while
+/// nothing is wrong; a stage still silent after it is restarted then.
+const WAKE_GRACE_MS: u64 = 10_000;
+
 /// Lets integration tests trip the storm brake in milliseconds instead of
 /// half a minute: the first backoff, in ms.
 #[cfg(feature = "test-hooks")]
@@ -131,6 +143,10 @@ pub struct Machine {
     pub state: SupervisorState,
     restarts: Vec<Instant>,
     attempt: u32,
+    /// When the watchdog last looked at the live generation's heartbeats.
+    watched_ms: Option<u64>,
+    /// When the watchdog last found such a gap, during [`WAKE_GRACE_MS`].
+    woke_ms: Option<u64>,
 }
 
 impl Machine {
@@ -141,6 +157,8 @@ impl Machine {
             },
             restarts: Vec::new(),
             attempt: 0,
+            watched_ms: None,
+            woke_ms: None,
         }
     }
 
@@ -298,6 +316,9 @@ impl Machine {
 
     pub fn note_started(&mut self, generation: u64) {
         self.state = SupervisorState::Running { generation };
+        // Joining the old generation can take seconds; that is no sleep.
+        self.watched_ms = None;
+        self.woke_ms = None;
     }
 
     /// A successful stretch of running clears the failure budget.
@@ -400,7 +421,7 @@ pub fn run(
                 let ticked = machine.on_tick(now);
                 if ticked != Effect::None {
                     ticked
-                } else if let Some(reason) = wedge_reason(&shared, &machine) {
+                } else if let Some(reason) = wedge_reason(&shared, &mut machine) {
                     machine.on_wedged(&reason, now)
                 } else {
                     Effect::None
@@ -572,17 +593,51 @@ fn stop_when_stopped(state: &SupervisorState) -> Option<StreamStop> {
 
 /// Watchdog rules over the heartbeat atomics. Only meaningful while Running
 /// and after the pipeline has had a moment to warm up.
-fn wedge_reason(shared: &SharedControl, machine: &Machine) -> Option<String> {
+fn wedge_reason(shared: &SharedControl, machine: &mut Machine) -> Option<String> {
     wedge_reason_at(shared, machine, crate::clock::host_now_us() / 1000)
 }
 
 pub(crate) fn wedge_reason_at(
     shared: &SharedControl,
-    machine: &Machine,
+    machine: &mut Machine,
     now_ms: u64,
 ) -> Option<String> {
     if !matches!(machine.state, SupervisorState::Running { .. }) {
+        machine.watched_ms = None;
+        machine.woke_ms = None;
         return None;
+    }
+    // After a sleep the first look can come before any stage has run again,
+    // and every heartbeat looks as old as the sleep: 7 of 10 "capture loop
+    // silent" restarts in the field were PCs waking after 3 min to 3.5 h.
+    // Give the stages a fresh window instead, with a grace while the
+    // displays wake; a real wedge still shows when the grace ends.
+    let last_look = machine.watched_ms.replace(now_ms);
+    if let Some(gap_ms) = last_look
+        .map(|last| now_ms.saturating_sub(last))
+        .filter(|&gap| gap > WATCH_GAP_MS)
+    {
+        info!(
+            gap_ms,
+            "The host did not run for a while (the PC slept?) — restarting the pipeline watchdog's clock"
+        );
+        for beat in [
+            &shared.hb_capture_loop_ms,
+            &shared.hb_capture_frame_ms,
+            &shared.hb_encode_frame_ms,
+        ] {
+            if beat.load(Ordering::Relaxed) > 0 {
+                beat.store(now_ms, Ordering::Relaxed);
+            }
+        }
+        machine.woke_ms = Some(now_ms);
+        return None;
+    }
+    if let Some(woke_ms) = machine.woke_ms {
+        if now_ms.saturating_sub(woke_ms) < WAKE_GRACE_MS {
+            return None;
+        }
+        machine.woke_ms = None;
     }
     let loop_ms = shared.hb_capture_loop_ms.load(Ordering::Relaxed);
     let frame_ms = shared.hb_capture_frame_ms.load(Ordering::Relaxed);
@@ -1007,6 +1062,100 @@ mod tests {
             Effect::None
         );
         assert_eq!(machine.on_command(&SupervisorCommand::Start), Effect::Start);
+    }
+
+    /// The PC sleeps for two hours mid-stream. Windows' clock counts the time
+    /// asleep, so at the supervisor's first look after waking, before capture
+    /// has run again, every heartbeat looks two hours old. The field logged
+    /// "capture loop silent for 184184ms" up to 12886316ms this way.
+    #[test]
+    fn a_pc_that_slept_is_not_a_wedged_pipeline() {
+        let shared = SharedControl::new(0, 1);
+        let mut machine = Machine::new(1);
+        let beat = |now_ms: u64| {
+            shared.hb_capture_loop_ms.store(now_ms, Ordering::Relaxed);
+            shared.hb_capture_frame_ms.store(now_ms, Ordering::Relaxed);
+            shared.hb_encode_frame_ms.store(now_ms, Ordering::Relaxed);
+        };
+        let mut now_ms = 10_000;
+        beat(now_ms);
+        for _ in 0..8 {
+            now_ms += 250;
+            beat(now_ms);
+            assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
+        }
+        // Asleep: no thread runs, the clock moves on two hours.
+        now_ms += 2 * 3600 * 1000;
+        assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
+        // The displays wake slowly: capture is stuck in a driver call for
+        // 6 s, then runs again. No restart.
+        let woke = now_ms;
+        while now_ms < woke + 6_000 {
+            now_ms += 250;
+            assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
+        }
+        while now_ms < woke + 12_000 {
+            now_ms += 250;
+            beat(now_ms);
+            assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
+        }
+
+        // A real wedge once awake is caught as before: 3 s after the capture
+        // loop stops.
+        let stuck = now_ms;
+        while now_ms < stuck + 3_000 {
+            now_ms += 250;
+            assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
+        }
+        now_ms += 250;
+        assert_eq!(
+            wedge_reason_at(&shared, &mut machine, now_ms),
+            Some("capture loop silent for 3250ms".into())
+        );
+
+        // A capture loop that never runs again after waking is restarted
+        // when the grace ends.
+        let mut machine = Machine::new(2);
+        beat(now_ms);
+        assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
+        now_ms += 250;
+        assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
+        now_ms += 3600 * 1000;
+        assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
+        let woke = now_ms;
+        while now_ms < woke + WAKE_GRACE_MS - 250 {
+            now_ms += 250;
+            assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
+        }
+        now_ms += 250;
+        assert_eq!(
+            wedge_reason_at(&shared, &mut machine, now_ms),
+            Some("capture loop silent for 10000ms".into())
+        );
+    }
+
+    /// A restart joins the old generation for up to 5 s between two looks;
+    /// the new generation's watchdog starts from its own first look.
+    #[test]
+    fn a_restart_is_not_taken_for_a_sleep() {
+        let shared = SharedControl::new(0, 1);
+        let mut machine = Machine::new(1);
+        let mut now_ms = 10_000;
+        shared.hb_capture_loop_ms.store(now_ms, Ordering::Relaxed);
+        assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
+        assert_eq!(
+            machine.on_wedged("capture loop silent", Instant::now()),
+            Effect::StopPipeline
+        );
+        now_ms += 100;
+        assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
+        // The join took 5 s, then the new generation started.
+        now_ms += 5_000;
+        machine.note_started(2);
+        shared
+            .hb_capture_loop_ms
+            .store(now_ms - 3_500, Ordering::Relaxed);
+        assert!(wedge_reason_at(&shared, &mut machine, now_ms).is_some());
     }
 
     #[test]
