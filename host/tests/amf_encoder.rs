@@ -12,20 +12,79 @@
 //! desktop mode under a running stream.
 
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use eternal_host::capture::synthetic::{decode_frame_counter_from_luma, render_synthetic_frame};
 use eternal_host::capture::{frame_buffer, frame_slot, RawFrame};
 use eternal_host::control::SharedControl;
-use eternal_host::encoder::{run_encode_stage, NALUnit, NAL_CHANNEL_CAPACITY};
+use eternal_host::encoder::{
+    forget_launch_failures, run_encode_stage, NALUnit, NAL_CHANNEL_CAPACITY,
+};
 use eternal_host::gpu::GpuInfo;
 use eternal_host::stats::PIPELINE_STATS;
 use eternal_wire::h264::{contains_nal_type, nal_type, parse_annex_b_units};
 use ffmpeg_next::codec::Id;
 
-/// The stage and PIPELINE_STATS are process-global, so stages run one at a time.
+/// The encode stage's state is process-wide: PIPELINE_STATS, the encoders
+/// that failed to open this launch, and the lane FFmpeg's hardware opens
+/// share. So is an AMD driver's limit on concurrent AMF sessions. Each test
+/// holds [`Serial`] from its first line, through its AMF probes and stages.
 static STAGE_LOCK: Mutex<()> = Mutex::new(());
+
+/// One test's turn at the encoders. A stage and an AMF probe take it by
+/// reference, so neither runs beside another test's, and PIPELINE_STATS is
+/// read only for the stage that just ran.
+struct Serial(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+/// Waits for this test's turn, then starts it from a clean launch: no
+/// earlier test's encoder open is still running, and no earlier failure
+/// keeps an encoder out of this test's stages.
+fn serial() -> Serial {
+    let guard = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    wait_for_clear_lane();
+    forget_launch_failures();
+    Serial(guard)
+}
+
+/// An open that went on in the background (see `encoder::Opening`) holds
+/// the encoders' lane until it returns, and a stage's open in that lane is
+/// refused meanwhile.
+fn lane_busy() -> bool {
+    eternal_host::stall::abandoned(eternal_host::stall::Call::EncoderOpen) > 0
+}
+
+fn wait_for_clear_lane() {
+    // Past the 15 s limit of the slowest open in the lane.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while lane_busy() {
+        assert!(
+            Instant::now() < deadline,
+            "an earlier encoder open is still running"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+/// A stage whose hardware open outlasted the first picture's wait starts on
+/// libx264 while the open goes on in the background, as it should when a
+/// driver is slow. On a busy test PC that says nothing about what a test
+/// checks, so the stage runs once more.
+fn started_on_the_fallback(_: &Serial) -> bool {
+    PIPELINE_STATS.lock().using_software_fallback && lane_busy()
+}
+
+const STAGE_TRIES: u32 = 2;
+
+/// Before a stage runs again: its open in the background is released, and
+/// what it remembered is forgotten, as for a new test.
+fn before_another_try(encoder: &str) {
+    eprintln!(
+        "{encoder} was still opening when the first picture was due; running the stage again"
+    );
+    wait_for_clear_lane();
+    forget_launch_failures();
+}
 
 const FRAME_INTERVAL: Duration = Duration::from_millis(20);
 const FRAME_COUNT: u64 = 90;
@@ -71,11 +130,11 @@ fn amf_expectation() -> Option<AmfExpectation> {
 
 /// Whether an AMF encoder opens on this machine. Cases that need a working
 /// AMF skip when it does not, except under `ETERNAL_AMF_TEST=hardware`.
-fn amf_available(name: &str) -> bool {
+fn amf_available(serial: &Serial, name: &str) -> bool {
     let Some(expectation) = amf_expectation() else {
         return false;
     };
-    let opens = amf_opens(name);
+    let opens = amf_opens(serial, name);
     if expectation == AmfExpectation::Hardware {
         assert!(
             opens,
@@ -88,7 +147,7 @@ fn amf_available(name: &str) -> bool {
     opens
 }
 
-fn amf_opens(name: &str) -> bool {
+fn amf_opens(_: &Serial, name: &str) -> bool {
     let Some(codec) = ffmpeg_next::encoder::find_by_name(name) else {
         return false;
     };
@@ -119,10 +178,29 @@ struct StageRun {
 /// `FRAME_INTERVAL`, sized by `size_of`, and raises a keyframe request just
 /// before frame `keyframe_at`. Panics if the stage fails or panics.
 fn run_stage(
+    serial: &Serial,
     encoder: &str,
     size_of: impl Fn(u64) -> (u32, u32),
     keyframe_at: Option<u64>,
 ) -> StageRun {
+    for _ in 1..STAGE_TRIES {
+        match run_stage_once(serial, encoder, &size_of, keyframe_at) {
+            Some(run) => return run,
+            None => before_another_try(encoder),
+        }
+    }
+    run_stage_once(serial, encoder, &size_of, keyframe_at)
+        .unwrap_or_else(|| panic!("{encoder} was still opening when the first picture was due"))
+}
+
+/// [`run_stage`] once. None if the stage started on the fallback while its
+/// encoder was still opening (see [`started_on_the_fallback`]).
+fn run_stage_once(
+    serial: &Serial,
+    encoder: &str,
+    size_of: impl Fn(u64) -> (u32, u32),
+    keyframe_at: Option<u64>,
+) -> Option<StageRun> {
     ffmpeg_next::init().unwrap();
     let (producer, consumer) = frame_slot();
     let (tx, mut rx) = tokio::sync::mpsc::channel(NAL_CHANNEL_CAPACITY);
@@ -140,19 +218,20 @@ fn run_stage(
         run_encode_stage(consumer, tx, stage_shared, gpu, generation).map_err(|e| e.to_string())
     });
     // The output channel holds only a few frames, so drain it as we go.
+    let (first_tx, first) = std::sync::mpsc::channel();
     let collector = std::thread::spawn(move || {
         let mut packets = Vec::new();
         while let Some(nal) = rx.blocking_recv() {
+            if packets.is_empty() {
+                let _ = first_tx.send(());
+            }
             packets.push(nal);
         }
         packets
     });
 
     let mut published = Vec::new();
-    for number in 0..FRAME_COUNT {
-        if keyframe_at == Some(number) {
-            shared.force_next_idr.store(true, Ordering::SeqCst);
-        }
+    let mut publish = |number: u64| {
         let (width, height) = size_of(number);
         let mut data = frame_buffer((width * height * 4) as usize);
         render_synthetic_frame(&mut data, width, height, number);
@@ -165,6 +244,23 @@ fn run_stage(
             height,
             cached: false,
         });
+    };
+    // The stage opens its encoder on the first frame. The rest follow once
+    // it is out, however long the open took.
+    publish(0);
+    if first.recv_timeout(Duration::from_secs(20)).is_ok() && started_on_the_fallback(serial) {
+        producer.close();
+        let _ = stage.join();
+        let _ = collector.join();
+        return None;
+    }
+    std::thread::sleep(FRAME_INTERVAL);
+
+    for number in 1..FRAME_COUNT {
+        if keyframe_at == Some(number) {
+            shared.force_next_idr.store(true, Ordering::SeqCst);
+        }
+        publish(number);
         std::thread::sleep(FRAME_INTERVAL);
     }
     producer.close();
@@ -177,13 +273,13 @@ fn run_stage(
     let packets = collector.join().unwrap();
     assert!(!packets.is_empty(), "{encoder} produced no packets");
     let stats = PIPELINE_STATS.lock();
-    StageRun {
+    Some(StageRun {
         packets,
         software_fallback: stats.using_software_fallback,
         codec_name: stats.codec_name.clone(),
         resubmits: stats.keyframe_resubmits - resubmits_before,
         published,
-    }
+    })
 }
 
 /// A stream whose frames come every `FRAME_INTERVAL` is never still, so no
@@ -428,15 +524,15 @@ fn a_repeat_is_excused_only_by_the_stall_right_after_it() {
 
 #[test]
 fn software_encoder_follows_capture_mode_changes() {
-    let _guard = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let run = run_stage("libx264", mode_changes, None);
+    let serial = serial();
+    let run = run_stage(&serial, "libx264", mode_changes, None);
     assert_follows_mode_changes(&run, Id::H264);
 }
 
 #[test]
 fn software_encoder_honours_keyframe_requests() {
-    let _guard = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let run = run_stage("libx264", |_| LARGE, Some(KEYFRAME_REQUEST_AT));
+    let serial = serial();
+    let run = run_stage(&serial, "libx264", |_| LARGE, Some(KEYFRAME_REQUEST_AT));
     assert!(
         !run.software_fallback,
         "explicit CPU selection is not a fallback"
@@ -450,8 +546,8 @@ fn software_encoder_honours_keyframe_requests() {
 #[test]
 #[ignore = "requires the NVIDIA/AMD reference PC without an Intel GPU"]
 fn unavailable_quick_sync_uses_another_gpu_and_decodes() {
-    let _guard = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let run = run_stage("h264_qsv", |_| LARGE, None);
+    let serial = serial();
+    let run = run_stage(&serial, "h264_qsv", |_| LARGE, None);
     assert!(!run.software_fallback, "fell straight from QSV to CPU");
     assert_eq!(run.codec_name, "H.264 (NVENC)");
     assert_h264_keyframe(&run.packets[0], "the first packet");
@@ -477,11 +573,11 @@ fn unavailable_quick_sync_uses_another_gpu_and_decodes() {
 #[test]
 #[ignore = "native: an NVIDIA card, with this exe on another card"]
 fn nvenc_encodes_while_the_process_runs_on_another_card() {
-    let _guard = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let serial = serial();
     let facts = eternal_host::gpu_preference::facts().expect("graphics card facts");
     let app_gpu = facts.running_on().expect("a hardware adapter").name.clone();
     let started = Instant::now();
-    let run = run_stage("h264_nvenc", |_| LARGE, Some(KEYFRAME_REQUEST_AT));
+    let run = run_stage(&serial, "h264_nvenc", |_| LARGE, Some(KEYFRAME_REQUEST_AT));
     assert!(!run.software_fallback, "NVENC fell back to the CPU");
     assert!(run.codec_name.contains("NVENC"), "{}", run.codec_name);
     assert_keyframe_on_request(&run, Id::H264);
@@ -494,8 +590,8 @@ fn nvenc_encodes_while_the_process_runs_on_another_card() {
 
 #[test]
 fn strict_decoder_rejects_broken_access_units() {
-    let _guard = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let run = run_stage("libx264", |_| SMALL, None);
+    let serial = serial();
+    let run = run_stage(&serial, "libx264", |_| SMALL, None);
     let predicted = run
         .packets
         .iter()
@@ -519,11 +615,11 @@ fn strict_decoder_rejects_broken_access_units() {
 
 #[test]
 fn amf_honours_keyframe_requests() {
+    let serial = serial();
     let Some(expectation) = amf_expectation() else {
         return;
     };
-    let _guard = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let run = run_stage("h264_amf", |_| LARGE, Some(KEYFRAME_REQUEST_AT));
+    let run = run_stage(&serial, "h264_amf", |_| LARGE, Some(KEYFRAME_REQUEST_AT));
     match expectation {
         AmfExpectation::Hardware => assert!(
             !run.software_fallback,
@@ -566,33 +662,33 @@ fn amf_honours_keyframe_requests() {
 
 #[test]
 fn amf_follows_capture_mode_changes() {
-    if !amf_available("h264_amf") {
+    let serial = serial();
+    if !amf_available(&serial, "h264_amf") {
         return;
     }
-    let _guard = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let run = run_stage("h264_amf", mode_changes, None);
+    let run = run_stage(&serial, "h264_amf", mode_changes, None);
     assert!(!run.software_fallback, "AMF fell back to libx264");
     assert_follows_mode_changes(&run, Id::H264);
 }
 
 #[test]
 fn amf_hevc_follows_capture_mode_changes() {
-    if !amf_available("hevc_amf") {
+    let serial = serial();
+    if !amf_available(&serial, "hevc_amf") {
         return;
     }
-    let _guard = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let run = run_stage("hevc_amf", mode_changes, None);
+    let run = run_stage(&serial, "hevc_amf", mode_changes, None);
     assert!(!run.software_fallback, "AMF fell back to libx264");
     assert_follows_mode_changes(&run, Id::HEVC);
 }
 
 #[test]
 fn amf_hevc_honours_keyframe_requests() {
-    if !amf_available("hevc_amf") {
+    let serial = serial();
+    if !amf_available(&serial, "hevc_amf") {
         return;
     }
-    let _guard = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let run = run_stage("hevc_amf", |_| LARGE, Some(KEYFRAME_REQUEST_AT));
+    let run = run_stage(&serial, "hevc_amf", |_| LARGE, Some(KEYFRAME_REQUEST_AT));
     assert_hevc_keyframe(&run.packets[0], "the first packet");
     assert_keyframe_on_request(&run, Id::HEVC);
 }
@@ -613,7 +709,19 @@ const WARM_UP_QUIET: Duration = Duration::from_millis(300);
 /// Streams a few frames and waits for the encoder to encode them, goes still,
 /// then requests a keyframe with one resent picture and nothing after it, as
 /// for a reconnecting viewer.
-fn keyframe_on_a_still_desktop(encoder: &str) -> StillRun {
+fn keyframe_on_a_still_desktop(serial: &Serial, encoder: &str) -> StillRun {
+    for _ in 1..STAGE_TRIES {
+        match keyframe_on_a_still_desktop_once(serial, encoder) {
+            Some(result) => return result,
+            None => before_another_try(encoder),
+        }
+    }
+    keyframe_on_a_still_desktop_once(serial, encoder)
+        .unwrap_or_else(|| panic!("{encoder} was still opening when the first picture was due"))
+}
+
+/// [`keyframe_on_a_still_desktop`] once, or None as [`run_stage_once`].
+fn keyframe_on_a_still_desktop_once(serial: &Serial, encoder: &str) -> Option<StillRun> {
     ffmpeg_next::init().unwrap();
     let (producer, consumer) = frame_slot();
     let (tx, mut rx) = tokio::sync::mpsc::channel(NAL_CHANNEL_CAPACITY);
@@ -663,7 +771,15 @@ fn keyframe_on_a_still_desktop(encoder: &str) -> StillRun {
     let mut seen = Vec::new();
     loop {
         match packets.recv_timeout(WARM_UP_QUIET) {
-            Ok(packet) => seen.push(packet),
+            Ok(packet) => {
+                if seen.is_empty() && started_on_the_fallback(serial) {
+                    producer.close();
+                    let _ = stage.join();
+                    let _ = collector.join();
+                    return None;
+                }
+                seen.push(packet);
+            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) if !seen.is_empty() => break,
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => assert!(
                 Instant::now() < warm_up_until,
@@ -721,12 +837,12 @@ fn keyframe_on_a_still_desktop(encoder: &str) -> StillRun {
             ))
             .collect::<Vec<_>>()
     );
-    StillRun {
+    Some(StillRun {
         keyframe,
         software_fallback,
         resubmits,
         sequences: seen.iter().map(|(_, nal)| nal.sequence).collect(),
-    }
+    })
 }
 
 /// The picture resent for the viewer, after the warm-up's frames 0 to 9.
@@ -742,8 +858,8 @@ struct StillRun {
     sequences: Vec<u64>,
 }
 
-fn assert_still_keyframe(encoder: &str) {
-    let run = keyframe_on_a_still_desktop(encoder);
+fn assert_still_keyframe(serial: &Serial, encoder: &str) {
+    let run = keyframe_on_a_still_desktop(serial, encoder);
     assert!(
         encoder == "libx264" || !run.software_fallback,
         "{encoder} fell back to libx264"
@@ -790,18 +906,18 @@ fn assert_still_keyframe(encoder: &str) {
 
 #[test]
 fn software_encoder_sends_a_requested_keyframe_on_a_still_desktop() {
-    let _guard = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    assert_still_keyframe("libx264");
+    let serial = serial();
+    assert_still_keyframe(&serial, "libx264");
 }
 
 #[test]
 fn amf_sends_a_requested_keyframe_on_a_still_desktop() {
+    let serial = serial();
     for name in ["h264_amf", "hevc_amf"] {
-        if !amf_available(name) {
+        if !amf_available(&serial, name) {
             continue;
         }
-        let _guard = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        assert_still_keyframe(name);
+        assert_still_keyframe(&serial, name);
     }
 }
 
@@ -809,20 +925,24 @@ fn amf_sends_a_requested_keyframe_on_a_still_desktop() {
 #[test]
 #[ignore = "native: an NVIDIA card"]
 fn nvenc_sends_a_requested_keyframe_on_a_still_desktop() {
-    let _guard = STAGE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let serial = serial();
     for name in ["h264_nvenc", "hevc_nvenc"] {
-        assert_still_keyframe(name);
+        assert_still_keyframe(&serial, name);
     }
 }
 
 #[test]
 fn amf_fails_cleanly_without_an_amd_driver() {
+    let serial = serial();
     if amf_expectation() != Some(AmfExpectation::Fallback) {
         return;
     }
     // Without an AMD driver, both AMF encoders must fail to open rather than
     // hang or crash. The HEVC one is chosen at runtime for HEVC clients.
     for name in ["h264_amf", "hevc_amf"] {
-        assert!(!amf_opens(name), "{name} opened without an AMD driver");
+        assert!(
+            !amf_opens(&serial, name),
+            "{name} opened without an AMD driver"
+        );
     }
 }
