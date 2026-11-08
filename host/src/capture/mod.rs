@@ -36,7 +36,6 @@ pub(crate) const FPS_WINDOW: usize = 60;
 /// DXGI delivers no new frames. If a client is connected and we haven't sent anything for this
 /// long, resend the last frame so the encoder emits the pending IDR and the iPad gets a sync
 /// sample instead of timing out on a black screen.
-#[cfg(any(windows, test))]
 pub(crate) const IDLE_KEEPALIVE: Duration = Duration::from_millis(750);
 
 /// With nobody connected the cached picture is refreshed this often, so a new
@@ -151,6 +150,10 @@ pub struct FrameSlot {
 struct SlotInner {
     state: Mutex<SlotState>,
     condvar: Condvar,
+    /// Runs after [`FrameSlot::take_within`] took a frame and let go of the
+    /// mailbox, where a taker can be descheduled.
+    #[cfg(test)]
+    after_take: Mutex<Option<Box<dyn FnMut() + Send>>>,
 }
 
 #[derive(Default)]
@@ -165,6 +168,8 @@ impl FrameSlot {
             inner: Arc::new(SlotInner {
                 state: Mutex::new(SlotState::default()),
                 condvar: Condvar::new(),
+                #[cfg(test)]
+                after_take: Mutex::new(None),
             }),
         }
     }
@@ -200,6 +205,56 @@ impl FrameSlot {
             self.inner.condvar.wait(&mut state);
         }
     }
+
+    /// As [`Self::blocking_take`], but gives up after `timeout`. A frame
+    /// taken replaces `kept`, a frame the caller still holds: `kept` is let
+    /// go under the mailbox lock before the frame leaves it, so capture,
+    /// which recycles a few buffers, never finds them all held at once.
+    pub fn take_within(&self, timeout: Duration, kept: &mut Option<RawFrame>) -> Taken {
+        let deadline = Instant::now() + timeout;
+        let taken = {
+            let mut state = self.inner.state.lock();
+            let mut timed_out = false;
+            loop {
+                if state.frame.is_some() {
+                    *kept = None;
+                    break Taken::Frame(state.frame.take().expect("checked above"));
+                }
+                if state.closed {
+                    break Taken::Closed;
+                }
+                if timed_out {
+                    break Taken::Nothing;
+                }
+                timed_out = self
+                    .inner
+                    .condvar
+                    .wait_until(&mut state, deadline)
+                    .timed_out();
+            }
+        };
+        #[cfg(test)]
+        if matches!(taken, Taken::Frame(_)) {
+            if let Some(hook) = self.inner.after_take.lock().as_mut() {
+                hook();
+            }
+        }
+        taken
+    }
+
+    #[cfg(test)]
+    pub(crate) fn after_take(&self, hook: impl FnMut() + Send + 'static) {
+        *self.inner.after_take.lock() = Some(Box::new(hook));
+    }
+}
+
+/// What [`FrameSlot::take_within`] found.
+#[derive(Debug)]
+pub enum Taken {
+    Frame(RawFrame),
+    /// No frame arrived in time.
+    Nothing,
+    Closed,
 }
 
 /// Stamp a watchdog heartbeat (ms on the process clock).
@@ -806,7 +861,6 @@ pub(crate) fn keepalive_allowed(seen_image: bool, second_screen: bool) -> bool {
 
 /// How long a keyframe request waits for the encoder to take the resent frame
 /// before the picture is resent again.
-#[cfg(any(windows, test))]
 const KEYFRAME_RESEND: Duration = Duration::from_millis(100);
 
 /// Whether an idle display's last picture is due to be resent to the viewer.
@@ -814,7 +868,6 @@ const KEYFRAME_RESEND: Duration = Duration::from_millis(100);
 /// at once when there is a real picture to send: a viewer back within the
 /// second screen's grace period otherwise waited for the next keepalive, up
 /// to 750 ms, before the encoder could start its session.
-#[cfg(any(windows, test))]
 pub(crate) fn keepalive_due(
     since_send: Duration,
     keyframe_requested: bool,
@@ -977,6 +1030,75 @@ fn pick_new_virtual_output<'a>(before: &[String], now: &'a [OutputInfo]) -> Opti
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn a_timed_take_returns_a_frame_nothing_or_the_close() {
+        let (producer, consumer) = super::frame_slot();
+        let frame = |frame_number| super::RawFrame {
+            frame_number,
+            timestamp: Instant::now(),
+            data: Arc::new(Vec::new()),
+            width: 2,
+            height: 2,
+        };
+        let short = Duration::from_millis(5);
+        assert!(matches!(
+            consumer.take_within(short, &mut None),
+            super::Taken::Nothing
+        ));
+        producer.publish(frame(1));
+        assert!(matches!(
+            consumer.take_within(short, &mut None),
+            super::Taken::Frame(taken) if taken.frame_number == 1
+        ));
+        let waiting =
+            std::thread::spawn(move || consumer.take_within(Duration::from_secs(10), &mut None));
+        std::thread::sleep(Duration::from_millis(20));
+        producer.publish(frame(2));
+        assert!(matches!(
+            waiting.join().unwrap(),
+            super::Taken::Frame(taken) if taken.frame_number == 2
+        ));
+        let (producer, consumer) = super::frame_slot();
+        producer.close();
+        assert!(matches!(
+            consumer.take_within(short, &mut None),
+            super::Taken::Closed
+        ));
+    }
+
+    /// The synthetic source recycles three buffers. A taker that still held
+    /// a kept picture next to the frame it took, while capture published a
+    /// third, left capture no buffer to render its next frame into.
+    #[test]
+    fn a_frame_taken_in_place_of_a_kept_one_leaves_capture_a_free_buffer() {
+        let (producer, consumer) = super::frame_slot();
+        let pool: Vec<Arc<Vec<u8>>> = (0..3).map(|_| Arc::new(vec![0u8; 16])).collect();
+        let frame = |n: usize| super::RawFrame {
+            frame_number: n as u64,
+            timestamp: Instant::now(),
+            data: Arc::clone(&pool[n]),
+            width: 2,
+            height: 2,
+        };
+        let mut kept = Some(frame(0));
+        producer.publish(frame(1));
+        let third = frame(2);
+        let capture = producer.handle();
+        // The taker is descheduled right after the take: capture publishes
+        // its third buffer and looks for a free one, as the synthetic source
+        // does before it renders.
+        consumer.after_take(move || {
+            capture.publish(third.clone());
+            assert!(
+                pool.iter().any(|buffer| Arc::strong_count(buffer) == 1),
+                "capture has no free buffer for its next frame"
+            );
+        });
+        let taken = consumer.take_within(Duration::from_secs(1), &mut kept);
+        assert!(matches!(taken, super::Taken::Frame(frame) if frame.frame_number == 1));
+        assert!(kept.is_none());
+    }
 
     #[test]
     fn pointer_only_frames_are_not_read_back_before_the_first_image() {

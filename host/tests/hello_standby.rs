@@ -1,7 +1,9 @@
 //! The PC answers an iPad's HELLO2 while it isn't streaming: in the pause
 //! before an automatic restart, across a restart, after Stop, and after the
-//! storm brake. Drives the REAL supervisor with synthetic capture and
-//! libx264, talked to by fake iPads over loopback UDP on ephemeral ports.
+//! storm brake. A stopped PC also proves it is the saved PC to an iPad that
+//! found it at a new address. Drives the REAL supervisor with synthetic
+//! capture and libx264, talked to by fake iPads over loopback UDP on
+//! ephemeral ports.
 
 use std::collections::BTreeMap;
 use std::net::UdpSocket;
@@ -530,4 +532,293 @@ fn a_stopped_pc_follows_the_chosen_network() {
         host.shared.session.lock().not_streaming(),
         Some(NotStreaming::Stopped)
     );
+}
+
+/// A stopped PC still proves it is the saved PC to an iPad that found it
+/// at a new address, within the same bounds as while it streams. The PC's
+/// home network address is a test listing, so debug builds only.
+#[cfg(debug_assertions)]
+mod identify {
+    use super::*;
+    use eternal_host::network::{
+        home_addresses, listed_home_addresses, set_test_adapters, Adapter, Kind,
+    };
+    use eternal_wire::v2::control::{identity_message, Identify, Identity, IDENTIFY_VERSION};
+
+    impl FakeIpad {
+        /// Asks the PC to prove it is the saved PC, as an iPad that found it at a
+        /// new address does.
+        fn identify(&self, nonce: [u8; 16]) {
+            let identify = ControlMessage::Identify(Identify {
+                version: IDENTIFY_VERSION,
+                nonce,
+            });
+            self.send(&encode_control(0, 1, &identify));
+        }
+
+        /// The next IDENTITY for `nonce` within `wait`, skipping anything else.
+        fn identity(&self, nonce: [u8; 16], wait: Duration) -> Option<Identity> {
+            let deadline = Instant::now() + wait;
+            let mut buffer = [0; 2048];
+            while Instant::now() < deadline {
+                if let Ok(len) = self.socket.recv(&mut buffer) {
+                    if let Ok((_, ControlMessage::Identity(identity))) =
+                        parse_control(&buffer[..len])
+                    {
+                        if identity.nonce == nonce {
+                            self.sizes.set((self.sizes.get().0, len));
+                            return Some(identity);
+                        }
+                    }
+                }
+            }
+            None
+        }
+
+        /// Asks up to 8 times, 250 ms apart, as an iPad's check does, and
+        /// returns the first answer.
+        fn check(&self, nonce: [u8; 16]) -> Option<Identity> {
+            (0..8).find_map(|_| {
+                self.identify(nonce);
+                self.identity(nonce, Duration::from_millis(250))
+            })
+        }
+    }
+
+    /// The address the test PC lists as its home network's. It listens on
+    /// every address, so an iPad that found it there reaches it on loopback.
+    const HOME: std::net::Ipv4Addr = std::net::Ipv4Addr::new(192, 168, 1, 20);
+
+    /// Makes [`HOME`] the PC's only home network address.
+    fn set_home_adapter() {
+        set_test_adapters(Some(vec![Adapter {
+            name: "Wi-Fi".into(),
+            kind: Kind::Wifi,
+            up: true,
+            gateway: true,
+            ipv4: vec![HOME],
+        }]));
+    }
+
+    /// Makes [`HOME`] the PC's only home network address, and waits until a
+    /// fresh listing has it.
+    fn list_home_address() {
+        set_home_adapter();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while home_addresses() != [HOME] {
+            assert!(
+                Instant::now() < deadline,
+                "the home address was never listed"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// What the iPad checks before it moves to `asked`: the proof is the
+    /// pairing token's over its nonce and the port and addresses the answer
+    /// names, and those are the port and one of the addresses it asked at.
+    fn ipad_accepts(
+        identity: &Identity,
+        token: [u8; 16],
+        nonce: [u8; 16],
+        asked: std::net::SocketAddrV4,
+    ) -> bool {
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &token);
+        let signed = identity_message(&nonce, identity.port, &identity.addresses);
+        ring::hmac::verify(&key, &signed, &identity.proof).is_ok()
+            && identity.port == asked.port()
+            && identity.addresses.contains(&asked.ip().octets())
+    }
+
+    /// A stopped PC that changed address proves it is the saved PC, so the iPad
+    /// moves to it and hears that it's stopped. The answer is no larger than
+    /// the request, and nothing starts.
+    #[test]
+    fn a_stopped_pc_proves_it_is_the_saved_pc() {
+        let host = Host::start(GpuInfo::software_fallback(), true);
+        host.send(SupervisorCommand::Stop);
+        host.wait_until_stopped();
+        let mut ipad = FakeIpad::new(&host, 1, NEW);
+        let token = host.shared.pairing.lock().token();
+
+        list_home_address();
+        let identity = ipad
+            .check([1; 16])
+            .expect("a stopped PC must answer IDENTIFY");
+        let asked = std::net::SocketAddrV4::new(HOME, host.port);
+        assert!(
+            ipad_accepts(&identity, token, [1; 16], asked),
+            "{identity:?}"
+        );
+        assert!(!ipad_accepts(&identity, [9; 16], [1; 16], asked));
+        assert_eq!(ipad.sizes.get(), (84, 84));
+
+        assert!(!host.streaming(), "an IDENTIFY started the stream");
+        assert_eq!(
+            host.shared.session.lock().not_streaming(),
+            Some(NotStreaming::Stopped)
+        );
+        ipad.auth_token = token;
+        let ack = ipad.ask(2).expect("a stopped PC must answer");
+        assert_eq!(ack.status, HelloStatus::Stopped);
+    }
+
+    /// Something at another address that passes the iPad's IDENTIFY on to the
+    /// stopped PC gets the PC's real answer back, and the iPad turns it down:
+    /// it names the PC's own port, and no rewrite of the port or addresses
+    /// keeps the proof.
+    #[test]
+    fn a_forwarded_identify_fails_the_ipads_check_while_stopped() {
+        let host = Host::start(GpuInfo::software_fallback(), true);
+        host.send(SupervisorCommand::Stop);
+        host.wait_until_stopped();
+        let token = host.shared.pairing.lock().token();
+        let forwarder = UdpSocket::bind("127.0.0.1:0").unwrap();
+        forwarder
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let std::net::SocketAddr::V4(forwarder_addr) = forwarder.local_addr().unwrap() else {
+            unreachable!()
+        };
+        let mut ipad = FakeIpad::new(&host, 1, NEW);
+        ipad.host = forwarder_addr.to_string();
+        // Passes what the iPad sends on to the PC, and the PC's answers back.
+        let relaying = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let relay = {
+            let relaying = relaying.clone();
+            let pc = std::net::SocketAddr::from(([127, 0, 0, 1], host.port));
+            std::thread::spawn(move || {
+                let mut buffer = [0; 2048];
+                let mut asker = None;
+                while relaying.load(Ordering::SeqCst) {
+                    let Ok((len, from)) = forwarder.recv_from(&mut buffer) else {
+                        continue;
+                    };
+                    let to = if from == pc {
+                        asker
+                    } else {
+                        asker = Some(from);
+                        Some(pc)
+                    };
+                    if let Some(to) = to {
+                        let _ = forwarder.send_to(&buffer[..len], to);
+                    }
+                }
+            })
+        };
+
+        list_home_address();
+        let identity = ipad.check([1; 16]);
+        relaying.store(false, Ordering::SeqCst);
+        relay.join().unwrap();
+        let identity = identity.expect("a stopped PC must answer a forwarded IDENTIFY");
+
+        // It is the PC's real answer, for the PC's own address...
+        let pc = std::net::SocketAddrV4::new(HOME, host.port);
+        assert!(ipad_accepts(&identity, token, [1; 16], pc));
+        // ...so not for the address the iPad asked at.
+        assert!(!ipad_accepts(&identity, token, [1; 16], forwarder_addr));
+        let mut rewritten = identity.clone();
+        rewritten.port = forwarder_addr.port();
+        rewritten.addresses = vec![forwarder_addr.ip().octets()];
+        assert!(!ipad_accepts(&rewritten, token, [1; 16], forwarder_addr));
+    }
+
+    /// A stopped PC answers no more IDENTIFYs than a streaming one: a burst
+    /// from one address gets the per-address limit, and the PC still answers
+    /// HELLO2.
+    #[test]
+    fn identify_answers_stay_bounded_while_stopped() {
+        let host = Host::start(GpuInfo::software_fallback(), true);
+        host.send(SupervisorCommand::Stop);
+        host.wait_until_stopped();
+        let mut ipad = FakeIpad::new(&host, 1, NEW);
+
+        list_home_address();
+        for nonce in 0..20u8 {
+            ipad.identify([nonce; 16]);
+        }
+        let mut answers = 0;
+        let mut buffer = [0; 2048];
+        let deadline = Instant::now() + Duration::from_millis(1500);
+        while Instant::now() < deadline {
+            if let Ok(len) = ipad.socket.recv(&mut buffer) {
+                answers += usize::from(matches!(
+                    parse_control(&buffer[..len]),
+                    Ok((_, ControlMessage::Identity(_)))
+                ));
+            }
+        }
+        // Per asking address and 10 s window (`IDENTIFY_PER_SOURCE`).
+        assert_eq!(answers, 8);
+
+        ipad.auth_token = host.shared.pairing.lock().token();
+        let ack = ipad.ask(1).expect("a stopped PC must answer");
+        assert_eq!(ack.status, HelloStatus::Stopped);
+    }
+
+    /// A stopped PC signs no address listing older than its 2 s freshness: the
+    /// IDENTIFY that finds it expired goes unanswered, the next one is answered
+    /// from the fresh listing it started.
+    #[test]
+    fn a_stopped_pc_signs_no_expired_listing() {
+        let host = Host::start(GpuInfo::software_fallback(), true);
+        host.send(SupervisorCommand::Stop);
+        host.wait_until_stopped();
+        let ipad = FakeIpad::new(&host, 1, NEW);
+
+        list_home_address();
+        std::thread::sleep(Duration::from_millis(2200));
+        ipad.identify([1; 16]);
+        assert!(
+            ipad.identity([1; 16], Duration::from_secs(1)).is_none(),
+            "signed an expired listing"
+        );
+        ipad.identify([2; 16]);
+        let identity = ipad
+            .identity([2; 16], Duration::from_secs(2))
+            .expect("never answered from a fresh listing");
+        assert_eq!(identity.addresses, [HOME.octets()]);
+    }
+
+    /// The standby lists the home network addresses as it starts on every
+    /// address, as the stream does, so the first IDENTIFY after Stop is
+    /// answered though the stream's listing expired long ago.
+    #[test]
+    fn the_first_identify_after_stop_is_answered() {
+        let host = Host::start_with(GpuInfo::software_fallback(), 500, |shared| {
+            shared.pairing.lock().required = true;
+            set_home_adapter();
+        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !host.streaming() {
+            assert!(Instant::now() < deadline, "never streamed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(2200));
+        host.send(SupervisorCommand::Stop);
+        host.wait_until_stopped();
+        let mut ipad = FakeIpad::new(&host, 1, NEW);
+        ipad.auth_token = host.shared.pairing.lock().token();
+        // Answered: the standby holds the port.
+        let ack = ipad
+            .ask_until_answered(1, Duration::from_secs(10))
+            .expect("a stopped PC must answer");
+        assert_eq!(ack.status, HelloStatus::Stopped);
+        // Its listing runs on a thread of its own. Waiting for it starts
+        // none, so only the standby's can come.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while listed_home_addresses().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the standby never listed the home network addresses"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        ipad.identify([1; 16]);
+        assert!(
+            ipad.identity([1; 16], Duration::from_secs(2)).is_some(),
+            "the first IDENTIFY after Stop went unanswered"
+        );
+    }
 }

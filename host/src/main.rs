@@ -324,6 +324,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tracing::warn!("Supervisor did not shut down within 3s — forcing exit");
             }
 
+            // Release every key and button the iPad left held, behind whatever the
+            // last stream queued, unless Windows is stuck.
+            quit_control
+                .shared
+                .input
+                .finish(std::time::Duration::from_millis(500));
+
             // The window is gone and the display is off, so a slow disk keeps no one
             // waiting on screen: give the second screen record up to 30 s to land.
             eternal_host::capture::second_screen::finish_saving(&quit_control.shared);
