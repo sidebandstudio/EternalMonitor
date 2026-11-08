@@ -127,6 +127,11 @@ final class ConnectionManager: ObservableObject {
     /// The PC has no display turned on, so there is nothing to capture and
     /// the picture is held. Its heartbeats say so until one comes back.
     @Published var pcNoDisplay = false
+    /// The PC's heartbeats say Windows won't let it capture from its
+    /// graphics card, and which screen.
+    @Published var pcGraphicsCard: PCGraphicsCard?
+    /// The PC's heartbeats counted video frames sent this attempt.
+    private var pcSentVideo = false
     /// Nonzero while an automatic reconnect cycle is running.
     @Published private(set) var reconnectAttempt = 0
 
@@ -183,6 +188,11 @@ final class ConnectionManager: ObservableObject {
     /// Disconnect, coming back to the app keeps it stopped until Try again
     /// or Connect USB.
     private var usbStoppedForNoPicture = false
+    /// The PC turned the cable down: it isn't answered until the hold ends
+    /// (see `CableHold`). Busy refusals in a row set the wait.
+    private var cableHold: CableHold?
+    private var cableBusyInARow = 0
+    private var cableHoldTask: Task<Void, Never>?
     private let currentAttempt = OSAllocatedUnfairLock<UUID?>(initialState: nil)
     private var frameAssembler: FrameAssembler?
     private var controlChannel: ControlChannel?
@@ -254,6 +264,12 @@ final class ConnectionManager: ObservableObject {
         /// How long video the PC says it sent may go missing before the
         /// next no-video step (see `NoVideoFallback`).
         var noVideoStepSeconds = 1.5
+        /// How long the cable goes unanswered after the given number of
+        /// Busy refusals in a row (see `CableHold`).
+        var cableBusyHoldSeconds: (Int) -> Double = CableHold.busySeconds
+        /// Waits out a cable hold. Tests replace it to end the wait when
+        /// they choose.
+        var cableHoldSleep: (Double) async -> Void = { try? await Task.sleep(for: .seconds($0)) }
         /// How long after the PC that didn't answer shows up on the network
         /// it is asked, so a few Bonjour updates count as one.
         var pcReturnDebounceSeconds = 1.0
@@ -392,8 +408,45 @@ final class ConnectionManager: ObservableObject {
     func resumeUSBConnections() {
         noPictureStreak.restartCount()
         usbStoppedForNoPicture = false
+        endCableHold()
+        cableBusyInARow = 0
         usbPaused = false
         refreshUSBAvailability()
+    }
+
+    /// The PC turned this iPad down over the cable. Stop answering the cable
+    /// for the hold's wait, or until the user acts after a version refusal,
+    /// instead of taking the PC's next dial a second later.
+    private func holdCable(_ reason: CableHold.Reason) {
+        var wait: Double?
+        if reason == .busy {
+            cableBusyInARow += 1
+            wait = timing.cableBusyHoldSeconds(cableBusyInARow)
+        }
+        let hold = CableHold(reason: reason, until: wait.map { now().addingTimeInterval($0) })
+        endCableHold()
+        cableHold = hold
+        record(.info, "usb", "The PC turned the cable down (\(reason)); " + (wait.map { "answering it again in \(Int($0.rounded())) s" }
+            ?? "answering it again after Try again or Connect USB"))
+        usbPaused = true
+        usbListener?.stop()
+        usbListener = nil
+        usbStatus = "USB: disconnected"
+        guard let wait else { return }
+        let sleep = timing.cableHoldSleep
+        cableHoldTask = Task { @MainActor [weak self] in
+            await sleep(wait)
+            guard let self, !Task.isCancelled, self.cableHold == hold else { return }
+            self.endCableHold()
+            self.usbPaused = self.usbStoppedForNoPicture
+            self.refreshUSBAvailability()
+        }
+    }
+
+    private func endCableHold() {
+        cableHoldTask?.cancel()
+        cableHoldTask = nil
+        cableHold = nil
     }
 
     // MARK: - Frame slot (thread-safe single-slot)
@@ -605,6 +658,8 @@ final class ConnectionManager: ObservableObject {
         signalLost = false
         pcLocked = false
         pcNoDisplay = false
+        pcGraphicsCard = nil
+        pcSentVideo = false
         degradedSinceUs = nil
         prevCounters = FrameAssembler.Counters()
         diagnostics.removeAll()
@@ -896,7 +951,10 @@ final class ConnectionManager: ObservableObject {
                     do { try self.pairingStore.save(token: info.authToken, hostName: info.hostName, address: pairingAddress) }
                     catch { self.record(.warning, "pairing", "Pairing was not saved on this iPad. Pair again next time.") }
                 }
-                if isUSB { self.usbStatus = "USB: connected to \(info.hostName)" }
+                if isUSB {
+                    self.usbStatus = "USB: connected to \(info.hostName)"
+                    self.cableBusyInARow = 0
+                }
                 self.hostStreamConfig = info.streamConfig
                 self.record(
                     .info, "ctrl",
@@ -955,7 +1013,16 @@ final class ConnectionManager: ObservableObject {
                     self.connectionError = "Your PC turned down the connection."
                 }
                 self.record(.error, "ctrl", self.connectionError ?? self.problem?.title ?? "rejected")
-                self.disconnect(.pcRefused)
+                switch status {
+                case .busy: self.disconnect(.pcBusy)
+                case .versionUnsupported where mismatch == .pcOlder: self.disconnect(.oldPC)
+                default: self.disconnect(.pcRefused)
+                }
+                // Over the cable the PC dials again a second later, and would
+                // be turned down again: wait for a change instead.
+                if isUSB, status == .busy || status == .versionUnsupported {
+                    self.holdCable(status == .busy ? .busy : .version)
+                }
             }
         }
         channel.onPCNotStreaming = { [weak self] status, reason in
@@ -985,6 +1052,7 @@ final class ConnectionManager: ObservableObject {
                     self.connectionError = VersionMismatch.pcLegacy.message
                     self.record(.error, "ctrl", "Legacy v1 host detected")
                     self.disconnect(.legacyPC)
+                    if isUSB { self.holdCable(.version) }
                 } else {
                     self.record(.warning, "ctrl", "HELLO2 handshake got no reply yet")
                     if self.leaveRememberedAddress(.pcMoved, result: "no_reply") {
@@ -1037,6 +1105,7 @@ final class ConnectionManager: ObservableObject {
                 self.hostStreamConfig = heartbeat.streamConfig
                 if let frames = heartbeat.framesSent {
                     self.noVideoFallback?.heard(framesSent: frames, at: ProcessInfo.processInfo.systemUptime)
+                    if frames > 0 { self.pcSentVideo = true }
                 }
                 let locked = heartbeat.notice == Heartbeat.noticePCLocked
                 if locked != self.pcLocked {
@@ -1047,6 +1116,12 @@ final class ConnectionManager: ObservableObject {
                 if noDisplay != self.pcNoDisplay {
                     self.pcNoDisplay = noDisplay
                     self.record(.info, "ctrl", noDisplay ? "PC has no active display: holding the picture" : "PC display back")
+                }
+                let card = PCGraphicsCard(notice: heartbeat.notice)
+                if card != self.pcGraphicsCard {
+                    self.pcGraphicsCard = card
+                    self.record(.info, "ctrl", card.map { "PC can't capture from its graphics card screen=\($0)" }
+                        ?? "PC captures from its graphics card again")
                 }
             }
         }
@@ -1755,7 +1830,11 @@ final class ConnectionManager: ObservableObject {
                 if handshakeDone { self.noPictureStreak.endedWithoutPicture() }
                 // A PC that said it isn't streaming and then went quiet (it
                 // closed, or slept) didn't answer: its answers were no picture.
-                let problem: ConnectionProblem = self.waitingForStream ? .noReply(usb: isUSB) : self.noPictureStreak.shown(.timeout(
+                // A PC that said why (its graphics card, which only the PC
+                // can switch) gets that card instead of "no picture".
+                let card = handshakeDone ? self.pcGraphicsCard : nil
+                let problem: ConnectionProblem = self.waitingForStream ? .noReply(usb: isUSB)
+                    : card.map { .pcGraphicsCard($0) } ?? self.noPictureStreak.shown(.timeout(
                     listenerReady: debug.listenerReadyPort != nil, helloAttempts: debug.helloAttempts,
                     handshakeDone: handshakeDone, datagramsReceived: debug.datagramsReceived,
                     isUSB: isUSB, host: debug.host), at: isUSB ? nil : "\(debug.host):\(debug.port)")
@@ -1936,7 +2015,9 @@ final class ConnectionManager: ObservableObject {
         endBackgroundGoodbye()
         isForeground = true
         recheckAppleDevicesSighting()
-        usbPaused = usbStoppedForNoPicture
+        // A hold whose wait ran out in the background ends here.
+        if let hold = cableHold, !hold.holds(at: now()) { endCableHold() }
+        usbPaused = usbStoppedForNoPicture || cableHold != nil
         refreshUSBAvailability()
         resumePCReturn()
         guard resumeOnForeground else { return }
@@ -2022,6 +2103,7 @@ final class ConnectionManager: ObservableObject {
         pictureRestoring = false
         pcLocked = false
         pcNoDisplay = false
+        pcGraphicsCard = nil
         degradedSinceUs = nil
         prevCounters = FrameAssembler.Counters()
         hostInfo = nil
@@ -2047,7 +2129,9 @@ final class ConnectionManager: ObservableObject {
         return SessionSummary(
             end: end, isUSB: mediaLink?.isUSB ?? (transportMode == "USB"), sessionId: hostInfo?.sessionId,
             nonce: controlChannel?.helloNonce ?? 0, awaitingPairing: awaitingPairing,
-            datagramsReceived: debugState.datagramsReceived, firstFrame: firstFrameAt.map { $0 - summaryStartedAt },
+            datagramsReceived: debugState.datagramsReceived, captureRefused: pcGraphicsCard != nil,
+            pcSentVideo: pcSentVideo,
+            firstFrame: firstFrameAt.map { $0 - summaryStartedAt },
             duration: now - summaryStartedAt)
     }
 

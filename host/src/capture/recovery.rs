@@ -446,12 +446,7 @@ pub(crate) fn run_until_unblocked_on(
         };
         // The first working frame clears the block (see
         // [`note_capture_resumed`]).
-        if shared
-            .capture_block
-            .lock()
-            .replace(unavailable.block)
-            .is_none()
-        {
+        if note_capture_blocked(shared, unavailable.block).is_none() {
             retry.resumed();
         }
         let (delay, changed) = retry.blocked(unavailable.block);
@@ -485,22 +480,69 @@ fn access_lost_is_blocked(
     }
 }
 
+/// How long Windows has to refuse the screen from this graphics card before
+/// the iPad is told. The same refusal comes and goes for a moment while the
+/// desktop changes mode, and the iPad's first-picture wait is 10 s.
+pub const GPU_NOTICE_AFTER: Duration = Duration::from_secs(2);
+
 /// The heartbeat's notice while capture is blocked. A secure screen says the
 /// PC is locked, and no display attached says so, so the iPad doesn't show a
 /// frozen picture without a word; it clears with the block when capture
-/// works again. The other blocks keep the held picture as before.
-pub fn heartbeat_notice(block: Option<CaptureBlock>) -> u8 {
-    use eternal_wire::v2::control::{NOTICE_NONE, NOTICE_NO_DISPLAY, NOTICE_PC_LOCKED};
+/// works again. A screen Windows won't share from this graphics card says so
+/// once the refusal has lasted [`GPU_NOTICE_AFTER`] (`gpu_since` keeps when
+/// it began: [`note_capture_blocked`] sets it, and a heartbeat that finds it
+/// unset starts it), naming the failed second screen when
+/// `second_screen_failed`.
+/// The other blocks keep the held picture as before.
+pub fn heartbeat_notice(
+    block: Option<CaptureBlock>,
+    second_screen_failed: bool,
+    gpu_since: &mut Option<Instant>,
+    now: Instant,
+) -> u8 {
+    use eternal_wire::v2::control::{
+        NOTICE_NONE, NOTICE_NO_DISPLAY, NOTICE_PC_LOCKED, NOTICE_SECOND_SCREEN_UNSUPPORTED_GPU,
+        NOTICE_UNSUPPORTED_GPU,
+    };
+    if block != Some(CaptureBlock::UnsupportedOnThisGpu) {
+        *gpu_since = None;
+    }
     match block {
         Some(CaptureBlock::SecureDesktop) => NOTICE_PC_LOCKED,
         Some(CaptureBlock::NoDisplay) => NOTICE_NO_DISPLAY,
+        Some(CaptureBlock::UnsupportedOnThisGpu)
+            if now.saturating_duration_since(*gpu_since.get_or_insert(now)) >= GPU_NOTICE_AFTER =>
+        {
+            if second_screen_failed {
+                NOTICE_SECOND_SCREEN_UNSUPPORTED_GPU
+            } else {
+                NOTICE_UNSUPPORTED_GPU
+            }
+        }
         _ => NOTICE_NONE,
     }
 }
 
+/// Records that Windows blocks capture with `block`, returning the block
+/// before. A refusal from this graphics card that begins now, after capture
+/// worked or another block, starts its own wait for the iPad's notice, so a
+/// refusal that came back between two heartbeats never inherits an earlier
+/// one's.
+pub fn note_capture_blocked(shared: &SharedControl, block: CaptureBlock) -> Option<CaptureBlock> {
+    let mut current = shared.capture_block.lock();
+    let before = current.replace(block);
+    if before != Some(block) {
+        *shared.gpu_refused_since.lock() =
+            (block == CaptureBlock::UnsupportedOnThisGpu).then(Instant::now);
+    }
+    before
+}
+
 /// Clears the blocked state once frames flow again.
 pub fn note_capture_resumed(shared: &SharedControl) {
-    if let Some(block) = shared.capture_block.lock().take() {
+    let resumed = shared.capture_block.lock().take();
+    *shared.gpu_refused_since.lock() = None;
+    if let Some(block) = resumed {
         info!(block = ?block, "Screen capture resumed");
     }
 }
@@ -618,29 +660,144 @@ mod tests {
         assert!(shared.gpu_switch.lock().as_ref().unwrap().failed);
     }
 
+    /// The notice for `block`, read once with no refusal before.
+    fn notice_now(block: Option<CaptureBlock>) -> u8 {
+        heartbeat_notice(block, false, &mut None, Instant::now())
+    }
+
     #[test]
-    fn only_a_secure_screen_or_no_display_has_a_notice_for_the_ipad() {
+    fn only_a_secure_screen_no_display_or_the_wrong_card_has_a_notice_for_the_ipad() {
         use eternal_wire::v2::control::{NOTICE_NONE, NOTICE_NO_DISPLAY, NOTICE_PC_LOCKED};
         assert_eq!(
-            heartbeat_notice(Some(CaptureBlock::SecureDesktop)),
+            notice_now(Some(CaptureBlock::SecureDesktop)),
             NOTICE_PC_LOCKED
         );
         // A closed lid or screens that are off: the field's PCs showed a
         // frozen picture without a word until a display came back.
-        assert_eq!(
-            heartbeat_notice(Some(CaptureBlock::NoDisplay)),
-            NOTICE_NO_DISPLAY
-        );
-        assert_eq!(heartbeat_notice(None), NOTICE_NONE);
+        assert_eq!(notice_now(Some(CaptureBlock::NoDisplay)), NOTICE_NO_DISPLAY);
+        assert_eq!(notice_now(None), NOTICE_NONE);
         for block in [
             CaptureBlock::DisplayChanging,
-            CaptureBlock::UnsupportedOnThisGpu,
             CaptureBlock::TooManyCaptureApps,
             CaptureBlock::SessionDisconnected,
             CaptureBlock::DriverNotResponding,
         ] {
-            assert_eq!(heartbeat_notice(Some(block)), NOTICE_NONE, "{block:?}");
+            assert_eq!(notice_now(Some(block)), NOTICE_NONE, "{block:?}");
         }
+    }
+
+    /// The hybrid laptops whose iPad saw 10 s of black, then "no picture":
+    /// Windows refused the screen from the card EternalMonitor runs on, and
+    /// the PC's window said so, but the iPad got no word. Now it does, once
+    /// the refusal has lasted 2 s (it comes and goes for a moment while the
+    /// desktop changes mode), naming the second screen when it failed too.
+    /// It clears with the refusal, and a new one waits again.
+    /// Review r1: capture worked for a moment and Windows refused the card
+    /// again, all between two heartbeats. The heartbeat never saw the gap,
+    /// so the new refusal took the old one's start and the iPad was told at
+    /// once. Now the refusal's start is kept where the block is set and
+    /// cleared: a new refusal waits its own 2 s, after capture worked or
+    /// after another block, while the same refusal going on keeps its start.
+    #[test]
+    fn a_refusal_that_comes_back_between_heartbeats_waits_its_own_2_s() {
+        use eternal_wire::v2::control::{NOTICE_NONE, NOTICE_UNSUPPORTED_GPU};
+        let shared = SharedControl::new(9876, 15_000_000);
+        let notice = |shared: &SharedControl| {
+            let block = *shared.capture_block.lock();
+            heartbeat_notice(
+                block,
+                false,
+                &mut shared.gpu_refused_since.lock(),
+                Instant::now(),
+            )
+        };
+        let long_ago = || Some(Instant::now() - Duration::from_secs(3));
+        note_capture_blocked(&shared, CaptureBlock::UnsupportedOnThisGpu);
+        assert_eq!(notice(&shared), NOTICE_NONE, "a refusal that just began");
+        // The same refusal, retried 3 s on: its start stays.
+        *shared.gpu_refused_since.lock() = long_ago();
+        note_capture_blocked(&shared, CaptureBlock::UnsupportedOnThisGpu);
+        assert_eq!(notice(&shared), NOTICE_UNSUPPORTED_GPU);
+        // Capture works, then is refused again, with no heartbeat between.
+        note_capture_resumed(&shared);
+        note_capture_blocked(&shared, CaptureBlock::UnsupportedOnThisGpu);
+        assert_eq!(notice(&shared), NOTICE_NONE, "a fresh refusal waits again");
+        // Another block in between restarts it too.
+        *shared.gpu_refused_since.lock() = long_ago();
+        note_capture_blocked(&shared, CaptureBlock::DisplayChanging);
+        note_capture_blocked(&shared, CaptureBlock::UnsupportedOnThisGpu);
+        assert_eq!(notice(&shared), NOTICE_NONE);
+        // Through the capture stage's own retries: worked, then refused.
+        *shared.gpu_refused_since.lock() = long_ago();
+        note_capture_resumed(&shared);
+        let mut attempts = 0;
+        let result = run_until_unblocked(
+            &shared,
+            |_| {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(blocked(CaptureBlock::UnsupportedOnThisGpu))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {
+                assert_eq!(notice(&shared), NOTICE_NONE);
+                true
+            },
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn a_screen_refused_from_this_graphics_card_is_told_to_the_ipad_after_2_s() {
+        use eternal_wire::v2::control::{
+            NOTICE_NONE, NOTICE_SECOND_SCREEN_UNSUPPORTED_GPU, NOTICE_UNSUPPORTED_GPU,
+        };
+        let refused = Some(CaptureBlock::UnsupportedOnThisGpu);
+        let start = Instant::now();
+        let at = |s: f64| start + Duration::from_secs_f64(s);
+        let mut since = None;
+        assert_eq!(
+            heartbeat_notice(refused, false, &mut since, at(0.0)),
+            NOTICE_NONE
+        );
+        assert_eq!(
+            heartbeat_notice(refused, false, &mut since, at(1.9)),
+            NOTICE_NONE
+        );
+        assert_eq!(
+            heartbeat_notice(refused, false, &mut since, at(2.0)),
+            NOTICE_UNSUPPORTED_GPU
+        );
+        // Second screen mode, after the second screen failed to start.
+        assert_eq!(
+            heartbeat_notice(refused, true, &mut since, at(3.0)),
+            NOTICE_SECOND_SCREEN_UNSUPPORTED_GPU
+        );
+        // Capture works: no notice, and the next refusal waits again.
+        assert_eq!(
+            heartbeat_notice(None, false, &mut since, at(4.0)),
+            NOTICE_NONE
+        );
+        assert_eq!(
+            heartbeat_notice(refused, false, &mut since, at(5.0)),
+            NOTICE_NONE
+        );
+        assert_eq!(
+            heartbeat_notice(refused, false, &mut since, at(7.0)),
+            NOTICE_UNSUPPORTED_GPU
+        );
+        // A display change in between restarts the wait too.
+        let changing = Some(CaptureBlock::DisplayChanging);
+        assert_eq!(
+            heartbeat_notice(changing, false, &mut since, at(8.0)),
+            NOTICE_NONE
+        );
+        assert_eq!(
+            heartbeat_notice(refused, false, &mut since, at(9.0)),
+            NOTICE_NONE
+        );
     }
 
     #[test]

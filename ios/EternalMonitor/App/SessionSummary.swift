@@ -13,6 +13,11 @@ enum AttemptEnd: Equatable {
     case pcGoodbye
     /// The PC turned the connection down.
     case pcRefused
+    /// The PC turned it down as Busy: it streams to another device.
+    case pcBusy
+    /// The PC turned it down as too old for this app.
+    case oldPC
+    /// A v0.1.x PC, too old to answer HELLO2.
     case legacyPC
     /// The connect watchdog ran out before a picture.
     case connectTimeout
@@ -73,6 +78,10 @@ struct SessionSummary: Equatable {
     /// The PC asked for the pairing code and the attempt ended before a session.
     var awaitingPairing = false
     var datagramsReceived = 0
+    /// The PC said it can't capture its screen from its graphics card.
+    var captureRefused = false
+    /// The PC's heartbeats counted video frames sent this attempt.
+    var pcSentVideo = false
     /// Seconds from the start to the first decoded frame.
     var firstFrame: TimeInterval?
     var duration: TimeInterval
@@ -115,12 +124,17 @@ struct SessionSummary: Equatable {
     private var failure: String {
         switch end {
         case .connectTimeout where sessionId == nil, .pcMoved: return "no_reply"
+        // Only when no video went out, as the PC's summary has it: video
+        // that went out and gave no picture was lost or didn't decode.
+        case .connectTimeout where captureRefused && !pcSentVideo && datagramsReceived == 0: return "capture_failed"
         case .connectTimeout: return datagramsReceived == 0 ? "no_video" : "no_frame"
         case .noVideoPath: return datagramsReceived == 0 ? "no_video" : "no_frame"
         case .pcStoppedResponding: return "signal_lost"
         case .cableUnplugged, .usbLinkFailed, .closedBeforePicture: return "usb_lost"
         case .noNetwork: return "no_network"
-        case .pcRefused, .legacyPC, .linkFailed, .receiverFailed, .pictureStalled, .otherPC: return "other"
+        case .pcBusy: return "pc_busy"
+        case .oldPC, .legacyPC: return "old_pc"
+        case .pcRefused, .linkFailed, .receiverFailed, .pictureStalled, .otherPC: return "other"
         default: return "none"
         }
     }
