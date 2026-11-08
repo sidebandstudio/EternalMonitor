@@ -26,7 +26,7 @@ use eternal_wire::h264::contains_nal_type;
 use eternal_wire::reassembly::{AddOutcome, Reassembler, MAX_STALL_ALLOWANCE};
 use eternal_wire::v2::control::{
     encode_control, parse_control, ByeReason, ControlMessage, Hello2, HelloAck, HelloStatus,
-    KeyframeReason, KeyframeRequest, ReceiverReport, CAP_DECODE_H264,
+    KeyframeReason, KeyframeRequest, Ping, ReceiverReport, CAP_DECODE_H264,
 };
 use eternal_wire::v2::media::MediaHeader;
 use eternal_wire::v2::{classify, Classified};
@@ -1210,7 +1210,29 @@ impl FakeReceiver {
         )
     }
 
+    /// The handshake, then a ping, as every iPad since 0.3.0 sends the
+    /// moment its HELLO_ACK lands.
     fn connect_as(
+        host_port: u16,
+        decoder_caps: u16,
+        feature_caps: u16,
+        preferred_fps: u8,
+        client_nonce: u32,
+    ) -> Self {
+        let mut receiver = Self::handshake(
+            host_port,
+            decoder_caps,
+            feature_caps,
+            preferred_fps,
+            client_nonce,
+        );
+        receiver.send(&ControlMessage::Ping(Ping { t1_us: 1 }));
+        receiver
+    }
+
+    /// The handshake alone: the first report, 400 ms later, is the first
+    /// thing the PC hears from this receiver.
+    fn handshake(
         host_port: u16,
         decoder_caps: u16,
         feature_caps: u16,
