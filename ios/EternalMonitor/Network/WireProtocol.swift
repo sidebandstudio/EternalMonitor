@@ -310,6 +310,7 @@ struct HelloAck: Equatable {
     static let hostCapPen: UInt16 = 1 << 4
     /// Media frame_seq counts the frames sent in a stream epoch without gaps,
     /// so a forward gap is a frame lost in transit. Older iPads ignore it.
+    /// Every 0.3.4 and later PC sets it; see `OldPC`.
     static let hostCapContiguousFrameSeq: UInt16 = 1 << 5
     var status: HelloStatus
     var acceptedVersion: UInt8

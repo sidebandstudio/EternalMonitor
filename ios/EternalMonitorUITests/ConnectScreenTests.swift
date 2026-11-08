@@ -61,6 +61,30 @@ final class ConnectScreenTests: UITestCase {
         XCTAssertTrue(gone(star, within: 5), "Close did not hide the card")
     }
 
+    /// A PC older than 0.3.4: a quiet card on the Connect screen, above the
+    /// connect controls, that names the PC and closes. When it shows is a
+    /// unit test (OldPCTests).
+    func testAnOldPCsCardNamesThePCAndCloses() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-checkForUpdates", "<false/>"]
+        app.launchEnvironment["EM_UI_PREVIEW"] = "old-pc"
+        app.launchEnvironment["EM_USB_PORT"] = "0"
+        launchCleanly(app)
+        let card = app.descendants(matching: .any)["connect.oldPC"]
+        XCTAssertTrue(card.waitForExistence(timeout: 15), app.debugDescription)
+        XCTAssertTrue(card.label.contains("Your PC app is out of date"), card.label)
+        XCTAssertTrue(card.label.contains("Update EternalMonitor on Studio PC for faster, steadier streaming."), card.label)
+        XCTAssertTrue(card.label.contains("eternalmonitor.dev"), card.label)
+        XCTAssertLessThan(card.frame.maxY, app.buttons["connect.button"].frame.minY, "above the connect controls")
+        XCTAssertTrue(app.buttons["connect.button"].isEnabled, "connecting isn't blocked")
+        let shot = XCTAttachment(screenshot: app.screenshot())
+        shot.name = "old-pc-card"; shot.lifetime = .keepAlways; add(shot)
+        let close = app.buttons["connect.oldPCClose"]
+        close.tap()
+        if !gone(card, within: 5), close.exists { close.tap() }
+        XCTAssertTrue(gone(card, within: 5), "Close did not hide the card")
+    }
+
     private func gone(_ element: XCUIElement, within timeout: TimeInterval) -> Bool {
         let gone = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: element)
         return XCTWaiter().wait(for: [gone], timeout: timeout) == .completed

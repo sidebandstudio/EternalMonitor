@@ -9,6 +9,7 @@ struct ConnectView: View {
     @ObservedObject private var pairings = PairingStore.shared
     @ObservedObject private var language = LanguageStore.shared
     @ObservedObject private var updates = UpdateChecker.shared
+    @ObservedObject private var oldPC = OldPCPrompt.shared
 
     @State private var hostIP: String = ""
     @State private var port: String = "9876"
@@ -94,6 +95,10 @@ struct ConnectView: View {
                                     },
                                     notNow: { withAnimation(Motion.fade) { connectionManager.finishFeedbackAsk() } }
                                 )
+                            }
+
+                            if let card = oldPC.card {
+                                OldPCCard(card: card, close: { withAnimation(Motion.fade) { oldPC.close() } })
                             }
 
                             if isConnecting {
@@ -229,6 +234,12 @@ struct ConnectView: View {
             .onChange(of: scenePhase) { _, phase in
                 if phase == .active && scanner.searchProblem == .localNetworkOff { scanner.startScan() }
             }
+            // The old-PC card shows only here, never over a stream.
+            .onAppear(perform: offerOldPC)
+            .onChange(of: connectionManager.state) { _, _ in offerOldPC() }
+            .onChange(of: scanner.hosts) { _, _ in offerOldPC() }
+            .onChange(of: showSetup) { _, _ in offerOldPC() }
+            .onDisappear { oldPC.close() }
             .animation(.easeInOut(duration: 0.2), value: isConnecting)
             .animation(.easeInOut(duration: 0.2), value: connectionManager.connectionError)
             .animation(.easeInOut(duration: 0.2), value: connectionManager.problem)
@@ -733,6 +744,16 @@ struct ConnectView: View {
         return host.finding
             ? L("Finding…")
             : "Couldn't get its address. Type the Address shown on the PC."
+    }
+
+    /// Notes the PCs the search found and shows a waiting old-PC card
+    /// while nothing is streaming and setup is closed.
+    private func offerOldPC() {
+        for host in scanner.hosts {
+            oldPC.saw(pc: OldPC.pcName(bonjour: host.name),
+                      announced: PCVersions.version(address: host.address, name: host.name), hostCaps: nil)
+        }
+        if connectionManager.state == .disconnected && !showSetup { oldPC.show() }
     }
 
     private var unlistedRecents: [RecentConnection] {
