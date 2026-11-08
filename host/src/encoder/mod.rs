@@ -6636,7 +6636,22 @@ mod tests {
     fn a_bitrate_change_after_a_stalled_nvenc_reopen_clears_is_prompt() {
         use std::time::Duration;
         let mut stage = NativeStage::start();
-        let (_, opened) = stage.publish_until("Encoder opened", 0, Duration::from_secs(20));
+        // NVENC streams before the ABR step. A first open slower than the
+        // first picture's wait streams libx264 until NVENC's session, opened
+        // in the background, takes over.
+        let mut from = 0;
+        let opened = loop {
+            let (_, at) = stage.publish_until("Encoder opened", from, Duration::from_secs(20));
+            if stage.text()[at..]
+                .lines()
+                .next()
+                .unwrap()
+                .contains("h264_nvenc")
+            {
+                break at;
+            }
+            from = at + 1;
+        };
         for _ in 0..30 {
             stage.publish();
         }
