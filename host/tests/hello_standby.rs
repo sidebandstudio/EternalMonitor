@@ -113,6 +113,10 @@ impl Host {
 impl Drop for Host {
     fn drop(&mut self) {
         eternal_host::supervisor::TEST_BACKOFF_BASE_MS.store(500, Ordering::SeqCst);
+        eternal_host::transport::session::TEST_RESTART_HOLD_MS.store(
+            eternal_host::transport::session::RESTART_HOLD_LIMIT.as_millis() as u64,
+            Ordering::SeqCst,
+        );
         #[cfg(debug_assertions)]
         eternal_host::network::set_test_adapters(None);
         self.shared.stop();
@@ -934,4 +938,173 @@ mod identify {
             "the first IDENTIFY after Stop went unanswered"
         );
     }
+}
+
+/// What a streaming iPad heard over a stretch of time.
+#[derive(Default, Debug)]
+struct Heard {
+    /// When each heartbeat for the session came.
+    heartbeats: Vec<Instant>,
+    /// Each media datagram for the session: when, its epoch, and whether
+    /// it was part of a keyframe.
+    media: Vec<(Instant, u32, bool)>,
+    /// Goodbyes for the session.
+    goodbyes: Vec<eternal_wire::v2::control::ByeReason>,
+}
+
+impl FakeIpad {
+    /// Streams as an iPad does for `within`, or until `done` says so:
+    /// reports every 250 ms for `session_id`, and notes what comes back.
+    fn stream(&self, session_id: u32, within: Duration, done: impl Fn(&Heard) -> bool) -> Heard {
+        use eternal_wire::v2::control::ReceiverReport;
+        use eternal_wire::v2::media::MediaHeader;
+        let mut heard = Heard::default();
+        let deadline = Instant::now() + within;
+        let mut next_report = Instant::now();
+        let mut seq = 100;
+        let mut buffer = [0; 2048];
+        while Instant::now() < deadline && !done(&heard) {
+            if Instant::now() >= next_report {
+                seq += 1;
+                let report = ControlMessage::ReceiverReport(ReceiverReport {
+                    frames_complete: 1,
+                    ..ReceiverReport::default()
+                });
+                self.send(&encode_control(session_id, seq, &report));
+                next_report += Duration::from_millis(250);
+            }
+            let Ok(len) = self.socket.recv(&mut buffer) else {
+                continue;
+            };
+            let bytes = &buffer[..len];
+            let at = Instant::now();
+            match eternal_wire::v2::classify(bytes) {
+                eternal_wire::v2::Classified::Control(_) => match parse_control(bytes) {
+                    Ok((header, ControlMessage::Heartbeat(_)))
+                        if header.session_id == session_id =>
+                    {
+                        heard.heartbeats.push(at)
+                    }
+                    Ok((header, ControlMessage::Bye(reason)))
+                        if header.session_id == session_id =>
+                    {
+                        heard.goodbyes.push(reason)
+                    }
+                    _ => {}
+                },
+                eternal_wire::v2::Classified::Media { .. } => {
+                    if let Ok((header, _)) = MediaHeader::decode(bytes) {
+                        if header.session_id == session_id {
+                            heard
+                                .media
+                                .push((at, header.stream_epoch, header.is_keyframe));
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        heard
+    }
+}
+
+/// The encoder fails once, after this many frames: a capture or encoder
+/// error that the supervisor restarts the stream for.
+fn fail_the_encoder_once(after: u32) -> impl FnOnce(&SharedControl) {
+    move |shared| {
+        shared.pairing.lock().required = false;
+        std::env::set_var("ETERNAL_FAULT_ENCODER_AFTER", after.to_string());
+    }
+}
+
+/// A stream restart longer than the iPad's liveness (3 s) used to drop it:
+/// nothing sent it heartbeats while the PC waited to restart, and it lost
+/// the signal. The PC now keeps the session alive with heartbeats, and the
+/// picture comes back on the same session with a keyframe.
+#[test]
+fn a_restart_longer_than_the_ipads_liveness_keeps_its_session() {
+    let host = Host::start_with(
+        GpuInfo::software_fallback(),
+        4_000,
+        fail_the_encoder_once(240),
+    );
+    let ipad = FakeIpad::new(&host, 1, NEW);
+    let ack = ipad.connect(1);
+    let id = ack.session_id;
+    // Until the stream has restarted: media from a second epoch.
+    let heard = ipad.stream(id, Duration::from_secs(60), |heard| {
+        heard
+            .media
+            .first()
+            .is_some_and(|(_, first, _)| heard.media.iter().any(|(_, epoch, _)| epoch != first))
+    });
+    assert!(
+        heard.goodbyes.is_empty(),
+        "the iPad was told to go: {:?}",
+        heard.goodbyes
+    );
+    let first_epoch = heard.media.first().expect("a picture before the restart").1;
+    let last_before = heard
+        .media
+        .iter()
+        .filter(|(_, epoch, _)| *epoch == first_epoch)
+        .map(|(at, _, _)| *at)
+        .next_back()
+        .unwrap();
+    let resumed = heard
+        .media
+        .iter()
+        .find(|(_, epoch, _)| *epoch != first_epoch)
+        .expect("the picture came back");
+    let gap = resumed.0 - last_before;
+    assert!(
+        gap > Duration::from_secs(3),
+        "the restart took only {gap:?}"
+    );
+    assert!(resumed.2, "the picture comes back with a keyframe");
+    // Heartbeats kept coming through the gap, as the iPad's liveness needs.
+    let mut beats: Vec<_> = heard
+        .heartbeats
+        .iter()
+        .copied()
+        .filter(|at| *at > last_before && *at < resumed.0)
+        .collect();
+    beats.insert(0, last_before);
+    beats.push(resumed.0);
+    let longest = beats
+        .windows(2)
+        .map(|pair| pair[1] - pair[0])
+        .max()
+        .unwrap();
+    assert!(
+        longest < Duration::from_millis(2_500),
+        "{longest:?} without a heartbeat in a {gap:?} restart"
+    );
+    assert_eq!(host.shared.session.lock().session_id(), Some(id));
+}
+
+/// A restart that outlasts the hold limit ends the session with the goodbye
+/// that tells the iPad to connect again; its HELLO2 then hears that the PC
+/// is restarting.
+#[test]
+fn a_restart_past_the_hold_limit_tells_the_ipad_to_connect_again() {
+    eternal_host::transport::session::TEST_RESTART_HOLD_MS.store(2_000, Ordering::SeqCst);
+    let host = Host::start_with(
+        GpuInfo::software_fallback(),
+        10_000,
+        fail_the_encoder_once(240),
+    );
+    let ipad = FakeIpad::new(&host, 1, NEW);
+    let id = ipad.connect(1).session_id;
+    let heard = ipad.stream(id, Duration::from_secs(60), |heard| {
+        !heard.goodbyes.is_empty()
+    });
+    assert_eq!(
+        heard.goodbyes.first(),
+        Some(&eternal_wire::v2::control::ByeReason::Error)
+    );
+    assert!(heard.heartbeats.len() >= 2, "kept alive until the limit");
+    assert_eq!(host.shared.session.lock().session_id(), None);
+    let ack = ipad.ask(2).expect("a restarting PC answers");
+    assert_eq!(ack.status, HelloStatus::Restarting);
 }
