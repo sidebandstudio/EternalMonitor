@@ -62,6 +62,14 @@ pub struct HostConfig {
     pub msg2_resend_interval: Duration,
     /// New `Stale` answers per `dev_id` per second.
     pub stale_per_second: u32,
+    /// Authenticated message 1s per `dev_id` per second that get no answer
+    /// (over its budget, a late copy, a timestamp past the ceiling) and are
+    /// still remembered, so their replays cost no crypto. Past it, they're
+    /// dropped without being remembered.
+    pub unanswered_per_second: u32,
+    /// Credentials the host holds at most. With the two budgets above it
+    /// sizes the table of remembered message 1s.
+    pub max_credentials: usize,
     /// Resends of a cached `Stale` answer per source per second.
     pub stale_replays_per_second: u32,
     /// Shortest gap between two re-sealed `SessionConfirmAck`s.
@@ -106,6 +114,8 @@ impl HostConfig {
             expired_msg1_lifetime: Duration::from_secs(30),
             msg2_resend_interval: Duration::from_millis(100),
             stale_per_second: 5,
+            unanswered_per_second: 5,
+            max_credentials: MAX_CREDENTIALS,
             stale_replays_per_second: 5,
             confirm_ack_interval: Duration::from_millis(50),
             refusal_lifetime: Duration::from_secs(5),
@@ -456,6 +466,8 @@ impl RateWindow {
 /// is answered without another Diffie-Hellman.
 struct StaleBudget<A: PeerAddr> {
     window: RateWindow,
+    /// Message 1s remembered without an answer.
+    unanswered: RateWindow,
     /// Newest last.
     cached: Vec<CachedAnswer<<A as PeerAddr>::Bucket>>,
 }
@@ -569,11 +581,23 @@ const MAX_RATE_ENTRIES: usize = 1024;
 const MAX_MSG2_SOURCES: usize = 16;
 /// Remembered timed-out message 1s.
 const MAX_EXPIRED_MSG1: usize = 4096;
-/// Remembered message 1s that got an answer without a pending session.
-/// Sized for every credential the host can hold (64) at the answer rate
-/// (5/s each) for the 30 s they're remembered: 64 × 5 × 30 = 9,600. When
-/// full, no new answer is given; an unexpired entry is never evicted.
-const MAX_ANSWERED_MSG1: usize = 16_384;
+/// Credentials a host holds at most, across every slot.
+pub const MAX_CREDENTIALS: usize = 64;
+
+/// The size of the remembered message 1 table. Each budget window lasts at
+/// least 1 s, so the entries still remembered after `expired_msg1_lifetime`
+/// come from at most `ceil(lifetime) + 1` windows per `dev_id`, each adding
+/// at most `stale_per_second + unanswered_per_second`. When more `dev_id`s
+/// than `max_credentials` fill it, no new answer is given and nothing
+/// unexpired is evicted.
+fn answered_capacity(config: &HostConfig) -> usize {
+    let lifetime = config.expired_msg1_lifetime;
+    let windows = lifetime.as_secs() + u64::from(lifetime.subsec_nanos() > 0) + 1;
+    let per_window = u64::from(config.stale_per_second) + u64::from(config.unanswered_per_second);
+    usize::try_from(windows.saturating_mul(per_window))
+        .unwrap_or(usize::MAX)
+        .saturating_mul(config.max_credentials)
+}
 
 pub struct HostSessions<A: PeerAddr> {
     config: HostConfig,
@@ -591,6 +615,9 @@ pub struct HostSessions<A: PeerAddr> {
     /// answer is gone is dropped without a Diffie-Hellman.
     answered: HashMap<Digest, Duration>,
     answered_order: VecDeque<(Digest, Duration)>,
+    /// Entries `answered` holds at most: what [`HostSessions::new`] derives
+    /// from the config.
+    answered_capacity: usize,
     dh_budget: RateWindow,
     unverified_replies: RateWindow,
     /// The host's wall clock: µs since the Unix epoch at a given `now`.
@@ -609,6 +636,7 @@ impl<A: PeerAddr> HostSessions<A> {
         wall_us: u64,
     ) -> Self {
         Self {
+            answered_capacity: answered_capacity(&config),
             msg1_rate: SourceLimiter::new(config.msg1_per_second),
             stale_replay_rate: SourceLimiter::new(config.stale_replays_per_second),
             config,
@@ -715,6 +743,10 @@ impl<A: PeerAddr> HostSessions<A> {
     fn stale_budget(&mut self, dev_id: &Id16, now: Duration) -> &mut StaleBudget<A> {
         self.stale.entry(*dev_id).or_insert(StaleBudget {
             window: RateWindow {
+                start: now,
+                count: 0,
+            },
+            unanswered: RateWindow {
                 start: now,
                 count: 0,
             },
@@ -849,7 +881,7 @@ impl<A: PeerAddr> HostSessions<A> {
         // has its own budget, charged only on its own path.
         let timestamp_us = responder.payload().timestamp_us;
         if timestamp_us >= MAX_TIMESTAMP_US {
-            self.remember_answered(now, key);
+            self.remember_unanswered(now, &dev_id, key);
             return;
         }
         let committed = creds.last_committed_timestamp(&dev_id).max(
@@ -880,7 +912,7 @@ impl<A: PeerAddr> HostSessions<A> {
             if timestamp_us <= p.timestamp_us {
                 // A late copy from an older attempt: no answer, and its
                 // replays cost no crypto from now on.
-                self.remember_answered(now, key);
+                self.remember_unanswered(now, &dev_id, key);
                 return;
             }
         }
@@ -949,16 +981,16 @@ impl<A: PeerAddr> HostSessions<A> {
         out: &mut Vec<HostOutput<A>>,
     ) {
         self.expire_answered(now);
-        if self.answered.len() >= MAX_ANSWERED_MSG1 && !self.answered.contains_key(&key) {
+        if self.answered.len() >= self.answered_capacity && !self.answered.contains_key(&key) {
             // Full of unexpired entries: refuse new work rather than forget
             // a message 1 that was already answered.
             return;
         }
         let limit = self.config.stale_per_second;
         if !self.stale_budget(dev_id, now).window.allow(now, limit) {
-            // Over the dev_id's budget: no answer, but remembered, so its
-            // replays cost no crypto.
-            self.remember_answered(now, key);
+            // Over the dev_id's budget: no answer, but remembered within
+            // its own budget, so its replays cost no crypto.
+            self.remember_unanswered(now, dev_id, key);
             return;
         }
         self.dh_performed += 1;
@@ -988,14 +1020,28 @@ impl<A: PeerAddr> HostSessions<A> {
     /// dropped before any crypto. Always queued, also when replacing an
     /// expired entry for the same message 1, so every entry expires. When
     /// the table is full of unexpired entries, nothing is evicted.
+    ///
+    /// Each `dev_id` adds at most `stale_per_second` answered and
+    /// `unanswered_per_second` unanswered entries a second, so the table
+    /// holds at most what [`answered_capacity`] allows for.
     fn remember_answered(&mut self, now: Duration, key: Digest) {
         self.expire_answered(now);
-        if self.answered.len() >= MAX_ANSWERED_MSG1 && !self.answered.contains_key(&key) {
+        if self.answered.len() >= self.answered_capacity && !self.answered.contains_key(&key) {
             return;
         }
         let until = now + self.config.expired_msg1_lifetime;
         self.answered.insert(key, until);
         self.answered_order.push_back((key, until));
+    }
+
+    /// Remembers an authenticated message 1 that got no answer, within the
+    /// `dev_id`'s budget for them. Past it, it isn't remembered: a replay is
+    /// read again, under the per-source limits, and gets no answer either.
+    fn remember_unanswered(&mut self, now: Duration, dev_id: &Id16, key: Digest) {
+        let limit = self.config.unanswered_per_second;
+        if self.stale_budget(dev_id, now).unanswered.allow(now, limit) {
+            self.remember_answered(now, key);
+        }
     }
 
     fn handle_record(
@@ -1470,7 +1516,9 @@ impl<A: PeerAddr> HostSessions<A> {
         self.stale_replay_rate.prune(now);
         self.stale.retain(|_, b| {
             b.cached.retain(|c| now < c.until);
-            !b.cached.is_empty() || now.saturating_sub(b.window.start) < Duration::from_secs(1)
+            !b.cached.is_empty()
+                || now.saturating_sub(b.window.start) < Duration::from_secs(1)
+                || now.saturating_sub(b.unanswered.start) < Duration::from_secs(1)
         });
         self.expire_answered(now);
         out
@@ -2485,6 +2533,94 @@ mod tests {
         let reads = host.msg1_reads();
         let out = host.handle_datagram(T0 + ms(29_900), &999, &first.unwrap(), &creds);
         assert!(out.is_empty());
+        assert_eq!(host.msg1_reads(), reads);
+    }
+
+    /// Floods `devices` distinct authenticated `Stale` message 1s per
+    /// device, 15 every 200 ms (75/s, past both budgets) from fresh
+    /// sources, for 31 s. Returns the answers per device, the largest
+    /// table size seen and the last message 1 that got an answer.
+    fn flood_remembered(
+        host: &mut HostSessions<u32>,
+        creds: &Creds,
+        ids: &[Id16],
+    ) -> (Vec<usize>, usize, Vec<u8>) {
+        let mut answers = vec![0; ids.len()];
+        let mut largest = 0;
+        let mut last = Vec::new();
+        let mut source = 1000u32;
+        let mut ts = 1u64;
+        for tick in 0..155u64 {
+            let at = T0 + ms(tick * 200);
+            for (n, id) in ids.iter().enumerate() {
+                for _ in 0..15 {
+                    ts += 1;
+                    source += 1;
+                    let ipad = Initiator::start(&K, id, &HOST, 1, &hello(ts)).unwrap();
+                    let sent = sends(&host.handle_datagram(at, &source, ipad.msg1(), creds)).len();
+                    if sent > 0 {
+                        last = ipad.msg1().to_vec();
+                    }
+                    answers[n] += sent;
+                    largest = largest.max(host.answered.len());
+                    assert!(host.answered.len() <= host.answered_capacity);
+                }
+            }
+            host.poll(at);
+        }
+        (answers, largest, last)
+    }
+
+    #[test]
+    fn the_remembered_table_fits_every_credential_at_full_rate() {
+        let mut config = HostConfig::new(HOST);
+        config.max_credentials = 4;
+        let mut host = HostSessions::new(config, Box::new(SeededRandom::new(1)), T0, WALL);
+        let mut creds = Creds::default();
+        *creds.timestamp.borrow_mut() = u64::from(u32::MAX);
+        let ids: Vec<Id16> = (0..4u8).map(|i| [0x80 | i; 16]).collect();
+        for id in &ids {
+            creds.keys.insert(*id, K);
+        }
+        // 4 × (5 + 5) × (30 + 1).
+        assert_eq!(host.answered_capacity, 1240);
+        let (answers, largest, _) = flood_remembered(&mut host, &creds, &ids);
+        // The table never filled: every device got its full answer budget
+        // in every second, 5 × 31.
+        for a in answers {
+            assert_eq!(a, 5 * 31);
+        }
+        // Windows aligned on whole seconds reach 30 of the 31 the bound
+        // allows for.
+        assert_eq!(largest, 1200);
+    }
+
+    #[test]
+    fn more_dev_ids_than_the_cap_are_refused_without_evicting() {
+        let mut config = HostConfig::new(HOST);
+        config.max_credentials = 1;
+        let mut host = HostSessions::new(config, Box::new(SeededRandom::new(1)), T0, WALL);
+        let mut creds = Creds::default();
+        *creds.timestamp.borrow_mut() = u64::from(u32::MAX);
+        let ids: Vec<Id16> = (0..3u8).map(|i| [0x80 | i; 16]).collect();
+        for id in &ids {
+            creds.keys.insert(*id, K);
+        }
+        let (answers, largest, last) = flood_remembered(&mut host, &creds, &ids);
+        assert_eq!(largest, host.answered_capacity);
+        assert!(
+            answers.iter().sum::<usize>() < 3 * 5 * 31,
+            "some answers refused"
+        );
+        // Full, and a new message 1 gets no answer.
+        let at = T0 + ms(154 * 200 + 100);
+        let new = Initiator::start(&K, &ids[2], &HOST, 1, &hello(2)).unwrap();
+        assert!(host.answered.len() == host.answered_capacity);
+        assert!(sends(&host.handle_datagram(at, &7, new.msg1(), &creds)).is_empty());
+        // Nothing unexpired was evicted to make room: the last answered one
+        // is still recognised, with no read.
+        let reads = host.msg1_reads();
+        host.handle_datagram(at, &8, &last, &creds);
         assert_eq!(host.msg1_reads(), reads);
     }
 

@@ -10,6 +10,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 eternal-wire = { path = "..", features = ["test-hooks"] }
+eternal-credstore = { path = "../../credstore", features = ["test-hooks"] }
 
 # Its own workspace: nightly-only, never built by the main workspace or CI.
 [workspace]
@@ -46,6 +47,20 @@ bench = false
 [[bin]]
 name = "v3_session_sim"
 path = "fuzz_targets/v3_session_sim.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "credstore_formats"
+path = "fuzz_targets/credstore_formats.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "credstore_ops"
+path = "fuzz_targets/credstore_ops.rs"
 test = false
 doc = false
 bench = false
