@@ -123,6 +123,68 @@ impl Drop for Host {
     }
 }
 
+/// The supervisor's log lines since [`capture_supervisor_log`], from every
+/// thread.
+#[cfg(debug_assertions)]
+static SUPERVISOR_LOG: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(debug_assertions)]
+struct SupervisorLog;
+
+#[cfg(debug_assertions)]
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SupervisorLog {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        struct Message(Option<String>);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = Some(format!("{value:?}"));
+                }
+            }
+        }
+        let mut message = Message(None);
+        event.record(&mut message);
+        if let Some(line) = message.0 {
+            SUPERVISOR_LOG.lock().unwrap().push(line);
+        }
+    }
+}
+
+/// Starts capturing the supervisor's log lines afresh. The capture is the
+/// process's subscriber, and sees nothing else; `ENV_LOCK` runs one test at
+/// a time.
+#[cfg(debug_assertions)]
+fn capture_supervisor_log() {
+    use tracing_subscriber::prelude::*;
+    static INSTALLED: std::sync::Once = std::sync::Once::new();
+    INSTALLED.call_once(|| {
+        let only_the_supervisor = tracing_subscriber::filter::filter_fn(|metadata| {
+            metadata.target() == "eternal_host::supervisor"
+        });
+        let _ = tracing_subscriber::registry()
+            .with(SupervisorLog.with_filter(only_the_supervisor))
+            .try_init();
+    });
+    SUPERVISOR_LOG.lock().unwrap().clear();
+}
+
+/// Waits for the supervisor to log `line`.
+#[cfg(debug_assertions)]
+fn wait_for_supervisor_line(line: &str) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let logged = SUPERVISOR_LOG.lock().unwrap().clone();
+        if logged.iter().any(|logged| logged == line) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the supervisor never logged {line:?}: {logged:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 /// A GPU whose encoder FFmpeg doesn't have: every generation fails as it
 /// starts, as a broken driver does.
 fn broken_gpu() -> GpuInfo {
@@ -466,6 +528,57 @@ fn the_storm_brake_says_why_and_waits_for_start() {
     assert!(!host.streaming());
     let ack = ipad.ask(1000).expect("still answered");
     assert_eq!(ack.status, HelloStatus::Failed);
+}
+
+/// A stream that finds its chosen network changed as Stop stops it asks to
+/// start again on the new address. That request comes from a stream the
+/// user already stopped: the PC stays stopped, and only Start streams.
+///
+/// The session lock holds the stream between its bind and its first look
+/// at the network, so it always looks after Stop, on the new address.
+#[cfg(debug_assertions)]
+#[test]
+fn a_stream_stopping_as_its_network_changes_stays_stopped() {
+    use eternal_host::network::{set_test_adapters, Adapter, Kind, ListenOn};
+    let wifi = |up| {
+        vec![Adapter {
+            name: "Wi-Fi".into(),
+            kind: Kind::Wifi,
+            up,
+            gateway: true,
+            ipv4: vec![std::net::Ipv4Addr::new(192, 168, 1, 20)],
+        }]
+    };
+    let host = Host::start_with(GpuInfo::software_fallback(), 500, |shared| {
+        shared.pairing.lock().required = false;
+        *shared.listen_on.lock() = ListenOn::Adapter("Wi-Fi".into());
+        set_test_adapters(Some(wifi(false)));
+        std::mem::forget(shared.session.lock());
+    });
+    capture_supervisor_log();
+    // The stream binds this PC only, the network being down, then waits
+    // for the session.
+    let shown = format!("unknown:{}", host.port);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while PIPELINE_STATS.lock().listen_addr != shown {
+        assert!(Instant::now() < deadline, "the stream never bound");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    host.send(SupervisorCommand::Stop);
+    set_test_adapters(Some(wifi(true)));
+    // SAFETY: the guard forgotten above was taken on this lock, and nothing
+    // else holds it.
+    unsafe { host.shared.session.force_unlock() };
+
+    host.wait_until_stopped();
+    // The stream asked after Stop, and the supervisor turned it down.
+    wait_for_supervisor_line("A stream that no longer runs asked to start again: left as it is");
+    assert_eq!(
+        host.shared.session.lock().not_streaming(),
+        Some(NotStreaming::Stopped),
+        "the stopped stream restarted itself"
+    );
+    assert!(!host.streaming(), "the stopped stream restarted itself");
 }
 
 /// A stopped PC listens where iPads can reach it, as the stream does: on

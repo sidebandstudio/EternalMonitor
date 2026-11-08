@@ -308,6 +308,24 @@ impl ConfigSource for SharedConfigSource<'_> {
     }
 }
 
+/// The supervisor a stream answers to, and the pipeline generation the
+/// stream belongs to.
+struct StreamSupervisor {
+    tx: std_mpsc::Sender<SupervisorCommand>,
+    generation: u64,
+}
+
+impl StreamSupervisor {
+    /// Asks the supervisor to restart this stream. It does only while this
+    /// stream's generation still runs: never one the user stopped, or one a
+    /// newer stream replaced.
+    fn restart(&self) -> Result<(), std_mpsc::SendError<SupervisorCommand>> {
+        self.tx.send(SupervisorCommand::RestartStream {
+            generation: self.generation,
+        })
+    }
+}
+
 /// Consumes NAL units from the encoder, fragments each access unit into v2 media
 /// datagrams (raw Annex B — no FlatBuffer wrapper), and runs the protocol-v2
 /// control plane (hello/ack, heartbeats, keyframe requests, liveness) on the
@@ -318,7 +336,12 @@ pub async fn start_sender(
     listen_port: u16,
     shared: SharedControl,
     supervisor_tx: std_mpsc::Sender<SupervisorCommand>,
+    generation: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let supervisor = StreamSupervisor {
+        tx: supervisor_tx,
+        generation,
+    };
     let listen_on = shared.listen_on.lock().clone();
     let bind_ip = crate::network::listen_ip_now(&listen_on);
     if bind_ip.is_loopback() {
@@ -475,14 +498,14 @@ pub async fn start_sender(
                 state.pointer.refresh(now());
                 beat.mark(Phase::Tick);
                 let actions = shared.session.lock().tick(&config, true, now());
-                act(actions, &mut state, &links, &shared, &config, &supervisor_tx).await;
+                act(actions, &mut state, &links, &shared, &config, &supervisor).await;
             }
             _ = network_check.tick(), if listen_on != crate::network::ListenOn::All => {
                 beat.mark(Phase::Tick);
                 if !shared.client_connected() && crate::network::listen_ip_now(&listen_on) != bind_ip {
                     info!(listen_on = listen_on.label(), "The chosen network changed: restarting the stream to listen on it");
                     shared.stop();
-                    if let Err(error) = supervisor_tx.send(SupervisorCommand::Restart) {
+                    if let Err(error) = supervisor.restart() {
                         warn!(error = %error, "Failed to request a pipeline restart for the chosen network");
                     }
                 }
@@ -497,7 +520,7 @@ pub async fn start_sender(
                     break;
                 }
                 let actions = shared.session.lock().tick(&config, false, now());
-                act(actions, &mut state, &links, &shared, &config, &supervisor_tx).await;
+                act(actions, &mut state, &links, &shared, &config, &supervisor).await;
             }
 
             result = receive_control(&mut links, &mut deferred_control) => {
@@ -505,7 +528,7 @@ pub async fn start_sender(
                 match result {
                     Ok(LinkEvent::Closed(id)) => {
                         let actions = shared.session.lock().link_lost(id);
-                        act(actions, &mut state, &links, &shared, &config, &supervisor_tx).await;
+                        act(actions, &mut state, &links, &shared, &config, &supervisor).await;
                     }
                     Ok(LinkEvent::Datagram(src, datagram)) => {
                         #[cfg(feature = "test-hooks")]
@@ -525,7 +548,7 @@ pub async fn start_sender(
                                             &config,
                                             now(),
                                         );
-                                        act(actions, &mut state, &links, &shared, &config, &supervisor_tx).await;
+                                        act(actions, &mut state, &links, &shared, &config, &supervisor).await;
                                     }
                                     Err(error) => {
                                         debug!(peer = %src, %error, "Dropped malformed control datagram");
@@ -682,7 +705,7 @@ pub async fn start_sender(
                     let paced = frame_pacer.after_send(Instant::now());
                     let pause = if refused { congestion::BACKOFF } else { paced };
                     if target_addr.link == LinkId::Udp && pause > Duration::ZERO {
-                        let repairs = repair_while_pacing(&links, &mut state, &shared, &config, &supervisor_tx,
+                        let repairs = repair_while_pacing(&links, &mut state, &shared, &config, &supervisor,
                             pacing_clock.until(Instant::now() + pause), &mut deferred_control);
                         tokio::pin!(repairs);
                         loop {
@@ -938,7 +961,7 @@ async fn repair_while_pacing(
     state: &mut LoopState,
     shared: &SharedControl,
     config: &impl ConfigSource,
-    supervisor_tx: &std_mpsc::Sender<SupervisorCommand>,
+    supervisor: &StreamSupervisor,
     timer: impl std::future::Future<Output = ()>,
     deferred: &mut DeferredControl,
 ) {
@@ -956,7 +979,7 @@ async fn repair_while_pacing(
                     probe::taken(peer);
                     let actions = shared.session.lock().handle_datagram(PeerId::udp(peer), &header,
                         message, len, config, now());
-                    act(actions, state, links, shared, config, supervisor_tx).await;
+                    act(actions, state, links, shared, config, supervisor).await;
                     continue;
                 }
                 if deferred.len() < 64 { deferred.push_back(LinkEvent::Datagram(PeerId::udp(peer), bytes[..len].to_vec())); }
@@ -986,7 +1009,7 @@ async fn act(
     links: &TransportLinks,
     shared: &SharedControl,
     config: &impl ConfigSource,
-    supervisor_tx: &std_mpsc::Sender<SupervisorCommand>,
+    supervisor: &StreamSupervisor,
 ) {
     if actions.new_target.is_some() || actions.client_lost {
         state.retransmit_ring.clear();
@@ -1047,7 +1070,7 @@ async fn act(
         };
         apply_bitrate(decision, links, shared, config).await;
     }
-    execute_actions(actions, links, shared, supervisor_tx).await;
+    execute_actions(actions, links, shared, supervisor).await;
     send_pointer(&mut state.pointer, links, shared).await;
 }
 
@@ -1174,7 +1197,7 @@ async fn execute_actions(
     mut actions: Actions,
     links: &TransportLinks,
     shared: &SharedControl,
-    supervisor_tx: &std_mpsc::Sender<SupervisorCommand>,
+    supervisor: &StreamSupervisor,
 ) {
     shared.transport_beat.mark(Phase::Actions);
     // An ended session's summary waits for this pass's second screen step,
@@ -1297,7 +1320,7 @@ async fn execute_actions(
     }
     if restart {
         shared.stop();
-        if let Err(error) = supervisor_tx.send(SupervisorCommand::Restart) {
+        if let Err(error) = supervisor.restart() {
             warn!(error = %error, "Failed to request pipeline restart for the virtual display");
         }
     }
@@ -1330,6 +1353,43 @@ mod tests {
         CAP_DECODE_H264, FEATURE_SUPPORTS_NACK,
     };
 
+    /// No iPad came back to the virtual display within the grace period:
+    /// the stream asks to restart itself, by its own generation, whichever
+    /// generation the supervisor counts now.
+    #[test]
+    fn the_second_screen_release_restarts_only_this_stream() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let shared = SharedControl::new(socket.local_addr().unwrap().port(), 15_000_000);
+            shared.running.store(true, Ordering::SeqCst);
+            *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
+            *shared.vdd_status.lock() = VddStatus::Active;
+            // The viewer left a grace period ago.
+            assert_eq!(
+                second_screen::next_step(&shared, Instant::now() - second_screen::RELEASE_GRACE),
+                second_screen::Step::Nothing
+            );
+            let links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
+            let (supervisor_tx, supervisor_rx) = std_mpsc::channel();
+            let generation = crate::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst) + 1000;
+            let supervisor = StreamSupervisor {
+                tx: supervisor_tx,
+                generation,
+            };
+            execute_actions(Actions::default(), &links, &shared, &supervisor).await;
+            assert_eq!(
+                supervisor_rx.try_recv(),
+                Ok(SupervisorCommand::RestartStream { generation })
+            );
+            assert!(!shared.running.load(Ordering::SeqCst));
+            assert!(supervisor_rx.try_recv().is_err());
+        });
+    }
+
     /// The second screen gives up for a session in the same pass that ends
     /// it: the session's summary names that fallback.
     #[test]
@@ -1357,6 +1417,10 @@ mod tests {
             *shared.vdd_status.lock() = VddStatus::Active;
             let links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
             let (supervisor_tx, _supervisor_rx) = std_mpsc::channel();
+            let supervisor = StreamSupervisor {
+                tx: supervisor_tx,
+                generation: 1,
+            };
             let config = SharedConfigSource {
                 shared: &shared,
                 stream_epoch: 1,
@@ -1387,7 +1451,7 @@ mod tests {
                 .session
                 .lock()
                 .handle_control(peer, 0, hello, &config, now);
-            execute_actions(accepted, &links, &shared, &supervisor_tx).await;
+            execute_actions(accepted, &links, &shared, &supervisor).await;
             // The virtual display attached and has shown no picture for too long.
             second_screen::note_attached(&shared, "virtual".into());
             second_screen::start_proving(&shared, 1, now - second_screen::PROVE_TIMEOUT);
@@ -1400,7 +1464,7 @@ mod tests {
                 Instant::now(),
             );
             assert!(bye.ended.is_some());
-            execute_actions(bye, &links, &shared, &supervisor_tx).await;
+            execute_actions(bye, &links, &shared, &supervisor).await;
         });
         let summaries = summaries.lock();
         assert_eq!(summaries.len(), 1, "{summaries:?}");
@@ -1502,13 +1566,17 @@ mod tests {
             };
             let links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
             let (supervisor_tx, _supervisor_rx) = std_mpsc::channel();
+            let supervisor = StreamSupervisor {
+                tx: supervisor_tx,
+                generation: 1,
+            };
             let mut deferred = DeferredControl::new();
             repair_while_pacing(
                 &links,
                 &mut state,
                 &shared,
                 &config,
-                &supervisor_tx,
+                &supervisor,
                 tokio::time::sleep(Duration::from_secs(1)),
                 &mut deferred,
             )
@@ -1717,6 +1785,10 @@ mod tests {
         };
         let links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
         let (supervisor_tx, _supervisor_rx) = std_mpsc::channel();
+        let supervisor = StreamSupervisor {
+            tx: supervisor_tx,
+            generation: 1,
+        };
         let mut state = loop_state();
         let cable = PeerId::usb(5);
         let hello = ControlMessage::Hello2(Hello2 {
@@ -1741,15 +1813,7 @@ mod tests {
             .session
             .lock()
             .handle_control(cable, 0, hello, &config, now());
-        act(
-            accepted,
-            &mut state,
-            &links,
-            &shared,
-            &config,
-            &supervisor_tx,
-        )
-        .await;
+        act(accepted, &mut state, &links, &shared, &config, &supervisor).await;
         let session_id = shared.session.lock().session_id().unwrap();
         let press = |event_id, kind, keycode| {
             ControlMessage::InputEvent(InputEvent {
@@ -1776,15 +1840,7 @@ mod tests {
                     .session
                     .lock()
                     .handle_control(cable, session_id, event, &config, now());
-            act(
-                pressed,
-                &mut state,
-                &links,
-                &shared,
-                &config,
-                &supervisor_tx,
-            )
-            .await;
+            act(pressed, &mut state, &links, &shared, &config, &supervisor).await;
         }
         // Windows takes input on the input thread.
         let injected = |count: usize| {
@@ -1805,15 +1861,7 @@ mod tests {
 
         let unplugged = shared.session.lock().link_lost(cable.link);
         assert!(unplugged.client_lost);
-        act(
-            unplugged,
-            &mut state,
-            &links,
-            &shared,
-            &config,
-            &supervisor_tx,
-        )
-        .await;
+        act(unplugged, &mut state, &links, &shared, &config, &supervisor).await;
         assert!(shared.session.lock().session_id().is_none());
         assert!(matches!(
             injected(2).as_slice(),
@@ -1909,13 +1957,17 @@ mod tests {
                 let links =
                     TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
                 let (supervisor_tx, _supervisor_rx) = std_mpsc::channel();
+                let supervisor = StreamSupervisor {
+                    tx: supervisor_tx,
+                    generation: 1,
+                };
                 let mut deferred = DeferredControl::new();
                 repair_while_pacing(
                     &links,
                     &mut state,
                     &shared,
                     &config,
-                    &supervisor_tx,
+                    &supervisor,
                     async {
                         let _ = paced.await;
                     },
@@ -2157,7 +2209,14 @@ mod tests {
                 .enable_all()
                 .build()
                 .unwrap()
-                .block_on(start_sender(nal_rx, audio_rx, port, control, supervisor_tx))
+                .block_on(start_sender(
+                    nal_rx,
+                    audio_rx,
+                    port,
+                    control,
+                    supervisor_tx,
+                    1,
+                ))
                 .unwrap();
         });
         // The refresh ticks from the stream's start; Windows holds it.
