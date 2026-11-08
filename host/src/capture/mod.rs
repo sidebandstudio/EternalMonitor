@@ -258,9 +258,10 @@ pub struct RawFrame {
     pub data: Arc<Vec<u8>>,
     pub width: u32,
     pub height: u32,
-    /// A picture capture had already, sent again for a still desktop: the
-    /// keepalive, a keyframe request's resend, or the cached picture
-    /// redrawn with or without the pointer. The desktop gave no new one.
+    /// A picture capture already had, sent again because the desktop gave
+    /// no new one: the keepalive, a keyframe request's resend, the cached
+    /// picture redrawn with or without the pointer, or a resend during
+    /// duplication recovery.
     pub cached: bool,
 }
 

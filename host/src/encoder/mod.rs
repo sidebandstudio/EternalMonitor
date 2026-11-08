@@ -6405,17 +6405,20 @@ mod tests {
         again
     }
 
-    /// Real pictures every `frame`, each up to a quarter frame early or late,
-    /// so gaps run from half a frame to a frame and a half.
+    /// Real pictures every `frame`, off by up to a quarter frame (offsets in
+    /// eighths of a frame). Gaps run from 0.75 to 1.5 frames. The 1.25- and
+    /// 1.5-frame gaps come once per 12 pictures, rarer than the 8 gaps the
+    /// pace remembers, so the 1.5-frame gap is longer than the pace when it
+    /// comes: the wait needs its half frame of margin (1.0x fails here).
     fn moving(start: Instant, frame: Duration, count: u32) -> Vec<(Instant, bool)> {
-        let quarter = frame / 4;
-        let offsets = [0i32, 1, 0, -1, -2];
+        let eighth = frame / 8;
+        let offsets = [0i32, 0, 2, 0, 0, -1, 0, 0, 0, 0, -2, 2];
         (0..count)
             .map(|n| {
                 let at = start + frame * n;
                 let at = match offsets[n as usize % offsets.len()] {
-                    k if k >= 0 => at + quarter * k as u32,
-                    k => at - quarter * (-k) as u32 / 2,
+                    k if k >= 0 => at + eighth * k as u32,
+                    k => at - eighth * (-k) as u32,
                 };
                 (at, false)
             })
