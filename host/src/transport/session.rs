@@ -1508,13 +1508,16 @@ impl Session {
             let frames_sent = (session.info.feature_caps & FEATURE_MEDIA_SIZE != 0)
                 .then_some(session.frames_sent);
             // Held through a restart, until the first new frame: an iPad
-            // that understands it says the picture comes back by itself.
-            let notice = if session.restart_held_since.is_some()
-                && session.info.feature_caps & FEATURE_STANDBY_STATUS != 0
-            {
-                eternal_wire::v2::control::NOTICE_RESTARTING
-            } else {
-                config.notice()
+            // that understands it says the picture comes back by itself,
+            // unless the capture has more to say (a locked PC, no display).
+            let notice = match config.notice() {
+                eternal_wire::v2::control::NOTICE_NONE
+                    if session.restart_held_since.is_some()
+                        && session.info.feature_caps & FEATURE_STANDBY_STATUS != 0 =>
+                {
+                    eternal_wire::v2::control::NOTICE_RESTARTING
+                }
+                notice => notice,
             };
             let stream_config = match self.not_streaming {
                 // No stream: the config of the one the iPad last had.
@@ -5907,5 +5910,54 @@ mod tests {
             notices(&session.restart_tick(&RestartConfig, at)),
             [eternal_wire::v2::control::NOTICE_NONE]
         );
+    }
+
+    /// The capture's own notice says more than "restarting": a stream that
+    /// comes back into a locked PC, or one with no display, says that, and
+    /// "restarting" shows only when nothing else does.
+    #[test]
+    fn a_capture_notice_comes_before_the_restarting_one() {
+        use eternal_wire::v2::control::{NOTICE_NONE, NOTICE_PC_LOCKED, NOTICE_RESTARTING};
+        struct Locked;
+        impl ConfigSource for Locked {
+            fn stream_config(&self) -> StreamConfig {
+                TestConfig.stream_config()
+            }
+            fn host_name(&self) -> String {
+                TestConfig.host_name()
+            }
+            fn notice(&self) -> u8 {
+                NOTICE_PC_LOCKED
+            }
+        }
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut session = Session::new(1234);
+        let ControlMessage::Hello2(mut hello) = hello(1, 50000) else {
+            unreachable!()
+        };
+        hello.feature_caps |= FEATURE_STANDBY_STATUS;
+        session.handle_control_authed(peer, ControlMessage::Hello2(hello), &TestConfig, now);
+        session.handle_control_authed(peer, report(10), &TestConfig, now);
+        session.set_not_streaming(Some(NotStreaming::Restarting));
+        let at = now + Duration::from_secs(1);
+        assert_eq!(
+            notices(&session.restart_tick(&RestartConfig, at)),
+            [NOTICE_RESTARTING]
+        );
+        // The next stream runs into a locked PC, before its first frame.
+        session.set_not_streaming(None);
+        let at = now + Duration::from_secs(2);
+        session.handle_control_authed(peer, report(10), &Locked, at);
+        assert_eq!(
+            notices(&session.tick(&Locked, true, at)),
+            [NOTICE_PC_LOCKED]
+        );
+        // Unlocked, still no frame: restarting again.
+        assert_eq!(
+            notices(&session.tick(&TestConfig, true, at)),
+            [NOTICE_RESTARTING]
+        );
+        assert_ne!(NOTICE_PC_LOCKED, NOTICE_NONE);
     }
 }
