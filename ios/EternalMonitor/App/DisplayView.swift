@@ -59,6 +59,10 @@ struct DisplayView: View {
                 noDisplayPill
                     .transition(.opacity)
                     .allowsHitTesting(false)
+            } else if let card = connectionManager.pcGraphicsCard {
+                graphicsCardPill(card)
+                    .transition(.opacity)
+                    .allowsHitTesting(false)
             } else if connectionManager.pcRestarting {
                 pcRestartingPill
                     .transition(.opacity)
@@ -127,6 +131,7 @@ struct DisplayView: View {
         .animation(.easeInOut(duration: 0.25), value: connectionManager.pictureRestoring)
         .animation(.easeInOut(duration: 0.25), value: connectionManager.pcLocked)
         .animation(.easeInOut(duration: 0.25), value: connectionManager.pcNoDisplay)
+        .animation(.easeInOut(duration: 0.25), value: connectionManager.pcGraphicsCard)
         .animation(.easeInOut(duration: 0.25), value: connectionManager.pcRestarting)
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.35), value: appeared)
         .onAppear {
@@ -463,6 +468,29 @@ struct DisplayView: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(L("Your PC has no active display. Turn on a screen to continue."))
         .accessibilityIdentifier("display.pcNoDisplay")
+    }
+
+    /// Over the held picture while Windows won't let the PC capture from its
+    /// graphics card, until it can again.
+    private func graphicsCardPill(_ card: PCGraphicsCard) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "display")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Theme.text)
+                .accessibilityHidden(true)
+            Text(card.short)
+                .font(.app(15, .semibold, relativeTo: .subheadline))
+                .foregroundStyle(Theme.text)
+                .multilineTextAlignment(.center)
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 8)
+        .frame(minHeight: 44)
+        .background(glass(Capsule()))
+        .padding(.horizontal, 24)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(card.short)
+        .accessibilityIdentifier("display.pcGraphicsCard")
     }
 
     /// Over the held picture while the PC restarts its stream, until the

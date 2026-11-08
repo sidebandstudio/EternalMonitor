@@ -42,6 +42,9 @@ pub struct SharedControl {
     /// Set while Windows blocks screen capture (lock screen, UAC, a display
     /// it will not duplicate); the GUI explains it instead of a frozen picture.
     pub capture_block: Arc<Mutex<Option<crate::capture::recovery::CaptureBlock>>>,
+    /// Since when the heartbeats have seen Windows refuse the screen from
+    /// this graphics card, for their notice (`recovery::heartbeat_notice`).
+    pub gpu_refused_since: Arc<Mutex<Option<std::time::Instant>>>,
     /// The stream port between two owners (a generation's transport and the
     /// standby responder), bound and with its queue, so a HELLO2 sent while
     /// it changes hands waits for the next one. The supervisor closes it
@@ -197,6 +200,7 @@ impl SharedControl {
             vdd_status: Arc::new(Mutex::new(VddStatus::Inactive)),
             vdd_problem: Arc::new(Mutex::new(None)),
             capture_block: Arc::new(Mutex::new(None)),
+            gpu_refused_since: Arc::new(Mutex::new(None)),
             stream_socket: Arc::new(Mutex::new(None)),
             gpu_diagnosis: Arc::new(Mutex::new(None)),
             screen_watch: Arc::new(Mutex::new(crate::gpu_preference::ScreenWatch::new())),

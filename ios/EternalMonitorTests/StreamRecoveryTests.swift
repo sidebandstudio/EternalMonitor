@@ -177,6 +177,30 @@ final class StreamRecoveryTests: XCTestCase {
         XCTAssertFalse(manager.pcNoDisplay, "the next session starts without it")
     }
 
+    /// Windows moved the PC's screen to the graphics card EternalMonitor
+    /// doesn't run on, mid-stream. Its heartbeats say so, which screen, and
+    /// the iPad says so over the held picture until the PC captures again.
+    /// A locked PC's notice still comes first.
+    func testAPCThatCantCaptureFromItsGraphicsCardIsShownOverTheHeldPicture() async throws {
+        let host = FakeUDPHost()
+        let manager = try await streaming(host)
+        XCTAssertNil(manager.pcGraphicsCard)
+        host.sendHeartbeat(notice: Heartbeat.noticeUnsupportedGPU)
+        try await until("the PC says why") { manager.pcGraphicsCard == .screen }
+        XCTAssertEqual(manager.state, .connected)
+        XCTAssertFalse(manager.pcLocked || manager.pcNoDisplay)
+        host.sendHeartbeat(notice: Heartbeat.noticeSecondScreenUnsupportedGPU)
+        try await until("the second screen failed too") { manager.pcGraphicsCard == .secondScreen }
+        host.sendHeartbeat(notice: Heartbeat.noticePCLocked)
+        try await until("locked instead") { manager.pcLocked && manager.pcGraphicsCard == nil }
+        host.sendHeartbeat()
+        try await until("the PC captures again") { !manager.pcLocked && manager.pcGraphicsCard == nil }
+        host.sendHeartbeat(notice: Heartbeat.noticeUnsupportedGPU)
+        try await until("again") { manager.pcGraphicsCard == .screen }
+        manager.cancel()
+        XCTAssertNil(manager.pcGraphicsCard, "the next session starts without it")
+    }
+
     func testContiguousNumberingRevealsALostReopenKeyframe() async throws {
         // The PC reopened its encoder and its new keyframe (seq 2) was lost;
         // the new encoder's first P-frame continues the codec's count. A PC

@@ -218,10 +218,11 @@ final class FakeUDPHost: @unchecked Sendable {
         send(Wire.encodeControl(sessionId: 41, msgSeq: 2, message: .bye(reason)))
     }
 
-    /// A session 41 heartbeat, as the PC sends one each second.
-    func sendHeartbeat(notice: UInt8 = Heartbeat.noticeNone) {
+    /// A session 41 heartbeat, as the PC sends one each second, counting
+    /// `framesSent` video frames when it is given.
+    func sendHeartbeat(notice: UInt8 = Heartbeat.noticeNone, framesSent: UInt32? = nil) {
         send(Wire.encodeControl(sessionId: 41, msgSeq: 3, message: .heartbeat(
-            Heartbeat(hostTimeUs: 0, streamConfig: StreamConfig(), notice: notice))))
+            Heartbeat(hostTimeUs: 0, streamConfig: StreamConfig(), notice: notice, framesSent: framesSent))))
     }
 
     /// The 64x64 H.264 keyframe fixture.
@@ -301,6 +302,12 @@ final class FakeUDPHost: @unchecked Sendable {
     /// `countFrames`) and `frame` as the next keyframe, cut at the size the
     /// iPad asked for. Answers identify requests as the PC holding `token`
     /// receiving on `addresses`, to whichever socket asks.
+    /// Takes the next HELLO2 as a new client's, as a PC does for the iPad's
+    /// next session.
+    func forgetClient() {
+        client = nil
+    }
+
     func servePath(limit: Int, frame: Data, hostCaps: UInt16, countFrames: Bool = true, token: Data = Data(17...32),
                    addresses: [Data] = [Data([127, 0, 0, 1])], until stop: () -> Bool) -> PathRun {
         var run = PathRun()
