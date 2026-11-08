@@ -27,13 +27,14 @@ final class NoVideoFallbackTests: XCTestCase {
     override func setUp() async throws {
         let store = RecentConnectionStore.shared
         let saved = store.connections
-        let defaults = ["recentConnections", "lastHost", "lastPort", "noVideoPaths"]
+        let defaults = ["recentConnections", "lastHost", "lastPort", "noVideoPaths", "noVideoSizes"]
             .map { ($0, UserDefaults.standard.object(forKey: $0)) }
         addTeardownBlock { @MainActor in
             store.connections = saved
             for (key, value) in defaults { UserDefaults.standard.set(value, forKey: key) }
         }
         UserDefaults.standard.removeObject(forKey: "noVideoPaths")
+        UserDefaults.standard.removeObject(forKey: "noVideoSizes")
         store.connections = []
     }
 
@@ -92,6 +93,155 @@ final class NoVideoFallbackTests: XCTestCase {
         XCTAssertEqual(steps.next(at: 123.5), .otherAddress)
         steps.heard(framesSent: 20, at: 124)
         XCTAssertNil(steps.next(at: 200), "then no more")
+    }
+
+    // MARK: - The size kept for a path
+
+    /// The route `manager(pairedAt:)` gives, and the one of another network.
+    nonisolated private static let homeRoute = MovedPC.Route(interface: "en0", direct: true, address: "127.0.0.1",
+                                                             netmask: "255.0.0.0")
+    nonisolated private static let otherRoute = MovedPC.Route(interface: "en0", direct: true, address: "10.0.0.5",
+                                                              netmask: "255.255.255.0")
+
+    private func sizeKey(_ pc: FakeUDPHost, pairing: Data = NoVideoFallbackTests.token,
+                         route: MovedPC.Route = NoVideoFallbackTests.homeRoute) -> NoVideoSizes.Key {
+        NoVideoSizes.Key(address: .init(host: "127.0.0.1", port: pc.port), pairing: pairing,
+                         network: NoVideoSizes.network(route))
+    }
+
+    /// A kept size answers only for its address, pairing and network, for a
+    /// week from when it was needed, and goes with `forget` on any network.
+    func testAKeptSizeIsBoundToItsAddressPairingNetworkAndWeek() {
+        let pc = FakeUDPHost(), elsewhere = FakeUDPHost()
+        let at = Date(timeIntervalSince1970: 1_800_000_000)
+        let key = sizeKey(pc)
+        NoVideoSizes.remember(576, for: key, now: at)
+        XCTAssertEqual(NoVideoSizes.size(for: key, now: at), 576)
+        XCTAssertEqual(NoVideoSizes.size(for: key, now: at.addingTimeInterval(NoVideoSizes.lifetime - 1)), 576)
+        XCTAssertNil(NoVideoSizes.size(for: key, now: at.addingTimeInterval(NoVideoSizes.lifetime)), "a week on")
+        XCTAssertNil(NoVideoSizes.size(for: key, now: at.addingTimeInterval(-1)), "a clock set back")
+        XCTAssertNil(NoVideoSizes.size(for: sizeKey(pc, pairing: Data(2...17)), now: at), "another pairing")
+        XCTAssertNil(NoVideoSizes.size(for: sizeKey(elsewhere), now: at), "another address")
+        XCTAssertNil(NoVideoSizes.size(for: sizeKey(pc, route: Self.otherRoute), now: at), "another network")
+        XCTAssertNil(NoVideoSizes.size(for: NoVideoSizes.Key(address: key.address, pairing: key.pairing,
+                                                             network: NoVideoSizes.network(nil)), now: at), "no route")
+        // Needed again later: the week starts over, at the newer size.
+        NoVideoSizes.remember(1200, for: key, now: at.addingTimeInterval(86_400))
+        XCTAssertEqual(NoVideoSizes.size(for: key, now: at.addingTimeInterval(NoVideoSizes.lifetime)), 1200)
+        XCTAssertFalse(NoVideoSizes.forget(sizeKey(pc, pairing: Data(2...17))))
+        XCTAssertTrue(NoVideoSizes.forget(sizeKey(pc, route: Self.otherRoute)))
+        XCTAssertNil(NoVideoSizes.size(for: key, now: at.addingTimeInterval(86_400)))
+    }
+
+    /// The size a path needed is kept: the next session at that address
+    /// asks for it as soon as the PC accepts, with no steps, and streams.
+    func testTheNextSessionStartsWithTheSizeThePathNeeded() async throws {
+        let pc = FakeUDPHost()
+        let (manager, _) = try manager(pairedAt: pc)
+        defer { manager.cancel() }
+        let at = Date(timeIntervalSince1970: 1_800_000_000)
+        manager.now = { at }
+        // The app's own wait: a slow runner's picture at the kept size comes
+        // well before any further step.
+        manager.timing.noVideoStepSeconds = 1.5
+        let (logged, sink) = lines(manager)
+        defer { sink.cancel() }
+        let frame = try FakeUDPHost.keyframe()
+        var runs: [FakeUDPHost.PathRun] = []
+        for session in 1...2 {
+            let streaming = OSAllocatedUnfairLock(initialState: false)
+            pc.forgetClient()
+            manager.connect(host: "127.0.0.1", port: pc.port)
+            let served = Task.detached {
+                pc.servePath(limit: 1000, frame: frame, hostCaps: HelloAck.hostCapMediaSize) { streaming.withLock { $0 } }
+            }
+            try await until("session \(session) streaming") { manager.state == .connected }
+            streaming.withLock { $0 = true }
+            runs.append(await served.value)
+            manager.cancel()
+        }
+        XCTAssertEqual(runs[0].sizesAsked, [1200, 576])
+        XCTAssertEqual(NoVideoSizes.size(for: sizeKey(pc), now: at), 576)
+        XCTAssertEqual(runs[1].sizesAsked, [576], "asked at once, once")
+        let steps = logged().filter { $0.hasPrefix("no_video_fallback ") }
+        XCTAssertEqual(steps, ["no_video_fallback step=smaller_packets size=1200 result=no_video",
+                               "no_video_fallback step=smaller_packets size=576 result=video",
+                               "no_video_fallback step=remembered_size size=576 result=asked"])
+    }
+
+    /// A size kept for this address over another network isn't used, and
+    /// once the PC's own size gives a picture, it is forgotten.
+    func testAKeptSizeIsForgottenOnceThePCsOwnSizeWorks() async throws {
+        let pc = FakeUDPHost()
+        let (manager, _) = try manager(pairedAt: pc)
+        defer { manager.cancel() }
+        let (logged, sink) = lines(manager)
+        defer { sink.cancel() }
+        NoVideoSizes.remember(576, for: sizeKey(pc, route: Self.otherRoute), now: Date())
+        let streaming = OSAllocatedUnfairLock(initialState: false)
+        manager.connect(host: "127.0.0.1", port: pc.port)
+        let frame = try FakeUDPHost.keyframe()
+        let served = Task.detached {
+            pc.servePath(limit: .max, frame: frame, hostCaps: HelloAck.hostCapMediaSize) { streaming.withLock { $0 } }
+        }
+        try await until("streaming") { manager.state == .connected }
+        try await until("forgotten", seconds: 10) {
+            logged().contains("no_video_fallback step=remembered_size result=forgotten")
+        }
+        streaming.withLock { $0 = true }
+        let run = await served.value
+        XCTAssertEqual(run.sizesAsked, [])
+        XCTAssertNil(NoVideoSizes.size(for: sizeKey(pc, route: Self.otherRoute), now: Date()))
+        XCTAssertFalse(NoVideoSizes.forget(sizeKey(pc)))
+    }
+
+    /// A week after the size was needed, the next session starts at the
+    /// PC's own size again; where the path still needs less, the steps find
+    /// it and the week starts over.
+    func testAnExpiredSizeIsNotUsed() async throws {
+        let pc = FakeUDPHost()
+        let (manager, _) = try manager(pairedAt: pc)
+        defer { manager.cancel() }
+        let needed = Date(timeIntervalSince1970: 1_800_000_000)
+        let later = needed.addingTimeInterval(NoVideoSizes.lifetime + 60)
+        manager.now = { later }
+        NoVideoSizes.remember(576, for: sizeKey(pc), now: needed)
+        let streaming = OSAllocatedUnfairLock(initialState: false)
+        manager.connect(host: "127.0.0.1", port: pc.port)
+        let frame = try FakeUDPHost.keyframe()
+        let served = Task.detached {
+            pc.servePath(limit: 1000, frame: frame, hostCaps: HelloAck.hostCapMediaSize) { streaming.withLock { $0 } }
+        }
+        try await until("streaming") { manager.state == .connected }
+        streaming.withLock { $0 = true }
+        let run = await served.value
+        XCTAssertEqual(run.sizesAsked, [1200, 576])
+        XCTAssertEqual(NoVideoSizes.size(for: sizeKey(pc), now: later.addingTimeInterval(NoVideoSizes.lifetime - 120)), 576)
+    }
+
+    /// A PC that doesn't take smaller sizes is asked for none, a kept size
+    /// or not, and the kept size stays as it was.
+    func testAnOlderPCIsNeverAskedForAKeptSize() async throws {
+        let pc = FakeUDPHost()
+        let (manager, _) = try manager(pairedAt: pc)
+        defer { manager.cancel() }
+        let (logged, sink) = lines(manager)
+        defer { sink.cancel() }
+        let at = Date()
+        NoVideoSizes.remember(576, for: sizeKey(pc), now: at)
+        let streaming = OSAllocatedUnfairLock(initialState: false)
+        manager.connect(host: "127.0.0.1", port: pc.port)
+        let frame = try FakeUDPHost.keyframe()
+        let served = Task.detached {
+            pc.servePath(limit: .max, frame: frame, hostCaps: 0, countFrames: false) { streaming.withLock { $0 } }
+        }
+        try await until("streaming") { manager.state == .connected }
+        try await Task.sleep(nanoseconds: 500_000_000)
+        streaming.withLock { $0 = true }
+        let run = await served.value
+        XCTAssertEqual(run.sizesAsked, [])
+        XCTAssertFalse(logged().contains { $0.hasPrefix("no_video_fallback ") }, logged().joined(separator: "\n"))
+        XCTAssertEqual(NoVideoSizes.size(for: sizeKey(pc), now: at), 576)
     }
 
     // MARK: - Connecting
