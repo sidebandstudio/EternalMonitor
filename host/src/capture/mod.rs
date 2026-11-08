@@ -10,9 +10,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::{Condvar, Mutex};
-use tracing::error;
 #[cfg(any(windows, test, debug_assertions))]
-use tracing::{info, warn};
+use tracing::warn;
+use tracing::{error, info};
 
 use crate::control::SharedControl;
 #[cfg(any(windows, test, debug_assertions))]
@@ -1176,10 +1176,34 @@ pub fn run_capture_stage(
             })
         },
     );
-    if let Err(ref e) = result {
-        error!(error = %e, "Capture loop exited with error");
+    stage_exit(result, stopping(&shared, generation))
+}
+
+/// The stream is stopping, or a newer generation has replaced this one.
+fn stopping(shared: &SharedControl, generation: u64) -> bool {
+    !shared.running.load(std::sync::atomic::Ordering::SeqCst)
+        || !crate::supervisor::generation_is_current(generation)
+}
+
+/// How the capture stage ends. An error once the stream is stopping is the
+/// stop: tearing the display down can fail the call in flight ("The
+/// parameter is incorrect"), and that is no capture failure for the
+/// supervisor to restart or count.
+fn stage_exit(
+    result: Result<(), Box<dyn std::error::Error + Send + Sync>>,
+    stopping: bool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match result {
+        Err(e) if stopping => {
+            info!(error = %e, "Capture loop stopped with the stream");
+            Ok(())
+        }
+        Err(e) => {
+            error!(error = %e, "Capture loop exited with error");
+            Err(e)
+        }
+        Ok(()) => Ok(()),
     }
-    result
 }
 
 /// What a capture attempt's error says about a second screen proving
@@ -1333,6 +1357,81 @@ fn pick_new_virtual_output<'a>(before: &[String], now: &'a [OutputInfo]) -> Opti
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use parking_lot::Mutex;
+
+    use crate::control::SharedControl;
+
+    /// Log lines `run` writes on this thread.
+    fn logged(run: impl FnOnce()) -> String {
+        #[derive(Clone)]
+        struct Captured(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Captured {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buffer = Arc::new(Mutex::new(Vec::new()));
+        let writer = Captured(buffer.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        crate::logging::prepare_log_capture();
+        tracing::subscriber::with_default(subscriber, run);
+        let text = String::from_utf8_lossy(&buffer.lock()).into_owned();
+        text
+    }
+
+    fn failed() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Err("The parameter is incorrect. (0x80070057)".into())
+    }
+
+    /// A call that fails as the stream stops is the stop: logged at info,
+    /// and the stage ends as completed, so the supervisor neither restarts
+    /// nor counts it.
+    #[test]
+    fn an_error_as_the_stream_stops_is_a_stop() {
+        let mut result = None;
+        let text = logged(|| result = Some(super::stage_exit(failed(), true)));
+        assert!(result.unwrap().is_ok());
+        assert!(text.contains(" INFO ") && !text.contains("ERROR"), "{text}");
+        assert!(
+            text.contains("Capture loop stopped with the stream"),
+            "{text}"
+        );
+    }
+
+    /// While the stream runs, the same error is a capture failure, as before.
+    #[test]
+    fn an_error_while_streaming_is_still_a_failure() {
+        let mut result = None;
+        let text = logged(|| result = Some(super::stage_exit(failed(), false)));
+        assert!(result.unwrap().is_err());
+        assert!(
+            text.contains("ERROR") && text.contains("Capture loop exited with error"),
+            "{text}"
+        );
+        let text = logged(|| assert!(super::stage_exit(Ok(()), true).is_ok()));
+        assert_eq!(text, "");
+    }
+
+    /// Stopping is `running` off, or a newer generation.
+    #[test]
+    fn a_stage_is_stopping_once_its_stream_stops_or_is_replaced() {
+        use std::sync::atomic::Ordering;
+        let shared = SharedControl::new(0, 1);
+        let live = crate::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
+        shared.running.store(false, Ordering::SeqCst);
+        assert!(super::stopping(&shared, live));
+        shared.running.store(true, Ordering::SeqCst);
+        assert!(super::stopping(&shared, live.wrapping_add(1_000_000)));
+    }
 
     #[test]
     fn a_timed_take_returns_a_frame_nothing_or_the_close() {
