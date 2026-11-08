@@ -675,6 +675,7 @@ pub fn run_capture_loop(
                             data: Arc::clone(&data),
                             width: tex_width,
                             height: tex_height,
+                            cached: false,
                         });
                         last_send = now;
                     } else {
@@ -1012,6 +1013,7 @@ fn resend_last_frame(
         data: Arc::clone(last_frame),
         width,
         height,
+        cached: true,
     });
     *last_send = now;
 }

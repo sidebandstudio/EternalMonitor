@@ -321,6 +321,35 @@ impl ConfigSource for SharedConfigSource<'_> {
     }
 }
 
+/// How often a stream looks at its chosen network while nobody streams.
+const NETWORK_CHECK: Duration = Duration::from_secs(10);
+
+/// With Listen on set to one network: while nobody streams, a stream bound
+/// to an address that network no longer gives restarts to listen on the
+/// one it gives now. The supervisor does that only while this stream still
+/// runs, never once the user stopped it.
+fn look_at_network(
+    shared: &SharedControl,
+    listen_on: &crate::network::ListenOn,
+    bind_ip: std::net::Ipv4Addr,
+    supervisor: &StreamSupervisor,
+) {
+    if *listen_on == crate::network::ListenOn::All
+        || shared.client_connected()
+        || crate::network::listen_ip_now(listen_on) == bind_ip
+    {
+        return;
+    }
+    info!(
+        listen_on = listen_on.label(),
+        "The chosen network changed: restarting the stream to listen on it"
+    );
+    shared.stop();
+    if let Err(error) = supervisor.restart() {
+        warn!(error = %error, "Failed to request a pipeline restart for the chosen network");
+    }
+}
+
 /// The supervisor a stream answers to, and the pipeline generation the
 /// stream belongs to.
 struct StreamSupervisor {
@@ -476,8 +505,13 @@ pub async fn start_sender(
     let mut liveness_tick = tokio::time::interval(Duration::from_millis(250));
     liveness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // A chosen network can connect, or get a new address, after the stream
-    // starts. It is looked at again while nobody streams.
-    let mut network_check = tokio::time::interval(Duration::from_secs(10));
+    // bound. It is looked at now, before anything else, and again every
+    // 10 s while nobody streams. The first look used to be the interval's
+    // first tick, which could lose to the liveness tick: a stream stopped
+    // meanwhile then ended without looking.
+    look_at_network(&shared, &listen_on, bind_ip, &supervisor);
+    let mut network_check =
+        tokio::time::interval_at(tokio::time::Instant::now() + NETWORK_CHECK, NETWORK_CHECK);
     network_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut pointer_budget = Deadline::new("pointer-budget")?;
 
@@ -520,15 +554,9 @@ pub async fn start_sender(
                 let actions = shared.session.lock().tick(&config, false, now());
                 act(actions, &mut state, &links, &shared, &config, &supervisor).await;
             }
-            _ = network_check.tick(), if listen_on != crate::network::ListenOn::All => {
+            _ = network_check.tick() => {
                 beat.mark(Phase::Tick);
-                if !shared.client_connected() && crate::network::listen_ip_now(&listen_on) != bind_ip {
-                    info!(listen_on = listen_on.label(), "The chosen network changed: restarting the stream to listen on it");
-                    shared.stop();
-                    if let Err(error) = supervisor.restart() {
-                        warn!(error = %error, "Failed to request a pipeline restart for the chosen network");
-                    }
-                }
+                look_at_network(&shared, &listen_on, bind_ip, &supervisor);
             }
             _ = liveness_tick.tick() => {
                 beat.mark(Phase::Tick);

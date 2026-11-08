@@ -258,6 +258,11 @@ pub struct RawFrame {
     pub data: Arc<Vec<u8>>,
     pub width: u32,
     pub height: u32,
+    /// A picture capture already had, sent again because the desktop gave
+    /// no new one: the keepalive, a keyframe request's resend, the cached
+    /// picture redrawn with or without the pointer, or a resend during
+    /// duplication recovery.
+    pub cached: bool,
 }
 
 /// Readable bytes after a frame's last row: FFmpeg's
@@ -1442,6 +1447,7 @@ mod tests {
             data: Arc::new(Vec::new()),
             width: 2,
             height: 2,
+            cached: false,
         };
         let short = Duration::from_millis(5);
         assert!(matches!(
@@ -1482,6 +1488,7 @@ mod tests {
             data: Arc::clone(&pool[n]),
             width: 2,
             height: 2,
+            cached: false,
         };
         let mut kept = Some(frame(0));
         producer.publish(frame(1));
