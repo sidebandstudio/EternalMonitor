@@ -248,6 +248,13 @@ static SESSION_FALLBACK: parking_lot::Mutex<SessionFallback> =
 
 /// `session_id` started: fallbacks logged from now on are its own.
 pub fn note_session_start(session_id: u32, shared: &SharedControl) {
+    // The slot is the process's, so a test that starts a session would
+    // replace another test's.
+    #[cfg(test)]
+    assert!(
+        tests::FALLBACK_SLOT.is_locked(),
+        "a test that starts a session holds diagnostics::tests::FALLBACK_SLOT"
+    );
     *SESSION_FALLBACK.lock() = SessionFallback {
         session_id: Some(session_id),
         mode: Some(Arc::clone(&shared.capture_target)),
@@ -419,6 +426,15 @@ pub fn session_summary(
         EndReason::LinkLost => "other",
         EndReason::Liveness | EndReason::Goodbye(ByeReason::Error) if !streamed => "no_video",
         EndReason::Liveness => "signal_lost",
+        // The iPad gave up on video that went out: none of it arrived, or
+        // no frame of it completed.
+        EndReason::Goodbye(ByeReason::Error) if !end.frames_received => {
+            if end.frags_received {
+                "no_frame"
+            } else {
+                "no_video"
+            }
+        }
         EndReason::Goodbye(ByeReason::Error) => "other",
         EndReason::Failed(StageFailure::Capture) => "capture_failed",
         EndReason::Failed(StageFailure::Encoder) => "encoder_failed",
@@ -706,6 +722,7 @@ pub(crate) mod tests {
             reason,
             first_video: first_video_ms.map(Duration::from_millis),
             frames_received: first_video_ms.is_some(),
+            frags_received: first_video_ms.is_some(),
             duration: Duration::from_millis(duration_ms),
         }
     }
@@ -777,6 +794,24 @@ pub(crate) mod tests {
             (
                 end(Goodbye(ByeReason::Error), Some(500), 30_000),
                 ["steady", "streamed", "other", "goodbye"],
+            ),
+            // The iPad gave up on video that went out: none of it arrived,
+            // or no frame of it completed.
+            (
+                SessionEnd {
+                    frames_received: false,
+                    frags_received: false,
+                    ..end(Goodbye(ByeReason::Error), Some(300), 10_000)
+                },
+                ["video_sent", "streamed", "no_video", "goodbye"],
+            ),
+            (
+                SessionEnd {
+                    frames_received: false,
+                    frags_received: true,
+                    ..end(Goodbye(ByeReason::Error), Some(300), 10_000)
+                },
+                ["video_sent", "streamed", "no_frame", "goodbye"],
             ),
             (
                 end(Liveness, None, 3_000),
@@ -1063,6 +1098,7 @@ pub(crate) mod tests {
             .with(SummaryCapture(summaries.clone()));
         let shared = SharedControl::new(9876, 15_000_000);
         *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(subscriber, || {
             for (id, reason) in [(1, "vdd_only"), (2, "panel_lost")] {
                 note_session_start(id, &shared);

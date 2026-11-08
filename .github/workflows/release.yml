@@ -101,12 +101,30 @@ jobs:
       - name: Download the bundled virtual display driver
         shell: pwsh
         run: |
+          # GitHub's download servers sometimes answer 5xx for a minute or two.
+          # Up to 5 tries over 2 minutes; another 4xx fails at once. The next
+          # step checks the driver's pinned SHA-256 either way.
+          function Get-WithRetry($uri, $out) {
+              $waits = 10, 20, 30, 60
+              for ($try = 1; ; $try++) {
+                  try {
+                      Invoke-WebRequest -Uri $uri -OutFile $out
+                      return
+                  } catch {
+                      $status = [int]$_.Exception.Response.StatusCode
+                      $transient = $status -eq 0 -or $status -eq 429 -or $status -ge 500
+                      if (-not $transient -or $try -gt $waits.Count) { throw }
+                      Write-Warning "Download of $uri failed (try $try): $($_.Exception.Message). Retrying in $($waits[$try - 1]) s."
+                      Start-Sleep -Seconds $waits[$try - 1]
+                  }
+              }
+          }
           $dest = "installer\vendor\vdd"
           $url = "https://github.com/VirtualDrivers/Virtual-Display-Driver/releases/download/$env:VDD_RELEASE_TAG/$env:VDD_ASSET"
-          Invoke-WebRequest -Uri $url -OutFile (Join-Path $dest $env:VDD_ASSET)
+          Get-WithRetry $url (Join-Path $dest $env:VDD_ASSET)
           # Its MIT license text, redistributed alongside the binary.
-          Invoke-WebRequest -Uri "https://raw.githubusercontent.com/VirtualDrivers/Virtual-Display-Driver/$env:VDD_RELEASE_TAG/LICENSE" `
-              -OutFile (Join-Path $dest "LICENSE-VirtualDisplayDriver.txt")
+          Get-WithRetry "https://raw.githubusercontent.com/VirtualDrivers/Virtual-Display-Driver/$env:VDD_RELEASE_TAG/LICENSE" `
+              (Join-Path $dest "LICENSE-VirtualDisplayDriver.txt")
 
       - name: Verify the driver against the pinned SHA-256
         shell: pwsh

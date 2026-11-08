@@ -43,9 +43,19 @@ pub enum Call {
     /// After a lost duplication: asking the duplicated output whether it is
     /// still on the desktop, and listing the outputs when it is not.
     ListOutputs,
+    /// The graphics calls before the window's first paint: finding the
+    /// graphics cards (`gpu::GpuInfo::detect`), listing the screens and the
+    /// window renderer's adapter list. They share one lane: they wait on the
+    /// same driver, so after one hangs the others are refused at once
+    /// instead of each waiting out its own limit.
+    GpuDetect,
+    /// The window's adapters listed through wgpu on another thread before
+    /// the window's thread makes its first graphics call
+    /// (`gui::renderer::adapter_probe`).
+    GpuProbe,
 }
 
-const CALLS: usize = 7;
+const CALLS: usize = 9;
 
 /// When a call is slow enough to log, and when it is given up on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,6 +84,8 @@ impl Call {
             Self::VddDisable => "vdd_disable",
             Self::GpuFacts => "gpu_facts",
             Self::ListOutputs => "list_outputs",
+            Self::GpuDetect => "gpu_detect",
+            Self::GpuProbe => "gpu_probe",
         }
     }
 
@@ -107,6 +119,16 @@ impl Call {
             // every adapter for its outputs, which is how device creation
             // begins; it keeps device creation's limits.
             Self::ListOutputs => Limits::ms(1_000, 4_000),
+            // 34 startups on 3 PCs (two test PCs, one field PC's uploads):
+            // median 10 ms, slowest 44 ms, from "Support system information"
+            // to "Selected encoder". It makes the same DXGI calls as
+            // GpuFacts and keeps its limits. One AMD laptop's dxgkrnl
+            // deadlock held it 62 s, and the window with it.
+            Self::GpuDetect => Limits::ms(1_000, 4_000),
+            // Not timed in the field yet: on a test PC (RTX 5080) 340-440 ms
+            // in debug builds, which run wgpu's validation. It makes the
+            // window's own first calls, and keeps detection's limits.
+            Self::GpuProbe => Limits::ms(1_000, 4_000),
         }
     }
 }
@@ -981,6 +1003,8 @@ mod tests {
             Call::VddDisable,
             Call::GpuFacts,
             Call::ListOutputs,
+            Call::GpuDetect,
+            Call::GpuProbe,
         ]
         .map(Call::name)
         .into();
@@ -999,6 +1023,8 @@ mod tests {
             Call::VddEnable,
             Call::GpuFacts,
             Call::ListOutputs,
+            Call::GpuDetect,
+            Call::GpuProbe,
         ] {
             let limits = call.limits();
             assert!(limits.limit >= Duration::from_secs(3), "{call:?}");

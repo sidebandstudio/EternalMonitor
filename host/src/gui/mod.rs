@@ -19,6 +19,7 @@
 //! `author_id`, see `widgets::automation_id`): scripts and tests find them by
 //! that id first, then by name, so the same name works in every language.
 
+mod driver_wait;
 mod feedback_panel;
 mod fonts;
 mod icons;
@@ -81,6 +82,7 @@ struct StatsSnapshot {
     codec_name: String,
     using_software_fallback: bool,
     nvidia_driver_outdated: bool,
+    gpu_detection_stalled: bool,
     driver_update_vendors: Vec<crate::gpu::GpuVendor>,
     gpu_name: String,
     capture_display: String,
@@ -120,6 +122,7 @@ impl StatsSnapshot {
             codec_name: s.codec_name.clone(),
             using_software_fallback: s.using_software_fallback,
             nvidia_driver_outdated: s.nvidia_driver_outdated,
+            gpu_detection_stalled: s.gpu_detection_stalled,
             driver_update_vendors: s.driver_update_vendors.clone(),
             gpu_name: s.gpu_name.clone(),
             capture_display: s.capture_display.clone(),
@@ -380,6 +383,7 @@ pub struct AnalyzerApp {
 
 impl AnalyzerApp {
     pub fn new(cc: &eframe::CreationContext<'_>, control: GuiControl) -> Self {
+        renderer::remember_window(cc);
         // Load persisted settings first; values fall back to the live runtime state when the
         // file is missing or unreadable.
         let persisted = SettingsFile::load();
@@ -446,7 +450,8 @@ impl AnalyzerApp {
                 String::new()
             }
         };
-        let available_outputs = listing::outputs(&control.shared);
+        // Before the first paint, so a stuck driver must not hold it.
+        let available_outputs = listing::outputs_at_startup(&control.shared);
 
         // Same model as encoder_override: push the persisted preference into
         // SharedControl so the encoder honours it without a restart.
@@ -1783,7 +1788,13 @@ pub fn shown_address(ip: std::net::Ipv4Addr, listen_port: u16) -> String {
 }
 
 /// Launch the GUI window. Blocks the calling thread.
-pub fn run_gui(control: GuiControl) -> eframe::Result<()> {
+/// Runs the window until it closes. `quit_while_stuck` is the app's quit
+/// path, for a Cancel in the graphics driver notice while the window's
+/// thread is stuck before its first frame; it ends the process.
+pub fn run_gui(
+    control: GuiControl,
+    quit_while_stuck: Box<dyn FnOnce() + Send>,
+) -> eframe::Result<()> {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon_256.png"))
         .expect("embedded icon PNG is valid");
 
@@ -1795,13 +1806,61 @@ pub fn run_gui(control: GuiControl) -> eframe::Result<()> {
             .with_icon(std::sync::Arc::new(icon)),
         ..Default::default()
     };
-    renderer::configure(&mut options.wgpu_options);
+    // The window's thread makes its first graphics call only once the
+    // driver has answered the same calls on another thread, and is watched
+    // until it is confirmed drawing.
+    let prepared = renderer::prepare();
+    #[cfg(windows)]
+    let watch = {
+        let prompt = driver_wait::Prompt::new(driver_wait::MessageNotice::default());
+        let skip_listing = prepared.listing_avoided();
+        let probe_limits = crate::stall::Call::GpuProbe.limits();
+        let opened = driver_wait::before_window(
+            crate::stall::lanes(),
+            crate::stall::Call::GpuDetect.limits(),
+            probe_limits,
+            &prompt,
+            driver_wait::POLL,
+            || renderer::adapter_list(skip_listing),
+            |adapters| {
+                renderer::configure(&mut options.wgpu_options, prepared, adapters);
+                renderer::probe_spec(&options.wgpu_options)
+            },
+            |spec| renderer::adapter_probe(spec.clone()),
+        );
+        if !opened {
+            renderer::abandon();
+            return Ok(());
+        }
+        let watch = driver_wait::watch_first_paint(
+            prompt,
+            probe_limits.limit,
+            driver_wait::PROOF_WITHIN,
+            driver_wait::POLL,
+            std::time::Instant::now,
+            renderer::last_pass,
+            renderer::window_held,
+            move || {
+                renderer::abandon();
+                quit_while_stuck();
+            },
+        );
+        renderer::when_drawing(watch.finisher());
+        watch
+    };
+    #[cfg(not(windows))]
+    {
+        renderer::configure(&mut options.wgpu_options, prepared, Vec::new());
+        drop(quit_while_stuck);
+    }
 
     let result = eframe::run_native(
         "EternalMonitor",
         options,
         Box::new(|cc| Ok(Box::new(AnalyzerApp::new(cc, control)))),
     );
+    #[cfg(windows)]
+    let _ = watch.stop();
     if result.is_ok() {
         renderer::window_closed();
     }

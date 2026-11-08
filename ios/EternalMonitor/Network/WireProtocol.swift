@@ -269,6 +269,10 @@ struct Hello2: Equatable {
     /// This app draws the pointer from POINTER_SHAPE and POINTER_STATE, so
     /// a PC with `HelloAck.hostCapPointer` leaves it out of the video.
     static let featureDrawsPointer: UInt16 = 1 << 5
+    /// This iPad may ask for smaller media datagrams in a keyframe request,
+    /// and wants heartbeats to count the frames the PC sent. Bit 5 is
+    /// `featureDrawsPointer`.
+    static let featureMediaSize: UInt16 = 1 << 6
     static let maxNameLength = 64
 
     var protoMin: UInt8 = 2
@@ -321,6 +325,10 @@ struct HelloAck: Equatable {
     /// The PC sends the pointer apart from the video to an iPad that said
     /// it draws it. Older iPads ignore it.
     static let hostCapPointer: UInt16 = 1 << 6
+    /// The PC takes `KeyframeRequest.maxMediaDgram` for the rest of the
+    /// session, and its heartbeats carry `framesSent`. Only an iPad that
+    /// sets `Hello2.featureMediaSize` hears it.
+    static let hostCapMediaSize: UInt16 = 1 << 7
     var status: HelloStatus
     var acceptedVersion: UInt8
     var clientNonce: UInt32
@@ -350,6 +358,10 @@ struct Heartbeat: Equatable {
     static let noticePCLocked: UInt8 = 1
     /// No display is on at the PC (a closed lid, screens off or unplugged).
     static let noticeNoDisplay: UInt8 = 2
+    /// The video frames the PC sent this session, from a PC that offered
+    /// `HelloAck.hostCapMediaSize`; nil from others. Appended after
+    /// `notice`, which is then always written.
+    var framesSent: UInt32?
 }
 
 enum ByeReason: UInt8 {
@@ -371,6 +383,11 @@ struct KeyframeRequest: Equatable {
     var streamEpoch: UInt32
     var lastCompleteSeq: UInt32
     var reason: KeyframeReason
+    /// The largest media datagram to send from now on in this session; 0
+    /// asks nothing. Appended: only for a PC with `HelloAck.hostCapMediaSize`.
+    var maxMediaDgram: UInt16 = 0
+    /// The smallest a request may ask for, as the PC's own setting.
+    static let minMediaDgram: UInt16 = 576
 }
 
 struct Nack: Equatable {
@@ -604,13 +621,15 @@ extension Wire {
         case .heartbeat(let hb):
             body.appendLE(hb.hostTimeUs)
             hb.streamConfig.encode(into: &body)
-            if hb.notice != Heartbeat.noticeNone { body.append(hb.notice) }
+            if hb.notice != Heartbeat.noticeNone || hb.framesSent != nil { body.append(hb.notice) }
+            if let frames = hb.framesSent { body.appendLE(frames) }
         case .bye(let reason):
             body.append(reason.rawValue)
         case .keyframeRequest(let k):
             body.appendLE(k.streamEpoch)
             body.appendLE(k.lastCompleteSeq)
             body.append(k.reason.rawValue)
+            if k.maxMediaDgram != 0 { body.appendLE(k.maxMediaDgram) }
         case .nack(let n):
             precondition(n.isValid)
             body.appendLE(n.streamEpoch)
@@ -751,7 +770,8 @@ extension Wire {
             guard let hostTimeUs = r.readU64(),
                   let cfg = StreamConfig.decode(&r) else { return nil }
             message = .heartbeat(Heartbeat(hostTimeUs: hostTimeUs, streamConfig: cfg,
-                                           notice: r.readU8() ?? Heartbeat.noticeNone))
+                                           notice: r.readU8() ?? Heartbeat.noticeNone,
+                                           framesSent: r.remaining >= 4 ? r.readU32() : nil))
         case .bye:
             guard let raw = r.readU8(), let reason = ByeReason(rawValue: raw) else { return nil }
             message = .bye(reason)
@@ -760,8 +780,8 @@ extension Wire {
                   let last: UInt32 = r.readU32(),
                   let raw = r.readU8(),
                   let reason = KeyframeReason(rawValue: raw) else { return nil }
-            message = .keyframeRequest(
-                KeyframeRequest(streamEpoch: epoch, lastCompleteSeq: last, reason: reason))
+            message = .keyframeRequest(KeyframeRequest(streamEpoch: epoch, lastCompleteSeq: last, reason: reason,
+                                                       maxMediaDgram: r.remaining >= 2 ? r.readU16() ?? 0 : 0))
         case .receiverReport:
             message = parseReceiverReport(&r)
         case .nack:

@@ -434,6 +434,7 @@ impl State {
     /// The display took the built-in panel away: save that until Second
     /// screen is chosen again. Neither a blocked mirror nor a withheld
     /// desktop excuses it, since trying again takes the panel again.
+    #[cfg(any(windows, test, debug_assertions))]
     fn remember_panel_lost(&mut self, now: Instant) {
         self.clear_blocked_retry();
         if let Some(hold) = self.memory.note_failure(PANEL_LOST, now) {
@@ -3661,6 +3662,7 @@ mod tests {
             .with_ansi(false)
             .with_writer(move || Sink(Arc::clone(&writer)))
             .finish();
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(subscriber, || attach(&shared, &driver, ATTACH_TIMEOUT));
         let lines = String::from_utf8(out.lock().clone()).unwrap();
         assert!(

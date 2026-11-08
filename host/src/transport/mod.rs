@@ -613,7 +613,13 @@ pub async fn start_sender(
                 }
 
                 let payload = &nal.data;
-                let payload_size = media_payload_size(shared.max_dgram.load(Ordering::SeqCst) as usize).unwrap_or(MAX_MEDIA_PAYLOAD);
+                // The PC's packet size, or the smaller one this session's
+                // client asked for when none of the larger reached it.
+                let max_dgram = shared.session.lock().max_media_dgram(session_id).map_or(
+                    shared.max_dgram.load(Ordering::SeqCst),
+                    |asked| shared.max_dgram.load(Ordering::SeqCst).min(u32::from(asked)),
+                );
+                let payload_size = media_payload_size(max_dgram as usize).unwrap_or(MAX_MEDIA_PAYLOAD);
                 let frag_count_usize = payload.len().div_ceil(payload_size).max(1);
                 // Held back until the client answers; the frames after it
                 // wait for the keyframe its answer asks for.
@@ -2149,6 +2155,8 @@ mod tests {
     fn a_pen_refresh_windows_holds_never_stops_the_loop() {
         use crate::input::{CaptureGeometry, InputThread, Sink, KIND_KEY, PHASE_BEGAN};
         use eternal_wire::v2::control::{HelloStatus, InputEvent, FEATURE_WANTS_INPUT};
+        // The loop's session starts through `act`, which uses the fallback slot.
+        let _slot = crate::diagnostics::tests::FALLBACK_SLOT.lock();
 
         /// Holds the first refresh until told to go on.
         struct StuckRefresh {

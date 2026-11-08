@@ -39,11 +39,28 @@ pub(super) fn listed(
     (listed, adapters)
 }
 
+/// [`outputs`] before the window's first paint, in the startup graphics
+/// lane ([`crate::stall::Call::GpuDetect`]): empty, and nothing judged, if
+/// it does not return within the limit or while an earlier startup call is
+/// still stuck on the same driver.
+pub fn outputs_at_startup(shared: &SharedControl) -> Vec<OutputInfo> {
+    let shared = shared.clone();
+    crate::stall::run(
+        crate::stall::Call::GpuDetect,
+        move || outputs(&shared),
+        || {},
+    )
+    .unwrap_or_default()
+}
+
 /// The display the startup banner names: the primary, or the first one.
 /// Before any host state exists there is no proof to judge; only this label
-/// leaves the module, never the outputs.
+/// leaves the module, never the outputs. Listed in the startup graphics
+/// lane with GPU detection, which waits on the same driver: "unknown" if it
+/// does not return in time.
 pub fn startup_display_label() -> String {
-    let outputs = from_dxgi();
+    let outputs =
+        crate::stall::run(crate::stall::Call::GpuDetect, from_dxgi, || {}).unwrap_or_default();
     outputs
         .iter()
         .find(|output| output.is_primary)

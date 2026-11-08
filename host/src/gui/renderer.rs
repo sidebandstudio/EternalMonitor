@@ -108,6 +108,10 @@ const DRIVER_MODULES: [&str; 18] = [
 /// PCI vendor id of Intel GPUs.
 const INTEL: u32 = 0x8086;
 const HISTORY_FILE: &str = "history.json";
+/// The marker backend of a launch listing the graphics cards through DXGI,
+/// before it knows their keys. A launch that dies there makes the next ones
+/// key the GPUs by wgpu's driver text instead, until clean launches retry.
+const LISTING: &str = "list dxgi";
 /// Held while one instance reads, changes and saves the history.
 const HISTORY_LOCK: &str = "history.lock";
 /// The window counts as working after this long and this many frames with no
@@ -115,13 +119,29 @@ const HISTORY_LOCK: &str = "history.lock";
 /// at the first present, within milliseconds.
 const CONFIRM_AFTER: Duration = Duration::from_secs(3);
 const CONFIRM_FRAMES: u64 = 10;
+/// Frames after asking for the proof of a presented frame before asking
+/// again: the ask is dropped with a frame whose surface was not acquired.
+const PROOF_AGAIN_AFTER: u64 = 3 * CONFIRM_FRAMES;
 
 static STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
-static STARTED: Mutex<Option<Marker>> = Mutex::new(None);
+static LAUNCH: Mutex<Launch> = Mutex::new(Launch::new());
 static PRESENT: Mutex<PresentTracker> = Mutex::new(PresentTracker::new());
 /// Frames whose surface texture could not be acquired, so nothing was presented.
 static FAILED_ACQUIRES: AtomicU64 = AtomicU64::new(0);
 static STATUS: Mutex<Option<Status>> = Mutex::new(None);
+/// The DXGI adapter list taken before the window, which the window's GPU
+/// keys come from until it is confirmed drawing: no more DXGI calls on its
+/// thread before then.
+static ADAPTERS: Mutex<Option<Vec<(u32, u32, String)>>> = Mutex::new(None);
+/// When the window's thread last began a UI pass.
+static LAST_PASS: Mutex<Option<Instant>> = Mutex::new(None);
+/// The window, once it exists (an HWND on Windows), for checks made from
+/// other threads while its own may be stuck.
+#[cfg_attr(not(windows), allow(dead_code))]
+static WINDOW: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+/// Run once, when the window is confirmed drawing.
+type OnDrawing = Box<dyn FnOnce() + Send>;
+static ON_DRAWING: Mutex<Option<OnDrawing>> = Mutex::new(None);
 /// Adapters chosen for the window this launch. After the first, each
 /// replaces a lost device (`vendor/egui-wgpu`).
 static SELECTIONS: AtomicU64 = AtomicU64::new(0);
@@ -280,9 +300,13 @@ fn driver_module(module: &str) -> bool {
     DRIVER_MODULES.iter().any(|name| module.starts_with(name))
 }
 
-/// Choose the instance backends and install the adapter selector, after
-/// recording failed earlier starts.
-pub(super) fn configure(config: &mut WgpuConfiguration) {
+/// The failed starts this launch knows of: earlier launches' markers are
+/// recorded first. Makes no graphics call.
+pub(super) struct Prepared {
+    history: Vec<Failure>,
+}
+
+pub(super) fn prepare() -> Prepared {
     let history = match crate::settings::app_data_dir() {
         Some(base) => {
             let directory = base.join("renderer");
@@ -293,6 +317,57 @@ pub(super) fn configure(config: &mut WgpuConfiguration) {
         }
         None => Vec::new(),
     };
+    Prepared { history }
+}
+
+impl Prepared {
+    /// A launch died listing the graphics cards through DXGI, and that is
+    /// not retried yet.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    pub(super) fn listing_avoided(&self) -> bool {
+        avoided(&self.history, "", LISTING)
+    }
+}
+
+/// The DXGI adapter list, for another thread to take before the window
+/// (`skip`: a launch died there; the GPUs are keyed by wgpu's driver text).
+/// This launch's marker names the listing before it starts, and the thread
+/// it runs on once it does, until a later step replaces it: a crash there,
+/// even after the caller gave up on a list that did not return, is the
+/// window's.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn adapter_list(skip: bool) -> impl FnOnce() -> Vec<(u32, u32, String)> + Send {
+    if skip {
+        info!(
+            "A launch died listing the graphics cards; keying them by the renderer's driver text"
+        );
+    } else {
+        let _ = start(Marker {
+            gpu: String::new(),
+            backend: LISTING.to_string(),
+            thread: None,
+        });
+    }
+    move || {
+        if skip {
+            return Vec::new();
+        }
+        mark_thread(current_thread());
+        list_dxgi_adapters()
+    }
+}
+
+/// Choose the instance backends and install the adapter selector, with the
+/// graphics cards `adapters` listed before the window.
+pub(super) fn configure(
+    config: &mut WgpuConfiguration,
+    prepared: Prepared,
+    adapters: Vec<(u32, u32, String)>,
+) {
+    let Prepared { history } = prepared;
+    if let Ok(mut listed) = ADAPTERS.lock() {
+        *listed = Some(adapters);
+    }
     let choice = crate::settings::SettingsFile::load().window_drawing;
     // Saved by the last update check; this launch's choice only.
     let rules = if cfg!(windows) {
@@ -311,6 +386,138 @@ pub(super) fn configure(config: &mut WgpuConfiguration) {
         FAILED_ACQUIRES.fetch_add(1, Ordering::SeqCst);
         default(status)
     });
+}
+
+/// The instance the window's renderer will create, for [`adapter_probe`].
+/// None when it is given an existing device.
+#[derive(Clone)]
+pub(super) struct ProbeSpec(
+    Option<(
+        Backends,
+        wgpu::InstanceFlags,
+        wgpu::BackendOptions,
+        wgpu::MemoryBudgetThresholds,
+    )>,
+);
+
+/// What `config`, as [`configure`] left it, will create.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn probe_spec(config: &WgpuConfiguration) -> ProbeSpec {
+    ProbeSpec(match &config.wgpu_setup {
+        WgpuSetup::CreateNew(setup) => Some((
+            setup.instance_descriptor.backends,
+            setup.instance_descriptor.flags,
+            setup.instance_descriptor.backend_options.clone(),
+            setup.instance_descriptor.memory_budget_thresholds,
+        )),
+        WgpuSetup::Existing(_) => None,
+    })
+}
+
+/// The wgpu calls the window's thread makes first, for another thread to
+/// make before it: an instance with this launch's backends lists its
+/// adapters (DX12 creates a device on each to describe it). Built on the
+/// window's thread, run on another by [`super::driver_wait::before_window`].
+/// While it lists, the marker names that thread, so a driver crash there is
+/// still the window's.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn adapter_probe(spec: ProbeSpec) -> impl FnOnce() + Send + 'static {
+    let window = current_thread();
+    move || {
+        let Some((backends, flags, backend_options, memory_budget_thresholds)) = spec.0 else {
+            return;
+        };
+        mark_thread(current_thread());
+        let started = Instant::now();
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends,
+            flags,
+            backend_options,
+            memory_budget_thresholds,
+            display: None,
+        });
+        let listed = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .map(|runtime| {
+                runtime
+                    .block_on(instance.enumerate_adapters(backends))
+                    .len()
+            });
+        drop(instance);
+        info!(
+            adapters = listed.unwrap_or(0),
+            took_ms = started.elapsed().as_millis() as u64,
+            "Window renderer: the graphics driver answered before the window"
+        );
+        mark_thread(window);
+    }
+}
+
+/// Name `thread` in this launch's marker and save it again.
+fn mark_thread(thread: Option<u32>) {
+    if let Ok(mut launch) = LAUNCH.lock() {
+        launch.mark_thread(
+            STATE_DIR.get().map(PathBuf::as_path),
+            ProcessId::current(),
+            thread,
+        );
+    }
+}
+
+/// This launch's marker, and whether the user quit before the window drew.
+/// One lock holds both, so a worker still in the driver cannot save the
+/// marker again after the quit cleared it.
+struct Launch {
+    started: Option<Marker>,
+    abandoned: bool,
+}
+
+impl Launch {
+    const fn new() -> Self {
+        Self {
+            started: None,
+            abandoned: false,
+        }
+    }
+
+    /// Leave `marker` in `directory` until the window is confirmed working.
+    /// False when it could not be saved, or the launch was abandoned.
+    fn start(&mut self, directory: Option<&Path>, owner: ProcessId, marker: Marker) -> bool {
+        if self.abandoned {
+            return false;
+        }
+        let saved = directory.is_some_and(|directory| save_marker(directory, owner, &marker));
+        self.started = Some(marker);
+        saved
+    }
+
+    fn mark_thread(&mut self, directory: Option<&Path>, owner: ProcessId, thread: Option<u32>) {
+        if self.abandoned {
+            return;
+        }
+        let Some(marker) = self.started.as_mut() else {
+            return;
+        };
+        marker.thread = thread;
+        if let Some(directory) = directory {
+            let _ = save_marker(directory, owner, marker);
+        }
+    }
+
+    /// Clear the marker, after recording that its backend drew when `drew`.
+    fn clear(&mut self, directory: &Path, owner: ProcessId, drew: bool) {
+        if let Some(marker) = self.started.as_ref() {
+            if finish_launch(directory, marker, owner, drew) {
+                self.started = None;
+            }
+        }
+    }
+
+    /// The user quit: the marker goes without counting, for good.
+    fn abandon(&mut self, directory: &Path, owner: ProcessId) {
+        self.abandoned = true;
+        self.clear(directory, owner, false);
+    }
 }
 
 /// `WGPU_BACKEND` decides when set, as in wgpu, and nothing is narrowed or
@@ -337,6 +544,9 @@ fn choose_backends(
                 backend: plan.stage().to_string(),
                 thread: current_thread(),
             });
+        } else {
+            // The listing's marker: nothing is recorded under WGPU_BACKEND.
+            clear_marker(false);
         }
         descriptor.backends = instance_backends(forced, plan);
     }
@@ -422,18 +632,28 @@ fn current_thread() -> Option<u32> {
 /// Leave this launch's marker until the window is confirmed working. False
 /// when it could not be saved.
 fn start(marker: Marker) -> bool {
-    let saved = STATE_DIR
-        .get()
-        .is_some_and(|directory| save_marker(directory, ProcessId::current(), &marker));
-    if let Ok(mut started) = STARTED.lock() {
-        *started = Some(marker);
-    }
-    saved
+    LAUNCH.lock().is_ok_and(|mut launch| {
+        launch.start(
+            STATE_DIR.get().map(PathBuf::as_path),
+            ProcessId::current(),
+            marker,
+        )
+    })
 }
 
 fn save_marker(directory: &Path, owner: ProcessId, marker: &Marker) -> bool {
     serde_json::to_vec(marker)
         .is_ok_and(|json| fs::write(marker_path(directory, owner), json).is_ok())
+}
+
+/// What a screenshot that proves a frame was presented carries: the span it
+/// was asked in (a new one after each surface error, skipped frame or new
+/// device) and which ask it answers. Only an answer to the current span's
+/// asks counts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PresentProof {
+    span: u64,
+    request: u64,
 }
 
 /// Called at the start of each UI pass; clears this launch's marker once the
@@ -446,23 +666,126 @@ pub(super) fn frame_started(ctx: &egui::Context) {
         lost_before_drawing();
     }
     let visible = ctx.input(|input| input.viewport().minimized != Some(true));
+    if let Ok(mut last) = LAST_PASS.lock() {
+        *last = Some(Instant::now());
+    }
+    let proofs: Vec<PresentProof> = ctx.input(|input| {
+        input
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::Screenshot { user_data, .. } => user_data
+                    .data
+                    .as_ref()?
+                    .downcast_ref::<PresentProof>()
+                    .copied(),
+                _ => None,
+            })
+            .collect()
+    });
     let Ok(mut tracker) = PRESENT.lock() else {
         return;
     };
-    let now_drawing = tracker.observe(
+    let step = tracker.observe(
         ctx.cumulative_frame_nr(),
         failures(),
         visible,
         Instant::now(),
+        &proofs,
     );
     let drawing = tracker.confirmed;
     drop(tracker);
-    if now_drawing {
+    if let Step::Prove(proof) = step {
+        // egui-wgpu answers only after it acquired the surface, drew the
+        // frame into it and submitted it, right before the present.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(
+            proof,
+        )));
+    }
+    if step == Step::Confirmed {
         crate::startup::mark_window_shown();
         info!("Window renderer is drawing");
+        let on_drawing = ON_DRAWING.lock().ok().and_then(|mut hook| hook.take());
+        if let Some(on_drawing) = on_drawing {
+            on_drawing();
+        }
     }
     if drawing {
         clear_marker(true);
+    }
+}
+
+/// When the window's thread last began a UI pass. None before the first.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn last_pass() -> Option<Instant> {
+    LAST_PASS.lock().ok().and_then(|last| *last)
+}
+
+/// Remember the window, for [`window_held`].
+pub(super) fn remember_window(cc: &eframe::CreationContext<'_>) {
+    #[cfg(windows)]
+    {
+        use eframe::wgpu::rwh::{HasWindowHandle, RawWindowHandle};
+        if let Ok(handle) = cc.window_handle() {
+            if let RawWindowHandle::Win32(window) = handle.as_raw() {
+                WINDOW.store(window.hwnd.get(), Ordering::SeqCst);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = cc;
+}
+
+/// Whether the window is minimized, or its thread is in the move/size or
+/// menu loop Windows runs while the title bar is held: no UI pass runs then
+/// in a working window either. Read from another thread, live.
+#[cfg(windows)]
+pub(super) fn window_held() -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetGUIThreadInfo, GetWindowThreadProcessId, IsIconic, GUITHREADINFO, GUI_INMENUMODE,
+        GUI_INMOVESIZE,
+    };
+    let hwnd = WINDOW.load(Ordering::SeqCst);
+    if hwnd == 0 {
+        return false;
+    }
+    let hwnd = HWND(hwnd as _);
+    if unsafe { IsIconic(hwnd) }.as_bool() {
+        return true;
+    }
+    let thread = unsafe { GetWindowThreadProcessId(hwnd, None) };
+    let mut info = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    thread != 0
+        && unsafe { GetGUIThreadInfo(thread, &mut info) }.is_ok()
+        && (info.flags & (GUI_INMOVESIZE | GUI_INMENUMODE)).0 != 0
+}
+
+#[cfg(not(windows))]
+#[allow(dead_code)]
+pub(super) fn window_held() -> bool {
+    false
+}
+
+/// Run `hook` once, when the window is confirmed drawing: frames presented
+/// for a while with no surface error, visible ([`PresentTracker`]).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn when_drawing(hook: OnDrawing) {
+    if let Ok(mut on_drawing) = ON_DRAWING.lock() {
+        *on_drawing = Some(hook);
+    }
+}
+
+/// The user quit before the window drew. A deliberate quit is no failed
+/// start: the marker goes without counting, and no worker still in the
+/// driver writes it again.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn abandon() {
+    if let (Some(directory), Ok(mut launch)) = (STATE_DIR.get(), LAUNCH.lock()) {
+        launch.abandon(directory, ProcessId::current());
     }
 }
 
@@ -479,8 +802,13 @@ fn failures() -> u64 {
 /// working, that means the backend it started on failed to draw.
 fn lost_before_drawing() {
     let confirmed = PRESENT.lock().is_ok_and(|tracker| tracker.confirmed);
-    if let (Some(directory), Ok(mut started)) = (STATE_DIR.get(), STARTED.lock()) {
-        lose_started(directory, &mut started, confirmed, ProcessId::current());
+    if let (Some(directory), Ok(mut launch)) = (STATE_DIR.get(), LAUNCH.lock()) {
+        lose_started(
+            directory,
+            &mut launch.started,
+            confirmed,
+            ProcessId::current(),
+        );
     }
 }
 
@@ -573,13 +901,8 @@ pub(super) fn window_closed() {
 /// `drew`. The history may be busy with another instance; the next frame
 /// tries again, so the GUI never waits for it.
 fn clear_marker(drew: bool) {
-    let (Some(directory), Ok(mut started)) = (STATE_DIR.get(), STARTED.lock()) else {
-        return;
-    };
-    if let Some(marker) = started.as_ref() {
-        if finish_launch(directory, marker, ProcessId::current(), drew) {
-            started.take();
-        }
+    if let (Some(directory), Ok(mut launch)) = (STATE_DIR.get(), LAUNCH.lock()) {
+        launch.clear(directory, ProcessId::current(), drew);
     }
 }
 
@@ -591,23 +914,42 @@ fn finish_launch(directory: &Path, marker: &Marker, owner: ProcessId, drew: bool
     true
 }
 
-/// Confirms a working window from the frame counter, the time and surface
-/// errors. egui-wgpu presents inside its painter and reports nothing after a
-/// present; a surface it fails to recreate is not reported at all. So the
-/// window must keep drawing for a while after the last reported error, which
-/// takes it past device creation and the first presents, where the drivers of
-/// issue #59 fail.
+/// Confirms a working window from the frame counter, the time, surface
+/// errors and a proof of a presented frame. egui-wgpu presents inside its
+/// painter and reports nothing after a present; a surface it fails to
+/// recreate is not reported at all, and its later paints return before
+/// drawing. So the window must keep drawing for a while after the last
+/// reported error, which takes it past device creation and the first
+/// presents, where the drivers of issue #59 fail, and then answer a
+/// screenshot, which egui-wgpu takes only from a frame it acquired and drew.
 struct PresentTracker {
     span: Option<Span>,
     confirmed: bool,
+    /// The id the next span gets, and the next ask.
+    next_span: u64,
+    next_request: u64,
 }
 
 /// Visible frames since the last surface error.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Span {
+    id: u64,
     since: Instant,
     first_frame: u64,
     failures: u64,
+    /// The frame that last asked for the proof in this span, and the asks
+    /// made in it.
+    asked: Option<(u64, std::ops::RangeInclusive<u64>)>,
+}
+
+/// What a UI pass does for the confirmation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    Wait,
+    /// Ask for the proof: a screenshot of this frame, carrying this.
+    Prove(PresentProof),
+    /// Confirmed, once.
+    Confirmed,
 }
 
 impl PresentTracker {
@@ -615,34 +957,66 @@ impl PresentTracker {
         Self {
             span: None,
             confirmed: false,
+            next_span: 0,
+            next_request: 0,
         }
     }
 
-    /// True once: after [`CONFIRM_AFTER`] and [`CONFIRM_FRAMES`] of visible
-    /// frames with no new surface error. A surface error or a minimized
-    /// window starts the span again.
-    fn observe(&mut self, frame: u64, failures: u64, visible: bool, now: Instant) -> bool {
+    /// After [`CONFIRM_AFTER`] and [`CONFIRM_FRAMES`] of visible frames with
+    /// no new surface error, asks for the proof (again after
+    /// [`PROOF_AGAIN_AFTER`] frames without it), and confirms once an
+    /// answer to one of this span's asks came (`proofs`). A surface error,
+    /// a skipped frame, a new device or a minimized window starts the span
+    /// again, and answers to an earlier span's asks are ignored.
+    fn observe(
+        &mut self,
+        frame: u64,
+        failures: u64,
+        visible: bool,
+        now: Instant,
+        proofs: &[PresentProof],
+    ) -> Step {
         if self.confirmed {
-            return false;
+            return Step::Wait;
         }
-        match self.span {
+        let request = self.next_request;
+        match self.span.as_mut() {
             Some(span) if visible && span.failures == failures => {
-                if frame >= span.first_frame + CONFIRM_FRAMES
-                    && now.duration_since(span.since) >= CONFIRM_AFTER
-                {
-                    self.confirmed = true;
-                    return true;
+                let ask = if let Some((asked, requests)) = &span.asked {
+                    if proofs
+                        .iter()
+                        .any(|proof| proof.span == span.id && requests.contains(&proof.request))
+                    {
+                        self.confirmed = true;
+                        return Step::Confirmed;
+                    }
+                    (frame >= asked + PROOF_AGAIN_AFTER).then_some(*requests.start()..=request)
+                } else {
+                    (frame >= span.first_frame + CONFIRM_FRAMES
+                        && now.duration_since(span.since) >= CONFIRM_AFTER)
+                        .then_some(request..=request)
+                };
+                if let Some(requests) = ask {
+                    span.asked = Some((frame, requests));
+                    self.next_request += 1;
+                    return Step::Prove(PresentProof {
+                        span: span.id,
+                        request,
+                    });
                 }
             }
             _ => {
                 self.span = visible.then_some(Span {
+                    id: self.next_span,
                     since: now,
                     first_frame: frame,
                     failures,
+                    asked: None,
                 });
+                self.next_span += 1;
             }
         }
-        false
+        Step::Wait
     }
 }
 
@@ -939,8 +1313,34 @@ fn system_gpus() -> String {
 }
 
 /// Vendor, device and driver version of each DXGI adapter. Creates no device.
+/// Until the window is confirmed drawing, the list taken before it. After
+/// that (a renderer rebuilt after a lost device), a fresh one under a limit
+/// on a thread of its own: empty if it does not return in time.
 #[cfg(windows)]
 fn dxgi_adapters() -> Vec<(u32, u32, String)> {
+    let shown = crate::startup::window_shown();
+    if !shown {
+        if let Some(listed) = ADAPTERS.lock().ok().and_then(|listed| listed.clone()) {
+            return listed;
+        }
+    }
+    crate::stall::run(adapters_lane(shown), list_dxgi_adapters, || {}).unwrap_or_default()
+}
+
+/// The lane of a DXGI adapter list the window takes itself: startup's until
+/// it is confirmed drawing, then the one the second screen's graphics reads
+/// use, so a later renderer neither waits behind nor holds startup's.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn adapters_lane(painted: bool) -> crate::stall::Call {
+    if painted {
+        crate::stall::Call::GpuFacts
+    } else {
+        crate::stall::Call::GpuDetect
+    }
+}
+
+#[cfg(windows)]
+fn list_dxgi_adapters() -> Vec<(u32, u32, String)> {
     use windows::core::Interface;
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIDevice, IDXGIFactory1};
     let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
@@ -965,6 +1365,11 @@ fn dxgi_adapters() -> Vec<(u32, u32, String)> {
 
 #[cfg(not(windows))]
 fn dxgi_adapters() -> Vec<(u32, u32, String)> {
+    Vec::new()
+}
+
+#[cfg(not(windows))]
+fn list_dxgi_adapters() -> Vec<(u32, u32, String)> {
     Vec::new()
 }
 
@@ -1743,6 +2148,67 @@ mod tests {
     }
 
     #[test]
+    fn a_quit_from_the_driver_notice_leaves_no_marker_and_no_worker_writes_it_again() {
+        let directory = temp_dir("abandon");
+        let owner = exited_process();
+        let mut launch = Launch::new();
+        assert!(launch.start(
+            Some(&directory),
+            owner,
+            marker("10de:2c02 32.0", "enumerate")
+        ));
+        assert!(marker_path(&directory, owner).exists());
+        // Cancel while the window's thread is stuck in the driver.
+        launch.abandon(&directory, owner);
+        assert!(!marker_path(&directory, owner).exists());
+        // A probe or list still in the driver returns later, and the
+        // window's thread may still reach its adapter selector.
+        launch.mark_thread(Some(&directory), owner, Some(WINDOW));
+        assert!(!launch.start(Some(&directory), owner, marker("10de:2c02 32.0", "dx12")));
+        assert!(!marker_path(&directory, owner).exists());
+        // The next launch counts no failed start.
+        assert!(sweep(&directory, ProcessId::current()).is_empty());
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn a_launch_that_dies_listing_the_graphics_cards_skips_the_list_next_time() {
+        let directory = temp_dir("listing");
+        let owner = exited_process();
+        let mut launch = Launch::new();
+        // The marker is there before the list starts, and names the thread
+        // that lists once it runs. A crash there is the window's.
+        launch.start(Some(&directory), owner, marker("", LISTING));
+        launch.mark_thread(Some(&directory), owner, Some(0x5150));
+        let saved: Marker =
+            serde_json::from_slice(&fs::read(marker_path(&directory, owner)).unwrap()).unwrap();
+        assert_eq!(saved.thread, Some(0x5150));
+        // That launch died in the driver while listing.
+        let history = sweep(&directory, ProcessId::current());
+        assert_eq!(history.len(), 1, "{history:?}");
+        assert_eq!(
+            (history[0].gpu.as_str(), history[0].backend.as_str()),
+            ("", LISTING)
+        );
+        assert!(Prepared { history }.listing_avoided());
+        assert!(!Prepared {
+            history: Vec::new()
+        }
+        .listing_avoided());
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    #[test]
+    fn after_the_first_frame_the_adapter_list_leaves_the_startup_lane() {
+        use crate::stall::Call;
+        // Before the window is confirmed, a stuck startup call refuses it.
+        assert_eq!(adapters_lane(false), Call::GpuDetect);
+        // A renderer started later (after a lost device) neither waits behind
+        // nor holds startup's lane, nor logs its stalls as startup's.
+        assert_eq!(adapters_lane(true), Call::GpuFacts);
+    }
+
+    #[test]
     fn the_windows_instance_leaves_out_opengl_unless_wgpu_backend_asks() {
         let full = instance_backends(None, Plan::Full);
         assert_eq!(full, Backends::DX12 | Backends::VULKAN);
@@ -2078,49 +2544,180 @@ mod tests {
     }
 
     /// Visible frames every 200 ms, as the GUI repaints, counted from `start`.
+    const NO_PROOF: &[PresentProof] = &[];
+
+    /// The proof a step asks for; panics on any other step.
+    fn ask(step: Step) -> PresentProof {
+        match step {
+            Step::Prove(proof) => proof,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// Frames `frames` a 200 ms apart, the proof answering the frame after
+    /// each ask: whether the window was confirmed.
     fn run(
         tracker: &mut PresentTracker,
         start: Instant,
         frames: std::ops::Range<u64>,
         failures: u64,
     ) -> bool {
+        let mut answer = None;
         frames.into_iter().any(|frame| {
-            tracker.observe(
+            let proofs: Vec<PresentProof> = answer.take().into_iter().collect();
+            let step = tracker.observe(
                 frame,
                 failures,
                 true,
                 start + Duration::from_millis(200 * frame),
-            )
+                &proofs,
+            );
+            if let Step::Prove(proof) = step {
+                answer = Some(proof);
+            }
+            step == Step::Confirmed
         })
     }
 
     #[test]
-    fn the_window_works_after_frames_and_time_without_surface_errors() {
+    fn the_window_works_after_frames_and_time_without_surface_errors_and_a_proof() {
         let start = Instant::now();
         let mut tracker = PresentTracker::new();
         // Frames alone are not enough: egui may lay out one frame many times.
         for frame in 0..100 {
-            assert!(!tracker.observe(frame, 0, true, start));
+            assert_eq!(tracker.observe(frame, 0, true, start, NO_PROOF), Step::Wait);
         }
-        assert!(tracker.observe(100, 0, true, start + CONFIRM_AFTER));
+        let proof = ask(tracker.observe(100, 0, true, start + CONFIRM_AFTER, NO_PROOF));
+        assert_eq!(
+            tracker.observe(101, 0, true, start + CONFIRM_AFTER, &[proof]),
+            Step::Confirmed
+        );
         let mut tracker = PresentTracker::new();
         // Nor is time alone, with one frame laid out repeatedly.
-        assert!(!tracker.observe(0, 0, true, start));
-        assert!(!tracker.observe(0, 0, true, start + 10 * CONFIRM_AFTER));
-        assert!(tracker.observe(CONFIRM_FRAMES, 0, true, start + CONFIRM_AFTER));
-        assert!(!tracker.observe(CONFIRM_FRAMES + 1, 0, true, start + CONFIRM_AFTER));
+        assert_eq!(tracker.observe(0, 0, true, start, NO_PROOF), Step::Wait);
+        assert_eq!(
+            tracker.observe(0, 0, true, start + 10 * CONFIRM_AFTER, NO_PROOF),
+            Step::Wait
+        );
+        let proof = ask(tracker.observe(CONFIRM_FRAMES, 0, true, start + CONFIRM_AFTER, NO_PROOF));
+        assert_eq!(
+            tracker.observe(CONFIRM_FRAMES + 1, 0, true, start + CONFIRM_AFTER, &[proof]),
+            Step::Confirmed
+        );
+        // Once.
+        assert_eq!(
+            tracker.observe(CONFIRM_FRAMES + 2, 0, true, start + CONFIRM_AFTER, &[proof]),
+            Step::Wait
+        );
+    }
+
+    #[test]
+    fn frames_that_present_nothing_are_never_confirmed() {
+        let start = Instant::now();
+        let later = start + CONFIRM_AFTER;
+        let mut tracker = PresentTracker::new();
+        assert_eq!(tracker.observe(0, 0, true, start, NO_PROOF), Step::Wait);
+        let first = ask(tracker.observe(CONFIRM_FRAMES, 0, true, later, NO_PROOF));
+        // The surface was removed and its recreation failed: egui-wgpu's
+        // paints return before drawing, with no surface error, and the UI
+        // passes go on. No screenshot answers, so nothing is confirmed; the
+        // ask is repeated now and then.
+        for frame in CONFIRM_FRAMES + 1..CONFIRM_FRAMES + PROOF_AGAIN_AFTER {
+            assert_eq!(tracker.observe(frame, 0, true, later, NO_PROOF), Step::Wait);
+        }
+        let again =
+            ask(tracker.observe(CONFIRM_FRAMES + PROOF_AGAIN_AFTER, 0, true, later, NO_PROOF));
+        assert_eq!(again.span, first.span);
+        assert_ne!(again.request, first.request);
+        // A late answer to the first ask of this span still proves a frame.
+        assert_eq!(
+            tracker.observe(
+                CONFIRM_FRAMES + PROOF_AGAIN_AFTER + 1,
+                0,
+                true,
+                later,
+                &[first]
+            ),
+            Step::Confirmed
+        );
+    }
+
+    #[test]
+    fn a_late_answer_from_before_a_surface_error_or_a_new_device_proves_nothing() {
+        let start = Instant::now();
+        let later = start + CONFIRM_AFTER;
+        // `failures` counts surface errors, frames the painter skipped and
+        // devices: a lost device skips frames and its replacement is one more.
+        for (what, after) in [
+            ("a surface error", 1),
+            ("skipped frames and a new device", 4),
+        ] {
+            let mut tracker = PresentTracker::new();
+            tracker.observe(0, 0, true, start, NO_PROOF);
+            let old = ask(tracker.observe(CONFIRM_FRAMES, 0, true, later, NO_PROOF));
+            // The old frame's answer arrives only after the change.
+            let frame = CONFIRM_FRAMES + 1;
+            assert_eq!(
+                tracker.observe(frame, after, true, later, &[old]),
+                Step::Wait,
+                "{what}"
+            );
+            let new_start = later;
+            let new_later = new_start + CONFIRM_AFTER;
+            assert_eq!(
+                tracker.observe(frame + 1, after, true, new_start, &[old]),
+                Step::Wait,
+                "{what}"
+            );
+            let new =
+                ask(tracker.observe(frame + 1 + CONFIRM_FRAMES, after, true, new_later, &[old]));
+            assert_ne!(new.span, old.span, "{what}");
+            // Still only the old answer: nothing.
+            assert_eq!(
+                tracker.observe(frame + 2 + CONFIRM_FRAMES, after, true, new_later, &[old]),
+                Step::Wait,
+                "{what}"
+            );
+            // The new span's own answer confirms.
+            assert_eq!(
+                tracker.observe(
+                    frame + 3 + CONFIRM_FRAMES,
+                    after,
+                    true,
+                    new_later,
+                    &[old, new]
+                ),
+                Step::Confirmed,
+                "{what}"
+            );
+        }
+        // An answer naming this span but an ask it never made proves nothing.
+        let mut tracker = PresentTracker::new();
+        tracker.observe(0, 0, true, start, NO_PROOF);
+        let asked = ask(tracker.observe(CONFIRM_FRAMES, 0, true, later, NO_PROOF));
+        let forged = PresentProof {
+            request: asked.request + 7,
+            ..asked
+        };
+        assert_eq!(
+            tracker.observe(CONFIRM_FRAMES + 1, 0, true, later, &[forged]),
+            Step::Wait
+        );
     }
 
     #[test]
     fn a_lost_surface_that_is_recreated_late_is_not_a_working_window() {
         let start = Instant::now();
         let mut tracker = PresentTracker::new();
-        assert!(!tracker.observe(0, 0, true, start));
+        assert_eq!(tracker.observe(0, 0, true, start, NO_PROOF), Step::Wait);
         // Lost: egui reports it and recreates the surface on the next frame,
         // which can fail without a report and without a present.
-        assert!(!tracker.observe(1, 1, true, start + Duration::from_millis(16)));
-        assert!(!tracker.observe(2, 1, true, start + Duration::from_millis(32)));
-        assert!(!tracker.observe(3, 1, true, start + Duration::from_millis(48)));
+        for (frame, ms) in [(1, 16), (2, 32), (3, 48)] {
+            assert_eq!(
+                tracker.observe(frame, 1, true, start + Duration::from_millis(ms), NO_PROOF),
+                Step::Wait
+            );
+        }
         // Confirmed only once the window kept drawing after the error.
         assert!(!run(&mut tracker, start, 4..15, 1));
         let mut tracker = PresentTracker::new();
@@ -2205,10 +2802,32 @@ mod tests {
     fn a_minimized_window_is_not_confirmed() {
         let start = Instant::now();
         let mut tracker = PresentTracker::new();
-        assert!(!tracker.observe(0, 0, true, start));
-        assert!(!tracker.observe(CONFIRM_FRAMES, 0, false, start + CONFIRM_AFTER));
-        assert!(!tracker.observe(2 * CONFIRM_FRAMES, 0, true, start + CONFIRM_AFTER));
-        assert!(tracker.observe(3 * CONFIRM_FRAMES, 0, true, start + 2 * CONFIRM_AFTER));
+        assert_eq!(tracker.observe(0, 0, true, start, NO_PROOF), Step::Wait);
+        assert_eq!(
+            tracker.observe(CONFIRM_FRAMES, 0, false, start + CONFIRM_AFTER, NO_PROOF),
+            Step::Wait
+        );
+        assert_eq!(
+            tracker.observe(2 * CONFIRM_FRAMES, 0, true, start + CONFIRM_AFTER, NO_PROOF),
+            Step::Wait
+        );
+        let proof = ask(tracker.observe(
+            3 * CONFIRM_FRAMES,
+            0,
+            true,
+            start + 2 * CONFIRM_AFTER,
+            NO_PROOF,
+        ));
+        assert_eq!(
+            tracker.observe(
+                3 * CONFIRM_FRAMES + 1,
+                0,
+                true,
+                start + 2 * CONFIRM_AFTER,
+                &[proof]
+            ),
+            Step::Confirmed
+        );
     }
 
     // ── Remote renderer rules ───────────────────────────────────────────────

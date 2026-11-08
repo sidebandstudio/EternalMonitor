@@ -35,7 +35,7 @@ final class WireProtocolGoldenTests: XCTestCase {
 
     func testGoldenFileIsBundledAndComplete() throws {
         XCTAssertEqual(
-            Self.vectors.count, 43,
+            Self.vectors.count, 47,
             "golden vector count drifted — update both test suites together"
         )
     }
@@ -494,6 +494,52 @@ final class WireProtocolGoldenTests: XCTestCase {
         XCTAssertEqual(data.dropFirst(8).dropLast(), plain.dropFirst(8))
         guard case .heartbeat(let old) = try XCTUnwrap(Wire.parseControl(plain)).message else { return XCTFail("wrong type") }
         XCTAssertEqual(old.notice, Heartbeat.noticeNone)
+    }
+
+    /// A PC that takes smaller media datagrams says so, to an iPad that
+    /// asked; the request and the frame count are appended to the bodies
+    /// earlier versions read, so those read them as before.
+    func testMediaSizeVectors() throws {
+        XCTAssertEqual(HelloAck.hostCapMediaSize, 0x0080)
+        XCTAssertEqual(Hello2.featureMediaSize, 0x0040)
+        XCTAssertEqual(KeyframeRequest.minMediaDgram, 576)
+
+        let ackData = try vector("hello_ack_media_size")
+        let (ackHeader, ackMessage) = try XCTUnwrap(Wire.parseControl(ackData))
+        guard case .helloAck(let ack) = ackMessage else { return XCTFail("wrong type") }
+        XCTAssertEqual(ack.hostCaps, HelloAck.hostCapNack | HelloAck.hostCapContiguousFrameSeq | HelloAck.hostCapMediaSize)
+        XCTAssertEqual(Wire.encodeControl(sessionId: ackHeader.sessionId, msgSeq: ackHeader.msgSeq, message: ackMessage), ackData)
+
+        let request = try vector("keyframe_request_media_size")
+        let (requestHeader, requestMessage) = try XCTUnwrap(Wire.parseControl(request))
+        XCTAssertEqual(requestHeader.msgSeq, 51)
+        XCTAssertEqual(requestMessage, .keyframeRequest(KeyframeRequest(streamEpoch: 3, lastCompleteSeq: 0, reason: .startup,
+                                                                        maxMediaDgram: 1200)))
+        XCTAssertEqual(Wire.encodeControl(sessionId: 0x1234_5678, msgSeq: 51, message: requestMessage), request)
+        XCTAssertEqual(request.count, try vector("keyframe_request").count + 2)
+
+        let counted = try vector("heartbeat_frames_sent")
+        let (heartbeatHeader, heartbeatMessage) = try XCTUnwrap(Wire.parseControl(counted))
+        guard case .heartbeat(let hb) = heartbeatMessage else { return XCTFail("wrong type") }
+        XCTAssertEqual(hb.framesSent, 1234)
+        XCTAssertEqual(hb.notice, Heartbeat.noticeNone)
+        XCTAssertEqual(hb.streamConfig, Self.sampleConfig)
+        XCTAssertEqual(Wire.encodeControl(sessionId: 0x1234_5678, msgSeq: heartbeatHeader.msgSeq, message: heartbeatMessage),
+                       counted)
+        let plain = try vector("heartbeat")
+        XCTAssertEqual(counted.count, plain.count + 5)
+        XCTAssertEqual(counted.dropFirst(16).prefix(plain.count - 16), plain.dropFirst(16))
+        guard case .heartbeat(let old) = try XCTUnwrap(Wire.parseControl(plain)).message else { return XCTFail("wrong type") }
+        XCTAssertNil(old.framesSent)
+
+        // A notice and the count together: the notice byte, then the count.
+        let both = try vector("heartbeat_no_display_frames_sent")
+        let (bothHeader, bothMessage) = try XCTUnwrap(Wire.parseControl(both))
+        guard case .heartbeat(let noDisplay) = bothMessage else { return XCTFail("wrong type") }
+        XCTAssertEqual(noDisplay.notice, Heartbeat.noticeNoDisplay)
+        XCTAssertEqual(noDisplay.framesSent, 77)
+        XCTAssertEqual(Array(both.dropFirst(plain.count)), [Heartbeat.noticeNoDisplay, 77, 0, 0, 0])
+        XCTAssertEqual(Wire.encodeControl(sessionId: 0x1234_5678, msgSeq: bothHeader.msgSeq, message: bothMessage), both)
     }
 
     func testByeVector() throws {

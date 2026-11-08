@@ -75,9 +75,12 @@ impl AnalyzerApp {
         }
         if snap.using_software_fallback {
             // Choices made while troubleshooting are the usual reason a
-            // working graphics card is skipped, so offer to undo them first.
-            let customized = self.settings_encoder_choice != ENCODER_AUTO_LABEL
-                || self.settings_encoder_input != crate::encoder::input::EncoderInput::default();
+            // working graphics card is skipped, so offer to undo them first,
+            // unless the driver did not answer at startup: then Restart.
+            let customized = !snap.gpu_detection_stalled
+                && (self.settings_encoder_choice != ENCODER_AUTO_LABEL
+                    || self.settings_encoder_input
+                        != crate::encoder::input::EncoderInput::default());
             let mut reset = false;
             let mut restart = false;
             widgets::banner(
@@ -88,6 +91,7 @@ impl AnalyzerApp {
                 &software_fallback_body(
                     customized,
                     snap.nvidia_driver_outdated,
+                    snap.gpu_detection_stalled,
                     &snap.driver_update_vendors,
                 ),
                 if customized { 230.0 } else { 110.0 },
@@ -834,19 +838,23 @@ enum HeaderAction {
 pub(super) const SOFTWARE_FALLBACK_TITLE: &str =
     "Video is using the processor instead of the graphics card";
 
-/// What the CPU fallback notice says: undo custom settings first, say the
-/// NVIDIA driver is too old when that is what the graphics card refused,
-/// name the AMD or Intel driver whose card could not start encoding
-/// (`driver_vendors`), or suggest a driver update.
+/// What the CPU fallback notice says: that the graphics driver did not
+/// answer at startup, undo custom settings first, say the NVIDIA driver is
+/// too old when that is what the graphics card refused, name the AMD or
+/// Intel driver whose card could not start encoding (`driver_vendors`), or
+/// suggest a driver update.
 pub(super) fn software_fallback_body(
     customized: bool,
     nvidia_driver_outdated: bool,
+    detection_stalled: bool,
     driver_vendors: &[crate::gpu::GpuVendor],
 ) -> String {
     use crate::gpu::GpuVendor::{Amd, Intel};
     let amd = driver_vendors.contains(&Amd);
     let intel = driver_vendors.contains(&Intel);
-    if customized {
+    if detection_stalled {
+        "The graphics driver did not respond when EternalMonitor started, so the processor encodes the video for now. The picture may lag and the PC may run hot. Click Restart to try the graphics card again.".to_string()
+    } else if customized {
         "The graphics card could not encode video with the options chosen in Settings, so the picture may lag and the PC may run hot. Go back to the recommended options first.".to_string()
     } else if nvidia_driver_outdated {
         format!(
