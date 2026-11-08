@@ -436,8 +436,9 @@ pub struct PairingHost<A: PeerAddr> {
     /// Message 1 reads per source (IP).
     per_source: SourceLimiter<A::Bucket>,
     /// Message 1 reads per exact address, for those with a valid cookie:
-    /// only the QR's holder can send them, so spoofing the iPad's IP from
-    /// another port never uses up its reads.
+    /// only the holder of the current QR can send them (the cookie binds
+    /// the window), so spoofing the iPad's IP from another port never uses
+    /// up its reads.
     verified_rate: SourceLimiter<A>,
     cookies: CookieJar,
     /// Message 1 arrivals, for the load test.
@@ -555,23 +556,20 @@ impl<A: PeerAddr> PairingHost<A> {
         }
     }
 
-    /// A cookie reply to `msg1` (without its cookie) from `from`.
+    /// A cookie reply to `msg1` (without its cookie) from `from`, for
+    /// `binding` ([`cookie::pairing_binding`]).
     fn send_cookie(
         &mut self,
         now: Duration,
         from: &A,
+        binding: &[u8],
         msg1: &[u8],
         key: &Key32,
         out: &mut Vec<PairOutput<A>>,
     ) {
-        let reply = self.cookies.reply(
-            now,
-            &from.cookie_input(),
-            key,
-            EXT_PAIR_QR,
-            msg1,
-            self.rng.as_mut(),
-        );
+        let reply = self
+            .cookies
+            .reply(now, binding, key, EXT_PAIR_QR, msg1, self.rng.as_mut());
         self.cookie_replies += 1;
         out.push(PairOutput::Send {
             to: from.clone(),
@@ -614,9 +612,10 @@ impl<A: PeerAddr> PairingHost<A> {
             return;
         };
         self.arrivals.record(now);
+        let binding = cookie::pairing_binding(&window.nonce_r, &from.cookie_input());
         let verified = mac.is_some_and(|mac| {
             self.cookies
-                .verify(now, &from.cookie_input(), &canon, &mac, self.rng.as_mut())
+                .verify(now, &binding, &canon, &mac, self.rng.as_mut())
         });
         // Under load, nothing answers or reads a message 1 without a valid
         // cookie for its exact source, retries of the pairing in flight
@@ -635,7 +634,7 @@ impl<A: PeerAddr> PairingHost<A> {
         };
         if self.under_load(now) && !verified {
             let key = cookie_key();
-            self.send_cookie(now, from, &canon, &key, out);
+            self.send_cookie(now, from, &binding, &canon, &key, out);
             return;
         }
         let resend = self
@@ -653,7 +652,7 @@ impl<A: PeerAddr> PairingHost<A> {
             }
             if !admitted && !verified {
                 let key = cookie_key();
-                self.send_cookie(now, from, &canon, &key, out);
+                self.send_cookie(now, from, &binding, &canon, &key, out);
                 return;
             }
             let attempt = self.attempt.as_mut().expect("checked above");
@@ -696,7 +695,7 @@ impl<A: PeerAddr> PairingHost<A> {
         if !allowed {
             if !verified {
                 let key = cookie_key();
-                self.send_cookie(now, from, &canon, &key, out);
+                self.send_cookie(now, from, &binding, &canon, &key, out);
             }
             return;
         }
@@ -1013,8 +1012,8 @@ impl PairingClient {
     }
 
     /// A cookie reply to this message 1, before message 2: keeps the cookie
-    /// and gives back message 1 to send again at once. Anything else is
-    /// `None` and changes nothing.
+    /// and gives back message 1 to send again at once. A copy of a cookie
+    /// already held, and anything else, is `None` and changes nothing.
     pub fn handle_cookie(&mut self, datagram: &[u8]) -> Option<Vec<u8>> {
         self.state.as_ref()?;
         let reply = CookieReply::parse(datagram).ok()?;
@@ -1023,6 +1022,9 @@ impl PairingClient {
         }
         let value = cookie::open(&self.cookie_key, &reply, &cookie::msg1_digest(&self.msg1))?;
         let msg1 = cookie::attach(&self.msg1, &value);
+        if self.with_cookie.as_ref() == Some(&msg1) {
+            return None;
+        }
         self.with_cookie = Some(msg1.clone());
         Some(msg1)
     }

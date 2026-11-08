@@ -150,11 +150,14 @@ def main():
     psk = bytes(range(0x50, 0x70))
     nonce_session = bytes(range(0x01, 0x0D))
     nonce_pair = bytes(range(0x11, 0x1D))
+    nonce_r = bytes(range(0x30, 0x40))
     v4 = address("192.0.2.10", 50000)
     v6 = address("2001:db8::1", 50000)
     mapped = address("::ffff:192.0.2.10", 50000)
     assert mapped == v4
-    cookie_v4 = hmac16(secret, v4)
+    # A session cookie binds the dev_id and the address; a pairing cookie
+    # binds the QR window's nonce_r and the address.
+    cookie_v4 = hmac16(secret, dev_id + v4)
     session_key = hkdf32(SALT, k_dev, dev_id)
     pairing_key = hkdf32(SALT, psk, b"pair")
     rows = [
@@ -162,10 +165,12 @@ def main():
         ("input.address_v4", v4),
         ("input.address_v6", v6),
         ("input.pair_psk", psk),
+        ("input.nonce_r", nonce_r),
         ("input.nonce_session", nonce_session),
         ("input.nonce_pair", nonce_pair),
         ("cookie.v4", cookie_v4),
-        ("cookie.v6", hmac16(secret, v6)),
+        ("cookie.v6", hmac16(secret, dev_id + v6)),
+        ("cookie.pair_v4", hmac16(secret, nonce_r + v4)),
         ("key.session", session_key),
         ("key.pairing", pairing_key),
         ("msg1.digest", hashlib.sha256(msg1).digest()),
@@ -178,8 +183,10 @@ def main():
         "# Return-routability cookie vectors. One `name<space>lowercase-hex` per line.",
         "# Written by cookie_vectors.py (independent of the Rust code); message 1, k_dev",
         "# and dev_id are session_golden.txt's. Addresses are the IP (4 or 16 bytes,",
-        "# v4-mapped IPv6 as IPv4) then the port, little-endian. cookie.* are",
-        "# HMAC-SHA-256(secret, address)[..16]; key.session is HKDF(salt \"EM v3 cookie\",",
+        "# v4-mapped IPv6 as IPv4) then the port, little-endian. cookie.v4/v6 are",
+        "# HMAC-SHA-256(secret, dev_id || address)[..16] (a session cookie);",
+        "# cookie.pair_v4 is HMAC-SHA-256(secret, nonce_r || address)[..16] (pairing).",
+        "# The iPad treats a cookie as opaque. key.session is HKDF(salt \"EM v3 cookie\",",
         "# k_dev, info dev_id), key.pairing HKDF(salt, pair_psk, info \"pair\");",
         "# msg1.with_cookie is message 1 with EXT_COOKIE carrying msg1.mac2 under",
         "# cookie.v4; reply.* seal cookie.v4 with AAD msg1.digest.",

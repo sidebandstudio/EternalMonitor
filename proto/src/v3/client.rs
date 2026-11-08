@@ -528,7 +528,8 @@ impl Client {
     }
 
     /// A cookie reply for the message 1 being sent: keep the cookie and
-    /// send message 1 again with it at once. Anything else is dropped: a
+    /// send message 1 again with it at once, unless it's the cookie already
+    /// held. Anything else is dropped: a
     /// reply opens only under this attempt's key and its exact message 1.
     fn handle_cookie(&mut self, now: Duration, datagram: &[u8], out: &mut Vec<ClientOutput>) {
         let Attempt::Connecting {
@@ -550,6 +551,14 @@ impl Client {
         let Some(value) = cookie::open(&k, &reply, &cookie::msg1_digest(initiator.msg1())) else {
             return;
         };
+        // The cookie it already holds: its next retry carries it. Copies of
+        // a reply never make the iPad send more.
+        if self
+            .cookie
+            .is_some_and(|c| c.cookie == value && c.fresh(now))
+        {
+            return;
+        }
         let held = HeldCookie {
             cookie: value,
             received: now,
@@ -1388,6 +1397,11 @@ mod tests {
             vec![cookie::attach(&msg1, &value)],
             "at once, with the cookie"
         );
+        // A copy of the same reply sends nothing more.
+        let copy = cookie_reply(&msg1, &value);
+        assert!(ipad
+            .handle_datagram(T0 + Duration::from_millis(4), &copy, 1_000)
+            .is_empty());
         // Retries carry it too, on the usual schedule from the resend.
         let at = T0 + Duration::from_millis(3) + ClientConfig::new(HOST).msg1_retry_interval;
         assert_eq!(

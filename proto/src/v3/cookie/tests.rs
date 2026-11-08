@@ -31,14 +31,20 @@ fn vectors() {
     assert_eq!(v6.cookie_input(), v["input.address_v6"]);
     assert_eq!(mapped.cookie_input(), v["input.address_v4"]);
 
-    let cookie: [u8; 16] = arr(&v["cookie.v4"]);
-    assert_eq!(cookie_value(&secret, &v["input.address_v4"]), cookie);
-    assert_eq!(
-        cookie_value(&secret, &v["input.address_v6"]).to_vec(),
-        v["cookie.v6"]
-    );
     let k_dev = key32(&g["input.k_dev"]);
     let dev_id: Id16 = arr(&g["input.dev_id"]);
+    let cookie: [u8; 16] = arr(&v["cookie.v4"]);
+    let binding = session_binding(&dev_id, &v["input.address_v4"]);
+    assert_eq!(cookie_value(&secret, &binding), cookie);
+    assert_eq!(
+        cookie_value(&secret, &session_binding(&dev_id, &v["input.address_v6"])).to_vec(),
+        v["cookie.v6"]
+    );
+    let nonce_r: Id16 = arr(&v["input.nonce_r"]);
+    assert_eq!(
+        cookie_value(&secret, &pairing_binding(&nonce_r, &v["input.address_v4"])).to_vec(),
+        v["cookie.pair_v4"]
+    );
     let session = session_key(&k_dev, &dev_id);
     assert_eq!(session.to_vec(), v["key.session"]);
     let pairing = pairing_key(&key32(&v["input.pair_psk"]));
@@ -311,4 +317,73 @@ fn a_held_cookie_is_fresh_for_its_lifetime() {
 fn a_reply_is_smaller_than_any_message_1() {
     const { assert!(COOKIE_REPLY_SIZE < wire::MSG1_EXTENSION_OFFSET + EXTENSION_HEADER_SIZE) };
     assert!(COOKIE_REPLY_SIZE < golden_msg1().len());
+}
+
+/// Reply nonces are a per-jar random prefix and a counter: they never
+/// repeat under one jar, and the prefix is drawn again when the counter
+/// wraps.
+#[test]
+fn reply_nonces_count_up_and_take_a_new_prefix_on_wrap() {
+    let mut rng = SeededRandom::new(6);
+    let mut jar = CookieJar::new(Duration::ZERO, &mut rng);
+    let msg1 = golden_msg1();
+    let nonce = |jar: &mut CookieJar, rng: &mut SeededRandom| {
+        let reply = jar.reply(
+            Duration::from_secs(1),
+            b"b",
+            &[3; 32],
+            EXT_SESSION,
+            &msg1,
+            rng,
+        );
+        CookieReply::parse(&reply).unwrap().nonce
+    };
+    let first = nonce(&mut jar, &mut rng);
+    let second = nonce(&mut jar, &mut rng);
+    assert_eq!(first[..8], second[..8], "one prefix");
+    assert_eq!(first[8..], 0u32.to_le_bytes());
+    assert_eq!(second[8..], 1u32.to_le_bytes());
+    jar.nonce_counter = u32::MAX;
+    let last = nonce(&mut jar, &mut rng);
+    assert_eq!(last[..8], first[..8]);
+    assert_eq!(last[8..], u32::MAX.to_le_bytes());
+    let wrapped = nonce(&mut jar, &mut rng);
+    assert_ne!(wrapped[..8], first[..8], "a new prefix");
+    assert_eq!(wrapped[8..], 0u32.to_le_bytes());
+    // Another jar (a host start) draws its own prefix.
+    let other = nonce(&mut CookieJar::new(Duration::ZERO, &mut rng), &mut rng);
+    assert_ne!(other[..8], first[..8]);
+}
+
+#[test]
+fn a_session_cookie_binds_its_dev_id() {
+    let address = [1u8, 2, 3, 4, 5, 6];
+    let a = session_binding(&[0xA0; 16], &address);
+    let b = session_binding(&[0xB0; 16], &address);
+    let secret = [9u8; 32];
+    assert_ne!(cookie_value(&secret, &a), cookie_value(&secret, &b));
+    let mut rng = SeededRandom::new(7);
+    let mut jar = CookieJar::new(Duration::ZERO, &mut rng);
+    let msg1 = golden_msg1();
+    let key = [3u8; 32];
+    let reply = jar.reply(
+        Duration::from_secs(1),
+        &b,
+        &key,
+        EXT_SESSION,
+        &msg1,
+        &mut rng,
+    );
+    let cookie = open(
+        &key,
+        &CookieReply::parse(&reply).unwrap(),
+        &msg1_digest(&msg1),
+    )
+    .unwrap();
+    let mac = mac2(&cookie, &msg1);
+    assert!(jar.verify(Duration::from_secs(1), &b, &msg1, &mac, &mut rng));
+    assert!(
+        !jar.verify(Duration::from_secs(1), &a, &msg1, &mac, &mut rng),
+        "another dev_id"
+    );
 }

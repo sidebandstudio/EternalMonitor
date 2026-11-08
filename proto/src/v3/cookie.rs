@@ -8,9 +8,11 @@
 //! address, so spoofed sources can never reach the host's crypto or its
 //! shared budgets.
 //!
-//! - **The cookie** is `HMAC-SHA-256(secret, address)[..16]`, where the
-//!   address is the source's IP and port ([`PeerAddr::cookie_input`]) and
-//!   the secret is 32 random bytes rotated every [`SECRET_LIFETIME`]. The
+//! - **The cookie** is `HMAC-SHA-256(secret, binding)[..16]`. For a session
+//!   the binding is the `dev_id` and the source's IP and port
+//!   ([`PeerAddr::cookie_input`]); for pairing, the QR window's `nonce_r`
+//!   and the source. The secret is 32 random bytes rotated every
+//!   [`SECRET_LIFETIME`]. The
 //!   previous secret is still accepted, so a cookie is good for at least
 //!   that long.
 //! - **The cookie reply**, host → iPad, packet type [`COOKIE_TYPE`]:
@@ -25,7 +27,8 @@
 //!
 //!   The AAD is `SHA-256` of the message 1 it answers, without any cookie.
 //!   The key ([`session_key`], [`pairing_key`]) comes from the handshake's
-//!   own secret, so only the iPad that sent the message 1 can read it.
+//!   own secret, so only the holder of that secret (the `dev_id`'s key, or
+//!   the QR) can read it.
 //! - **Message 1 with a cookie** ends in one more extension,
 //!   [`EXT_COOKIE`], length 16: `mac2 = HMAC-SHA-256(cookie, message 1
 //!   without it)[..16]`. The authenticated part of message 1 is unchanged.
@@ -76,9 +79,23 @@ pub fn pairing_key(psk: &Key32) -> Zeroizing<Key32> {
     hkdf32(COOKIE_KEY_SALT, psk, b"pair")
 }
 
-/// The cookie for `address` under `secret`.
-pub fn cookie_value(secret: &Key32, address: &[u8]) -> [u8; COOKIE_LEN] {
-    hmac16(secret, address)
+/// The cookie for `binding` under `secret`: [`session_binding`] or
+/// [`pairing_binding`]. The iPad treats a cookie as opaque.
+pub fn cookie_value(secret: &Key32, binding: &[u8]) -> [u8; COOKIE_LEN] {
+    hmac16(secret, binding)
+}
+
+/// What a session cookie binds: the `dev_id`, then the address
+/// ([`PeerAddr::cookie_input`]). A cookie one device got is no use with
+/// another's message 1, even from the same address.
+pub fn session_binding(dev_id: &Id16, address: &[u8]) -> Vec<u8> {
+    [&dev_id[..], address].concat()
+}
+
+/// What a pairing cookie binds: the QR window's `nonce_r`, then the
+/// address. A cookie from an earlier QR is no use under a later one.
+pub fn pairing_binding(nonce_r: &Id16, address: &[u8]) -> Vec<u8> {
+    [&nonce_r[..], address].concat()
 }
 
 /// `HMAC-SHA-256(cookie, message 1 without a cookie)[..16]`.
@@ -252,21 +269,45 @@ pub fn open(key: &Key32, reply: &CookieReply, digest: &[u8; 32]) -> Option<[u8; 
 /// symmetric work, it's smaller than the message 1 it answers, and a budget
 /// would be the one thing a flood of spoofed message 1s could use up to
 /// keep the genuine iPad from its cookie.
+///
+/// A reply's nonce is a random 64-bit prefix and a 32-bit counter, with a
+/// fresh prefix whenever the counter wraps: never repeated under one jar,
+/// and prefixes drawn at random for every jar (a host start) collide with
+/// a chance of about one in 2^64 per pair, although the reply keys stay the
+/// same for a device across starts.
 pub struct CookieJar {
     current: Zeroizing<Key32>,
     previous: Option<Zeroizing<Key32>>,
     rotated: Duration,
+    nonce_prefix: [u8; 8],
+    nonce_counter: u32,
 }
 
 impl CookieJar {
     pub fn new(now: Duration, rng: &mut dyn Random) -> Self {
         let mut current = Zeroizing::new([0u8; 32]);
         rng.fill(&mut *current);
+        let mut nonce_prefix = [0u8; 8];
+        rng.fill(&mut nonce_prefix);
         Self {
             current,
             previous: None,
             rotated: now,
+            nonce_prefix,
+            nonce_counter: 0,
         }
+    }
+
+    /// The next reply nonce.
+    fn next_nonce(&mut self, rng: &mut dyn Random) -> [u8; 12] {
+        let mut nonce = [0u8; 12];
+        nonce[..8].copy_from_slice(&self.nonce_prefix);
+        nonce[8..].copy_from_slice(&self.nonce_counter.to_le_bytes());
+        self.nonce_counter = self.nonce_counter.wrapping_add(1);
+        if self.nonce_counter == 0 {
+            rng.fill(&mut self.nonce_prefix);
+        }
+        nonce
     }
 
     /// Moves to a fresh secret once the current one is [`SECRET_LIFETIME`]
@@ -286,11 +327,11 @@ impl CookieJar {
     }
 
     /// Whether `mac` is a valid cookie MAC for `msg1` (without its cookie)
-    /// from `address`, under the current or the previous secret.
+    /// under `binding`'s cookie, from the current or the previous secret.
     pub fn verify(
         &mut self,
         now: Duration,
-        address: &[u8],
+        binding: &[u8],
         msg1: &[u8],
         mac: &[u8; MAC2_LEN],
         rng: &mut dyn Random,
@@ -300,26 +341,25 @@ impl CookieJar {
             .chain(self.previous.as_ref())
             .any(|secret| {
                 use subtle::ConstantTimeEq;
-                let expected = mac2(&cookie_value(secret, address), msg1);
+                let expected = mac2(&cookie_value(secret, binding), msg1);
                 bool::from(expected.ct_eq(mac))
             })
     }
 
-    /// A reply to `msg1` (without any cookie) carrying `address`'s current
+    /// A reply to `msg1` (without any cookie) carrying `binding`'s current
     /// cookie, sealed under `key`.
     pub fn reply(
         &mut self,
         now: Duration,
-        address: &[u8],
+        binding: &[u8],
         key: &Key32,
         tag: u16,
         msg1: &[u8],
         rng: &mut dyn Random,
     ) -> Vec<u8> {
         self.rotate(now, rng);
-        let cookie = cookie_value(&self.current, address);
-        let mut nonce = [0u8; 12];
-        rng.fill(&mut nonce);
+        let cookie = cookie_value(&self.current, binding);
+        let nonce = self.next_nonce(rng);
         seal(key, tag, nonce, &cookie, &msg1_digest(msg1)).encode()
     }
 }

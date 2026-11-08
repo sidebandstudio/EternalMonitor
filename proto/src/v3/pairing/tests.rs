@@ -763,6 +763,10 @@ fn under_load_a_pairing_message_1_gets_only_a_cookie_reply_and_pairs_through_it(
     // It reads nothing and remembers nothing: the same message 1 gets the
     // same treatment, and with the cookie it pairs.
     let msg1 = ipad.handle_cookie(reply).expect("the iPad opens it");
+    assert!(
+        ipad.handle_cookie(reply).is_none(),
+        "a copy sends nothing more"
+    );
     assert_eq!(ipad.msg1(), &msg1[..], "retries carry the cookie");
     let msg2 = sends(&host.handle_datagram(T0 + ms(1), &ADDR, &msg1, &creds));
     assert_eq!(msg2.len(), 1);
@@ -901,4 +905,32 @@ fn another_port_on_the_ipads_ip_never_uses_up_its_pairing_reads() {
     let out = sends(&host.handle_datagram(T0, &ipad_addr, &msg1, &creds));
     assert_eq!(wire::classify(&out[0]), V3Kind::Handshake2);
     assert!(!host.under_load(T0));
+}
+
+/// A cookie from an earlier QR window is no use under a later one, even
+/// with a correct MAC over the new message 1 from the same address.
+#[test]
+fn a_pairing_cookie_binds_its_qr_window() {
+    let creds = Creds::default();
+    let mut host = host_with(CookieMode::Always);
+    let qr = host.open(T0, addr());
+    let ipad = client(&qr, 70);
+    let out = sends(&host.handle_datagram(T0, &ADDR, ipad.msg1(), &creds));
+    let reply = cookie::CookieReply::parse(&out[0]).unwrap();
+    let value = cookie::open(&ipad.cookie_key, &reply, &cookie::msg1_digest(ipad.msg1())).unwrap();
+    // Under the same window it verifies...
+    let again = cookie::attach(ipad.msg1(), &value);
+    let msg2 = sends(&host.handle_datagram(T0, &ADDR, &again, &creds));
+    assert_eq!(wire::classify(&msg2[0]), V3Kind::Handshake2);
+    // ...under the next one it doesn't.
+    host.close();
+    let next = host.open(T0 + ms(10), addr());
+    let fresh = client(&next, 71);
+    let reused = cookie::attach(fresh.msg1(), &value);
+    let out = sends(&host.handle_datagram(T0 + ms(10), &ADDR, &reused, &creds));
+    assert!(
+        out.len() == 1 && cookie::is_reply(&out[0]),
+        "a new cookie, not a read"
+    );
+    assert!(!host.in_flight(T0 + ms(10)));
 }
