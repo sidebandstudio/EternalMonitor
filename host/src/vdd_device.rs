@@ -235,22 +235,37 @@ fn read_devices() -> Vec<Option<(u32, u32, bool, Monitors)>> {
     let Some(devnodes) = root_devnodes() else {
         return Vec::new();
     };
+    reads_from(&devnodes, |devinst, (flags, problem)| {
+        let has_driver = matches!(registry_property(devinst, CM_DRP_DRIVER), Ok(Some(_)));
+        let children = children(devinst);
+        (
+            flags,
+            problem,
+            has_driver,
+            Monitors::from_children(children.as_deref()),
+        )
+    })
+}
+
+/// `read_devices` from the present root devices, with `read` reading one
+/// device of the driver whose status was read. A root device that couldn't
+/// be read may be the driver's, with a monitor of its own: it stays, as a
+/// read that isn't certain. Only devices known to be another driver's are
+/// left out.
+#[cfg(any(windows, test))]
+fn reads_from(
+    devnodes: &[Devnode],
+    mut read: impl FnMut(u32, (u32, u32)) -> (u32, u32, bool, Monitors),
+) -> Vec<Option<(u32, u32, bool, Monitors)>> {
     devnodes
-        .into_iter()
-        .filter_map(|devnode| match devnode {
-            Devnode::Driver { devinst, status } => Some((devinst, status)),
-            _ => None,
-        })
-        .map(|(devinst, status)| {
-            let (flags, problem) = status?;
-            let has_driver = matches!(registry_property(devinst, CM_DRP_DRIVER), Ok(Some(_)));
-            let children = children(devinst);
-            Some((
-                flags,
-                problem,
-                has_driver,
-                Monitors::from_children(children.as_deref()),
-            ))
+        .iter()
+        .filter_map(|devnode| match *devnode {
+            Devnode::Other => None,
+            Devnode::Unread | Devnode::Driver { status: None, .. } => Some(None),
+            Devnode::Driver {
+                devinst,
+                status: Some(status),
+            } => Some(Some(read(devinst, status))),
         })
         .collect()
 }
@@ -805,6 +820,50 @@ mod tests {
             Some(DeviceState::Ready)
         );
         assert_eq!(confirmed_from(vec![]), Some(DeviceState::Missing));
+    }
+
+    /// Review r2 of #233: a root device that couldn't be read may be the
+    /// driver's, with a monitor still arriving. Next to a running device
+    /// with no children, the read isn't a confirmed absence.
+    #[test]
+    fn an_unread_root_device_keeps_the_read_uncertain() {
+        let running_childless = |_, (flags, problem)| (flags, problem, true, Monitors::None);
+        let alone = reads_from(
+            &[
+                Devnode::Other,
+                Devnode::Driver {
+                    devinst: 7,
+                    status: Some((DN_STARTED, 0)),
+                },
+            ],
+            running_childless,
+        );
+        assert_eq!(confirmed_from(alone), Some(DeviceState::NoMonitor));
+        let with_unread = reads_from(
+            &[
+                Devnode::Unread,
+                Devnode::Driver {
+                    devinst: 7,
+                    status: Some((DN_STARTED, 0)),
+                },
+            ],
+            running_childless,
+        );
+        assert_eq!(confirmed_from(with_unread), None);
+        let unread_status = reads_from(
+            &[
+                Devnode::Driver {
+                    devinst: 8,
+                    status: None,
+                },
+                Devnode::Driver {
+                    devinst: 7,
+                    status: Some((DN_STARTED, 0)),
+                },
+            ],
+            running_childless,
+        );
+        assert_eq!(confirmed_from(unread_status), None);
     }
 
     #[test]
