@@ -51,6 +51,42 @@ pub enum VddProblem {
     NotExtended,
 }
 
+/// A device's monitor children, as Configuration Manager listed them.
+#[cfg_attr(not(windows), allow(dead_code))] // Read from Windows only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Monitors {
+    /// The list was read and is empty.
+    None,
+    /// At least one child started without a problem.
+    Started,
+    /// Every child was read, and none has started yet.
+    Pending,
+    /// The list, or a child's status, couldn't be read.
+    Unread,
+}
+
+impl Monitors {
+    /// From every child's status flags (`None` when a child's couldn't be
+    /// read), or `None` when the children couldn't be listed. A started
+    /// child counts even when another couldn't be read.
+    #[cfg_attr(not(windows), allow(dead_code))] // Read from Windows only.
+    fn from_children(children: Option<&[Option<u32>]>) -> Self {
+        let Some(children) = children else {
+            return Self::Unread;
+        };
+        let started = |flags: &u32| flags & DN_STARTED != 0 && flags & DN_HAS_PROBLEM == 0;
+        if children.iter().flatten().any(started) {
+            Self::Started
+        } else if children.is_empty() {
+            Self::None
+        } else if children.iter().any(Option::is_none) {
+            Self::Unread
+        } else {
+            Self::Pending
+        }
+    }
+}
+
 impl DeviceState {
     /// The Enable task's result, as vdd-toggle.ps1 exits.
     pub fn from_task_result(code: i64) -> Option<Self> {
@@ -65,20 +101,34 @@ impl DeviceState {
     }
 
     /// The device as Configuration Manager reports it: its status flags and
-    /// problem number, whether a driver is bound, and whether its monitor
-    /// child is started (`None` without a child).
+    /// problem number, whether a driver is bound, and its monitor children.
+    /// A running device without a started monitor reads as `NoMonitor`, for
+    /// the snapshot and the notice once the display did not appear.
     #[cfg_attr(not(windows), allow(dead_code))] // Read from Windows only.
-    fn from_devnode(status: u32, problem: u32, has_driver: bool, monitor: Option<bool>) -> Self {
+    fn from_devnode(status: u32, problem: u32, has_driver: bool, monitors: Monitors) -> Self {
         if status & DN_HAS_PROBLEM != 0 {
             Self::Problem(problem)
         } else if !has_driver {
             Self::NoDriver
         } else if status & DN_STARTED == 0 {
             Self::NotStarted
-        } else if monitor == Some(true) {
+        } else if monitors == Monitors::Started {
             Self::Ready
         } else {
             Self::NoMonitor
+        }
+    }
+
+    /// As `from_devnode`, for a decision made while the display may still be
+    /// arriving: `NoMonitor` only when the device runs and Windows reported
+    /// no child at all. A child that has not started, or children that could
+    /// not all be read, are `None`: the monitor may be on its way.
+    #[cfg_attr(not(windows), allow(dead_code))] // Read from Windows only.
+    fn confirmed(status: u32, problem: u32, has_driver: bool, monitors: Monitors) -> Option<Self> {
+        let state = Self::from_devnode(status, problem, has_driver, monitors);
+        match (state, monitors) {
+            (Self::NoMonitor, Monitors::Pending | Monitors::Unread) => None,
+            (state, _) => Some(state),
         }
     }
 
@@ -140,29 +190,115 @@ pub fn from_task_stderr(stderr: &str) -> Option<DeviceState> {
 /// Read the driver's device from Configuration Manager.
 #[cfg(windows)]
 pub fn query() -> DeviceState {
-    use windows::Win32::Devices::DeviceAndDriverInstallation::{
-        CM_Get_Child, CM_DRP_DRIVER, CR_SUCCESS,
-    };
-
-    let Some(devnodes) = root_devnodes() else {
-        return DeviceState::Missing;
-    };
-    let states = devnodes.into_iter().filter_map(|devnode| {
-        let Devnode::Driver { devinst, status } = devnode else {
-            return None;
-        };
-        let (flags, problem) = status?;
-        let mut child = 0u32;
-        let monitor = (unsafe { CM_Get_Child(&mut child, devinst, 0) } == CR_SUCCESS).then(|| {
-            devnode_status(child)
-                .is_some_and(|(flags, _)| flags & DN_STARTED != 0 && flags & DN_HAS_PROBLEM == 0)
-        });
-        let has_driver = matches!(registry_property(devinst, CM_DRP_DRIVER), Ok(Some(_)));
+    DeviceState::best(read_devices().into_iter().filter_map(|read| {
+        let (flags, problem, has_driver, monitors) = read?;
         Some(DeviceState::from_devnode(
-            flags, problem, has_driver, monitor,
+            flags, problem, has_driver, monitors,
         ))
-    });
-    DeviceState::best(states)
+    }))
+}
+
+/// As `query`, for the attach wait: `NoMonitor` only when every running
+/// device of the driver has confirmed no monitor child (see
+/// `DeviceState::confirmed`). `None` when that isn't certain: a device or
+/// its children couldn't be read, or a monitor hasn't started yet.
+#[cfg(windows)]
+pub fn query_confirmed() -> Option<DeviceState> {
+    confirmed_from(read_devices())
+}
+
+/// `query_confirmed` from each driver device's read (`None` when its status
+/// couldn't be read). A device with a monitor wins; otherwise anything
+/// uncertain makes the whole read uncertain.
+#[cfg_attr(not(windows), allow(dead_code))] // Read from Windows only.
+fn confirmed_from(reads: Vec<Option<(u32, u32, bool, Monitors)>>) -> Option<DeviceState> {
+    let states: Vec<Option<DeviceState>> = reads
+        .into_iter()
+        .map(|read| {
+            let (flags, problem, has_driver, monitors) = read?;
+            DeviceState::confirmed(flags, problem, has_driver, monitors)
+        })
+        .collect();
+    if states.contains(&Some(DeviceState::Ready)) {
+        return Some(DeviceState::Ready);
+    }
+    let states: Option<Vec<DeviceState>> = states.into_iter().collect();
+    Some(DeviceState::best(states?))
+}
+
+/// Each present device of the driver: its status flags and problem code,
+/// whether a driver is bound, and its monitor children; `None` for one whose
+/// status couldn't be read.
+#[cfg(windows)]
+fn read_devices() -> Vec<Option<(u32, u32, bool, Monitors)>> {
+    use windows::Win32::Devices::DeviceAndDriverInstallation::CM_DRP_DRIVER;
+    let Some(devnodes) = root_devnodes() else {
+        return Vec::new();
+    };
+    reads_from(&devnodes, |devinst, (flags, problem)| {
+        let has_driver = matches!(registry_property(devinst, CM_DRP_DRIVER), Ok(Some(_)));
+        let children = children(devinst);
+        (
+            flags,
+            problem,
+            has_driver,
+            Monitors::from_children(children.as_deref()),
+        )
+    })
+}
+
+/// `read_devices` from the present root devices, with `read` reading one
+/// device of the driver whose status was read. A root device that couldn't
+/// be read may be the driver's, with a monitor of its own: it stays, as a
+/// read that isn't certain. Only devices known to be another driver's are
+/// left out.
+#[cfg(any(windows, test))]
+fn reads_from(
+    devnodes: &[Devnode],
+    mut read: impl FnMut(u32, (u32, u32)) -> (u32, u32, bool, Monitors),
+) -> Vec<Option<(u32, u32, bool, Monitors)>> {
+    devnodes
+        .iter()
+        .filter_map(|devnode| match *devnode {
+            Devnode::Other => None,
+            Devnode::Unread | Devnode::Driver { status: None, .. } => Some(None),
+            Devnode::Driver {
+                devinst,
+                status: Some(status),
+            } => Some(Some(read(devinst, status))),
+        })
+        .collect()
+}
+
+/// The status flags of every child of `devinst` (`None` for one whose
+/// status couldn't be read), or `None` when the children couldn't be listed.
+#[cfg(windows)]
+fn children(devinst: u32) -> Option<Vec<Option<u32>>> {
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{
+        CM_Get_Child, CM_Get_Sibling, CR_NO_SUCH_DEVNODE, CR_SUCCESS,
+    };
+    /// More children than a virtual display ever has: a list this long is
+    /// not one to trust.
+    const MOST: usize = 64;
+    let mut statuses = Vec::new();
+    let mut child = 0u32;
+    match unsafe { CM_Get_Child(&mut child, devinst, 0) } {
+        CR_NO_SUCH_DEVNODE => return Some(statuses),
+        CR_SUCCESS => {}
+        _ => return None,
+    }
+    loop {
+        statuses.push(devnode_status(child).map(|(flags, _)| flags));
+        if statuses.len() > MOST {
+            return None;
+        }
+        let mut next = 0u32;
+        match unsafe { CM_Get_Sibling(&mut next, child, 0) } {
+            CR_NO_SUCH_DEVNODE => return Some(statuses),
+            CR_SUCCESS => child = next,
+            _ => return None,
+        }
+    }
 }
 
 /// One present root device, as Configuration Manager read it.
@@ -572,37 +708,162 @@ mod tests {
         let started = DN_STARTED;
         let problem = DN_HAS_PROBLEM;
         assert_eq!(
-            DeviceState::from_devnode(problem, 22, true, None),
+            DeviceState::from_devnode(problem, 22, true, Monitors::None),
             DeviceState::Problem(22)
         );
         assert_eq!(
-            DeviceState::from_devnode(problem, 43, true, None),
+            DeviceState::from_devnode(problem, 43, true, Monitors::None),
             DeviceState::Problem(43)
         );
         assert_eq!(
-            DeviceState::from_devnode(problem, 28, false, None),
+            DeviceState::from_devnode(problem, 28, false, Monitors::None),
             DeviceState::Problem(28)
         );
         assert_eq!(
-            DeviceState::from_devnode(started, 0, false, None),
+            DeviceState::from_devnode(started, 0, false, Monitors::None),
             DeviceState::NoDriver
         );
         assert_eq!(
-            DeviceState::from_devnode(0, 0, true, None),
+            DeviceState::from_devnode(0, 0, true, Monitors::None),
             DeviceState::NotStarted
         );
         assert_eq!(
-            DeviceState::from_devnode(started, 0, true, None),
+            DeviceState::from_devnode(started, 0, true, Monitors::None),
             DeviceState::NoMonitor
         );
         assert_eq!(
-            DeviceState::from_devnode(started, 0, true, Some(false)),
+            DeviceState::from_devnode(started, 0, true, Monitors::Pending),
             DeviceState::NoMonitor
         );
         assert_eq!(
-            DeviceState::from_devnode(started, 0, true, Some(true)),
+            DeviceState::from_devnode(started, 0, true, Monitors::Started),
             DeviceState::Ready
         );
+    }
+
+    /// Review r1 of #233: the attach wait ends early on `NoMonitor`, so only
+    /// a confirmed absence may read as one. Every child counts, not only the
+    /// first: Windows lists further children as its siblings.
+    #[test]
+    fn only_a_confirmed_absence_of_monitors_reads_as_no_monitor_while_waiting() {
+        let (started, problem) = (DN_STARTED, DN_HAS_PROBLEM);
+        let starting = 0;
+        // The children as listed.
+        assert_eq!(Monitors::from_children(None), Monitors::Unread);
+        assert_eq!(Monitors::from_children(Some(&[])), Monitors::None);
+        assert_eq!(
+            Monitors::from_children(Some(&[Some(starting)])),
+            Monitors::Pending
+        );
+        assert_eq!(Monitors::from_children(Some(&[None])), Monitors::Unread);
+        assert_eq!(
+            Monitors::from_children(Some(&[Some(started | problem)])),
+            Monitors::Pending
+        );
+        assert_eq!(
+            Monitors::from_children(Some(&[Some(starting), Some(started)])),
+            Monitors::Started,
+            "a monitor among the siblings"
+        );
+        assert_eq!(
+            Monitors::from_children(Some(&[None, Some(started)])),
+            Monitors::Started
+        );
+        assert_eq!(
+            Monitors::from_children(Some(&[Some(starting), None])),
+            Monitors::Unread
+        );
+
+        // A running device: only no children at all is a confirmed absence.
+        let running = |monitors| DeviceState::confirmed(started, 0, true, monitors);
+        assert_eq!(running(Monitors::None), Some(DeviceState::NoMonitor));
+        assert_eq!(running(Monitors::Started), Some(DeviceState::Ready));
+        assert_eq!(running(Monitors::Pending), None);
+        assert_eq!(running(Monitors::Unread), None);
+        // The snapshot after a timeout still names the device as before.
+        for monitors in [Monitors::None, Monitors::Pending, Monitors::Unread] {
+            assert_eq!(
+                DeviceState::from_devnode(started, 0, true, monitors),
+                DeviceState::NoMonitor
+            );
+        }
+        // States that don't depend on the children are certain.
+        assert_eq!(
+            DeviceState::confirmed(0, 0, true, Monitors::Unread),
+            Some(DeviceState::NotStarted)
+        );
+        assert_eq!(
+            DeviceState::confirmed(problem, 22, true, Monitors::Unread),
+            Some(DeviceState::Problem(22))
+        );
+
+        // Across the driver's devices.
+        let confirmed_none = Some((started, 0, true, Monitors::None));
+        assert_eq!(
+            confirmed_from(vec![confirmed_none]),
+            Some(DeviceState::NoMonitor)
+        );
+        assert_eq!(
+            confirmed_from(vec![None]),
+            None,
+            "a status that couldn't be read"
+        );
+        assert_eq!(
+            confirmed_from(vec![
+                confirmed_none,
+                Some((started, 0, true, Monitors::Pending))
+            ]),
+            None
+        );
+        assert_eq!(
+            confirmed_from(vec![None, Some((started, 0, true, Monitors::Started))]),
+            Some(DeviceState::Ready)
+        );
+        assert_eq!(confirmed_from(vec![]), Some(DeviceState::Missing));
+    }
+
+    /// Review r2 of #233: a root device that couldn't be read may be the
+    /// driver's, with a monitor still arriving. Next to a running device
+    /// with no children, the read isn't a confirmed absence.
+    #[test]
+    fn an_unread_root_device_keeps_the_read_uncertain() {
+        let running_childless = |_, (flags, problem)| (flags, problem, true, Monitors::None);
+        let alone = reads_from(
+            &[
+                Devnode::Other,
+                Devnode::Driver {
+                    devinst: 7,
+                    status: Some((DN_STARTED, 0)),
+                },
+            ],
+            running_childless,
+        );
+        assert_eq!(confirmed_from(alone), Some(DeviceState::NoMonitor));
+        let with_unread = reads_from(
+            &[
+                Devnode::Unread,
+                Devnode::Driver {
+                    devinst: 7,
+                    status: Some((DN_STARTED, 0)),
+                },
+            ],
+            running_childless,
+        );
+        assert_eq!(confirmed_from(with_unread), None);
+        let unread_status = reads_from(
+            &[
+                Devnode::Driver {
+                    devinst: 8,
+                    status: None,
+                },
+                Devnode::Driver {
+                    devinst: 7,
+                    status: Some((DN_STARTED, 0)),
+                },
+            ],
+            running_childless,
+        );
+        assert_eq!(confirmed_from(unread_status), None);
     }
 
     #[test]

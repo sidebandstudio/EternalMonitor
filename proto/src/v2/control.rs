@@ -293,6 +293,11 @@ pub const NOTICE_UNSUPPORTED_GPU: u8 = 3;
 /// [`NOTICE_UNSUPPORTED_GPU`] in Second screen mode, once the second screen
 /// failed to start: the main screen it fell back to can't be captured either.
 pub const NOTICE_SECOND_SCREEN_UNSUPPORTED_GPU: u8 = 4;
+/// The PC is restarting its stream and keeps the session meanwhile: the
+/// picture comes back by itself. Sent only to iPads that set
+/// [`FEATURE_STANDBY_STATUS`]. (3 and 4 are taken by the graphics card
+/// notices.)
+pub const NOTICE_RESTARTING: u8 = 5;
 
 /// Host → client, every heartbeat interval while a session is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
