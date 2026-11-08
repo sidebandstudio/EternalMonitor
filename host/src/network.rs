@@ -428,11 +428,7 @@ impl HomeCache {
     pub fn get(&self) -> Vec<Ipv4Addr> {
         let (addresses, start) = {
             let mut state = self.state.lock();
-            let fresh = state
-                .listed
-                .as_ref()
-                .filter(|(started, _)| started.elapsed() < self.ttl);
-            let addresses = fresh.map(|(_, addresses)| addresses.clone());
+            let addresses = self.fresh(&state);
             let start = addresses.is_none() && !state.listing;
             state.listing |= start;
             (
@@ -457,6 +453,22 @@ impl HomeCache {
                 });
         }
         addresses
+    }
+
+    /// The last listing's addresses while it is fresh.
+    fn fresh(&self, state: &HomeState) -> Option<Vec<Ipv4Addr>> {
+        state
+            .listed
+            .as_ref()
+            .filter(|(started, _)| started.elapsed() < self.ttl)
+            .map(|(_, addresses)| addresses.clone())
+    }
+
+    /// Debug builds only: the last listing's addresses while it is fresh,
+    /// without starting a listing.
+    #[cfg(debug_assertions)]
+    fn peek(&self) -> Option<Vec<Ipv4Addr>> {
+        self.fresh(&self.state.lock())
     }
 
     /// Debug builds only: forgets the last listing, and any listing under
@@ -487,6 +499,14 @@ fn listed_home() -> Option<Vec<Adapter>> {
 /// [`HomeCache`]).
 pub fn home_addresses() -> Vec<Ipv4Addr> {
     HOME.get()
+}
+
+/// Debug builds only: the home network addresses of a fresh listing, if
+/// there is one, without starting a listing as [`home_addresses`] does.
+#[cfg(debug_assertions)]
+#[doc(hidden)]
+pub fn listed_home_addresses() -> Option<Vec<Ipv4Addr>> {
+    HOME.peek()
 }
 
 static HOME: std::sync::LazyLock<HomeCache> =
@@ -1275,8 +1295,11 @@ mod tests {
         let closed = SWITCHED_GATE.lock();
         cache.clear();
         assert!(cache.get().is_empty(), "a cleared listing was given out");
+        // The first listing may have published before its worker let go:
+        // asking again starts the second once it has.
         let deadline = Instant::now() + Duration::from_secs(10);
         while SWITCHED_CALLS.load(Ordering::SeqCst) < 2 {
+            assert!(cache.get().is_empty(), "a cleared listing was given out");
             assert!(Instant::now() < deadline, "no listing started");
             std::thread::sleep(Duration::from_millis(5));
         }

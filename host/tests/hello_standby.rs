@@ -540,7 +540,9 @@ fn a_stopped_pc_follows_the_chosen_network() {
 #[cfg(debug_assertions)]
 mod identify {
     use super::*;
-    use eternal_host::network::{home_addresses, set_test_adapters, Adapter, Kind};
+    use eternal_host::network::{
+        home_addresses, listed_home_addresses, set_test_adapters, Adapter, Kind,
+    };
     use eternal_wire::v2::control::{identity_message, Identify, Identity, IDENTIFY_VERSION};
 
     impl FakeIpad {
@@ -798,13 +800,21 @@ mod identify {
         host.wait_until_stopped();
         let mut ipad = FakeIpad::new(&host, 1, NEW);
         ipad.auth_token = host.shared.pairing.lock().token();
-        // Answered: the standby holds the port. Its listing runs on a
-        // thread of its own: give it a moment.
+        // Answered: the standby holds the port.
         let ack = ipad
             .ask_until_answered(1, Duration::from_secs(10))
             .expect("a stopped PC must answer");
         assert_eq!(ack.status, HelloStatus::Stopped);
-        std::thread::sleep(Duration::from_millis(300));
+        // Its listing runs on a thread of its own. Waiting for it starts
+        // none, so only the standby's can come.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while listed_home_addresses().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "the standby never listed the home network addresses"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         ipad.identify([1; 16]);
         assert!(
             ipad.identity([1; 16], Duration::from_secs(2)).is_some(),
