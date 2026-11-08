@@ -262,7 +262,11 @@ pub fn note_session_start(session_id: u32, shared: &SharedControl) {
     };
 }
 
-fn note_fallback(reason: &str) {
+/// Notes `reason` for the live session's summary, as a
+/// `second_screen_fallback` log field does. Also called directly for a
+/// Second screen that is held by design rather than failed, so the field
+/// (which the daily check counts as a failure) isn't logged for it.
+pub(crate) fn note_fallback(reason: &str) {
     let (session_id, mode) = {
         let slot = SESSION_FALLBACK.lock();
         match (slot.session_id, &slot.mode) {
@@ -1059,6 +1063,54 @@ pub(crate) mod tests {
             note_session_start(3, &shared);
             tracing::warn!(second_screen_fallback = %"something new", "unknown");
             assert_eq!(take_fallback(3), Some("other"));
+        });
+    }
+
+    /// The Windows 10 Second screen hold names `no_driver` in the session
+    /// summary without logging a `second_screen_fallback` field, which the
+    /// daily check counts as a failure. A failed start without a driver
+    /// still logs the field.
+    #[test]
+    fn a_windows_10_hold_is_summarised_as_no_driver_without_a_fallback_line() {
+        use tracing_subscriber::prelude::*;
+        struct Fields(std::sync::Arc<parking_lot::Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Fields {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let names = event
+                    .metadata()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().to_string());
+                self.0.lock().extend(names);
+            }
+        }
+        let _slot = FALLBACK_SLOT.lock();
+        let shared = SharedControl::new(9876, 15_000_000);
+        *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
+        let fields = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(FallbackWatch)
+            .with(Fields(std::sync::Arc::clone(&fields)));
+        crate::logging::prepare_log_capture();
+        let has_field = || {
+            fields
+                .lock()
+                .iter()
+                .any(|name| name == "second_screen_fallback")
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            note_session_start(1, &shared);
+            crate::capture::second_screen::log_windows_hold();
+            assert!(!has_field(), "{:?}", fields.lock());
+            assert_eq!(take_fallback(1), Some("no_driver"));
+            note_session_start(2, &shared);
+            tracing::info!(second_screen_fallback = "no_driver", "no driver here");
+            assert!(has_field());
+            assert_eq!(take_fallback(2), Some("no_driver"));
         });
     }
 

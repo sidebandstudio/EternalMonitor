@@ -586,14 +586,16 @@ fn log_hold(hold: Hold) {
 }
 
 /// The one log line for a connection that mirrors because Windows is too
-/// old for the display driver. The summary names it `no_driver`: there is
-/// no display driver for this Windows.
-fn log_windows_hold() {
+/// old for the display driver. It is expected, not a failure, so it has no
+/// `second_screen_fallback` field: the daily check counts those. The
+/// session summary still names it `no_driver`: there is no display driver
+/// for this Windows.
+pub(crate) fn log_windows_hold() {
+    crate::diagnostics::note_fallback("no_driver");
     tracing::info!(
-        second_screen_fallback = "no_driver",
         reason = WINDOWS_10,
-        "Second screen needs Windows 11 — mirroring the primary display without turning the \
-         display driver on"
+        "Second screen held: needs Windows 11 — mirroring the primary display without turning \
+         the display driver on"
     );
 }
 

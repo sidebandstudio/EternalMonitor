@@ -2570,7 +2570,7 @@ mod tests {
     }
 
     /// Windows 10: a Second screen connection mirrors at once, with no
-    /// Enable, and says why: the log names `no_driver`, and the iPad's
+    /// Enable, and says why: its own log line, and the iPad's
     /// notice lasts a few seconds from each connection. Neither a failure
     /// an earlier version saved, Try again, nor choosing Second screen again
     /// turns the driver on.
@@ -2586,13 +2586,13 @@ mod tests {
         let (log, step) = logs(|| next_step(&shared, start));
         assert_eq!(step, Step::Nothing, "no Enable");
         assert!(
-            log.contains("second_screen_fallback")
-                && log.contains("no_driver")
-                && log.contains(WINDOWS_10)
-                && log.contains("Second screen needs Windows 11"),
+            log.contains("Second screen held: needs Windows 11") && log.contains(WINDOWS_10),
             "{log}"
         );
-        assert!(!log.contains("remembered"), "{log}");
+        assert!(
+            !log.contains("second_screen_fallback") && !log.contains("remembered"),
+            "an expected hold is no fallback for the daily check: {log}"
+        );
         assert!(shared.vdd_worker.queue.lock().commands.is_empty());
         assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
         assert_eq!(remembered_failure(&shared), Some(WINDOWS_10));
@@ -2624,7 +2624,9 @@ mod tests {
         });
         assert_eq!(step, Step::Nothing);
         assert!(
-            log.contains("no_driver") && !log.contains("remembered"),
+            log.contains("Second screen held: needs Windows 11")
+                && !log.contains("second_screen_fallback")
+                && !log.contains("remembered"),
             "{log}"
         );
         assert!(windows_notice(&shared, later));
