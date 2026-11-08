@@ -1718,16 +1718,17 @@ struct WindowsDriver<'a> {
 
 #[cfg(windows)]
 impl WindowsDriver<'_> {
-    /// After an Enable that succeeded: a driver that started in it read
-    /// the file `prepare` wrote, so keep what that file gives the pointer
-    /// (`vdd_settings::record_after_enable`). One already running keeps the
-    /// record of its own start.
+    /// After an Enable that succeeded: a driver seen off before it and
+    /// running after it started in it, with the file `prepare` wrote, so
+    /// keep what that file gives the pointer
+    /// (`vdd_settings::record_after_enable`). One already running, or one
+    /// that couldn't be read, keeps the record of its own start.
     fn note_start(&self) {
         let request = self.request.borrow();
         let Some(request) = request.as_ref() else {
             return;
         };
-        let after = crate::vdd_device::instance();
+        let after = crate::vdd_device::run_state();
         let record = crate::vdd_settings::record_after_enable(
             request.instance,
             after,
@@ -1736,7 +1737,8 @@ impl WindowsDriver<'_> {
         );
         info!(
             started = record.is_some(),
-            running = after.is_some(),
+            before = ?request.instance,
+            ?after,
             "The virtual display's driver after the Enable"
         );
         let (Some(record), Some(path)) = (record, super::cursor_record_path()) else {

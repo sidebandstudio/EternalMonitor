@@ -162,11 +162,14 @@ pub fn query() -> DeviceState {
     DeviceState::best(states)
 }
 
-/// The running driver's start (`vdd_settings::DriverInstance`): this boot
-/// and its device's last arrival. `None` when no one device of the driver
-/// runs, or Windows doesn't say.
+/// The driver as Configuration Manager reads it now
+/// (`vdd_settings::DriverRun`): its one running start (this boot and its
+/// device's last arrival), off when every device of the driver reads as
+/// not started (or there is none), and unreadable when a read fails or
+/// more than one runs.
 #[cfg(windows)]
-pub fn instance() -> Option<crate::vdd_settings::DriverInstance> {
+pub fn run_state() -> crate::vdd_settings::DriverRun {
+    use crate::vdd_settings::{DriverInstance, DriverRun};
     use windows::Win32::Devices::DeviceAndDriverInstallation::{
         CM_Get_DevNode_PropertyW, CR_SUCCESS,
     };
@@ -174,13 +177,25 @@ pub fn instance() -> Option<crate::vdd_settings::DriverInstance> {
         DEVPKEY_Device_LastArrivalDate, DEVPROPTYPE, DEVPROP_TYPE_FILETIME,
     };
 
-    let mut running = driver_devnodes()?.into_iter().filter(|&devinst| {
-        devnode_status(devinst)
-            .is_some_and(|(flags, _)| flags & DN_STARTED != 0 && flags & DN_HAS_PROBLEM == 0)
-    });
-    let devinst = match (running.next(), running.next()) {
-        (Some(devinst), None) => devinst,
-        _ => return None,
+    let Some(devnodes) = driver_devnodes() else {
+        return DriverRun::Unreadable;
+    };
+    let mut running = Vec::new();
+    for devinst in devnodes {
+        let Some((flags, _)) = devnode_status(devinst) else {
+            return DriverRun::Unreadable;
+        };
+        if flags & DN_STARTED != 0 && flags & DN_HAS_PROBLEM == 0 {
+            running.push(devinst);
+        } else if flags & DN_STARTED != 0 {
+            // Started with a problem: neither cleanly off nor running.
+            return DriverRun::Unreadable;
+        }
+    }
+    let devinst = match running[..] {
+        [] => return DriverRun::Off,
+        [devinst] => devinst,
+        _ => return DriverRun::Unreadable,
     };
     let (mut arrival, mut kind, mut size) = (0u64, DEVPROPTYPE(0), 8u32);
     let result = unsafe {
@@ -194,12 +209,12 @@ pub fn instance() -> Option<crate::vdd_settings::DriverInstance> {
         )
     };
     if result != CR_SUCCESS || kind != DEVPROP_TYPE_FILETIME || size != 8 || arrival == 0 {
-        return None;
+        return DriverRun::Unreadable;
     }
-    Some(crate::vdd_settings::DriverInstance {
-        boot_id: boot_id()?,
-        arrival,
-    })
+    match boot_id() {
+        Some(boot_id) => DriverRun::Running(DriverInstance { boot_id, arrival }),
+        None => DriverRun::Unreadable,
+    }
 }
 
 /// Windows' count of boots, which the kernel raises at each one.

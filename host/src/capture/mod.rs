@@ -527,7 +527,7 @@ struct VddRequest {
     /// The driver's start before the Enable, if it was running, and what
     /// an Enable that starts it gives Windows for the pointer, from the
     /// file it reads (see `vdd_settings::record_after_enable`).
-    instance: Option<crate::vdd_settings::DriverInstance>,
+    instance: crate::vdd_settings::DriverRun,
     settings: Option<String>,
     cursor: crate::vdd_settings::DriverCursor,
 }
@@ -618,19 +618,16 @@ fn prepare_vdd_settings(shared: &SharedControl, outputs: &[OutputInfo]) -> VddRe
     // The driver reads this file when it starts; a driver already running
     // keeps what it read then.
     let settings = std::fs::read_to_string(path).ok();
-    let reads_cursor = if owned {
-        Some(true)
-    } else {
-        crate::vdd_settings::driver_version()
-            .and_then(|version| crate::vdd_settings::driver_reads_cursor(&version))
-    };
+    let reads_cursor = owned
+        || crate::vdd_settings::driver_version()
+            .is_some_and(|version| crate::vdd_settings::driver_reads_cursor(&version));
     let overridden = crate::vdd_settings::registry_overrides_cursor();
     let cursor =
         crate::vdd_settings::starting_cursor(settings.as_deref(), reads_cursor, overridden);
-    let instance = crate::vdd_device::instance();
+    let instance = crate::vdd_device::run_state();
     info!(
-        running = instance.is_some(),
-        ?reads_cursor,
+        ?instance,
+        reads_cursor,
         overridden,
         ?cursor,
         "The virtual display's pointer settings"
@@ -656,14 +653,11 @@ pub(crate) fn cursor_record_path() -> Option<std::path::PathBuf> {
 #[cfg(windows)]
 pub(crate) fn running_driver_cursor() -> crate::vdd_settings::DriverCursor {
     let record = cursor_record_path().and_then(|path| crate::vdd_settings::load_record(&path));
-    let running = crate::vdd_device::instance();
+    let running = crate::vdd_device::run_state();
     let cursor = crate::vdd_settings::running_cursor(record.as_ref(), running);
     info!(
         recorded = record.is_some(),
-        same_start = record
-            .as_ref()
-            .zip(running)
-            .is_some_and(|(record, running)| record.instance == running),
+        ?running,
         settings_sha256 = record
             .as_ref()
             .map_or("", |record| record.settings_sha256.as_str()),
