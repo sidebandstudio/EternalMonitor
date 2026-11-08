@@ -5913,13 +5913,17 @@ mod tests {
     }
 
     /// The capture's own notice says more than "restarting": a stream that
-    /// comes back into a locked PC, or one with no display, says that, and
+    /// comes back into a locked PC, one with no display, or one whose
+    /// graphics card Windows won't capture from, says that, and
     /// "restarting" shows only when nothing else does.
     #[test]
     fn a_capture_notice_comes_before_the_restarting_one() {
-        use eternal_wire::v2::control::{NOTICE_NONE, NOTICE_PC_LOCKED, NOTICE_RESTARTING};
-        struct Locked;
-        impl ConfigSource for Locked {
+        use eternal_wire::v2::control::{
+            NOTICE_NONE, NOTICE_NO_DISPLAY, NOTICE_PC_LOCKED, NOTICE_RESTARTING,
+            NOTICE_SECOND_SCREEN_UNSUPPORTED_GPU, NOTICE_UNSUPPORTED_GPU,
+        };
+        struct Blocked(u8);
+        impl ConfigSource for Blocked {
             fn stream_config(&self) -> StreamConfig {
                 TestConfig.stream_config()
             }
@@ -5927,7 +5931,7 @@ mod tests {
                 TestConfig.host_name()
             }
             fn notice(&self) -> u8 {
-                NOTICE_PC_LOCKED
+                self.0
             }
         }
         let now = Instant::now();
@@ -5945,19 +5949,24 @@ mod tests {
             notices(&session.restart_tick(&RestartConfig, at)),
             [NOTICE_RESTARTING]
         );
-        // The next stream runs into a locked PC, before its first frame.
+        // The next stream runs into a blocked capture, before its first frame.
         session.set_not_streaming(None);
         let at = now + Duration::from_secs(2);
-        session.handle_control_authed(peer, report(10), &Locked, at);
-        assert_eq!(
-            notices(&session.tick(&Locked, true, at)),
-            [NOTICE_PC_LOCKED]
-        );
-        // Unlocked, still no frame: restarting again.
-        assert_eq!(
-            notices(&session.tick(&TestConfig, true, at)),
-            [NOTICE_RESTARTING]
-        );
-        assert_ne!(NOTICE_PC_LOCKED, NOTICE_NONE);
+        for notice in [
+            NOTICE_PC_LOCKED,
+            NOTICE_NO_DISPLAY,
+            NOTICE_UNSUPPORTED_GPU,
+            NOTICE_SECOND_SCREEN_UNSUPPORTED_GPU,
+        ] {
+            assert_ne!(notice, NOTICE_NONE);
+            session.handle_control_authed(peer, report(10), &Blocked(notice), at);
+            assert_eq!(notices(&session.tick(&Blocked(notice), true, at)), [notice]);
+            // Unblocked, still no frame: restarting again.
+            assert_eq!(
+                notices(&session.tick(&TestConfig, true, at)),
+                [NOTICE_RESTARTING],
+                "after notice {notice}"
+            );
+        }
     }
 }
