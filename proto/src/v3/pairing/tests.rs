@@ -402,7 +402,8 @@ fn message_1_retries_get_the_same_message_2_and_reads_are_budgeted() {
     assert_eq!(again, first, "the same message 2");
 
     // Forged message 1s: 20 reads a second from one source, then nothing
-    // more from it is read.
+    // more from it is read without a cookie, only a cookie reply. With the
+    // cookie (only the QR's holder can open it), the iPad is read.
     let mut host = self::host();
     let qr = host.open(T0, addr());
     let mut forged = qr.clone();
@@ -411,9 +412,14 @@ fn message_1_retries_get_the_same_message_2_and_reads_are_budgeted() {
     for _ in 0..60 {
         host.handle_datagram(T0, &ADDR, forged.msg1(), &creds);
     }
-    assert!(host
-        .handle_datagram(T0, &ADDR, client(&qr, 9).msg1(), &creds)
-        .is_empty());
+    let mut ipad = client(&qr, 10);
+    let out = sends(&host.handle_datagram(T0, &ADDR, ipad.msg1(), &creds));
+    assert!(out.len() == 1 && cookie::is_reply(&out[0]));
+    let msg1 = ipad.handle_cookie(&out[0]).unwrap();
+    let out = sends(&host.handle_datagram(T0, &ADDR, &msg1, &creds));
+    assert_eq!(wire::classify(&out[0]), V3Kind::Handshake2);
+    host.close();
+    let qr = host.open(T0, addr());
     assert_eq!(
         sends(&host.handle_datagram(
             T0 + Duration::from_secs(1),
@@ -699,7 +705,9 @@ fn one_sender_flooding(cookies: CookieMode) {
         answered >= 1,
         "the genuine iPad got its message 2: {cookies:?}"
     );
-    assert_eq!(host.cookie_replies() > 0, cookies != CookieMode::Off);
+    if cookies != CookieMode::Off {
+        assert!(host.cookie_replies() > 0);
+    }
 }
 
 /// Many senders, each inside its own limit, burst junk right before each of
@@ -857,4 +865,38 @@ fn low_rate_spoofed_replays_never_take_the_ipads_message_2_resends() {
         }
         assert_eq!(received, 8, "every retry; spoofer first: {spoofer_first}");
     }
+}
+
+/// Junk pairing message 1s from another port on the iPad's IP, past the
+/// IP's read limit, never keep the iPad's own from being read: it gets a
+/// cookie reply and is read on its address's own lane.
+#[test]
+fn another_port_on_the_ipads_ip_never_uses_up_its_pairing_reads() {
+    let creds = Creds::default();
+    let mut host: PairingHost<SocketAddr> = PairingHost::new(
+        PairingConfig::default(),
+        HOST,
+        "0.4.0",
+        "Test PC",
+        Box::new(SeededRandom::new(1)),
+    );
+    let qr = host.open(T0, addr());
+    let mut forged = qr.clone();
+    forged.secret = Zeroizing::new([0x07; 32]);
+    let junk = client(&forged, 60).msg1().to_vec();
+    let old_port: SocketAddr = "192.0.2.1:40000".parse().unwrap();
+    let ipad_addr: SocketAddr = "192.0.2.1:40001".parse().unwrap();
+    for _ in 0..25 {
+        host.handle_datagram(T0, &old_port, &junk, &creds);
+    }
+    let mut ipad = client(&qr, 61);
+    let out = sends(&host.handle_datagram(T0, &ipad_addr, ipad.msg1(), &creds));
+    assert!(
+        out.len() == 1 && cookie::is_reply(&out[0]),
+        "the IP's limit: a cookie"
+    );
+    let msg1 = ipad.handle_cookie(&out[0]).unwrap();
+    let out = sends(&host.handle_datagram(T0, &ipad_addr, &msg1, &creds));
+    assert_eq!(wire::classify(&out[0]), V3Kind::Handshake2);
+    assert!(!host.under_load(T0));
 }

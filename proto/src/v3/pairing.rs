@@ -430,8 +430,12 @@ pub struct PairingHost<A: PeerAddr> {
     /// The generation the next window gets.
     next_generation: u64,
     attempt: Option<Attempt<A>>,
-    /// Message 1 reads per source.
+    /// Message 1 reads per source (IP).
     per_source: SourceLimiter<A::Bucket>,
+    /// Message 1 reads per exact address, for those with a valid cookie:
+    /// only the QR's holder can send them, so spoofing the iPad's IP from
+    /// another port never uses up its reads.
+    verified_rate: SourceLimiter<A>,
     cookies: CookieJar,
     /// Message 1 arrivals, for the load test.
     arrivals: LoadMeter,
@@ -453,6 +457,7 @@ impl<A: PeerAddr> PairingHost<A> {
             arrivals: LoadMeter::new(Duration::ZERO),
             cookie_replies: 0,
             per_source: SourceLimiter::new(config.msg1_per_source_per_second),
+            verified_rate: SourceLimiter::new(config.msg1_per_source_per_second),
             config,
             host_id,
             host_version: host_version.to_string(),
@@ -677,8 +682,19 @@ impl<A: PeerAddr> PairingHost<A> {
         if window.handled.contains(&digest) || window.handled.len() >= MAX_HANDLED_MSG1 {
             return;
         }
-        // One source can't use up everyone's reads.
-        if !self.per_source.allow(now, &from.rate_bucket()) {
+        // One source can't use up everyone's reads. With a valid cookie the
+        // limit is per exact address; without, per IP, and a message 1 the
+        // IP's limit refuses gets a cookie reply instead.
+        let allowed = if verified {
+            self.verified_rate.allow(now, from)
+        } else {
+            self.per_source.allow(now, &from.rate_bucket())
+        };
+        if !allowed {
+            if !verified {
+                let key = cookie_key();
+                self.send_cookie(now, from, &canon, &key, out);
+            }
             return;
         }
         let ctx = pairing_ctx(
@@ -901,6 +917,7 @@ impl<A: PeerAddr> PairingHost<A> {
             self.window = None;
         }
         self.per_source.prune(now);
+        self.verified_rate.prune(now);
         self.attempt
             .take_if(|a| a.expired(now) || (a.step != Step::Storing && now >= a.deadline));
     }

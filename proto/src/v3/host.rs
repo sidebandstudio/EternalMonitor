@@ -58,10 +58,11 @@ pub struct HostConfig {
     pub pending_lifetime: Duration,
     /// How long a timed-out message 1 is remembered and dropped.
     pub expired_msg1_lifetime: Duration,
-    /// Shortest gap between two resends of a cached message 2 to one
-    /// source.
+    /// Shortest gap between two resends of a cached answer (message 2, or
+    /// `Stale`, `TooNew` and `PairAgain`) to one address.
     pub msg2_resend_interval: Duration,
-    /// New `Stale` answers per `dev_id` per second.
+    /// New `Stale` answers per `dev_id` per second, and as many again for
+    /// message 1s that carry a valid cookie.
     pub stale_per_second: u32,
     /// Authenticated message 1s per `dev_id` per second that get no answer
     /// (over its budget, a late copy, a timestamp past the ceiling) and are
@@ -71,8 +72,6 @@ pub struct HostConfig {
     /// Credentials the host holds at most. With the two budgets above it
     /// sizes the table of remembered message 1s.
     pub max_credentials: usize,
-    /// Resends of a cached `Stale` answer per source per second.
-    pub stale_replays_per_second: u32,
     /// Shortest gap between two re-sealed `SessionConfirmAck`s.
     pub confirm_ack_interval: Duration,
     /// How long a sealed `SessionRefused` is kept: resent on the
@@ -120,7 +119,6 @@ impl HostConfig {
             stale_per_second: 5,
             unanswered_per_second: 5,
             max_credentials: MAX_CREDENTIALS,
-            stale_replays_per_second: 5,
             confirm_ack_interval: Duration::from_millis(50),
             refusal_lifetime: Duration::from_secs(5),
             refusal_resend_interval: Duration::from_millis(100),
@@ -484,6 +482,9 @@ impl RateWindow {
 /// is answered without another Diffie-Hellman.
 struct StaleBudget<A: PeerAddr> {
     window: RateWindow,
+    /// The same budget again, for message 1s with a valid cookie: only the
+    /// iPad can send those, so replays from elsewhere never use it up.
+    verified: RateWindow,
     /// Message 1s remembered without an answer.
     unanswered: RateWindow,
     /// Newest last.
@@ -493,8 +494,8 @@ struct StaleBudget<A: PeerAddr> {
 struct CachedAnswer<A> {
     key: Digest,
     msg2: Vec<u8>,
-    /// The exact address whose message 1 got this answer.
-    origin: A,
+    /// Where it may be resent, and when it last was.
+    resends: ResendSlots<A>,
     until: Duration,
 }
 
@@ -658,13 +659,15 @@ pub const MAX_CREDENTIALS: usize = 64;
 /// The size of the remembered message 1 table. Each budget window lasts at
 /// least 1 s, so the entries still remembered after `expired_msg1_lifetime`
 /// come from at most `ceil(lifetime) + 1` windows per `dev_id`, each adding
-/// at most `stale_per_second + unanswered_per_second`. When more `dev_id`s
+/// at most `2 × stale_per_second + unanswered_per_second` (the Stale budget
+/// and its lane for message 1s with a cookie). When more `dev_id`s
 /// than `max_credentials` fill it, no new answer is given and nothing
 /// unexpired is evicted.
 fn answered_capacity(config: &HostConfig) -> usize {
     let lifetime = config.expired_msg1_lifetime;
     let windows = lifetime.as_secs() + u64::from(lifetime.subsec_nanos() > 0) + 1;
-    let per_window = u64::from(config.stale_per_second) + u64::from(config.unanswered_per_second);
+    let per_window =
+        2 * u64::from(config.stale_per_second) + u64::from(config.unanswered_per_second);
     usize::try_from(windows.saturating_mul(per_window))
         .unwrap_or(usize::MAX)
         .saturating_mul(config.max_credentials)
@@ -679,7 +682,10 @@ pub struct HostSessions<A: PeerAddr> {
     refusal_contexts: Vec<RefusalContext<A>>,
     refusals: Vec<Refusal<A>>,
     msg1_rate: SourceLimiter<A::Bucket>,
-    stale_replay_rate: SourceLimiter<A::Bucket>,
+    /// Message 1 reads per exact address, for those with a valid cookie:
+    /// only the iPad can send them, so spoofing its IP from another port
+    /// never uses up its reads.
+    verified_rate: SourceLimiter<A>,
     stale: HashMap<Id16, StaleBudget<A>>,
     /// Message 1s that already got a `Stale`, `TooNew` or `PairAgain`
     /// answer, for 30 s, with expiry order. A recognised replay whose cached
@@ -718,7 +724,7 @@ impl<A: PeerAddr> HostSessions<A> {
             cookie_replies: 0,
             answered_capacity: answered_capacity(&config),
             msg1_rate: SourceLimiter::new(config.msg1_per_second),
-            stale_replay_rate: SourceLimiter::new(config.stale_replays_per_second),
+            verified_rate: SourceLimiter::new(config.msg1_per_second),
             config,
             rng,
             devices: HashMap::new(),
@@ -849,6 +855,10 @@ impl<A: PeerAddr> HostSessions<A> {
                 start: now,
                 count: 0,
             },
+            verified: RateWindow {
+                start: now,
+                count: 0,
+            },
             unanswered: RateWindow {
                 start: now,
                 count: 0,
@@ -930,23 +940,30 @@ impl<A: PeerAddr> HostSessions<A> {
         {
             return;
         }
-        if let Some(answer) = self
-            .stale
-            .get(&dev_id)
-            .and_then(|b| b.cached.iter().find(|c| c.key == key && now < c.until))
-        {
+        let cached = self.stale.get(&dev_id).and_then(|b| {
+            b.cached
+                .iter()
+                .find(|c| c.key == key && now < c.until)
+                .map(|c| c.resends.admitted(from))
+        });
+        if let Some(admitted) = cached {
             // A replay of a message 1 that got an answer without a pending
-            // session: the cached answer, within its per-source budget. As
-            // for message 2, another address must show a cookie first.
-            let msg2 = answer.msg2.clone();
-            if answer.origin != *from && !verified {
+            // session: the cached answer, as for message 2. At most every
+            // 100 ms per address, and another address must show a cookie
+            // first.
+            if !admitted && !verified {
                 self.send_cookie(now, from, &canon, &dev_id, creds, out);
                 return;
             }
-            if self.stale_replay_rate.allow(now, &bucket) {
+            let answer = self
+                .stale
+                .get_mut(&dev_id)
+                .and_then(|b| b.cached.iter_mut().find(|c| c.key == key && now < c.until))
+                .expect("checked above");
+            if answer.resends.due(from, now, resend_interval) {
                 out.push(HostOutput::Send {
                     to: from.clone(),
-                    datagram: msg2,
+                    datagram: answer.msg2.clone(),
                 });
             }
             return;
@@ -978,8 +995,21 @@ impl<A: PeerAddr> HostSessions<A> {
                 reserved = false;
             }
         }
-        if !reserved && !self.msg1_rate.allow(now, &bucket) {
-            return;
+        if !reserved {
+            // A message 1 with a valid cookie is limited per exact address;
+            // without one, per IP. One the IP's limit refuses gets a cookie
+            // reply, so spoofing the iPad's IP never keeps it from a read.
+            let allowed = if verified {
+                self.verified_rate.allow(now, from)
+            } else {
+                self.msg1_rate.allow(now, &bucket)
+            };
+            if !allowed {
+                if !verified {
+                    self.send_cookie(now, from, &canon, &dev_id, creds, out);
+                }
+                return;
+            }
         }
         let has_pending = self
             .devices
@@ -1021,7 +1051,13 @@ impl<A: PeerAddr> HostSessions<A> {
             None
         };
         if let Some(reply) = no_pending {
-            self.answer_without_pending(now, from, &dev_id, key, responder, &reply, out);
+            let answered = self
+                .answer_without_pending(now, from, &dev_id, key, responder, &reply, verified, out);
+            if !answered && !verified {
+                // Over the shared budget: a cookie reply, so the iPad's own
+                // retry comes back on the lane only it can use.
+                self.send_cookie(now, from, &canon, &dev_id, creds, out);
+            }
             return;
         }
         if let Some(p) = self.devices.get(&dev_id).and_then(|d| d.pending.as_ref()) {
@@ -1109,7 +1145,10 @@ impl<A: PeerAddr> HostSessions<A> {
     }
 
     /// Answers a message 1 with `Stale`, `TooNew` or `PairAgain`, within the
-    /// `dev_id`'s budget, caches the answer, and remembers the message 1.
+    /// `dev_id`'s budget (its own lane when `verified`), caches the answer,
+    /// and remembers the message 1. `false` when an unverified message 1 is
+    /// over the budget: it isn't remembered, and the caller asks for a
+    /// cookie.
     #[allow(clippy::too_many_arguments)]
     fn answer_without_pending(
         &mut self,
@@ -1119,27 +1158,37 @@ impl<A: PeerAddr> HostSessions<A> {
         key: Digest,
         responder: Responder,
         reply: &Msg2Payload,
+        verified: bool,
         out: &mut Vec<HostOutput<A>>,
-    ) {
+    ) -> bool {
         self.expire_answered(now);
         if self.answered.len() >= self.answered_capacity && !self.answered.contains_key(&key) {
             // Full of unexpired entries: refuse new work rather than forget
             // a message 1 that was already answered.
-            return;
+            return true;
         }
         let limit = self.config.stale_per_second;
-        if !self.stale_budget(dev_id, now).window.allow(now, limit) {
-            // Over the dev_id's budget: no answer, but remembered within
-            // its own budget, so its replays cost no crypto.
+        let budget = self.stale_budget(dev_id, now);
+        let window = if verified {
+            &mut budget.verified
+        } else {
+            &mut budget.window
+        };
+        if !window.allow(now, limit) {
+            if !verified {
+                return false;
+            }
+            // Over its own lane: no answer, but remembered within its own
+            // budget, so its replays cost no crypto.
             self.remember_unanswered(now, dev_id, key);
-            return;
+            return true;
         }
         self.dh_performed += 1;
         let Ok((msg2, _)) = responder.write_msg2(reply) else {
-            return;
+            return true;
         };
         let until = now + self.config.expired_msg1_lifetime;
-        let origin = from.clone();
+        let resends = ResendSlots::new(from.clone(), now);
         let budget = self.stale_budget(dev_id, now);
         if budget.cached.len() >= MAX_CACHED_STALE {
             budget.cached.remove(0);
@@ -1147,7 +1196,7 @@ impl<A: PeerAddr> HostSessions<A> {
         budget.cached.push(CachedAnswer {
             key,
             msg2: msg2.clone(),
-            origin,
+            resends,
             until,
         });
         self.remember_answered(now, key);
@@ -1155,6 +1204,7 @@ impl<A: PeerAddr> HostSessions<A> {
             to: from.clone(),
             datagram: msg2,
         });
+        true
     }
 
     /// Remembers an authenticated message 1 for 30 s, so its replays are
@@ -1694,7 +1744,7 @@ impl<A: PeerAddr> HostSessions<A> {
         }
         self.refusals.retain(|r| r.until > now);
         self.msg1_rate.prune(now);
-        self.stale_replay_rate.prune(now);
+        self.verified_rate.prune(now);
         self.stale.retain(|_, b| {
             b.cached.retain(|c| now < c.until);
             !b.cached.is_empty()
@@ -1824,6 +1874,11 @@ mod tests {
             timestamp_us: ts,
             ..Default::default()
         }
+    }
+
+    /// Sends other than cookie replies.
+    fn real_answers<A: Clone>(out: &[HostOutput<A>]) -> usize {
+        sends(out).iter().filter(|d| !cookie::is_reply(d)).count()
     }
 
     fn sends<A: Clone>(out: &[HostOutput<A>]) -> Vec<Vec<u8>> {
@@ -2155,9 +2210,10 @@ mod tests {
             .collect();
         let answered = attempts
             .iter()
-            .filter(|a| !host.handle_datagram(T0, &ADDR, a.msg1(), &creds).is_empty())
+            .filter(|a| real_answers(&host.handle_datagram(T0, &ADDR, a.msg1(), &creds)) > 0)
             .count();
         assert_eq!(answered, 20);
+        assert_eq!(host.cookie_replies(), 5, "the rest get a cookie reply");
         let other_addr = attempts[24].msg1();
         assert!(!host.handle_datagram(T0, &2, other_addr, &creds).is_empty());
         let next_second = T0 + Duration::from_secs(1);
@@ -2181,9 +2237,7 @@ mod tests {
             .filter(|&i| {
                 let ipad = Initiator::start(&K, &DEV, &HOST, 1, &hello(10 + u64::from(i))).unwrap();
                 let from = SocketAddr::from(([10, 0, 0, 7], 40_000 + i));
-                !host
-                    .handle_datagram(T0, &from, ipad.msg1(), &creds)
-                    .is_empty()
+                real_answers(&host.handle_datagram(T0, &from, ipad.msg1(), &creds)) > 0
             })
             .count();
         assert_eq!(answered, 20, "25 ports, one IP, one bucket");
@@ -2278,12 +2332,11 @@ mod tests {
             .filter(|&i| {
                 let ipad =
                     Initiator::start(&K, &DEV, &HOST, i, &hello(500 + u64::from(i))).unwrap();
-                !host
-                    .handle_datagram(T0, &(100 + i), ipad.msg1(), &creds)
-                    .is_empty()
+                real_answers(&host.handle_datagram(T0, &(100 + i), ipad.msg1(), &creds)) > 0
             })
             .count();
         assert_eq!(answered, 5);
+        assert_eq!(host.cookie_replies(), 5, "the rest get a cookie reply");
 
         let replayed = Initiator::start(&K, &DEV, &HOST, 1, &hello(900)).unwrap();
         let later = T0 + Duration::from_secs(2);
@@ -2539,8 +2592,8 @@ mod tests {
         assert_eq!(host.handshakes_performed(), dh);
         // The source that sent it first keeps its own allowance.
         assert_eq!(
-            sends(&host.handle_datagram(T0 + ms(20), &1, old.msg1(), &creds)).len(),
-            1
+            sends(&host.handle_datagram(T0 + ms(150), &1, old.msg1(), &creds)),
+            answer
         );
         // And the iPad's own new stale attempt is still answered.
         let fresh = Initiator::start(&K, &DEV, &HOST, 2, &hello(600)).unwrap();
@@ -2809,30 +2862,57 @@ mod tests {
         assert_eq!(host.msg1_reads(), reads);
     }
 
+    /// A new authenticated `Stale` message 1 for `id` from `source`, through
+    /// the cookie if the host asks for one, as the iPad does. The answers it
+    /// got, and the message 1.
+    fn stale_attempt(
+        host: &mut HostSessions<u32>,
+        creds: &Creds,
+        at: Duration,
+        source: u32,
+        id: &Id16,
+        ts: u64,
+    ) -> (usize, Vec<u8>) {
+        let ipad = Initiator::start(&K, id, &HOST, 1, &hello(ts)).unwrap();
+        let mut out = host.handle_datagram(at, &source, ipad.msg1(), creds);
+        if let [HostOutput::Send { datagram, .. }] = &out[..] {
+            if cookie::is_reply(datagram) {
+                let reply = cookie::CookieReply::parse(datagram).unwrap();
+                let digest = cookie::msg1_digest(ipad.msg1());
+                let value = cookie::open(&cookie::session_key(&K, id), &reply, &digest).unwrap();
+                let msg1 = cookie::attach(ipad.msg1(), &value);
+                out = host.handle_datagram(at, &source, &msg1, creds);
+            }
+        }
+        (real_answers(&out), ipad.msg1().to_vec())
+    }
+
     /// Floods `devices` distinct authenticated `Stale` message 1s per
-    /// device, 15 every 200 ms (75/s, past both budgets) from fresh
-    /// sources, for 31 s. Returns the answers per device, the largest
-    /// table size seen and the last message 1 that got an answer.
+    /// device, 15 every 200 ms (75/s, past every budget) from fresh
+    /// sources, for `ticks` × 200 ms. One the shared budget refuses comes back with its
+    /// cookie, as the iPad's would, so the cookie lane and the unanswered
+    /// memory fill too. Returns the answers per device, the largest table
+    /// size seen and the last message 1 that got an answer.
     fn flood_remembered(
         host: &mut HostSessions<u32>,
         creds: &Creds,
         ids: &[Id16],
+        ticks: u64,
     ) -> (Vec<usize>, usize, Vec<u8>) {
         let mut answers = vec![0; ids.len()];
         let mut largest = 0;
         let mut last = Vec::new();
         let mut source = 1000u32;
         let mut ts = 1u64;
-        for tick in 0..155u64 {
+        for tick in 0..ticks {
             let at = T0 + ms(tick * 200);
             for (n, id) in ids.iter().enumerate() {
                 for _ in 0..15 {
                     ts += 1;
                     source += 1;
-                    let ipad = Initiator::start(&K, id, &HOST, 1, &hello(ts)).unwrap();
-                    let sent = sends(&host.handle_datagram(at, &source, ipad.msg1(), creds)).len();
+                    let (sent, msg1) = stale_attempt(host, creds, at, source, id, ts);
                     if sent > 0 {
-                        last = ipad.msg1().to_vec();
+                        last = msg1;
                     }
                     answers[n] += sent;
                     largest = largest.max(host.answered.len());
@@ -2856,17 +2936,17 @@ mod tests {
         for id in &ids {
             creds.keys.insert(*id, K);
         }
-        // 4 × (5 + 5) × (30 + 1).
-        assert_eq!(host.answered_capacity, 1240);
-        let (answers, largest, _) = flood_remembered(&mut host, &creds, &ids);
-        // The table never filled: every device got its full answer budget
-        // in every second, 5 × 31.
+        // 4 × (5 + 5 + 5) × (30 + 1).
+        assert_eq!(host.answered_capacity, 1860);
+        let (answers, largest, _) = flood_remembered(&mut host, &creds, &ids, 155);
+        // The table never filled: every device got both its answer budgets
+        // in every second, (5 + 5) × 31.
         for a in answers {
-            assert_eq!(a, 5 * 31);
+            assert_eq!(a, 10 * 31);
         }
         // Windows aligned on whole seconds reach 30 of the 31 the bound
         // allows for.
-        assert_eq!(largest, 1200);
+        assert_eq!(largest, 1800);
     }
 
     #[test]
@@ -2880,21 +2960,36 @@ mod tests {
         for id in &ids {
             creds.keys.insert(*id, K);
         }
-        let (answers, largest, last) = flood_remembered(&mut host, &creds, &ids);
+        let (answers, largest, last) = flood_remembered(&mut host, &creds, &ids, 100);
         assert_eq!(largest, host.answered_capacity);
         assert!(
-            answers.iter().sum::<usize>() < 3 * 5 * 31,
+            answers.iter().sum::<usize>() < 3 * 10 * 20,
             "some answers refused"
         );
-        // Full, and a new message 1 gets no answer.
-        let at = T0 + ms(154 * 200 + 100);
-        let new = Initiator::start(&K, &ids[2], &HOST, 1, &hello(2)).unwrap();
-        assert!(host.answered.len() == host.answered_capacity);
-        assert!(sends(&host.handle_datagram(at, &7, new.msg1(), &creds)).is_empty());
-        // Nothing unexpired was evicted to make room: the last answered one
-        // is still recognised, with no read.
+        // Full (it fills well before anything expires), and a new message 1,
+        // even through its cookie, gets no answer.
+        let at = T0 + ms(100 * 200);
+        assert_eq!(host.answered.len(), host.answered_capacity);
+        let (sent, _) = stale_attempt(&mut host, &creds, at, 7, &ids[2], 2);
+        assert_eq!(sent, 0);
+        // Nothing unexpired was evicted to make room: the last answered one,
+        // with a valid cookie, is still recognised (its cached answer, if
+        // any), with no read.
+        let out = host.handle_datagram(at, &8, &last, &creds);
+        let msg1 = match &out[..] {
+            [HostOutput::Send { datagram, .. }] if cookie::is_reply(datagram) => {
+                let reply = cookie::CookieReply::parse(datagram).unwrap();
+                let digest = cookie::msg1_digest(&last);
+                let id = ids
+                    .iter()
+                    .find_map(|id| cookie::open(&cookie::session_key(&K, id), &reply, &digest))
+                    .unwrap();
+                cookie::attach(&last, &id)
+            }
+            _ => last.clone(),
+        };
         let reads = host.msg1_reads();
-        host.handle_datagram(at, &8, &last, &creds);
+        host.handle_datagram(at, &8, &msg1, &creds);
         assert_eq!(host.msg1_reads(), reads);
     }
 
@@ -3251,5 +3346,112 @@ mod tests {
         }
         assert_eq!(received, 7, "every retry after the cookie round trip");
         assert_eq!(host.pending_count(), 1);
+    }
+
+    /// The iPad's address and another port on its IP, for the tests below.
+    fn two_ports() -> (HostSessions<SocketAddr>, SocketAddr, SocketAddr) {
+        let host = HostSessions::new(
+            HostConfig::new(HOST),
+            Box::new(SeededRandom::new(1)),
+            T0,
+            WALL,
+        );
+        let old_port: SocketAddr = "192.0.2.1:40000".parse().unwrap();
+        let ipad: SocketAddr = "192.0.2.1:40001".parse().unwrap();
+        (host, old_port, ipad)
+    }
+
+    /// After a NAT rebind, cookie-less replays of a cached Stale answer's
+    /// message 1 to its first port never take the resends of the iPad on
+    /// its new port, which came back with a cookie.
+    #[test]
+    fn replays_to_the_old_port_never_take_a_rebound_ipads_cached_answer() {
+        let (_, creds) = setup();
+        *creds.timestamp.borrow_mut() = 1000;
+        let (mut host, old_port, ipad) = two_ports();
+        let attempt = Initiator::start(&K, &DEV, &HOST, 1, &hello(500)).unwrap();
+        let first = sends(&host.handle_datagram(T0, &old_port, attempt.msg1(), &creds));
+        assert_eq!(first.len(), 1);
+        let reply = sends(&host.handle_datagram(T0 + ms(1), &ipad, attempt.msg1(), &creds));
+        assert!(reply.len() == 1 && cookie::is_reply(&reply[0]));
+        let with = with_cookie(&reply[0], attempt.msg1());
+        let mut received = 0;
+        for tick in 0..8u64 {
+            let at = T0 + ms(2 + tick * 250);
+            for _ in 0..5 {
+                host.handle_datagram(at, &old_port, attempt.msg1(), &creds);
+            }
+            let out = sends(&host.handle_datagram(at + ms(1), &ipad, &with, &creds));
+            if out == first {
+                received += 1;
+            }
+            assert!(!host.under_load(at));
+        }
+        assert_eq!(received, 8, "every retry from the new port");
+    }
+
+    /// Forged message 1s from another port on the iPad's IP, past the IP's
+    /// read limit, never keep the iPad's own message 1 from being read: it
+    /// gets a cookie reply and is read on its address's own lane.
+    #[test]
+    fn another_port_on_the_ipads_ip_never_uses_up_its_reads() {
+        let (_, creds) = setup();
+        let (mut host, old_port, ipad) = two_ports();
+        let mut connected = 0;
+        for second in 0..4u64 {
+            let at = T0 + Duration::from_secs(second);
+            for i in 0..25u64 {
+                let forged =
+                    Initiator::start(&[7; 32], &DEV, &HOST, 1, &hello(100 * second + i)).unwrap();
+                host.handle_datagram(at, &old_port, forged.msg1(), &creds);
+            }
+            let attempt = Initiator::start(&K, &DEV, &HOST, 2, &hello(10 + second)).unwrap();
+            let out = sends(&host.handle_datagram(at, &ipad, attempt.msg1(), &creds));
+            assert!(
+                out.len() == 1 && cookie::is_reply(&out[0]),
+                "the IP's limit: a cookie"
+            );
+            let msg1 = with_cookie(&out[0], attempt.msg1());
+            let out = sends(&host.handle_datagram(at, &ipad, &msg1, &creds));
+            if out.len() == 1 && wire::classify(&out[0]) == V3Kind::Handshake2 {
+                connected += 1;
+            }
+            assert!(!host.under_load(at));
+        }
+        assert_eq!(connected, 4);
+    }
+
+    /// Captured old genuine message 1s replayed from spoofed sources, past
+    /// the dev_id's Stale budget, never keep the iPad's own Stale answer
+    /// from it: it gets a cookie reply and is answered on the lane only a
+    /// message 1 with a cookie reaches.
+    #[test]
+    fn replayed_old_message_1s_never_use_up_the_ipads_stale_answer() {
+        let (mut host, creds) = setup();
+        *creds.timestamp.borrow_mut() = 1_000_000;
+        let mut answered = 0;
+        for second in 0..4u64 {
+            let at = T0 + Duration::from_secs(second);
+            for i in 0..6u64 {
+                let old =
+                    Initiator::start(&K, &DEV, &HOST, 1, &hello(1 + 10 * second + i)).unwrap();
+                host.handle_datagram(at, &(500 + (10 * second + i) as u32), old.msg1(), &creds);
+            }
+            let mut ipad = Initiator::start(&K, &DEV, &HOST, 2, &hello(900 + second)).unwrap();
+            let out = sends(&host.handle_datagram(at, &ADDR, ipad.msg1(), &creds));
+            assert!(
+                out.len() == 1 && cookie::is_reply(&out[0]),
+                "over the shared budget"
+            );
+            let msg1 = with_cookie(&out[0], ipad.msg1());
+            let out = sends(&host.handle_datagram(at, &ADDR, &msg1, &creds));
+            if out.len() == 1
+                && matches!(ipad.read_msg2(&out[0]), Ok((Msg2Payload::Stale { .. }, _)))
+            {
+                answered += 1;
+            }
+            assert!(!host.under_load(at));
+        }
+        assert_eq!(answered, 4);
     }
 }

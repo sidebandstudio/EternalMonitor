@@ -14,6 +14,7 @@
 //! - the iPad hears `PairDone` only after its own pairing's write
 //!   succeeded, and `PairRefused` only after its own write was refused;
 //! - each written record is reported paired once;
+//! - a forged message 1 gets at most a cookie reply its sender can't open;
 //! - nothing panics.
 #![no_main]
 
@@ -21,6 +22,7 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use eternal_wire::v3::client::ClientKey;
+use eternal_wire::v3::cookie;
 use eternal_wire::v3::pairing::{
     PairCredentials, PairOutput, PairResult, PairingClient, PairingConfig, PairingHost,
     PendingPairing, QrPayload, StoreResult, QR_LIFETIME,
@@ -318,13 +320,22 @@ fuzz_target!(|data: &[u8]| {
                 // A forged message 1 under another secret.
                 let mut forged = qr.clone();
                 forged.secret = Zeroizing::new([b; 32]);
-                let client =
+                let mut client =
                     PairingClient::start(&forged, &SLOT, "0.4.0", "x", 1, &mut rng).unwrap();
                 let msg1 = client.msg1().to_vec();
                 for output in host.handle_datagram(now, &2, &msg1, &creds) {
                     assert!(!matches!(output, PairOutput::Store(_)));
-                    if let PairOutput::Send { .. } = output {
-                        assert_eq!(forged.secret, qr.secret, "an answer to a forged message 1");
+                    if let PairOutput::Send { datagram, .. } = output {
+                        if cookie::is_reply(&datagram) {
+                            // Sealed under the real QR's key: no use to it.
+                            assert!(
+                                forged.secret == qr.secret
+                                    || client.handle_cookie(&datagram).is_none(),
+                                "a forger opened a cookie reply"
+                            );
+                        } else {
+                            assert_eq!(forged.secret, qr.secret, "an answer to a forged message 1");
+                        }
                     }
                 }
             }
