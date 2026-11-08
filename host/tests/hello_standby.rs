@@ -468,6 +468,58 @@ fn the_storm_brake_says_why_and_waits_for_start() {
     assert_eq!(ack.status, HelloStatus::Failed);
 }
 
+/// A stream that finds its chosen network changed as Stop stops it asks to
+/// start again on the new address. That request comes from a stream the
+/// user already stopped: the PC stays stopped, and only Start streams.
+///
+/// The session lock holds the stream between its bind and its first look
+/// at the network, so it always looks after Stop, on the new address.
+#[cfg(debug_assertions)]
+#[test]
+fn a_stream_stopping_as_its_network_changes_stays_stopped() {
+    use eternal_host::network::{set_test_adapters, Adapter, Kind, ListenOn};
+    let wifi = |up| {
+        vec![Adapter {
+            name: "Wi-Fi".into(),
+            kind: Kind::Wifi,
+            up,
+            gateway: true,
+            ipv4: vec![std::net::Ipv4Addr::new(192, 168, 1, 20)],
+        }]
+    };
+    let host = Host::start_with(GpuInfo::software_fallback(), 500, |shared| {
+        shared.pairing.lock().required = false;
+        *shared.listen_on.lock() = ListenOn::Adapter("Wi-Fi".into());
+        set_test_adapters(Some(wifi(false)));
+        std::mem::forget(shared.session.lock());
+    });
+    // The stream binds this PC only, the network being down, then waits
+    // for the session.
+    let shown = format!("unknown:{}", host.port);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while PIPELINE_STATS.lock().listen_addr != shown {
+        assert!(Instant::now() < deadline, "the stream never bound");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    host.send(SupervisorCommand::Stop);
+    set_test_adapters(Some(wifi(true)));
+    // SAFETY: the guard forgotten above was taken on this lock, and nothing
+    // else holds it.
+    unsafe { host.shared.session.force_unlock() };
+
+    host.wait_until_stopped();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        assert_eq!(
+            host.shared.session.lock().not_streaming(),
+            Some(NotStreaming::Stopped),
+            "the stopped stream restarted itself"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(!host.streaming(), "the stopped stream restarted itself");
+}
+
 /// A stopped PC listens where iPads can reach it, as the stream does: on
 /// this PC only while the chosen network is down, on the network's address
 /// once it is back, on this PC again when it goes, and on every network

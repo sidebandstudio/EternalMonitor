@@ -1523,6 +1523,13 @@ pub(super) fn audio_summary(
             ACCENT,
         );
     }
+    if audio.status == crate::audio::DEVICE_IN_USE_STATUS {
+        return (
+            "Another app is using your speakers on its own. PC audio comes back when it lets go."
+                .into(),
+            WARNING,
+        );
+    }
     // The audio stage's idle status names the protocol, not the device.
     if audio.status == "Waiting for client" {
         return ("Starts when an iPad connects.".into(), TEXT_MUTED);

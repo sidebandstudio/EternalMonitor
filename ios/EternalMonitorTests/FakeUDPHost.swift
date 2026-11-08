@@ -19,6 +19,11 @@ final class FakeUDPHost: @unchecked Sendable {
     private(set) var lastHelloSize = 0
     /// The pairing token the HELLO2 answered last carried.
     private(set) var lastAuthToken = Data()
+    /// When the HELLO2 answered last arrived, by the kernel's receive
+    /// time: how fast this fake read it doesn't move it.
+    private(set) var lastHelloArrival: Date?
+    /// When the datagram read last arrived, by the kernel's receive time.
+    private var arrival = Date()
     /// A HELLO2 came before the identify request was answered.
     private(set) var helloBeforeIdentify = false
 
@@ -38,20 +43,63 @@ final class FakeUDPHost: @unchecked Sendable {
         }
         var timeout = timeval(tv_sec: 0, tv_usec: 300_000)
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        var on: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_TIMESTAMP, &on, socklen_t(MemoryLayout<Int32>.size))
     }
 
     deinit { Darwin.close(fd) }
 
     private func receive() -> (Data, sockaddr_storage, socklen_t)? {
         var buffer = [UInt8](repeating: 0, count: 2048)
+        var control = [UInt8](repeating: 0, count: 64)
         var from = sockaddr_storage()
         var length = socklen_t(MemoryLayout<sockaddr_storage>.size)
-        let count = withUnsafeMutablePointer(to: &from) { pointer in
-            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                recvfrom(fd, &buffer, buffer.count, 0, $0, &length)
+        var controlLength = 0
+        let count = buffer.withUnsafeMutableBytes { bytes in
+            control.withUnsafeMutableBytes { controlBytes in
+                withUnsafeMutablePointer(to: &from) { name in
+                    var vector = iovec(iov_base: bytes.baseAddress, iov_len: bytes.count)
+                    return withUnsafeMutablePointer(to: &vector) { vectors in
+                        var message = msghdr(
+                            msg_name: UnsafeMutableRawPointer(name), msg_namelen: length,
+                            msg_iov: vectors, msg_iovlen: 1,
+                            msg_control: controlBytes.baseAddress, msg_controllen: socklen_t(controlBytes.count),
+                            msg_flags: 0)
+                        let count = recvmsg(fd, &message, 0)
+                        length = message.msg_namelen
+                        controlLength = Int(message.msg_controllen)
+                        return count
+                    }
+                }
             }
         }
-        return count > 0 ? (Data(buffer.prefix(count)), from, length) : nil
+        guard count > 0 else { return nil }
+        arrival = Self.kernelTimestamp(control.prefix(controlLength)) ?? Date()
+        return (Data(buffer.prefix(count)), from, length)
+    }
+
+    /// The SCM_TIMESTAMP in a datagram's control messages. Darwin aligns
+    /// each message and its data to 4 bytes after a 12-byte header.
+    private static func kernelTimestamp(_ control: ArraySlice<UInt8>) -> Date? {
+        let bytes = Array(control)
+        var offset = 0
+        while offset + 12 <= bytes.count {
+            let (length, level, type) = bytes.withUnsafeBytes {
+                ($0.loadUnaligned(fromByteOffset: offset, as: UInt32.self),
+                 $0.loadUnaligned(fromByteOffset: offset + 4, as: Int32.self),
+                 $0.loadUnaligned(fromByteOffset: offset + 8, as: Int32.self))
+            }
+            guard length >= 12 else { return nil }
+            if level == SOL_SOCKET, type == SCM_TIMESTAMP,
+               offset + 12 + MemoryLayout<timeval>.size <= bytes.count {
+                let time = bytes.withUnsafeBytes {
+                    $0.loadUnaligned(fromByteOffset: offset + 12, as: timeval.self)
+                }
+                return Date(timeIntervalSince1970: TimeInterval(time.tv_sec) + TimeInterval(time.tv_usec) / 1_000_000)
+            }
+            offset += (Int(length) + 3) & ~3
+        }
+        return nil
     }
 
     /// Answers the next HELLO2 attempt, with session 41 unless `status`
@@ -70,6 +118,7 @@ final class FakeUDPHost: @unchecked Sendable {
             lastHello = hello
             lastHelloSize = data.count
             lastAuthToken = hello.authToken
+            lastHelloArrival = arrival
             send(Self.ack(nonce: hello.clientNonce, status: status, acceptedVersion: acceptedVersion,
                           hostName: hostName, authToken: authToken, hostCaps: hostCaps, reason: reason))
             return true

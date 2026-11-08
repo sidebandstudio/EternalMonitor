@@ -36,15 +36,20 @@ final class PCNotStreamingTests: XCTestCase {
         XCTAssertEqual(manager.state, .connecting)
 
         // It keeps asking, every two seconds rather than four times a
-        // second, with the same HELLO2, past the connect timeout.
-        var answeredAt = [Date()]
-        for _ in 0..<3 {
+        // second, with the same HELLO2, past the connect timeout. The gaps
+        // are between the HELLO2s the PC received, by their arrival times,
+        // from those sent after the iPad showed it heard the answer: a quick
+        // retry sent before that may still have been on its way.
+        let told = Date()
+        var askedAt: [Date] = []
+        for _ in 0..<6 where askedAt.count < 3 {
             let again = await Task.detached { host.acceptSession(status: .stopped) }.value
             XCTAssertTrue(again, "the iPad stopped asking")
-            answeredAt.append(Date())
             XCTAssertEqual(host.lastNonce, firstNonce)
+            if let arrival = host.lastHelloArrival, arrival > told { askedAt.append(arrival) }
         }
-        for (earlier, later) in zip(answeredAt.dropLast(), answeredAt.dropFirst()) {
+        XCTAssertEqual(askedAt.count, 3, "the iPad stopped asking")
+        for (earlier, later) in zip(askedAt.dropLast(), askedAt.dropFirst()) {
             XCTAssertGreaterThan(later.timeIntervalSince(earlier), 1.5, "asking too often")
         }
         XCTAssertEqual(manager.state, .connecting)
