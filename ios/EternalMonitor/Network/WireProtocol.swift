@@ -364,6 +364,10 @@ struct Heartbeat: Equatable {
     /// The same in Second screen mode, after the second screen failed to
     /// start: the main screen it fell back to can't be captured either.
     static let noticeSecondScreenUnsupportedGPU: UInt8 = 4
+    /// The PC is restarting its stream and keeps this session: the picture
+    /// comes back by itself. Sent only to an iPad that sets
+    /// `Hello2.featureStandbyStatus`. (3 and 4 are the graphics card notices.)
+    static let noticeRestarting: UInt8 = 5
     /// Second screen needs Windows 11, so the PC shows its main screen
     /// instead. Sent for a few seconds, over a picture that works.
     static let noticeSecondScreenNeedsWindows11: UInt8 = 6

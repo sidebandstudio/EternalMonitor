@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use eternal_wire::reassembly::{AddOutcome, Reassembler};
 use eternal_wire::v2::control::{
-    encode_control, parse_control, ControlMessage, Hello2, HelloStatus, ReceiverReport,
+    encode_control, parse_control, ControlMessage, Hello2, HelloStatus, Ping, ReceiverReport,
     CAP_DECODE_H264,
 };
 use eternal_wire::v2::media::MediaHeader;
@@ -102,7 +102,19 @@ fn main() {
                 if let Ok((_, ControlMessage::HelloAck(ack))) = parse_control(bytes) {
                     assert_eq!(ack.status, HelloStatus::Ok, "pairing must be off");
                     session_id = ack.session_id;
-                    acked_at.get_or_insert_with(Instant::now);
+                    if acked_at.is_none() {
+                        acked_at = Some(Instant::now());
+                        // As the app does when its HELLO_ACK lands: the host
+                        // sends a viewer that has not answered only its
+                        // first picture.
+                        msg_seq += 1;
+                        let ping = ControlMessage::Ping(Ping {
+                            t1_us: started.elapsed().as_micros() as u64,
+                        });
+                        socket
+                            .send_to(&encode_control(session_id, msg_seq, &ping), &host)
+                            .unwrap();
+                    }
                 }
             }
             Classified::Media { .. } if session_id != 0 => {

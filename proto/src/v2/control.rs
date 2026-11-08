@@ -293,9 +293,14 @@ pub const NOTICE_UNSUPPORTED_GPU: u8 = 3;
 /// [`NOTICE_UNSUPPORTED_GPU`] in Second screen mode, once the second screen
 /// failed to start: the main screen it fell back to can't be captured either.
 pub const NOTICE_SECOND_SCREEN_UNSUPPORTED_GPU: u8 = 4;
+/// The PC is restarting its stream and keeps the session meanwhile: the
+/// picture comes back by itself. Sent only to iPads that set
+/// [`FEATURE_STANDBY_STATUS`]. (3 and 4 are taken by the graphics card
+/// notices.)
+pub const NOTICE_RESTARTING: u8 = 5;
 /// Second screen needs Windows 11, so the iPad shows the PC's main screen
 /// instead. Sent for a few seconds after the session starts mirroring for
-/// it, over a picture that works. (5 is kept for the restart notice.)
+/// it, over a picture that works.
 pub const NOTICE_SECOND_SCREEN_NEEDS_WINDOWS_11: u8 = 6;
 
 /// Host → client, every heartbeat interval while a session is active.

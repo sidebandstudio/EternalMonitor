@@ -13,6 +13,11 @@ enum AttemptEnd: Equatable {
     case pcGoodbye
     /// The PC turned the connection down.
     case pcRefused
+    /// The PC turned it down as Busy: it streams to another device.
+    case pcBusy
+    /// The PC turned it down as too old for this app.
+    case oldPC
+    /// A v0.1.x PC, too old to answer HELLO2.
     case legacyPC
     /// The connect watchdog ran out before a picture.
     case connectTimeout
@@ -127,7 +132,9 @@ struct SessionSummary: Equatable {
         case .pcStoppedResponding: return "signal_lost"
         case .cableUnplugged, .usbLinkFailed, .closedBeforePicture: return "usb_lost"
         case .noNetwork: return "no_network"
-        case .pcRefused, .legacyPC, .linkFailed, .receiverFailed, .pictureStalled, .otherPC: return "other"
+        case .pcBusy: return "pc_busy"
+        case .oldPC, .legacyPC: return "old_pc"
+        case .pcRefused, .linkFailed, .receiverFailed, .pictureStalled, .otherPC: return "other"
         default: return "none"
         }
     }

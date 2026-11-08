@@ -25,6 +25,7 @@ final class LocalizationTests: XCTestCase {
     private let awaitingTranslation: Set<String> = [
         "Your PC can't share its screen from its current graphics card. Check the PC.",
         "The second screen didn't start, and your PC can't share its main screen from its current graphics card. Check the PC.",
+        "Your PC is restarting the stream…",
         "Second screen needs Windows 11. Showing your PC's screen instead.",
     ]
 

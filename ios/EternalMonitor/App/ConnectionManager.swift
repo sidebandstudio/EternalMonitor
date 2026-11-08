@@ -127,6 +127,14 @@ final class ConnectionManager: ObservableObject {
     @Published var pcGraphicsCard: PCGraphicsCard?
     /// The PC's heartbeats counted video frames sent this attempt.
     private var pcSentVideo = false
+    /// The PC is restarting its stream and kept this session, and no new
+    /// frame has come for `Timing.restartNoticeSeconds`. The first new frame
+    /// clears it.
+    @Published private(set) var pcRestarting = false
+    /// When the last frame was decoded, by the system uptime clock.
+    private var lastFrameAt: TimeInterval?
+    /// Shows the restarting pill once the picture has been held long enough.
+    private var restartNoticeTask: Task<Void, Never>?
     /// Second screen needs Windows 11, so the PC mirrors its main screen.
     /// Its heartbeats say so for a few seconds after the session starts.
     @Published var secondScreenNeedsWindows11 = false
@@ -186,6 +194,11 @@ final class ConnectionManager: ObservableObject {
     /// Disconnect, coming back to the app keeps it stopped until Try again
     /// or Connect USB.
     private var usbStoppedForNoPicture = false
+    /// The PC turned the cable down: it isn't answered until the hold ends
+    /// (see `CableHold`). Busy refusals in a row set the wait.
+    private var cableHold: CableHold?
+    private var cableBusyInARow = 0
+    private var cableHoldTask: Task<Void, Never>?
     private let currentAttempt = OSAllocatedUnfairLock<UUID?>(initialState: nil)
     private var frameAssembler: FrameAssembler?
     private var controlChannel: ControlChannel?
@@ -257,6 +270,15 @@ final class ConnectionManager: ObservableObject {
         /// How long video the PC says it sent may go missing before the
         /// next no-video step (see `NoVideoFallback`).
         var noVideoStepSeconds = 1.5
+        /// How long the cable goes unanswered after the given number of
+        /// Busy refusals in a row (see `CableHold`).
+        var cableBusyHoldSeconds: (Int) -> Double = CableHold.busySeconds
+        /// Waits out a cable hold. Tests replace it to end the wait when
+        /// they choose.
+        var cableHoldSleep: (Double) async -> Void = { try? await Task.sleep(for: .seconds($0)) }
+        /// How long the picture is held through a PC's stream restart before
+        /// the iPad says so. A quick restart shows nothing.
+        var restartNoticeSeconds = 1.5
     }
     var timing: Timing
     /// The Wi-Fi link to a host's port. Tests pass a fake one, or replace it
@@ -362,8 +384,45 @@ final class ConnectionManager: ObservableObject {
     func resumeUSBConnections() {
         noPictureStreak.restartCount()
         usbStoppedForNoPicture = false
+        endCableHold()
+        cableBusyInARow = 0
         usbPaused = false
         refreshUSBAvailability()
+    }
+
+    /// The PC turned this iPad down over the cable. Stop answering the cable
+    /// for the hold's wait, or until the user acts after a version refusal,
+    /// instead of taking the PC's next dial a second later.
+    private func holdCable(_ reason: CableHold.Reason) {
+        var wait: Double?
+        if reason == .busy {
+            cableBusyInARow += 1
+            wait = timing.cableBusyHoldSeconds(cableBusyInARow)
+        }
+        let hold = CableHold(reason: reason, until: wait.map { now().addingTimeInterval($0) })
+        endCableHold()
+        cableHold = hold
+        record(.info, "usb", "The PC turned the cable down (\(reason)); " + (wait.map { "answering it again in \(Int($0.rounded())) s" }
+            ?? "answering it again after Try again or Connect USB"))
+        usbPaused = true
+        usbListener?.stop()
+        usbListener = nil
+        usbStatus = "USB: disconnected"
+        guard let wait else { return }
+        let sleep = timing.cableHoldSleep
+        cableHoldTask = Task { @MainActor [weak self] in
+            await sleep(wait)
+            guard let self, !Task.isCancelled, self.cableHold == hold else { return }
+            self.endCableHold()
+            self.usbPaused = self.usbStoppedForNoPicture
+            self.refreshUSBAvailability()
+        }
+    }
+
+    private func endCableHold() {
+        cableHoldTask?.cancel()
+        cableHoldTask = nil
+        cableHold = nil
     }
 
     // MARK: - Frame slot (thread-safe single-slot)
@@ -572,6 +631,7 @@ final class ConnectionManager: ObservableObject {
         pcNoDisplay = false
         pcGraphicsCard = nil
         pcSentVideo = false
+        clearRestartNotice()
         secondScreenNeedsWindows11 = false
         degradedSinceUs = nil
         prevCounters = FrameAssembler.Counters()
@@ -644,6 +704,9 @@ final class ConnectionManager: ObservableObject {
                 guard self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 self.debugState.decodedFrames += 1
                 self.debugState.lastDecodedTimestampUs = ts
+                self.lastFrameAt = ProcessInfo.processInfo.systemUptime
+                if self.pcRestarting { self.record(.info, "ctrl", "Picture back after the PC's stream restart") }
+                self.clearRestartNotice()
                 if self.debugState.decodedFrames == 1 {
                     self.firstFrameAt = ProcessInfo.processInfo.systemUptime
                     self.record(.info, "decode", "First frame decoded successfully" + self.attemptTimings)
@@ -850,7 +913,10 @@ final class ConnectionManager: ObservableObject {
                     do { try self.pairingStore.save(token: info.authToken, hostName: info.hostName, address: pairingAddress) }
                     catch { self.record(.warning, "pairing", "Pairing was not saved on this iPad. Pair again next time.") }
                 }
-                if isUSB { self.usbStatus = "USB: connected to \(info.hostName)" }
+                if isUSB {
+                    self.usbStatus = "USB: connected to \(info.hostName)"
+                    self.cableBusyInARow = 0
+                }
                 self.hostStreamConfig = info.streamConfig
                 self.record(
                     .info, "ctrl",
@@ -901,7 +967,16 @@ final class ConnectionManager: ObservableObject {
                     self.connectionError = "Your PC turned down the connection."
                 }
                 self.record(.error, "ctrl", self.connectionError ?? self.problem?.title ?? "rejected")
-                self.disconnect(.pcRefused)
+                switch status {
+                case .busy: self.disconnect(.pcBusy)
+                case .versionUnsupported where mismatch == .pcOlder: self.disconnect(.oldPC)
+                default: self.disconnect(.pcRefused)
+                }
+                // Over the cable the PC dials again a second later, and would
+                // be turned down again: wait for a change instead.
+                if isUSB, status == .busy || status == .versionUnsupported {
+                    self.holdCable(status == .busy ? .busy : .version)
+                }
             }
         }
         channel.onPCNotStreaming = { [weak self] status, reason in
@@ -931,6 +1006,7 @@ final class ConnectionManager: ObservableObject {
                     self.connectionError = VersionMismatch.pcLegacy.message
                     self.record(.error, "ctrl", "Legacy v1 host detected")
                     self.disconnect(.legacyPC)
+                    if isUSB { self.holdCable(.version) }
                 } else {
                     self.record(.warning, "ctrl", "HELLO2 handshake got no reply yet")
                     if self.leaveRememberedAddress(.pcMoved, result: "no_reply") {
@@ -989,6 +1065,11 @@ final class ConnectionManager: ObservableObject {
                 if locked != self.pcLocked {
                     self.pcLocked = locked
                     self.record(.info, "ctrl", locked ? "PC locked: holding the picture" : "PC unlocked")
+                }
+                if heartbeat.notice == Heartbeat.noticeRestarting {
+                    self.noteRestartNotice()
+                } else {
+                    self.clearRestartNotice()
                 }
                 let noDisplay = heartbeat.notice == Heartbeat.noticeNoDisplay
                 if noDisplay != self.pcNoDisplay {
@@ -1241,6 +1322,29 @@ final class ConnectionManager: ObservableObject {
             degradedSinceUs = nil
             record(.info, "ctrl", "Signal recovered")
         }
+    }
+
+    /// The PC said it is restarting its stream and holds this session. Once
+    /// the picture has been held `restartNoticeSeconds` since its last
+    /// frame, say so; a frame first means a quick restart, and nothing shows.
+    private func noteRestartNotice() {
+        guard state == .connected, !pcRestarting, restartNoticeTask == nil else { return }
+        let heldFor = ProcessInfo.processInfo.systemUptime - (lastFrameAt ?? ProcessInfo.processInfo.systemUptime)
+        let wait = max(0, timing.restartNoticeSeconds - heldFor)
+        let frameAt = lastFrameAt
+        restartNoticeTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(wait))
+            guard !Task.isCancelled, let self, self.state == .connected, self.lastFrameAt == frameAt else { return }
+            self.restartNoticeTask = nil
+            self.pcRestarting = true
+            self.record(.info, "ctrl", "PC is restarting its stream: holding the picture")
+        }
+    }
+
+    private func clearRestartNotice() {
+        restartNoticeTask?.cancel()
+        restartNoticeTask = nil
+        pcRestarting = false
     }
 
     /// Ends the session that `reason` interrupted (`end` when it was not
@@ -1718,7 +1822,9 @@ final class ConnectionManager: ObservableObject {
         endBackgroundGoodbye()
         isForeground = true
         recheckAppleDevicesSighting()
-        usbPaused = usbStoppedForNoPicture
+        // A hold whose wait ran out in the background ends here.
+        if let hold = cableHold, !hold.holds(at: now()) { endCableHold() }
+        usbPaused = usbStoppedForNoPicture || cableHold != nil
         refreshUSBAvailability()
         guard resumeOnForeground else { return }
         resumeOnForeground = false
@@ -1802,6 +1908,7 @@ final class ConnectionManager: ObservableObject {
         pcLocked = false
         pcNoDisplay = false
         pcGraphicsCard = nil
+        clearRestartNotice()
         secondScreenNeedsWindows11 = false
         degradedSinceUs = nil
         prevCounters = FrameAssembler.Counters()

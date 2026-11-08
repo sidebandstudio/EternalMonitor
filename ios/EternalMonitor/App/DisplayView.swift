@@ -63,12 +63,16 @@ struct DisplayView: View {
                 graphicsCardPill(card)
                     .transition(.opacity)
                     .allowsHitTesting(false)
-            } else if connectionManager.pictureRestoring {
-                restoringPill
+            } else if connectionManager.pcRestarting {
+                pcRestartingPill
                     .transition(.opacity)
                     .allowsHitTesting(false)
             } else if connectionManager.secondScreenNeedsWindows11 {
                 needsWindows11Pill
+                    .transition(.opacity)
+                    .allowsHitTesting(false)
+            } else if connectionManager.pictureRestoring {
+                restoringPill
                     .transition(.opacity)
                     .allowsHitTesting(false)
             }
@@ -132,6 +136,7 @@ struct DisplayView: View {
         .animation(.easeInOut(duration: 0.25), value: connectionManager.pcLocked)
         .animation(.easeInOut(duration: 0.25), value: connectionManager.pcNoDisplay)
         .animation(.easeInOut(duration: 0.25), value: connectionManager.pcGraphicsCard)
+        .animation(.easeInOut(duration: 0.25), value: connectionManager.pcRestarting)
         .animation(.easeInOut(duration: 0.25), value: connectionManager.secondScreenNeedsWindows11)
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.35), value: appeared)
         .onAppear {
@@ -511,6 +516,25 @@ struct DisplayView: View {
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(card.short)
         .accessibilityIdentifier("display.pcGraphicsCard")
+    }
+
+    /// Over the held picture while the PC restarts its stream, until the
+    /// first new frame.
+    private var pcRestartingPill: some View {
+        HStack(spacing: 10) {
+            ProgressView()
+                .tint(Theme.text)
+                .accessibilityHidden(true)
+            Text(L("Your PC is restarting the stream…"))
+                .font(.app(15, .semibold, relativeTo: .subheadline))
+                .foregroundStyle(Theme.text)
+        }
+        .padding(.horizontal, 18)
+        .frame(minHeight: 44)
+        .background(glass(Capsule()))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(L("Your PC is restarting the stream…"))
+        .accessibilityIdentifier("display.pcRestarting")
     }
 
     /// The PC is still connected but a lost frame left the picture waiting
