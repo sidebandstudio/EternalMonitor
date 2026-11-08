@@ -590,10 +590,10 @@ impl Session {
         else {
             return true;
         };
-        session.restart_held_since = None;
-        session.last_frame_at = Some(now);
         if session.answered {
             session.frames_sent = session.frames_sent.saturating_add(1);
+            session.restart_held_since = None;
+            session.last_frame_at = Some(now);
             return true;
         }
         if session.withheld
@@ -603,6 +603,9 @@ impl Session {
             session.withheld = true;
             return false;
         }
+        // Only a frame that goes out ends a hold through a restart.
+        session.restart_held_since = None;
+        session.last_frame_at = Some(now);
         session.unanswered_sent += bytes;
         session.frames_sent = session.frames_sent.saturating_add(1);
         self.unanswered_media = (host_spent + bytes, now);
@@ -1443,9 +1446,12 @@ impl Session {
 
         // Kept alive through a restart and no frame since: past the limit,
         // even once the next generation runs, tell the iPad to connect again.
+        // Not one that said goodbye to hand over to the cable: its takeover
+        // deadline below ends it as it said.
         if let Some(since) = session
             .restart_held_since
             .filter(|since| now.saturating_duration_since(*since) >= restart_hold_limit())
+            .filter(|_| session.bye.is_none())
         {
             info!(
                 session_id = session.session_id,
@@ -5765,5 +5771,65 @@ mod tests {
             eternal_wire::v2::control::parse_control(&actions.goodbye.expect("a goodbye").1),
             Ok((_, ControlMessage::Bye(ByeReason::Error)))
         ));
+    }
+
+    /// A frame held back for an iPad that hasn't answered never went out,
+    /// so it neither resets the hold limit nor counts as the last frame.
+    #[test]
+    fn a_held_back_frame_does_not_reset_the_hold_limit() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut session = Session::new(1234);
+        session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
+        let id = session.session_id().unwrap();
+        session.set_not_streaming(Some(NotStreaming::Restarting));
+        session.restart_tick(&RestartConfig, now);
+        let held = |session: &Session| {
+            let active = session.active.as_ref().unwrap();
+            (active.restart_held_since, active.last_frame_at)
+        };
+        let before = held(&session);
+        assert!(before.0.is_some());
+        let later = now + Duration::from_millis(500);
+        assert!(!session.may_send_media(id, UNANSWERED_MEDIA_BUDGET + 1, later));
+        assert_eq!(
+            held(&session),
+            before,
+            "a frame that never went out counted"
+        );
+    }
+
+    /// An iPad that said goodbye to hand over to the cable during the pause
+    /// ends as it said, on its takeover deadline, not with the hold limit's
+    /// goodbye.
+    #[test]
+    fn an_ipads_own_goodbye_during_the_pause_ends_its_session_as_it_said() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut session = Session::new(1234);
+        session.handle_control_authed(peer, identified_hello(1, 77), &TestConfig, now);
+        session.handle_control_authed(peer, report(10), &TestConfig, now);
+        session.set_not_streaming(Some(NotStreaming::Restarting));
+        session.restart_tick(&RestartConfig, now);
+        let limit = now + restart_hold_limit();
+        let bye_at = limit - Duration::from_millis(500);
+        session.handle_control_authed(peer, report(10), &RestartConfig, bye_at);
+        session.handle_control_authed(
+            peer,
+            ControlMessage::Bye(ByeReason::Superseded),
+            &RestartConfig,
+            bye_at,
+        );
+        let mut ended = None;
+        for step in 0..20 {
+            let at = limit + Duration::from_millis(100 * step);
+            let actions = session.restart_tick(&RestartConfig, at);
+            assert!(actions.goodbye.is_none(), "told to connect again at {step}");
+            if let Some(end) = actions.ended {
+                ended = Some(end.reason);
+                break;
+            }
+        }
+        assert_eq!(ended, Some(EndReason::Goodbye(ByeReason::Superseded)));
     }
 }
