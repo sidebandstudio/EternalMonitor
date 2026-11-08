@@ -316,6 +316,9 @@ pub async fn start_sender(
     shared: SharedControl,
     supervisor_tx: std_mpsc::Sender<SupervisorCommand>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // The generation this stream belongs to: it asks the supervisor to
+    // restart only itself, never a stream the user stopped.
+    let generation = crate::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
     let listen_on = shared.listen_on.lock().clone();
     let bind_ip = crate::network::listen_ip_now(&listen_on);
     if bind_ip.is_loopback() {
@@ -464,7 +467,7 @@ pub async fn start_sender(
                 if !shared.client_connected() && crate::network::listen_ip_now(&listen_on) != bind_ip {
                     info!(listen_on = listen_on.label(), "The chosen network changed: restarting the stream to listen on it");
                     shared.stop();
-                    if let Err(error) = supervisor_tx.send(SupervisorCommand::Restart) {
+                    if let Err(error) = supervisor_tx.send(SupervisorCommand::RestartStream { generation }) {
                         warn!(error = %error, "Failed to request a pipeline restart for the chosen network");
                     }
                 }
@@ -1172,7 +1175,10 @@ async fn execute_actions(
     }
     if restart {
         shared.stop();
-        if let Err(error) = supervisor_tx.send(SupervisorCommand::Restart) {
+        // Only this stream: one the user stopped keeps its generation until
+        // Start, so the supervisor leaves it stopped.
+        let generation = crate::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
+        if let Err(error) = supervisor_tx.send(SupervisorCommand::RestartStream { generation }) {
             warn!(error = %error, "Failed to request pipeline restart for the virtual display");
         }
     }

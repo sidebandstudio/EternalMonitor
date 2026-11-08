@@ -91,7 +91,8 @@ fn the_address_row_shows_a_chosen_network_that_came_back() {
     let command = supervisor_rx
         .recv_timeout(Duration::from_secs(30))
         .expect("the network check asks for a restart");
-    assert!(matches!(command, SupervisorCommand::Restart));
+    let generation = eternal_host::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
+    assert_eq!(command, SupervisorCommand::RestartStream { generation });
     transport.join().unwrap();
 
     // The supervisor starts the stream again, now on the network's address.

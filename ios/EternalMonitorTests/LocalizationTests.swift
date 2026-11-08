@@ -23,10 +23,7 @@ final class LocalizationTests: XCTestCase {
     /// English strings whose translations come in a separate pass. Until
     /// then every language shows them in English.
     private let awaitingTranslation: Set<String> = [
-        "Your PC is locked. Unlock it to continue.",
         "Your PC has no active display. Turn on a screen to continue.",
-        "Your PC app is out of date",
-        "Update EternalMonitor on %@ for faster, steadier streaming. Download it on the PC from eternalmonitor.dev.",
     ]
 
     /// Every language has exactly English's strings, none empty, each with
