@@ -15,6 +15,7 @@ pub mod feedback;
 pub mod firewall;
 pub mod firewall_fix;
 pub mod gpu_preference;
+pub mod gpu_wake;
 pub mod gui;
 pub mod handoff;
 pub mod i18n;

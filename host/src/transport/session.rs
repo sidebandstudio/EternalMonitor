@@ -889,6 +889,11 @@ impl Session {
         self.active.as_ref().map(|s| s.session_id)
     }
 
+    /// Changes each time a session starts: a count, from a random start.
+    pub fn sessions_started(&self) -> u32 {
+        self.next_session_id
+    }
+
     pub fn link_lost(&mut self, link: LinkId) -> Actions {
         let on_link = self
             .active

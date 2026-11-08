@@ -46,8 +46,15 @@ impl ReAdvertLog {
 /// documented upsert in mdns-sd, so the refresh never takes the service off
 /// the air (the old unregister-first cycle opened a ~1s discovery hole).
 ///
+/// `on_browse` runs each time another device on the network looks for PCs
+/// running EternalMonitor, as an iPad does on its connect screen (see
+/// [`watch_browsers`] and [`crate::gpu_wake`]).
+///
 /// Returns the `ServiceDaemon` handle — call [`say_goodbye`] on it at exit.
-pub fn advertise_service(port: u16) -> Option<ServiceDaemon> {
+pub fn advertise_service(
+    port: u16,
+    on_browse: impl FnMut() + Send + 'static,
+) -> Option<ServiceDaemon> {
     let mdns = match ServiceDaemon::new() {
         Ok(d) => d,
         Err(e) => {
@@ -78,6 +85,7 @@ pub fn advertise_service(port: u16) -> Option<ServiceDaemon> {
     }
     info!("mDNS service registered — iPad can now discover this host");
     PIPELINE_STATS.lock().mdns_active = true;
+    watch_browsers(on_browse);
 
     let mdns_clone = mdns.clone();
     let host_fqdn_for_thread = host_fqdn.clone();
@@ -105,6 +113,173 @@ pub fn advertise_service(port: u16) -> Option<ServiceDaemon> {
     });
 
     Some(mdns)
+}
+
+/// Calls `on_browse` on a thread of its own each time a device that isn't
+/// this PC asks the network for the service: a PTR or ANY question for
+/// [`SERVICE_TYPE`]. The daemon's own events can't tell: it answers its own
+/// probes too, at each registration and re-advertisement. Reads alongside
+/// the daemon on the shared mDNS port and sends nothing.
+#[cfg(windows)]
+fn watch_browsers(mut on_browse: impl FnMut() + Send + 'static) {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let group = std::net::Ipv4Addr::new(224, 0, 0, 251);
+    let socket = (|| -> std::io::Result<std::net::UdpSocket> {
+        let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+        socket.set_reuse_address(true)?;
+        socket.bind(&std::net::SocketAddr::from(([0, 0, 0, 0], 5353)).into())?;
+        let mut joined = 0;
+        for address in own_ipv4() {
+            joined += usize::from(socket.join_multicast_v4(&group, &address).is_ok());
+        }
+        if joined == 0 {
+            socket.join_multicast_v4(&group, &std::net::Ipv4Addr::UNSPECIFIED)?;
+        }
+        Ok(socket.into())
+    })();
+    let socket = match socket {
+        Ok(socket) => socket,
+        Err(error) => {
+            info!(%error, "Not watching for iPads looking for this PC");
+            return;
+        }
+    };
+    let _ = thread::Builder::new()
+        .name("mdns-browsers".into())
+        .spawn(move || {
+            let mut packet = vec![0u8; MDNS_PACKET_MAX];
+            let mut errors = 0u32;
+            loop {
+                match socket.recv_from(&mut packet) {
+                    Ok((len, from)) => {
+                        errors = 0;
+                        if asks_for_service(&packet[..len]) && !is_own(from.ip()) {
+                            on_browse();
+                        }
+                    }
+                    Err(error) => {
+                        let pause = after_receive_error(&error, errors);
+                        errors = errors.saturating_add(1);
+                        if errors.is_power_of_two() {
+                            tracing::debug!(%error, errors, "mDNS browse watch: receive failed");
+                        }
+                        thread::sleep(pause);
+                    }
+                }
+            }
+        });
+}
+
+/// The largest mDNS message (RFC 6762 section 17). A longer datagram fails
+/// the receive with WSAEMSGSIZE, and is dropped.
+#[cfg(windows)]
+const MDNS_PACKET_MAX: usize = 9000;
+
+/// How long the browse watch pauses after a receive error, the `in_a_row`th
+/// since the last packet. It never stops: one oversized or reset datagram
+/// had ended it until the app restarted. Errors that pass (an oversized
+/// datagram, a reset from an ICMP reply, an interruption) go on at once, a
+/// few in a row; anything else, or more, waits longer each time, up to a
+/// minute.
+#[cfg(any(windows, test))]
+fn after_receive_error(error: &std::io::Error, in_a_row: u32) -> Duration {
+    use std::io::ErrorKind;
+    const WSAEMSGSIZE: i32 = 10040;
+    let passing = matches!(
+        error.kind(),
+        ErrorKind::Interrupted
+            | ErrorKind::WouldBlock
+            | ErrorKind::TimedOut
+            | ErrorKind::ConnectionReset
+    ) || error.raw_os_error() == Some(WSAEMSGSIZE);
+    if passing && in_a_row < 8 {
+        return Duration::ZERO;
+    }
+    (Duration::from_millis(100) * 2u32.pow(in_a_row.min(10))).min(Duration::from_secs(60))
+}
+
+#[cfg(not(windows))]
+fn watch_browsers(_on_browse: impl FnMut() + Send + 'static) {}
+
+/// This PC's IPv4 addresses.
+#[cfg(windows)]
+fn own_ipv4() -> Vec<std::net::Ipv4Addr> {
+    crate::network::adapters()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|adapter| adapter.up)
+        .flat_map(|adapter| adapter.ipv4)
+        .collect()
+}
+
+/// Whether a query came from this PC: its own daemon, or another program on it.
+#[cfg(windows)]
+fn is_own(address: IpAddr) -> bool {
+    address.is_loopback()
+        || match address {
+            IpAddr::V4(address) => own_ipv4().contains(&address),
+            IpAddr::V6(_) => false,
+        }
+}
+
+/// Whether `packet` is a DNS query (not a response) with a PTR or ANY
+/// question for [`SERVICE_TYPE`], as a device browsing for EternalMonitor
+/// PCs sends.
+#[cfg(any(windows, test))]
+pub(crate) fn asks_for_service(packet: &[u8]) -> bool {
+    const PTR: u16 = 12;
+    const ANY: u16 = 255;
+    let u16_at = |at: usize| -> Option<u16> {
+        Some(u16::from_be_bytes([*packet.get(at)?, *packet.get(at + 1)?]))
+    };
+    let (Some(flags), Some(questions)) = (u16_at(2), u16_at(4)) else {
+        return false;
+    };
+    if flags & 0x8000 != 0 {
+        return false;
+    }
+    let wanted = SERVICE_TYPE.trim_end_matches('.');
+    let mut at = 12;
+    for _ in 0..questions {
+        let Some((name, next)) = dns_name(packet, at) else {
+            return false;
+        };
+        let Some(kind) = u16_at(next) else {
+            return false;
+        };
+        if (kind == PTR || kind == ANY) && name.eq_ignore_ascii_case(wanted) {
+            return true;
+        }
+        at = next + 4;
+    }
+    false
+}
+
+/// The dotted name at `at`, following compression pointers, and where the
+/// record goes on after it. None if it is malformed or loops.
+#[cfg(any(windows, test))]
+fn dns_name(packet: &[u8], mut at: usize) -> Option<(String, usize)> {
+    let mut name = String::new();
+    let mut after = None;
+    for _ in 0..32 {
+        let len = *packet.get(at)? as usize;
+        if len == 0 {
+            return Some((name, after.unwrap_or(at + 1)));
+        }
+        if len & 0xC0 == 0xC0 {
+            let target = ((len & 0x3F) << 8) | *packet.get(at + 1)? as usize;
+            after.get_or_insert(at + 2);
+            at = target;
+            continue;
+        }
+        let label = packet.get(at + 1..at + 1 + len)?;
+        if !name.is_empty() {
+            name.push('.');
+        }
+        name.push_str(std::str::from_utf8(label).ok()?);
+        at += 1 + len;
+    }
+    None
 }
 
 /// Send mDNS goodbye packets and stop the daemon. Called on the way out so
@@ -152,6 +327,92 @@ fn hostname() -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A DNS packet with one question per `(name, type)`.
+    fn query(flags: u16, questions: &[(&str, u16)]) -> Vec<u8> {
+        let mut packet = vec![0, 0];
+        packet.extend_from_slice(&flags.to_be_bytes());
+        packet.extend_from_slice(&(questions.len() as u16).to_be_bytes());
+        packet.extend_from_slice(&[0; 6]);
+        for (name, kind) in questions {
+            for label in name.split('.') {
+                packet.push(label.len() as u8);
+                packet.extend_from_slice(label.as_bytes());
+            }
+            packet.push(0);
+            packet.extend_from_slice(&kind.to_be_bytes());
+            packet.extend_from_slice(&[0x80, 1]);
+        }
+        packet
+    }
+
+    #[test]
+    fn a_browse_for_the_service_is_told_from_other_mdns_traffic() {
+        let ours = "_eternaldisplay._udp.local";
+        assert!(asks_for_service(&query(0, &[(ours, 12)])));
+        assert!(asks_for_service(&query(
+            0,
+            &[("_airplay._tcp.local", 12), (ours, 12)]
+        )));
+        assert!(asks_for_service(&query(
+            0,
+            &[("_EternalDisplay._UDP.local", 255)]
+        )));
+        assert!(!asks_for_service(&query(0, &[("_airplay._tcp.local", 12)])));
+        assert!(!asks_for_service(&query(0, &[(ours, 1)])), "an A question");
+        assert!(
+            !asks_for_service(&query(0x8400, &[(ours, 12)])),
+            "a response"
+        );
+        // A second question that points back into the first name.
+        let mut packet = query(0, &[("_airplay._tcp.local", 12)]);
+        packet[5] = 2;
+        packet.extend_from_slice(&[15]);
+        packet.extend_from_slice(b"_eternaldisplay");
+        packet.extend_from_slice(&[4]);
+        packet.extend_from_slice(b"_udp");
+        // "local" is at offset 12 + 1 + 8 + 1 + 4 = 26.
+        packet.extend_from_slice(&[0xC0, 26, 0, 12, 0, 1]);
+        assert!(asks_for_service(&packet));
+    }
+
+    #[test]
+    fn a_receive_error_never_ends_the_browse_watch() {
+        use std::io::{Error, ErrorKind};
+        let oversized = Error::from_raw_os_error(10040);
+        let reset = Error::from(ErrorKind::ConnectionReset);
+        let interrupted = Error::from(ErrorKind::Interrupted);
+        for error in [&oversized, &reset, &interrupted] {
+            assert_eq!(after_receive_error(error, 0), Duration::ZERO, "{error}");
+            assert_eq!(after_receive_error(error, 7), Duration::ZERO, "{error}");
+            assert!(
+                after_receive_error(error, 8) > Duration::ZERO,
+                "{error} keeps coming"
+            );
+        }
+        let other = Error::from(ErrorKind::PermissionDenied);
+        let pauses: Vec<Duration> = (0..20).map(|n| after_receive_error(&other, n)).collect();
+        assert!(pauses[0] > Duration::ZERO);
+        assert!(
+            pauses.windows(2).all(|pair| pair[0] <= pair[1]),
+            "{pauses:?}"
+        );
+        assert_eq!(*pauses.last().unwrap(), Duration::from_secs(60));
+    }
+
+    #[test]
+    fn a_malformed_or_looping_packet_is_not_a_browse() {
+        assert!(!asks_for_service(&[]));
+        assert!(!asks_for_service(&[0; 11]));
+        let full = query(0, &[("_eternaldisplay._udp.local", 12)]);
+        for cut in 12..full.len() - 4 {
+            assert!(!asks_for_service(&full[..cut]), "cut at {cut}");
+        }
+        // A pointer to itself.
+        let mut looping = vec![0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0];
+        looping.extend_from_slice(&[0xC0, 12, 0, 12, 0, 1]);
+        assert!(!asks_for_service(&looping));
+    }
 
     /// The service pins no address: mdns-sd advertises every interface's,
     /// Wi-Fi and Tailscale alike. The Address row's ranking never reaches it.
