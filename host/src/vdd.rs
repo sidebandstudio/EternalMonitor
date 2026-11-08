@@ -595,14 +595,46 @@ pub fn disable_in_background() {
     }
 }
 
+/// How long the Disable at startup, at quit or in a panic waits for
+/// Configuration Manager's read of the device before it runs the task.
+#[cfg_attr(not(windows), allow(dead_code))] // Driver tasks exist only on Windows.
+const DEVICE_READ_LIMIT: Duration = Duration::from_secs(2);
+
 /// Whether Configuration Manager reads the device disabled, said in the log.
 #[cfg(windows)]
 fn device_off() -> bool {
-    let off = reports_disabled(crate::vdd_device::query());
+    let off = off_within(crate::vdd_device::query, DEVICE_READ_LIMIT);
     if off {
         info!("Virtual display already off — not running the Disable task");
     }
     off
+}
+
+/// Whether `query`, run on its own thread, reads the device disabled within
+/// `limit`. A read that doesn't answer in time, or whose thread can't start,
+/// counts as not disabled, so the Disable task runs under its own limit; a
+/// late answer is dropped.
+#[cfg_attr(not(windows), allow(dead_code))] // Driver tasks exist only on Windows.
+fn off_within(
+    query: impl FnOnce() -> crate::vdd_device::DeviceState + Send + 'static,
+    limit: Duration,
+) -> bool {
+    let (answer, answered) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new()
+        .name("vdd-device-read".into())
+        .spawn(move || {
+            let _ = answer.send(query());
+        });
+    match spawned.ok().map(|_| answered.recv_timeout(limit)) {
+        Some(Ok(device)) => reports_disabled(device),
+        _ => {
+            tracing::warn!(
+                limit_ms = limit.as_millis() as u64,
+                "Could not read the virtual display's state in time — running the Disable task"
+            );
+            false
+        }
+    }
 }
 
 /// Whether the device reads disabled (problem 22): a Disable has nothing to
@@ -842,6 +874,59 @@ mod tests {
                 !read.get(),
                 "read the device after an Enable that {enable:?}"
             );
+        }
+    }
+
+    /// Configuration Manager's read of the device had no limit: a read that
+    /// hung held the startup, quit and panic Disables, and every request
+    /// behind them, for as long as it hung.
+    #[test]
+    fn a_device_read_that_hangs_runs_the_disable_task_after_its_limit() {
+        use crate::vdd_device::DeviceState;
+        use std::cell::Cell;
+        let (release, held) = std::sync::mpsc::channel::<()>();
+        let (done, finished) = std::sync::mpsc::channel();
+        let started = Instant::now();
+        std::thread::spawn(move || {
+            let tasks = DriverTasks::new();
+            let ran = Cell::new(false);
+            let hung = move || {
+                let _ = held.recv();
+                DeviceState::Problem(22)
+            };
+            tasks.disable_unless_off(
+                || {},
+                || off_within(hung, DEVICE_READ_LIMIT),
+                |enabled, _| {
+                    assert!(!enabled);
+                    ran.set(true);
+                    TaskOutcome::Done
+                },
+            );
+            let _ = done.send(ran.get());
+        });
+        let ran = finished
+            .recv_timeout(DEVICE_READ_LIMIT + Duration::from_secs(5))
+            .expect("the Disable waited on a hung device read past its limit");
+        assert!(ran, "a hung device read skipped the Disable task");
+        assert!(started.elapsed() >= DEVICE_READ_LIMIT);
+        // The read answers late; nothing waits for it.
+        let _ = release.send(());
+    }
+
+    #[test]
+    fn a_device_read_that_answers_disabled_at_once_keeps_the_skip() {
+        use crate::vdd_device::DeviceState;
+        let tasks = DriverTasks::new();
+        let started = Instant::now();
+        assert!(tasks.disable_unless_off(
+            || {},
+            || off_within(|| DeviceState::Problem(22), DEVICE_READ_LIMIT),
+            |_, _| panic!("ran the Disable task for a display that reads disabled")
+        ));
+        assert!(started.elapsed() < DEVICE_READ_LIMIT);
+        for device in [DeviceState::Ready, DeviceState::Missing] {
+            assert!(!off_within(move || device, DEVICE_READ_LIMIT), "{device:?}");
         }
     }
 
