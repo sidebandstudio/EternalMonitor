@@ -310,6 +310,11 @@ pub fn check_invariants(store: &Store) {
         );
         assert_eq!(snapshot.replaces(&r.dev_id), r.replaces);
         assert_eq!(snapshot.slot_of(&r.dev_id), Some(r.slot_id));
+        let active = records
+            .iter()
+            .find(|o| o.slot_id == r.slot_id && o.state == RecordState::Active)
+            .map(|o| o.dev_id);
+        assert_eq!(snapshot.active_in(&r.slot_id), active);
         assert_eq!(
             snapshot.is_pending(&r.dev_id),
             r.state == RecordState::Pending

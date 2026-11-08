@@ -59,6 +59,7 @@
 pub mod client;
 pub mod handshake;
 pub mod host;
+pub mod pairing;
 pub mod record;
 pub mod replay;
 pub mod wire;
@@ -87,9 +88,12 @@ pub const SEALED_TYPE: u8 = 0x40;
 /// Packet type of handshake message 2.
 pub const HANDSHAKE2_TYPE: u8 = 0x41;
 
-/// Extension tag for the reconnect handshake. Pairing methods (phase 4) take
-/// other tags.
+/// Extension tag for the reconnect handshake. Pairing methods take other
+/// tags.
 pub const EXT_SESSION: u16 = 0x0001;
+/// Extension tag for QR pairing (method P1). Code pairing (CPace, phase 4)
+/// takes another.
+pub const EXT_PAIR_QR: u16 = 0x0002;
 
 /// 16-byte identifiers: `dev_id` (assigned by the host at pairing) and
 /// `host_id` (one per host install).

@@ -1156,6 +1156,14 @@ impl CredentialSnapshot {
         self.slot_of.get(dev_id).copied()
     }
 
+    /// The slot's active record, if it has one.
+    pub fn active_in(&self, slot_id: &Id16) -> Option<Id16> {
+        self.meta
+            .iter()
+            .find(|(_, m)| m.slot_id == *slot_id && m.state == RecordState::Active)
+            .map(|(id, _)| *id)
+    }
+
     /// Whether `dev_id` is a pending record.
     pub fn is_pending(&self, dev_id: &Id16) -> bool {
         self.meta

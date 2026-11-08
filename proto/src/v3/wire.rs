@@ -6,7 +6,7 @@
 //! control bodies: decoders ignore trailing bytes they don't understand. The
 //! cleartext handshake framing is exact: no trailing bytes.
 
-use super::{Id16, EXT_SESSION, HANDSHAKE2_TYPE, PROTOCOL_VERSION};
+use super::{Id16, Key32, Zeroizing, EXT_PAIR_QR, EXT_SESSION, HANDSHAKE2_TYPE, PROTOCOL_VERSION};
 use crate::v2::control::{StreamConfig, CONTROL_HEADER_SIZE, MAX_NAME_LEN};
 use crate::v2::{CommonPrefix, PacketType, WireError, MAGIC, PREFIX_SIZE, VERSION};
 
@@ -33,7 +33,15 @@ pub struct Msg1<'a> {
 
 /// Builds message 1 around a Noise message.
 pub fn encode_msg1(client_nonce: u32, listen_port: u16, dev_id: &Id16, noise: &[u8]) -> Vec<u8> {
-    let ext_len = 16 + noise.len();
+    let mut ext = Vec::with_capacity(16 + noise.len());
+    ext.extend_from_slice(dev_id);
+    ext.extend_from_slice(noise);
+    hello2_with_extension(client_nonce, listen_port, EXT_SESSION, &ext)
+}
+
+/// The HELLO2 shell asking for protocol 3, with one extension.
+fn hello2_with_extension(client_nonce: u32, listen_port: u16, tag: u16, ext: &[u8]) -> Vec<u8> {
+    let ext_len = ext.len();
     let body_len = HELLO2_SHELL_SIZE + EXTENSION_HEADER_SIZE + ext_len;
     let mut out = Vec::with_capacity(CONTROL_HEADER_SIZE + body_len);
     out.resize(CONTROL_HEADER_SIZE, 0);
@@ -51,10 +59,9 @@ pub fn encode_msg1(client_nonce: u32, listen_port: u16, dev_id: &Id16, noise: &[
     // decoder_caps, feature_caps, four screen fields, refresh_hz, name_len,
     // then the 29-byte tail: 14 + 29 zero bytes.
     out.resize(out.len() + 14 + 29, 0);
-    out.extend_from_slice(&EXT_SESSION.to_le_bytes());
+    out.extend_from_slice(&tag.to_le_bytes());
     out.extend_from_slice(&(ext_len as u16).to_le_bytes());
-    out.extend_from_slice(dev_id);
-    out.extend_from_slice(noise);
+    out.extend_from_slice(ext);
     out
 }
 
@@ -74,7 +81,7 @@ pub fn parse_msg1(datagram: &[u8]) -> Result<Msg1<'_>, WireError> {
     if datagram[8..16] != [0, 0, 0, 0, 1, 0, 0, 0] {
         return Err(WireError::InvalidField("header"));
     }
-    let ext = extension(&mut r)?;
+    let ext = extension(&mut r, EXT_SESSION)?;
     let mut e = Reader::new(ext);
     let dev_id = e.array16()?;
     let noise = e.rest();
@@ -104,9 +111,278 @@ pub fn parse_msg2(datagram: &[u8]) -> Result<&[u8], WireError> {
         return Err(WireError::InvalidField("header"));
     }
     let mut r = Reader::new(body);
-    let noise = extension(&mut r)?;
+    let noise = extension(&mut r, EXT_SESSION)?;
     check_noise_len(noise)?;
     Ok(noise)
+}
+
+/// The extension tag of a v3 message 1 or message 2, read without parsing
+/// the rest: which handshake it belongs to.
+pub fn extension_tag(datagram: &[u8]) -> Option<u16> {
+    let at = match classify(datagram) {
+        V3Kind::Handshake1 => MSG1_EXTENSION_OFFSET,
+        V3Kind::Handshake2 => CONTROL_HEADER_SIZE,
+        _ => return None,
+    };
+    let bytes = datagram.get(at..at + 2)?;
+    Some(u16::from_le_bytes([bytes[0], bytes[1]]))
+}
+
+/// The longest app version either side sends: ASCII letters, digits and
+/// `.`, `+`, `-`.
+pub const MAX_VERSION_LEN: usize = 32;
+
+/// Pairing message 1 as it arrives, before any cryptography.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Pair1<'a> {
+    pub client_nonce: u32,
+    /// The iPad's place on this host. In the clear, as §4.1 says; it never
+    /// authorizes anything on its own.
+    pub slot_id: Id16,
+    pub nonce_i: Id16,
+    pub ipad_version: &'a str,
+    pub noise: &'a [u8],
+}
+
+/// Builds pairing message 1: the HELLO2 shell of [`encode_msg1`], with the
+/// QR pairing extension.
+pub fn encode_pair1(
+    client_nonce: u32,
+    listen_port: u16,
+    slot_id: &Id16,
+    nonce_i: &Id16,
+    ipad_version: &str,
+    noise: &[u8],
+) -> Vec<u8> {
+    assert!(valid_version(ipad_version));
+    let mut ext = Vec::with_capacity(33 + ipad_version.len() + noise.len());
+    ext.extend_from_slice(slot_id);
+    ext.extend_from_slice(nonce_i);
+    ext.push(ipad_version.len() as u8);
+    ext.extend_from_slice(ipad_version.as_bytes());
+    ext.extend_from_slice(noise);
+    hello2_with_extension(client_nonce, listen_port, EXT_PAIR_QR, &ext)
+}
+
+/// Parses pairing message 1, exactly: the shell [`encode_msg1`] writes and
+/// the QR pairing extension.
+pub fn parse_pair1(datagram: &[u8]) -> Result<Pair1<'_>, WireError> {
+    let body = control_body(datagram, PacketType::Hello2 as u8)?;
+    let mut r = Reader::new(body);
+    let shell = r.take(HELLO2_SHELL_SIZE)?;
+    if shell[0] != PROTOCOL_VERSION || shell[1] != PROTOCOL_VERSION {
+        return Err(WireError::InvalidField("proto_range"));
+    }
+    let client_nonce = u32::from_le_bytes([shell[2], shell[3], shell[4], shell[5]]);
+    if shell[8..].iter().any(|&b| b != 0) {
+        return Err(WireError::InvalidField("shell"));
+    }
+    if datagram[8..16] != [0, 0, 0, 0, 1, 0, 0, 0] {
+        return Err(WireError::InvalidField("header"));
+    }
+    let ext = extension(&mut r, EXT_PAIR_QR)?;
+    let mut e = Reader::new(ext);
+    let slot_id = e.array16()?;
+    let nonce_i = e.array16()?;
+    let ipad_version = e.version()?;
+    let noise = e.rest();
+    check_noise_len(noise)?;
+    Ok(Pair1 {
+        client_nonce,
+        slot_id,
+        nonce_i,
+        ipad_version,
+        noise,
+    })
+}
+
+/// Builds pairing message 2 around a Noise message.
+pub fn encode_pair2(noise: &[u8]) -> Vec<u8> {
+    let body_len = EXTENSION_HEADER_SIZE + noise.len();
+    let mut out = vec![0u8; CONTROL_HEADER_SIZE];
+    encode_raw_prefix(&mut out, HANDSHAKE2_TYPE, body_len);
+    out.extend_from_slice(&EXT_PAIR_QR.to_le_bytes());
+    out.extend_from_slice(&(noise.len() as u16).to_le_bytes());
+    out.extend_from_slice(noise);
+    out
+}
+
+/// Parses pairing message 2 and returns its Noise message.
+pub fn parse_pair2(datagram: &[u8]) -> Result<&[u8], WireError> {
+    let body = control_body(datagram, HANDSHAKE2_TYPE)?;
+    if datagram[8..16] != [0; 8] {
+        return Err(WireError::InvalidField("header"));
+    }
+    let mut r = Reader::new(body);
+    let noise = extension(&mut r, EXT_PAIR_QR)?;
+    check_noise_len(noise)?;
+    Ok(noise)
+}
+
+/// An app version: 1 to [`MAX_VERSION_LEN`] bytes of ASCII letters, digits,
+/// `.`, `+` and `-`.
+pub fn valid_version(version: &str) -> bool {
+    (1..=MAX_VERSION_LEN).contains(&version.len())
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-'))
+}
+
+/// The encrypted payload of pairing message 1.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PairHello {
+    /// Shown in the host's list of pairings.
+    pub device_name: String,
+}
+
+impl PairHello {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(1 + self.device_name.len());
+        push_name(&mut out, &self.device_name);
+        out
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<Self, WireError> {
+        let mut r = Reader::new(bytes);
+        Ok(Self {
+            device_name: r.name()?,
+        })
+    }
+}
+
+/// The encrypted payload of pairing message 2: the new credential. The host
+/// holds it in memory only until the iPad confirms it stored it.
+#[derive(Clone, PartialEq, Eq)]
+pub struct PairAccept {
+    /// Nonzero. Every pairing record carries it.
+    pub session_id: u32,
+    pub dev_id: Id16,
+    pub k_new: Zeroizing<Key32>,
+    pub host_name: String,
+}
+
+impl std::fmt::Debug for PairAccept {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PairAccept")
+            .field("session_id", &self.session_id)
+            .field("dev_id", &self.dev_id)
+            .field("host_name", &self.host_name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PairAccept {
+    pub fn encode(&self) -> Zeroizing<Vec<u8>> {
+        assert_ne!(self.session_id, 0);
+        let mut out = Zeroizing::new(Vec::with_capacity(53 + self.host_name.len()));
+        out.extend_from_slice(&self.session_id.to_le_bytes());
+        out.extend_from_slice(&self.dev_id);
+        out.extend_from_slice(&*self.k_new);
+        push_name(&mut out, &self.host_name);
+        out
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<Self, WireError> {
+        let mut r = Reader::new(bytes);
+        let session_id = r.u32()?;
+        if session_id == 0 {
+            return Err(WireError::InvalidField("session_id"));
+        }
+        let dev_id = r.array16()?;
+        let mut k_new = Zeroizing::new([0u8; 32]);
+        k_new.copy_from_slice(r.take(32)?);
+        Ok(Self {
+            session_id,
+            dev_id,
+            k_new,
+            host_name: r.name()?,
+        })
+    }
+}
+
+/// Inner types of the pairing messages sealed under a pairing's keys.
+pub const INNER_PAIR_CONFIRM: u8 = 0x54;
+pub const INNER_PAIR_DONE: u8 = 0x55;
+pub const INNER_PAIR_REFUSED: u8 = 0x56;
+pub const INNER_PAIR_ABORT: u8 = 0x57;
+
+/// `PairRefused` reason: storing the record would exceed a cap.
+pub const PAIR_REFUSED_TOO_MANY: u8 = 1;
+
+/// The sealed messages of a pairing exchange.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PairMessage {
+    /// iPad → host: it stored `K_new` (`HMAC(K_new, "confirm" ‖ h)`), and,
+    /// if it holds the slot's active key, which one and a proof of it
+    /// (`HMAC(K_old, "replace" ‖ h)`).
+    Confirm {
+        confirm_mac: [u8; 32],
+        replace: Option<(Id16, [u8; 32])>,
+    },
+    /// Host → iPad: the pending record is stored. The slot status.
+    Done(SlotStatus),
+    /// Host → iPad: nothing was stored, for this reason. Terminal.
+    Refused(u8),
+    /// iPad → host: it couldn't store `K_new`; the host stores nothing.
+    Abort,
+}
+
+impl PairMessage {
+    pub fn inner_type(&self) -> u8 {
+        match self {
+            Self::Confirm { .. } => INNER_PAIR_CONFIRM,
+            Self::Done(_) => INNER_PAIR_DONE,
+            Self::Refused(_) => INNER_PAIR_REFUSED,
+            Self::Abort => INNER_PAIR_ABORT,
+        }
+    }
+
+    pub fn encode_body(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        match self {
+            Self::Confirm {
+                confirm_mac,
+                replace,
+            } => {
+                out.extend_from_slice(confirm_mac);
+                match replace {
+                    None => out.push(0),
+                    Some((old, mac)) => {
+                        out.push(1);
+                        out.extend_from_slice(old);
+                        out.extend_from_slice(mac);
+                    }
+                }
+            }
+            Self::Done(status) => status.encode_into(&mut out),
+            Self::Refused(reason) => out.push(*reason),
+            Self::Abort => {}
+        }
+        out
+    }
+
+    /// Parses a pairing message, or `Ok(None)` for any other inner type.
+    pub fn parse(inner_type: u8, body: &[u8]) -> Result<Option<Self>, WireError> {
+        let mut r = Reader::new(body);
+        Ok(Some(match inner_type {
+            INNER_PAIR_CONFIRM => {
+                let confirm_mac = r.array32()?;
+                let replace = match r.u8()? {
+                    0 => None,
+                    1 => Some((r.array16()?, r.array32()?)),
+                    _ => return Err(WireError::InvalidField("replace_flag")),
+                };
+                Self::Confirm {
+                    confirm_mac,
+                    replace,
+                }
+            }
+            INNER_PAIR_DONE => Self::Done(SlotStatus::read(&mut r)?),
+            INNER_PAIR_REFUSED => Self::Refused(r.u8()?),
+            INNER_PAIR_ABORT => Self::Abort,
+            _ => return Ok(None),
+        }))
+    }
 }
 
 /// The kind of a v3 datagram, from its first bytes only.
@@ -386,6 +662,7 @@ impl Msg2Payload {
 pub const INNER_SESSION_CONFIRM: u8 = 0x50;
 pub const INNER_SESSION_CONFIRM_ACK: u8 = 0x51;
 pub const INNER_SESSION_REFUSED: u8 = 0x52;
+pub const INNER_SESSION_BUSY: u8 = 0x53;
 pub const INNER_BYE: u8 = PacketType::Bye as u8;
 
 /// The sealed messages the session state machines act on themselves.
@@ -397,6 +674,9 @@ pub enum SessionMessage {
     ConfirmAck(SlotStatus),
     /// Host → iPad: this key's record conflicted and is retired.
     Refused(SlotStatus),
+    /// Host → iPad: another iPad is streaming; this session wasn't committed
+    /// and nothing changed. Empty body.
+    Busy,
     /// Either way: the session is over. One byte, the v2 `ByeReason`.
     Bye(u8),
 }
@@ -407,6 +687,7 @@ impl SessionMessage {
             Self::Confirm => INNER_SESSION_CONFIRM,
             Self::ConfirmAck(_) => INNER_SESSION_CONFIRM_ACK,
             Self::Refused(_) => INNER_SESSION_REFUSED,
+            Self::Busy => INNER_SESSION_BUSY,
             Self::Bye(_) => INNER_BYE,
         }
     }
@@ -414,7 +695,7 @@ impl SessionMessage {
     pub fn encode_body(&self) -> Vec<u8> {
         let mut out = Vec::new();
         match self {
-            Self::Confirm => {}
+            Self::Confirm | Self::Busy => {}
             Self::ConfirmAck(status) | Self::Refused(status) => status.encode_into(&mut out),
             Self::Bye(reason) => out.push(*reason),
         }
@@ -429,6 +710,7 @@ impl SessionMessage {
             INNER_SESSION_CONFIRM => Self::Confirm,
             INNER_SESSION_CONFIRM_ACK => Self::ConfirmAck(SlotStatus::read(&mut r)?),
             INNER_SESSION_REFUSED => Self::Refused(SlotStatus::read(&mut r)?),
+            INNER_SESSION_BUSY => Self::Busy,
             INNER_BYE => Self::Bye(r.u8()?),
             _ => return Ok(None),
         }))
@@ -470,10 +752,11 @@ fn control_body(datagram: &[u8], packet_type: u8) -> Result<&[u8], WireError> {
     Ok(&datagram[CONTROL_HEADER_SIZE..])
 }
 
-/// Reads one extension that runs exactly to the end of the body.
-fn extension<'a>(r: &mut Reader<'a>) -> Result<&'a [u8], WireError> {
+/// Reads one extension with tag `want` that runs exactly to the end of the
+/// body.
+fn extension<'a>(r: &mut Reader<'a>, want: u16) -> Result<&'a [u8], WireError> {
     let tag = r.u16()?;
-    if tag != EXT_SESSION {
+    if tag != want {
         return Err(WireError::InvalidField("extension_tag"));
     }
     let len = usize::from(r.u16()?);
@@ -570,6 +853,21 @@ impl<'a> Reader<'a> {
 
     fn array16(&mut self) -> Result<Id16, WireError> {
         Ok(self.take(16)?.try_into().unwrap())
+    }
+
+    fn array32(&mut self) -> Result<[u8; 32], WireError> {
+        Ok(self.take(32)?.try_into().unwrap())
+    }
+
+    /// A length-prefixed app version ([`valid_version`]).
+    fn version(&mut self) -> Result<&'a str, WireError> {
+        let len = usize::from(self.u8()?);
+        let bytes = self.take(len)?;
+        let version = std::str::from_utf8(bytes).map_err(|_| WireError::InvalidField("version"))?;
+        if !valid_version(version) {
+            return Err(WireError::InvalidField("version"));
+        }
+        Ok(version)
     }
 
     fn name(&mut self) -> Result<String, WireError> {
@@ -772,6 +1070,7 @@ mod tests {
             SessionMessage::Confirm,
             SessionMessage::ConfirmAck(sample_status()),
             SessionMessage::Refused(sample_status()),
+            SessionMessage::Busy,
             SessionMessage::Bye(2),
         ] {
             let body = message.encode_body();
@@ -785,5 +1084,139 @@ mod tests {
             None
         );
         assert!(SessionMessage::parse(INNER_BYE, &[]).is_err());
+        assert_eq!(
+            (
+                SessionMessage::Busy.inner_type(),
+                SessionMessage::Busy.encode_body()
+            ),
+            (0x53, vec![])
+        );
+    }
+
+    #[test]
+    fn pairing_messages_round_trip_and_reject_bad_bodies() {
+        for message in [
+            PairMessage::Confirm {
+                confirm_mac: [1; 32],
+                replace: None,
+            },
+            PairMessage::Confirm {
+                confirm_mac: [1; 32],
+                replace: Some(([2; 16], [3; 32])),
+            },
+            PairMessage::Done(sample_status()),
+            PairMessage::Refused(PAIR_REFUSED_TOO_MANY),
+            PairMessage::Abort,
+        ] {
+            let body = message.encode_body();
+            assert_eq!(
+                PairMessage::parse(message.inner_type(), &body).unwrap(),
+                Some(message)
+            );
+        }
+        assert_eq!(
+            PairMessage::parse(INNER_SESSION_CONFIRM, &[]).unwrap(),
+            None
+        );
+        let mut bad = vec![1; 32];
+        bad.push(2);
+        assert!(PairMessage::parse(INNER_PAIR_CONFIRM, &bad).is_err());
+        assert!(PairMessage::parse(INNER_PAIR_CONFIRM, &[1; 33][..32]).is_err());
+        assert!(PairMessage::parse(INNER_PAIR_REFUSED, &[]).is_err());
+        assert_eq!(
+            [
+                INNER_PAIR_CONFIRM,
+                INNER_PAIR_DONE,
+                INNER_PAIR_REFUSED,
+                INNER_PAIR_ABORT
+            ],
+            [0x54, 0x55, 0x56, 0x57]
+        );
+    }
+
+    #[test]
+    fn pair1_is_a_v2_hello2_and_rejects_any_shell_or_framing_change() {
+        let noise = vec![0x5A; 64];
+        let datagram = encode_pair1(7, 50_000, &[1; 16], &[2; 16], "0.4.0", &noise);
+        let (_, message) = parse_control(&datagram).expect("v2 parser accepts the shell");
+        assert!(
+            matches!(message, ControlMessage::Hello2(h) if (h.proto_min, h.proto_max) == (3, 3))
+        );
+        assert_eq!(classify(&datagram), V3Kind::Handshake1);
+        assert_eq!(extension_tag(&datagram), Some(EXT_PAIR_QR));
+        assert!(
+            parse_msg1(&datagram).is_err(),
+            "never read as a session message 1"
+        );
+        let parsed = parse_pair1(&datagram).unwrap();
+        assert_eq!(
+            (
+                parsed.slot_id,
+                parsed.nonce_i,
+                parsed.ipad_version,
+                parsed.noise
+            ),
+            ([1; 16], [2; 16], "0.4.0", &noise[..])
+        );
+        let version_at = MSG1_EXTENSION_OFFSET + 4 + 32;
+        for at in 0..datagram.len() {
+            let mut bad = datagram.clone();
+            bad[at] ^= 0x01;
+            if at == version_at {
+                // The version's length moves a byte between it and the Noise
+                // message: it parses as another version, which `ctx` binds,
+                // so the handshake fails.
+                let parsed = parse_pair1(&bad).unwrap();
+                assert_ne!(parsed.ipad_version, "0.4.0");
+                continue;
+            }
+            let allowed = (18..24).contains(&at) // client_nonce, listen_port
+                || (MSG1_EXTENSION_OFFSET + 4..version_at).contains(&at) // ids
+                || (at > version_at && bad[at].is_ascii_alphanumeric()) // version
+                || at >= version_at + 1 + 5; // Noise bytes
+            assert_eq!(parse_pair1(&bad).is_ok(), allowed, "byte {at}");
+        }
+        assert!(parse_pair1(&datagram[..datagram.len() - 1]).is_err());
+        let session = encode_msg1(1, 2, &[9; 16], &[0x5A; 64]);
+        assert!(parse_pair1(&session).is_err());
+        assert_eq!(extension_tag(&session), Some(EXT_SESSION));
+    }
+
+    #[test]
+    fn pair2_and_versions() {
+        let noise = vec![0x33; 80];
+        let datagram = encode_pair2(&noise);
+        assert_eq!(classify(&datagram), V3Kind::Handshake2);
+        assert_eq!(extension_tag(&datagram), Some(EXT_PAIR_QR));
+        assert_eq!(parse_pair2(&datagram).unwrap(), &noise[..]);
+        assert!(parse_msg2(&datagram).is_err());
+        assert!(parse_pair2(&encode_msg2(&noise)).is_err());
+        for good in [
+            "0.4.0",
+            "1",
+            "0.4.0-beta.2+build.7",
+            &"9".repeat(MAX_VERSION_LEN),
+        ] {
+            assert!(valid_version(good), "{good}");
+        }
+        for bad in [
+            "",
+            "0.4 0",
+            "0.4.0\n",
+            "é",
+            &"9".repeat(MAX_VERSION_LEN + 1),
+        ] {
+            assert!(!valid_version(bad), "{bad}");
+        }
+        let accept = PairAccept {
+            session_id: 0,
+            dev_id: [0; 16],
+            k_new: Zeroizing::new([0; 32]),
+            host_name: String::new(),
+        };
+        let mut zero = vec![0u8; 4];
+        zero.extend_from_slice(&[0; 49]);
+        assert!(PairAccept::parse(&zero).is_err(), "session_id 0");
+        assert!(!format!("{accept:?}").contains("k_new"));
     }
 }
