@@ -23,7 +23,7 @@ use super::{session_prologue, V3Error, MAX_RECORDS_PER_DIRECTION};
 use crate::v2::control::StreamConfig;
 use crate::v2::{PacketType, WireError};
 
-fn pattern<const N: usize>(start: u8, step: u8) -> [u8; N] {
+pub(super) fn pattern<const N: usize>(start: u8, step: u8) -> [u8; N] {
     let mut out = [0u8; N];
     for (i, byte) in out.iter_mut().enumerate() {
         *byte = start.wrapping_add(step.wrapping_mul(i as u8));
@@ -374,15 +374,15 @@ fn replay_script() -> Vec<(&'static str, Vec<u8>)> {
     ]
 }
 
-fn render(header: &str, entries: &[(&'static str, Vec<u8>)]) -> String {
+fn render<N: AsRef<str>>(header: &str, entries: &[(N, Vec<u8>)]) -> String {
     let mut text = String::from(header);
     for (name, bytes) in entries {
-        writeln!(text, "{name} {}", hex(bytes)).unwrap();
+        writeln!(text, "{} {}", name.as_ref(), hex(bytes)).unwrap();
     }
     text
 }
 
-fn check(file: &str, header: &str, entries: Vec<(&'static str, Vec<u8>)>) {
+pub(super) fn check<N: AsRef<str>>(file: &str, header: &str, entries: Vec<(N, Vec<u8>)>) {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("testdata/v3")
         .join(file);
@@ -392,8 +392,9 @@ fn check(file: &str, header: &str, entries: Vec<(&'static str, Vec<u8>)>) {
     let on_disk = load(file);
     assert_eq!(on_disk.len(), entries.len(), "{file}: entry count");
     for (name, bytes) in &entries {
+        let name = name.as_ref();
         let stored = on_disk
-            .get(*name)
+            .get(name)
             .unwrap_or_else(|| panic!("{file}: missing {name}"));
         assert_eq!(hex(stored), hex(bytes), "{file}: {name}");
     }
