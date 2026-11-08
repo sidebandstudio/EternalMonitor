@@ -187,30 +187,11 @@ pub fn from_task_stderr(stderr: &str) -> Option<DeviceState> {
     DeviceState::from_task_result(digits.parse().ok()?)
 }
 
-/// As [`query`], but `None` when Windows lists the present root devices,
-/// reads each of them, and none is the driver's: there is no device to turn
-/// off, as on Windows 10, where Setup installs none. [`query`] reads that as
-/// `Missing`, as it does a list it couldn't get.
-#[cfg(windows)]
-pub fn query_present() -> Option<DeviceState> {
-    match root_devnodes() {
-        Some(devnodes) if confirmed_absent(&devnodes) => None,
-        _ => Some(query()),
-    }
-}
-
-/// Whether every present root device was read and none is the driver's.
-#[cfg(any(windows, test))]
-fn confirmed_absent(devnodes: &[Devnode]) -> bool {
-    devnodes
-        .iter()
-        .all(|devnode| matches!(devnode, Devnode::Other))
-}
-
 /// Read the driver's device from Configuration Manager.
 #[cfg(windows)]
 pub fn query() -> DeviceState {
-    DeviceState::best(read_devices().into_iter().filter_map(|read| {
+    let reads = read_devices().unwrap_or_default();
+    DeviceState::best(reads.into_iter().filter_map(|read| {
         let (flags, problem, has_driver, monitors) = read?;
         Some(DeviceState::from_devnode(
             flags, problem, has_driver, monitors,
@@ -220,18 +201,24 @@ pub fn query() -> DeviceState {
 
 /// As `query`, for the attach wait: `NoMonitor` only when every running
 /// device of the driver has confirmed no monitor child (see
-/// `DeviceState::confirmed`). `None` when that isn't certain: a device or
-/// its children couldn't be read, or a monitor hasn't started yet.
+/// `DeviceState::confirmed`). `None` when that isn't certain: the devices,
+/// one of them or its children couldn't be read, or a monitor hasn't
+/// started yet. `Missing` only when every present root device was read and
+/// none is the driver's, as on Windows 10, where Setup installs none.
 #[cfg(windows)]
 pub fn query_confirmed() -> Option<DeviceState> {
-    confirmed_from(read_devices())
+    confirmed_from(read_devices()?)
 }
+
+/// One device of the driver as read: its status flags and problem code,
+/// whether a driver is bound, and its monitor children.
+type DeviceRead = (u32, u32, bool, Monitors);
 
 /// `query_confirmed` from each driver device's read (`None` when its status
 /// couldn't be read). A device with a monitor wins; otherwise anything
 /// uncertain makes the whole read uncertain.
 #[cfg_attr(not(windows), allow(dead_code))] // Read from Windows only.
-fn confirmed_from(reads: Vec<Option<(u32, u32, bool, Monitors)>>) -> Option<DeviceState> {
+fn confirmed_from(reads: Vec<Option<DeviceRead>>) -> Option<DeviceState> {
     let states: Vec<Option<DeviceState>> = reads
         .into_iter()
         .map(|read| {
@@ -248,14 +235,13 @@ fn confirmed_from(reads: Vec<Option<(u32, u32, bool, Monitors)>>) -> Option<Devi
 
 /// Each present device of the driver: its status flags and problem code,
 /// whether a driver is bound, and its monitor children; `None` for one whose
-/// status couldn't be read.
+/// status couldn't be read. `None` when the present devices couldn't be
+/// listed.
 #[cfg(windows)]
-fn read_devices() -> Vec<Option<(u32, u32, bool, Monitors)>> {
+fn read_devices() -> Option<Vec<Option<DeviceRead>>> {
     use windows::Win32::Devices::DeviceAndDriverInstallation::CM_DRP_DRIVER;
-    let Some(devnodes) = root_devnodes() else {
-        return Vec::new();
-    };
-    reads_from(&devnodes, |devinst, (flags, problem)| {
+    let devnodes = root_devnodes()?;
+    Some(reads_from(&devnodes, |devinst, (flags, problem)| {
         let has_driver = matches!(registry_property(devinst, CM_DRP_DRIVER), Ok(Some(_)));
         let children = children(devinst);
         (
@@ -264,7 +250,7 @@ fn read_devices() -> Vec<Option<(u32, u32, bool, Monitors)>> {
             has_driver,
             Monitors::from_children(children.as_deref()),
         )
-    })
+    }))
 }
 
 /// `read_devices` from the present root devices, with `read` reading one
@@ -275,8 +261,8 @@ fn read_devices() -> Vec<Option<(u32, u32, bool, Monitors)>> {
 #[cfg(any(windows, test))]
 fn reads_from(
     devnodes: &[Devnode],
-    mut read: impl FnMut(u32, (u32, u32)) -> (u32, u32, bool, Monitors),
-) -> Vec<Option<(u32, u32, bool, Monitors)>> {
+    mut read: impl FnMut(u32, (u32, u32)) -> DeviceRead,
+) -> Vec<Option<DeviceRead>> {
     devnodes
         .iter()
         .filter_map(|devnode| match *devnode {
@@ -603,22 +589,38 @@ pub fn query() -> DeviceState {
 mod tests {
     use super::*;
 
-    /// Only a list where every root device was read, and none is the
-    /// driver's, says there is no device to turn off.
+    /// Setup installs no driver on Windows 10: a list where every root
+    /// device was read, and none is the driver's, reads as a confirmed
+    /// `Missing`. A device that couldn't be read keeps it uncertain.
     #[test]
-    fn only_a_fully_read_list_without_the_driver_is_an_absent_device() {
+    fn only_a_fully_read_list_without_the_driver_confirms_it_missing() {
+        let unreachable = |_, _| unreachable!("no device of the driver");
+        assert_eq!(
+            confirmed_from(reads_from(&[Devnode::Other, Devnode::Other], unreachable)),
+            Some(DeviceState::Missing)
+        );
+        for uncertain in [
+            Devnode::Unread,
+            Devnode::Driver {
+                devinst: 7,
+                status: None,
+            },
+        ] {
+            assert_eq!(
+                confirmed_from(reads_from(&[Devnode::Other, uncertain], unreachable)),
+                None,
+                "{uncertain:?}"
+            );
+        }
+        let off = |_, (flags, problem)| (flags, problem, true, Monitors::None);
         let driver = Devnode::Driver {
             devinst: 7,
-            status: Some((0, 22)),
+            status: Some((DN_HAS_PROBLEM, 22)),
         };
-        assert!(confirmed_absent(&[]));
-        assert!(confirmed_absent(&[Devnode::Other, Devnode::Other]));
-        assert!(!confirmed_absent(&[Devnode::Other, driver]));
-        assert!(!confirmed_absent(&[Devnode::Other, Devnode::Unread]));
-        assert!(!confirmed_absent(&[Devnode::Driver {
-            devinst: 7,
-            status: None
-        }]));
+        assert_eq!(
+            confirmed_from(reads_from(&[Devnode::Other, driver], off)),
+            Some(DeviceState::Problem(22))
+        );
     }
 
     /// Review r6: a root device whose location or hardware IDs couldn't be

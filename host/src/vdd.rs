@@ -604,13 +604,14 @@ const DEVICE_READ_LIMIT: Duration = Duration::from_secs(2);
 /// there is none, said in the log.
 #[cfg(windows)]
 fn device_off() -> bool {
-    off_within(crate::vdd_device::query_present, DEVICE_READ_LIMIT)
+    off_within(crate::vdd_device::query_confirmed, DEVICE_READ_LIMIT)
 }
 
 /// Whether `query`, run on its own thread, reads the device disabled, or
-/// confirms there is no device (`None`), within `limit`. A read that doesn't
-/// answer in time, or whose thread can't start, counts as not disabled, so
-/// the Disable task runs under its own limit; a late answer is dropped.
+/// confirms there is no device (`Missing`), within `limit`. A read that isn't
+/// certain (`None`), doesn't answer in time, or whose thread can't start
+/// counts as not disabled, so the Disable task runs under its own limit; a
+/// late answer is dropped.
 #[cfg_attr(not(windows), allow(dead_code))] // Driver tasks exist only on Windows.
 fn off_within(
     query: impl FnOnce() -> Option<crate::vdd_device::DeviceState> + Send + 'static,
@@ -623,7 +624,7 @@ fn off_within(
             let _ = answer.send(query());
         });
     match spawned.ok().map(|_| answered.recv_timeout(limit)) {
-        Some(Ok(None)) => {
+        Some(Ok(Some(crate::vdd_device::DeviceState::Missing))) => {
             tracing::info!("No virtual display device — not running the Disable task");
             true
         }
@@ -634,6 +635,7 @@ fn off_within(
             }
             off
         }
+        Some(Ok(None)) => false,
         _ => {
             tracing::warn!(
                 limit_ms = limit.as_millis() as u64,
@@ -932,18 +934,15 @@ mod tests {
             |_, _| panic!("ran the Disable task for a display that reads disabled")
         ));
         assert!(started.elapsed() < DEVICE_READ_LIMIT);
-        for device in [DeviceState::Ready, DeviceState::Missing] {
-            assert!(
-                !off_within(move || Some(device), DEVICE_READ_LIMIT),
-                "{device:?}"
-            );
+        for device in [Some(DeviceState::Ready), None] {
+            assert!(!off_within(move || device, DEVICE_READ_LIMIT), "{device:?}");
         }
     }
 
     /// Windows 10, where Setup installs no driver: Windows confirms there is
-    /// no device, so the Disable at startup and quit runs no task, and no
-    /// missing task is logged at every launch. A device list that couldn't
-    /// be read (`Missing`) still runs it.
+    /// no device (`Missing`), so the Disable at startup and quit runs no
+    /// task, and no missing task is logged at every launch. A read that isn't
+    /// certain (`None`) still runs it.
     #[test]
     fn a_confirmed_absent_device_runs_no_disable_task() {
         use crate::vdd_device::DeviceState;
@@ -951,19 +950,22 @@ mod tests {
         let tasks = DriverTasks::new();
         assert!(tasks.disable_unless_off(
             || {},
-            || off_within(|| None, DEVICE_READ_LIMIT),
+            || off_within(|| Some(DeviceState::Missing), DEVICE_READ_LIMIT),
             |_, _| panic!("ran the Disable task with no device to turn off")
         ));
         let ran = Cell::new(false);
         tasks.disable_unless_off(
             || {},
-            || off_within(|| Some(DeviceState::Missing), DEVICE_READ_LIMIT),
+            || off_within(|| None, DEVICE_READ_LIMIT),
             |_, _| {
                 ran.set(true);
                 TaskOutcome::Missing
             },
         );
-        assert!(ran.get(), "an unread device list skipped the Disable task");
+        assert!(
+            ran.get(),
+            "an uncertain device read skipped the Disable task"
+        );
         assert_eq!(tasks.health(), VddTaskHealth::TasksMissing);
     }
 
