@@ -1,7 +1,7 @@
 //! A transport loop stuck in one call is named by the supervisor's watch, with
 //! the step it is stuck in, and again when it moves. Drives the real loop and
 //! blocks it the way a stuck call would: the session lock it needs at its
-//! next tick is held elsewhere.
+//! next tick, or at the second screen's step after it, is held elsewhere.
 
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -97,13 +97,21 @@ fn a_stuck_transport_loop_is_named_with_its_step() {
         Instant::now() + Duration::from_secs(4),
     );
     drop(held);
+    // The loop takes the session lock at its tick and again, after each
+    // tick's replies, for the second screen's next step. Whichever it
+    // reaches first while the lock is held is where it is stuck.
+    let [Verdict::Stalled {
+        phase: stuck_in,
+        silent_ms,
+    }] = stuck.as_slice()
+    else {
+        panic!("{stuck:?}");
+    };
     assert!(
-        matches!(
-            stuck.as_slice(),
-            [Verdict::Stalled { phase: Phase::Tick, silent_ms }] if *silent_ms >= 2_000
-        ),
+        matches!(stuck_in, Phase::Tick | Phase::SecondScreen),
         "{stuck:?}"
     );
+    assert!(*silent_ms >= 2_000, "{stuck:?}");
     let moved = watch_until(
         &mut watch,
         &shared,
@@ -113,7 +121,7 @@ fn a_stuck_transport_loop_is_named_with_its_step() {
     assert!(
         matches!(
             moved.as_slice(),
-            [Verdict::Moving { phase: Phase::Tick, stalled_ms }] if *stalled_ms >= 2_000
+            [Verdict::Moving { phase, stalled_ms }] if phase == stuck_in && *stalled_ms >= 2_000
         ),
         "{moved:?}"
     );

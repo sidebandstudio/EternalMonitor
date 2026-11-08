@@ -15,9 +15,9 @@ use tracing::{debug, info, warn};
 
 use super::apple_usb::{self, AppleUsbState};
 use super::congestion::{is_no_buffer_space, SendCongestion};
-use super::link::{FramedLink, Link, LinkId, PeerId, UdpLink};
+use super::link::{CloseReport, FramedLink, Link, LinkId, PeerId, UdpLink};
 use super::usbmuxd::{self, BoxedTunnel, Client};
-use crate::stats::PIPELINE_STATS;
+use crate::stats::{PipelineStats, PIPELINE_STATS};
 
 static NEXT_GENERATION: AtomicU64 = AtomicU64::new(1);
 static HUB: OnceLock<UsbHub> = OnceLock::new();
@@ -31,6 +31,26 @@ pub enum LinkEvent {
 struct UsbEvent {
     generation: u64,
     link: FramedLink,
+    opened: Opened,
+}
+
+/// How a tunnel came to be, for its connected line.
+#[derive(Clone, Debug, Default)]
+struct Opened {
+    /// The service's Connect and the preamble.
+    connect: Duration,
+    /// Since the device was listed, or since its last tunnel closed.
+    waited: Duration,
+    /// Connects that failed in that time, and the last one's error.
+    failed: u32,
+    last_error: Option<String>,
+}
+
+impl Opened {
+    fn failed_with(&mut self, error: String) {
+        self.failed += 1;
+        self.last_error = Some(error);
+    }
 }
 
 /// What the hub reports to the pipeline generation that currently owns it.
@@ -162,15 +182,20 @@ fn subscriber(state: &Mutex<HubState>) -> Option<mpsc::Sender<HubEvent>> {
 
 /// Owns tunnels for the hub: forwards their datagrams to whichever pipeline
 /// generation is subscribed and drops them while none is (a restart gap).
+/// Each tunnel's opening and close are logged here, once, whether or not a
+/// pipeline is subscribed.
 async fn run_hub(mut events: mpsc::Receiver<UsbEvent>, state: Arc<Mutex<HubState>>) {
     while let Some(UsbEvent {
         generation,
         mut link,
+        opened,
     }) = events.recv().await
     {
+        log_connected(generation, &opened);
         let id = link.id();
         let mut inbound = link.take_inbound().expect("new USB link owns its reader");
         let link = Arc::new(link);
+        let closing = Arc::clone(&link);
         state
             .lock()
             .links
@@ -191,6 +216,8 @@ async fn run_hub(mut events: mpsc::Receiver<UsbEvent>, state: Arc<Mutex<HubState
                         .await;
                 }
             }
+            // The reader has stopped, so the link knows what ended it.
+            log_closed(generation, closing.close_report());
             close_link(&state, generation, id).await;
         });
     }
@@ -260,8 +287,8 @@ impl TransportLinks {
             events: subscription.events,
             _subscription: HubToken(subscription.token),
         };
-        for (id, generation, link) in subscription.open {
-            info!(?id, generation, "USB tunnel kept across pipeline restart");
+        for (_, generation, link) in subscription.open {
+            info!(generation, "USB tunnel kept across pipeline restart");
             links.adopt(generation, link);
         }
         links
@@ -343,7 +370,6 @@ impl TransportLinks {
             };
             match event {
                 Some(HubEvent::Connected { generation, link }) => {
-                    info!(id = ?link.id(), generation, "USB tunnel connected");
                     self.adopt(generation, link);
                 }
                 Some(HubEvent::Datagram {
@@ -370,7 +396,6 @@ impl TransportLinks {
                             PIPELINE_STATS.lock().usb_link_state =
                                 "Waiting for the iPad app".into();
                         }
-                        info!(?id, generation, "USB tunnel closed");
                         return Ok(LinkEvent::Closed(id));
                     }
                 }
@@ -389,6 +414,34 @@ impl TransportLinks {
     pub fn into_udp_socket(self) -> UdpSocket {
         self.udp.socket
     }
+}
+
+/// How long the service's Connect and the preamble took, how long the
+/// worker waited for the tunnel, and the connects that failed meanwhile.
+fn log_connected(generation: u64, opened: &Opened) {
+    info!(
+        generation,
+        connect_ms = opened.connect.as_millis() as u64,
+        waited_ms = opened.waited.as_millis() as u64,
+        failed = opened.failed,
+        last_error = opened.last_error.as_deref().unwrap_or("none"),
+        "USB tunnel connected"
+    );
+}
+
+/// What the host saw end the tunnel first, after how long, and how long
+/// the iPad had been quiet: a timer shows as the same `open_ms` every time.
+/// `seen_first` is the first end this host saw, not necessarily what
+/// started it: the iPad or Apple's service closing shows as `peer_eof`.
+fn log_closed(generation: u64, report: Option<CloseReport>) {
+    let ms = |duration: Duration| duration.as_millis() as u64;
+    info!(
+        generation,
+        seen_first = %report.map_or("unknown", |report| report.cause.as_str()),
+        open_ms = report.map_or(0, |report| ms(report.open)),
+        quiet_ms = report.map_or(0, |report| ms(report.quiet)),
+        "USB tunnel closed"
+    );
 }
 
 #[derive(Clone)]
@@ -428,14 +481,28 @@ impl Source {
 async fn device_worker(source: Source, events: mpsc::Sender<UsbEvent>, force_idr: Arc<AtomicBool>) {
     let peer = source.peer();
     let mut backoff = 1;
+    let mut opened = Opened::default();
+    let mut waiting_since = tokio::time::Instant::now();
     loop {
+        let started = tokio::time::Instant::now();
         match source.connect().await {
             Ok(stream) => match FramedLink::connect(stream, peer, Arc::clone(&force_idr)).await {
                 Ok(link) => {
                     let mut closed = link.closed_signal();
                     let _close_on_exit = link.close_guard();
                     let generation = NEXT_GENERATION.fetch_add(1, Ordering::Relaxed);
-                    if events.send(UsbEvent { generation, link }).await.is_err() {
+                    opened.connect = started.elapsed();
+                    opened.waited = started.saturating_duration_since(waiting_since);
+                    let opened = std::mem::take(&mut opened);
+                    if events
+                        .send(UsbEvent {
+                            generation,
+                            link,
+                            opened,
+                        })
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                     loop {
@@ -447,10 +514,17 @@ async fn device_worker(source: Source, events: mpsc::Sender<UsbEvent>, force_idr
                         }
                     }
                     backoff = 1;
+                    waiting_since = tokio::time::Instant::now();
                 }
-                Err(error) => debug!(%peer, %error, "USB framing handshake failed"),
+                Err(error) => {
+                    debug!(%peer, %error, "USB framing handshake failed");
+                    opened.failed_with(format!("framing handshake: {error}"));
+                }
             },
-            Err(error) => debug!(%peer, %error, backoff, "USB app unavailable; retrying"),
+            Err(error) => {
+                debug!(%peer, %error, backoff, "USB app unavailable; retrying");
+                opened.failed_with(error.to_string());
+            }
         }
         tokio::time::sleep(Duration::from_secs(backoff)).await;
         backoff = (backoff + 1).min(5);
@@ -494,21 +568,103 @@ async fn supervise(events: mpsc::Sender<UsbEvent>, force_idr: Arc<AtomicBool>) {
     }
 
     let client = Arc::new(Client::new(usbmuxd::Endpoint::default()));
-    let mut workers = JoinSet::new();
-    let mut handles: HashMap<u32, AbortHandle> = HashMap::new();
     let mut poll = tokio::time::interval(Duration::from_secs(2));
     poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    supervise_devices(client, events, force_idr, &PIPELINE_STATS, poll).await;
+}
+
+/// When the supervisor polls Apple's device list next, and the time it
+/// judges that poll by.
+trait PollClock {
+    fn next(&mut self) -> impl std::future::Future<Output = tokio::time::Instant> + Send;
+}
+
+impl PollClock for tokio::time::Interval {
+    async fn next(&mut self) -> tokio::time::Instant {
+        self.tick().await;
+        tokio::time::Instant::now()
+    }
+}
+
+/// How long Apple's device list may keep failing before the service counts
+/// as down and the devices' workers stop, closing their tunnels. A single
+/// failed poll used to close every live tunnel, though the service and the
+/// tunnels through it were fine.
+const LIST_OUTAGE: Duration = Duration::from_secs(10);
+
+/// Device-list polls that failed in a row, and when the first one did.
+#[derive(Debug, Default)]
+struct ListFailures {
+    count: u32,
+    since: Option<tokio::time::Instant>,
+}
+
+impl ListFailures {
+    /// Whether a poll keeps the running workers, whatever it listed: its
+    /// list failed, but the failures have not lasted [`LIST_OUTAGE`] yet.
+    /// Only a list that answers can show a device gone.
+    fn keep_workers(&mut self, listed: bool, workers: usize, now: tokio::time::Instant) -> bool {
+        if listed {
+            if self.count > 0 {
+                info!(
+                    failed_polls = self.count,
+                    "Apple's device list answers again"
+                );
+            }
+            *self = Self::default();
+            return false;
+        }
+        self.count = self.count.saturating_add(1);
+        let since = *self.since.get_or_insert(now);
+        if workers == 0 {
+            return false;
+        }
+        if now.saturating_duration_since(since) < LIST_OUTAGE {
+            info!(
+                failed_polls = self.count,
+                "Apple's device list failed — keeping the USB tunnels"
+            );
+            return true;
+        }
+        info!(
+            failed_polls = self.count,
+            failing_ms = now.saturating_duration_since(since).as_millis() as u64,
+            "Apple's device list keeps failing — closing the USB tunnels"
+        );
+        false
+    }
+}
+
+/// Polls Apple's device list and runs a worker for each listed device. What
+/// a poll finds goes to `stats`, which the PC window reads.
+async fn supervise_devices(
+    client: Arc<Client>,
+    events: mpsc::Sender<UsbEvent>,
+    force_idr: Arc<AtomicBool>,
+    stats: &Mutex<PipelineStats>,
+    mut poll: impl PollClock,
+) {
+    let mut workers = JoinSet::new();
+    let mut handles: HashMap<u32, AbortHandle> = HashMap::new();
     let mut unreachable = AppleUsbState::default();
+    let mut failures = ListFailures::default();
     loop {
         tokio::select! {
-            _ = poll.tick() => {
+            now = poll.next() => {
                 let devices = client.list_devices().await;
                 let available = devices.is_ok();
+                let list_error = devices.as_ref().err().map(ToString::to_string);
                 let devices = devices.unwrap_or_default();
-                let ids: HashSet<_> = devices.iter().map(|device| device.device_id).collect();
+                let kept = failures.keep_workers(available, handles.len(), now);
+                let ids: HashSet<_> = if kept {
+                    handles.keys().copied().collect()
+                } else {
+                    devices.iter().map(|device| device.device_id).collect()
+                };
                 // Without the service the cable is invisible to us; ask
                 // Windows whether an iPad is attached so the GUI can say why.
-                let cabled = if available {
+                // A poll that keeps the tunnels shows nothing new: they work.
+                let cabled = if available || kept {
                     AppleUsbState::default()
                 } else {
                     tokio::task::spawn_blocking(apple_usb::probe).await.unwrap_or_default()
@@ -521,8 +677,8 @@ async fn supervise(events: mpsc::Sender<UsbEvent>, force_idr: Arc<AtomicBool>) {
                     }
                 }
                 unreachable = cabled;
-                {
-                    let mut stats = PIPELINE_STATS.lock();
+                if !kept {
+                    let mut stats = stats.lock();
                     stats.usb_service_reachable = available;
                     stats.usb_devices = devices.len();
                     stats.usb_cabled_devices = cabled.cabled_devices;
@@ -532,7 +688,17 @@ async fn supervise(events: mpsc::Sender<UsbEvent>, force_idr: Arc<AtomicBool>) {
                     else if stats.usb_link_state != "Connected" { stats.usb_link_state = "Waiting for the iPad app".into(); }
                 }
                 handles.retain(|id, task| {
-                    if !ids.contains(id) { task.abort(); false } else { !task.is_finished() }
+                    if ids.contains(id) {
+                        return !task.is_finished();
+                    }
+                    // Stopping the worker closes its tunnel, if it has one.
+                    info!(
+                        reason = %if available { "device_gone" } else { "list_failed" },
+                        error = list_error.as_deref().unwrap_or("none"),
+                        "USB device worker stopped"
+                    );
+                    task.abort();
+                    false
                 });
                 for id in ids {
                     handles.entry(id).or_insert_with(|| workers.spawn(device_worker(
@@ -569,6 +735,172 @@ mod tests {
         assert_eq!(direct_value(true, || None), None);
     }
 
+    /// Every tunnel's opening and close are logged once, by the hub, whether
+    /// or not a pipeline is subscribed: with none (a restart gap) they used
+    /// to go unlogged. The lines carry the tunnel generation, not the device.
+    #[tokio::test(start_paused = true)]
+    async fn the_hub_logs_each_tunnel_once_with_or_without_a_pipeline() {
+        use tracing_subscriber::prelude::*;
+        #[derive(Clone, Default)]
+        struct Lines(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Lines {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let lines = Lines::default();
+        let writer = lines.clone();
+        crate::logging::prepare_log_capture();
+        let _capture = tracing::subscriber::set_default(
+            tracing_subscriber::registry().with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .without_time()
+                    .with_target(false)
+                    .with_writer(move || writer.clone()),
+            ),
+        );
+        let state = Arc::new(Mutex::new(HubState::default()));
+        let (events, hub_events) = mpsc::channel(4);
+        tokio::spawn(run_hub(hub_events, Arc::clone(&state)));
+        let open = |generation| async move {
+            let (host, mut ipad) = tokio::io::duplex(64 * 1024);
+            let link = FramedLink::connect(host, PeerId::usb(3), Arc::new(AtomicBool::new(false)))
+                .await
+                .unwrap();
+            super::super::link::read_preamble(&mut ipad).await.unwrap();
+            let opened = Opened {
+                connect: Duration::from_millis(5),
+                waited: Duration::from_millis(1_200),
+                failed: 2,
+                last_error: Some("usbmuxd Result 3".into()),
+            };
+            let event = UsbEvent {
+                generation,
+                link,
+                opened,
+            };
+            (event, ipad)
+        };
+        let gone = |state: Arc<Mutex<HubState>>| async move {
+            for _ in 0..1000 {
+                if state.lock().links.is_empty() {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+            panic!("the hub kept a closed tunnel");
+        };
+
+        // No pipeline: a restart gap.
+        let (event, ipad) = open(41).await;
+        events.send(event).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(9_600)).await;
+        drop(ipad);
+        gone(Arc::clone(&state)).await;
+
+        // A subscriber (standing in for a pipeline) gets the events, and the
+        // hub does not log the lines again. This checks the hub only: the
+        // pipeline's TransportLinks no longer logs these lines at all.
+        let (pipeline, mut hub) = mpsc::channel(8);
+        state.lock().subscriber = Some((1, pipeline));
+        let (event, ipad) = open(42).await;
+        events.send(event).await.unwrap();
+        assert!(matches!(
+            hub.recv().await,
+            Some(HubEvent::Connected { generation: 42, .. })
+        ));
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        drop(ipad);
+        assert!(matches!(
+            hub.recv().await,
+            Some(HubEvent::Closed { generation: 42, .. })
+        ));
+
+        let text = String::from_utf8(lines.0.lock().clone()).unwrap();
+        let lines: Vec<&str> = text.lines().map(str::trim).collect();
+        let connected = |generation| {
+            format!(
+                "INFO USB tunnel connected generation={generation} connect_ms=5 waited_ms=1200 \
+                 failed=2 last_error=\"usbmuxd Result 3\""
+            )
+        };
+        assert_eq!(
+            lines,
+            [
+                connected(41),
+                "INFO USB tunnel closed generation=41 seen_first=peer_eof open_ms=9600 \
+                 quiet_ms=9600"
+                    .into(),
+                connected(42),
+                "INFO USB tunnel closed generation=42 seen_first=peer_eof open_ms=1500 \
+                 quiet_ms=1500"
+                    .into(),
+            ]
+        );
+    }
+
+    /// The connected line says how long the worker waited for the tunnel and
+    /// how many connects failed meanwhile: Apple's service refuses a Connect
+    /// while the app isn't listening, and a tunnel the iPad closed starts
+    /// the count again.
+    #[tokio::test]
+    async fn a_tunnel_says_how_it_was_opened() {
+        let service = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let client = Arc::new(Client::new(usbmuxd::Endpoint::Tcp(
+            service.local_addr().unwrap(),
+        )));
+        // Answers each Connect with `result`, and returns the connection.
+        let answer = |result: u64| {
+            let service = &service;
+            async move {
+                let (mut stream, _) = service.accept().await.unwrap();
+                let (tag, _) = usbmuxd::read_message(&mut stream).await.unwrap();
+                let reply = plist::Value::Dictionary(plist::Dictionary::from_iter([
+                    ("MessageType".to_string(), plist::Value::from("Result")),
+                    ("Number".to_string(), plist::Value::from(result)),
+                ]));
+                tokio::io::AsyncWriteExt::write_all(
+                    &mut stream,
+                    &usbmuxd::encode_message(tag, &reply).unwrap(),
+                )
+                .await
+                .unwrap();
+                stream
+            }
+        };
+        let (events, mut opened) = mpsc::channel(4);
+        let worker = tokio::spawn(device_worker(
+            Source::Device(client, 3),
+            events,
+            Arc::new(AtomicBool::new(false)),
+        ));
+        answer(3).await;
+        let mut ipad = answer(0).await;
+        let first = opened.recv().await.unwrap();
+        assert_eq!(first.opened.failed, 1, "{:?}", first.opened);
+        assert_eq!(first.opened.last_error.as_deref(), Some("usbmuxd Result 3"));
+        assert!(first.opened.waited >= Duration::from_secs(1));
+
+        super::super::link::read_preamble(&mut ipad).await.unwrap();
+        drop(ipad);
+        let _ipad = answer(0).await;
+        let second = opened.recv().await.unwrap();
+        assert_eq!(
+            first.link.close_report().map(|report| report.cause),
+            Some(super::super::link::CloseCause::PeerEof)
+        );
+        assert_eq!(second.opened.failed, 0, "{:?}", second.opened);
+        assert_eq!(second.opened.last_error, None);
+        assert!(second.opened.waited >= Duration::from_secs(1));
+        assert!(second.generation > first.generation);
+        worker.abort();
+    }
+
     /// `cargo test --release` runs this; other builds may use the endpoint.
     #[cfg(not(any(debug_assertions, feature = "usb-direct")))]
     #[test]
@@ -576,5 +908,281 @@ mod tests {
         std::env::set_var("ETERNAL_USB_DIRECT", "127.0.0.1:9");
         assert_eq!(direct_endpoint(), None);
         std::env::remove_var("ETERNAL_USB_DIRECT");
+    }
+
+    /// A failed device list keeps the workers that run, until the failures
+    /// last [`LIST_OUTAGE`]: then the service counts as down and they stop,
+    /// as every failed poll used to stop them. Each step is logged with the
+    /// count of failed polls.
+    #[test]
+    fn failed_device_lists_keep_the_workers_for_a_while() {
+        use tracing_subscriber::prelude::*;
+        #[derive(Clone, Default)]
+        struct Lines(Arc<Mutex<Vec<u8>>>);
+        impl io::Write for Lines {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                self.0.lock().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let lines = Lines::default();
+        let writer = lines.clone();
+        let subscriber = tracing_subscriber::registry().with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .without_time()
+                .with_target(false)
+                .with_writer(move || writer.clone()),
+        );
+        let start = tokio::time::Instant::now();
+        let at = |secs: u64| start + Duration::from_secs(secs);
+        let mut failures = ListFailures::default();
+        crate::logging::prepare_log_capture();
+        tracing::subscriber::with_default(subscriber, || {
+            // One failed poll between good ones.
+            assert!(!failures.keep_workers(true, 1, at(0)));
+            assert!(failures.keep_workers(false, 1, at(2)));
+            assert!(!failures.keep_workers(true, 1, at(4)));
+            // Failures in a row, until they have lasted the outage.
+            for secs in [6, 8, 10, 12, 14] {
+                assert!(failures.keep_workers(false, 1, at(secs)), "{secs} s");
+            }
+            assert!(!failures.keep_workers(false, 1, at(16)));
+            // Nothing left to keep, nothing more to say.
+            assert!(!failures.keep_workers(false, 0, at(18)));
+            assert!(!failures.keep_workers(true, 0, at(20)));
+            // Without workers a failure keeps nothing, but still counts.
+            assert!(!failures.keep_workers(false, 0, at(22)));
+            assert!(!failures.keep_workers(false, 1, at(32)));
+        });
+        let text = String::from_utf8(lines.0.lock().clone()).unwrap();
+        let lines: Vec<&str> = text.lines().map(str::trim).collect();
+        let keeping = |n: u32| {
+            format!("INFO Apple's device list failed — keeping the USB tunnels failed_polls={n}")
+        };
+        assert_eq!(
+            lines,
+            [
+                keeping(1),
+                "INFO Apple's device list answers again failed_polls=1".into(),
+                keeping(1),
+                keeping(2),
+                keeping(3),
+                keeping(4),
+                keeping(5),
+                "INFO Apple's device list keeps failing — closing the USB tunnels \
+                 failed_polls=6 failing_ms=10000"
+                    .into(),
+                "INFO Apple's device list answers again failed_polls=7".into(),
+                "INFO Apple's device list keeps failing — closing the USB tunnels \
+                 failed_polls=2 failing_ms=10000"
+                    .into(),
+            ]
+        );
+    }
+
+    /// Apple's device service whose list fails on demand: it drops the
+    /// request unanswered. It lists one USB iPad otherwise, and hands every
+    /// Connect's stream to the test as that iPad's end of a tunnel.
+    struct FlakyService {
+        failing: Arc<AtomicBool>,
+        failed: Arc<AtomicU64>,
+        tunnels: mpsc::Receiver<tokio::net::TcpStream>,
+        client: Arc<Client>,
+    }
+
+    impl FlakyService {
+        async fn start() -> Self {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let client = Arc::new(Client::new(usbmuxd::Endpoint::Tcp(
+                listener.local_addr().unwrap(),
+            )));
+            let failing = Arc::new(AtomicBool::new(false));
+            let failed = Arc::new(AtomicU64::new(0));
+            let (tunnel_tx, tunnels) = mpsc::channel(4);
+            let state = (failing.clone(), failed.clone());
+            tokio::spawn(async move {
+                loop {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    let (failing, failed) = state.clone();
+                    let tunnel_tx = tunnel_tx.clone();
+                    tokio::spawn(async move {
+                        let (tag, request) = usbmuxd::read_message(&mut stream).await.unwrap();
+                        let kind = request.as_dictionary().unwrap()["MessageType"]
+                            .as_string()
+                            .unwrap()
+                            .to_string();
+                        let reply = if kind == "ListDevices" {
+                            if failing.load(Ordering::SeqCst) {
+                                failed.fetch_add(1, Ordering::SeqCst);
+                                return;
+                            }
+                            let device = plist::Dictionary::from_iter([
+                                ("DeviceID".to_string(), plist::Value::from(3u64)),
+                                (
+                                    "Properties".to_string(),
+                                    plist::Value::Dictionary(plist::Dictionary::from_iter([(
+                                        "ConnectionType".to_string(),
+                                        plist::Value::from("USB"),
+                                    )])),
+                                ),
+                            ]);
+                            plist::Dictionary::from_iter([(
+                                "DeviceList".to_string(),
+                                plist::Value::Array(vec![plist::Value::Dictionary(device)]),
+                            )])
+                        } else {
+                            plist::Dictionary::from_iter([
+                                ("MessageType".to_string(), plist::Value::from("Result")),
+                                ("Number".to_string(), plist::Value::from(0u64)),
+                            ])
+                        };
+                        let bytes =
+                            usbmuxd::encode_message(tag, &plist::Value::Dictionary(reply)).unwrap();
+                        tokio::io::AsyncWriteExt::write_all(&mut stream, &bytes)
+                            .await
+                            .unwrap();
+                        if kind == "Connect" {
+                            let _ = tunnel_tx.send(stream).await;
+                        }
+                    });
+                }
+            });
+            Self {
+                failing,
+                failed,
+                tunnels,
+                client,
+            }
+        }
+
+        /// The iPad's end of the next tunnel, past its preamble.
+        async fn tunnel(&mut self) -> tokio::net::TcpStream {
+            let mut ipad = tokio::time::timeout(Duration::from_secs(20), self.tunnels.recv())
+                .await
+                .expect("a tunnel")
+                .unwrap();
+            super::super::link::read_preamble(&mut ipad).await.unwrap();
+            ipad
+        }
+    }
+
+    /// Poll times a test hands the supervisor one at a time. It hears when
+    /// each poll has finished: the supervisor asks for the next one.
+    struct Polls {
+        finished: mpsc::Sender<()>,
+        at: mpsc::Receiver<tokio::time::Instant>,
+    }
+
+    impl PollClock for Polls {
+        async fn next(&mut self) -> tokio::time::Instant {
+            let _ = self.finished.send(()).await;
+            self.at.recv().await.expect("the test's next poll")
+        }
+    }
+
+    /// The test's side of [`Polls`].
+    struct Poller {
+        at: mpsc::Sender<tokio::time::Instant>,
+        polled: mpsc::Receiver<()>,
+        start: tokio::time::Instant,
+    }
+
+    impl Poller {
+        /// Polls `secs` after the start, and returns once that poll has
+        /// finished.
+        async fn poll(&mut self, secs: u64) {
+            let at = self.start + Duration::from_secs(secs);
+            self.at.send(at).await.unwrap();
+            self.polled.recv().await.unwrap();
+        }
+    }
+
+    /// A device list that fails once leaves the live tunnel open; one that
+    /// keeps failing closes it once the failures have lasted
+    /// [`LIST_OUTAGE`], and once the list answers again the iPad gets a new
+    /// tunnel. While the tunnel is kept, the PC window goes on showing USB
+    /// as it was, not "Open Apple Devices". A single failed list used to
+    /// close the tunnel at once. Each poll's time is the test's, so how the
+    /// machine schedules the test changes nothing.
+    #[tokio::test]
+    async fn a_failed_device_list_keeps_the_tunnel_until_the_service_is_down() {
+        let mut service = FlakyService::start().await;
+        let stats: &'static Mutex<PipelineStats> =
+            Box::leak(Box::new(Mutex::new(PipelineStats::default())));
+        let (finished, mut polled) = mpsc::channel(1);
+        let (at, polls) = mpsc::channel(1);
+        let (events, mut opened) = mpsc::channel(4);
+        let supervisor = tokio::spawn(supervise_devices(
+            Arc::clone(&service.client),
+            events,
+            Arc::new(AtomicBool::new(false)),
+            stats,
+            Polls {
+                finished,
+                at: polls,
+            },
+        ));
+        polled.recv().await.unwrap();
+        let mut poller = Poller {
+            at,
+            polled,
+            start: tokio::time::Instant::now(),
+        };
+        let shown = || {
+            let stats = stats.lock();
+            (
+                stats.usb_service_reachable,
+                stats.usb_devices,
+                stats.usb_link_state.clone(),
+            )
+        };
+        let streaming = (true, 1, "Waiting for the iPad app".to_string());
+
+        poller.poll(0).await;
+        let _ipad = service.tunnel().await;
+        let first = opened.recv().await.unwrap();
+        assert_eq!(shown(), streaming);
+
+        // One failed list between good ones.
+        service.failing.store(true, Ordering::SeqCst);
+        poller.poll(2).await;
+        assert_eq!(service.failed.load(Ordering::SeqCst), 1);
+        assert!(!first.link.is_closed(), "one failed list closed the tunnel");
+        assert_eq!(shown(), streaming, "a kept tunnel shown as unavailable");
+        service.failing.store(false, Ordering::SeqCst);
+        poller.poll(4).await;
+        assert!(!first.link.is_closed());
+        assert!(service.tunnels.try_recv().is_err(), "a second tunnel");
+
+        // Failures in a row: kept until they have lasted the outage.
+        service.failing.store(true, Ordering::SeqCst);
+        for secs in [6, 8, 10, 12, 14] {
+            poller.poll(secs).await;
+            assert!(!first.link.is_closed(), "closed at {secs} s");
+            assert_eq!(shown(), streaming, "at {secs} s");
+        }
+        poller.poll(16).await;
+        let mut closed = first.link.closed_signal();
+        tokio::time::timeout(Duration::from_secs(20), closed.wait_for(|closed| *closed))
+            .await
+            .expect("the tunnel closes once the service is down")
+            .unwrap();
+        assert_eq!(
+            shown(),
+            (false, 0, "Apple device service unavailable".to_string())
+        );
+
+        service.failing.store(false, Ordering::SeqCst);
+        poller.poll(18).await;
+        let _ipad = service.tunnel().await;
+        let second = opened.recv().await.unwrap();
+        assert!(second.generation > first.generation);
+        assert!(!second.link.is_closed());
+        assert_eq!(shown(), streaming);
+        supervisor.abort();
     }
 }

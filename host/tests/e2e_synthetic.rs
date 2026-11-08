@@ -2078,6 +2078,147 @@ fn a_session_ends_with_one_summary_naming_the_clients_nonce() {
     }
 }
 
+/// A hybrid laptop where Windows won't share the screen from the graphics
+/// card EternalMonitor runs on (capture fails with DXGI_ERROR_UNSUPPORTED,
+/// faked here). The iPad got 10 s of black, then "no picture", while only
+/// the PC's window said why. Now the session's heartbeats tell it after the
+/// refusal lasts 2 s, the summary names a capture failure, and once Windows
+/// lets capture work, the next session streams with no notice.
+#[cfg(debug_assertions)]
+#[test]
+fn a_screen_refused_from_this_graphics_card_is_told_to_the_ipad() {
+    use eternal_wire::v2::control::{NOTICE_NONE, NOTICE_UNSUPPORTED_GPU};
+    let _env = test_env();
+    init_test_tracing();
+    let _ = ffmpeg_next::init();
+
+    std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
+    std::env::set_var("ETERNAL_CAPTURE", "synthetic");
+    std::env::set_var("ETERNAL_SYNTH_REFUSE_GPU", "1");
+    std::env::remove_var("ETERNAL_DROP");
+
+    let listen_port = free_udp_port();
+    let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
+    shared.pairing.lock().required = false;
+    *shared.encoder_override.lock() = Some("libx264".to_string());
+    let gpu_info = GpuInfo::software_fallback();
+    let (supervisor_tx, supervisor_rx) = mpsc::channel();
+    let supervisor = {
+        let (shared, supervisor_tx) = (shared.clone(), supervisor_tx.clone());
+        std::thread::spawn(move || {
+            eternal_host::supervisor::run(
+                listen_port,
+                shared,
+                gpu_info,
+                supervisor_tx,
+                supervisor_rx,
+            );
+        })
+    };
+
+    // The session the iPad gives up on: heartbeats, no video.
+    const REFUSED: u32 = 0x6B0_0001;
+    let mut receiver = FakeReceiver::connect_as(listen_port, CAP_DECODE_H264, 0, 0, REFUSED);
+    let accepted = Instant::now();
+    let mut datagram = [0u8; 2048];
+    let mut told_after = None;
+    while told_after.is_none() {
+        assert!(
+            accepted.elapsed() < Duration::from_secs(8),
+            "no notice within 8 s of the session"
+        );
+        receiver.maybe_report(0, 0);
+        let Ok((len, _)) = receiver.socket.recv_from(&mut datagram) else {
+            continue;
+        };
+        match classify(&datagram[..len]) {
+            Classified::Media { .. } => panic!("video went out from a refused screen"),
+            Classified::Control(_) => {
+                if let Ok((_, ControlMessage::Heartbeat(hb))) = parse_control(&datagram[..len]) {
+                    if hb.notice == NOTICE_UNSUPPORTED_GPU {
+                        told_after = Some(accepted.elapsed());
+                    } else {
+                        assert_eq!(hb.notice, NOTICE_NONE);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let told_after = told_after.unwrap();
+    assert!(
+        told_after >= Duration::from_millis(1500),
+        "told after {told_after:?}: a refusal that lasts a moment says nothing"
+    );
+    // The iPad's first-picture wait runs out.
+    receiver.send(&ControlMessage::Bye(ByeReason::Error));
+    receiver.send(&ControlMessage::Bye(ByeReason::Error));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while summaries_with_nonce(REFUSED).is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "no summary within 3 s of the goodbye"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let line = summaries_with_nonce(REFUSED)[0].clone();
+    assert!(
+        line.contains(" stage=accepted outcome=no_picture failure=capture_failed "),
+        "{line}"
+    );
+
+    // Windows lets capture work again (the user switched the card).
+    std::env::remove_var("ETERNAL_SYNTH_REFUSE_GPU");
+    const WORKS: u32 = 0x6B0_0002;
+    let mut receiver = FakeReceiver::connect_as(listen_port, CAP_DECODE_H264, 0, 0, WORKS);
+    let deadline = Instant::now() + DEADLINE;
+    let mut video = false;
+    let mut notices_after_video = Vec::new();
+    while notices_after_video.len() < 2 {
+        assert!(
+            Instant::now() < deadline,
+            "no video and heartbeats within {DEADLINE:?}"
+        );
+        receiver.maybe_report(0, 0);
+        let Ok((len, _)) = receiver.socket.recv_from(&mut datagram) else {
+            continue;
+        };
+        match classify(&datagram[..len]) {
+            Classified::Media { .. } => video = true,
+            Classified::Control(_) if video => {
+                if let Ok((_, ControlMessage::Heartbeat(hb))) = parse_control(&datagram[..len]) {
+                    notices_after_video.push(hb.notice);
+                }
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(notices_after_video, [NOTICE_NONE, NOTICE_NONE]);
+    receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
+
+    shared.stop();
+    supervisor_tx
+        .send(SupervisorCommand::Shutdown)
+        .expect("send shutdown");
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = supervisor.join();
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("supervisor must shut down within 5s");
+    if let Some(path) = std::env::var_os("ETERNAL_SUMMARY_DUMP") {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .unwrap();
+        file.write_all(format!("{line}\n").as_bytes()).unwrap();
+    }
+}
+
 /// Repair is negotiated and exercised through the real encoder and transport.
 #[test]
 fn lossy_stream_recovers_and_adapts() {

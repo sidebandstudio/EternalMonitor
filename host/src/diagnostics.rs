@@ -248,6 +248,13 @@ static SESSION_FALLBACK: parking_lot::Mutex<SessionFallback> =
 
 /// `session_id` started: fallbacks logged from now on are its own.
 pub fn note_session_start(session_id: u32, shared: &SharedControl) {
+    // The slot is the process's, so a test that starts a session would
+    // replace another test's.
+    #[cfg(test)]
+    assert!(
+        tests::FALLBACK_SLOT.is_locked(),
+        "a test that starts a session holds diagnostics::tests::FALLBACK_SLOT"
+    );
     *SESSION_FALLBACK.lock() = SessionFallback {
         session_id: Some(session_id),
         mode: Some(Arc::clone(&shared.capture_target)),
@@ -340,9 +347,11 @@ pub fn log_session_end(end: &SessionEnd, shared: &SharedControl) {
     // `mode=` is the mode at the end; the fallback was counted in Second
     // screen mode, perhaps before a switch to Mirror.
     let fallback = end.session_id.and_then(take_fallback);
+    let refused = *shared.capture_block.lock()
+        == Some(crate::capture::recovery::CaptureBlock::UnsupportedOnThisGpu);
     info!(
         "{}",
-        session_summary(end, second_screen, fallback, host_facts())
+        session_summary(end, second_screen, fallback, refused, host_facts())
     );
 }
 
@@ -397,11 +406,14 @@ pub fn log_session_end_now(end: &SessionEnd, shared: &SharedControl) {
 }
 
 /// The `session_summary v=1` line (b-session-summary contract): enumerated
-/// tokens, bounded numbers and the facts above, nothing else.
+/// tokens, bounded numbers and the facts above, nothing else. `gpu_refused`:
+/// Windows refuses the screen from the graphics card EternalMonitor runs on,
+/// so a session that gets no picture failed in capture, not on the network.
 pub fn session_summary(
     end: &SessionEnd,
     second_screen: bool,
     fallback: Option<&'static str>,
+    gpu_refused: bool,
     host: &HostFacts,
 ) -> String {
     use eternal_wire::v2::control::{ByeReason, HelloStatus};
@@ -438,6 +450,9 @@ pub fn session_summary(
         EndReason::Refused(_) => "other",
         EndReason::LinkLost if matches!(end.link, LinkId::Usb { .. }) => "usb_lost",
         EndReason::LinkLost => "other",
+        EndReason::Liveness | EndReason::Goodbye(ByeReason::Error) if !streamed && gpu_refused => {
+            "capture_failed"
+        }
         EndReason::Liveness | EndReason::Goodbye(ByeReason::Error) if !streamed => "no_video",
         EndReason::Liveness => "signal_lost",
         // The iPad gave up on video that went out: none of it arrived, or
@@ -760,6 +775,7 @@ pub(crate) mod tests {
             ),
             true,
             Some("attach_timeout"),
+            false,
             &pc(),
         );
         assert_eq!(
@@ -903,7 +919,7 @@ pub(crate) mod tests {
             ),
         ];
         for (end, expected) in cases {
-            let line = session_summary(&end, false, None, &pc());
+            let line = session_summary(&end, false, None, false, &pc());
             assert_eq!(tokens(&line), expected, "{end:?}");
             assert_contract(&line);
         }
@@ -911,6 +927,7 @@ pub(crate) mod tests {
             &end(Refused(HelloStatus::Busy), None, 0),
             true,
             Some("no_frames"),
+            false,
             &pc(),
         );
         assert!(
@@ -919,6 +936,47 @@ pub(crate) mod tests {
                 && refused.contains(" ttff_ms=- "),
             "{refused}"
         );
+    }
+
+    /// A hybrid laptop whose screen Windows won't share from the card
+    /// EternalMonitor runs on: the iPad gave up with no picture. That is a
+    /// capture failure, which the backend's check lists, not lost video. A
+    /// session that got its picture, or that the user ended, keeps its own
+    /// tokens.
+    #[test]
+    fn no_picture_from_a_refused_graphics_card_is_a_capture_failure() {
+        use EndReason::{Goodbye, Liveness};
+        for (end, expected) in [
+            (
+                end(Goodbye(ByeReason::Error), None, 10_000),
+                ["accepted", "no_picture", "capture_failed", "goodbye"],
+            ),
+            (
+                end(Liveness, None, 10_000),
+                ["accepted", "no_picture", "capture_failed", "liveness"],
+            ),
+            (
+                end(Goodbye(ByeReason::UserDisconnect), None, 4_000),
+                ["accepted", "user_ended", "none", "goodbye"],
+            ),
+            (
+                end(Liveness, Some(400), 60_000),
+                ["steady", "streamed", "signal_lost", "liveness"],
+            ),
+        ] {
+            let line = session_summary(&end, false, None, true, &pc());
+            assert_eq!(tokens(&line), expected, "{end:?}");
+            assert_contract(&line);
+        }
+        // Without the refusal, the same end is lost video, as before.
+        let line = session_summary(
+            &end(Goodbye(ByeReason::Error), None, 10_000),
+            false,
+            None,
+            false,
+            &pc(),
+        );
+        assert_eq!(tokens(&line)[2], "no_video");
     }
 
     #[test]
@@ -930,7 +988,7 @@ pub(crate) mod tests {
             duration: Duration::from_secs(40 * 86_400),
             ..end(EndReason::Liveness, None, 0)
         };
-        let line = session_summary(&long, false, None, &pc());
+        let line = session_summary(&long, false, None, false, &pc());
         assert!(line.contains(" nonce=00000000ffffffff "), "{line}");
         assert!(
             line.contains(" ttff_ms=600000 duration_ms=2592000000 "),
@@ -942,7 +1000,13 @@ pub(crate) mod tests {
             gpu: gpu_token(&[]),
             hybrid: None,
         };
-        let line = session_summary(&end(EndReason::Shutdown, None, 0), false, None, &unknown);
+        let line = session_summary(
+            &end(EndReason::Shutdown, None, 0),
+            false,
+            None,
+            false,
+            &unknown,
+        );
         assert!(line.ends_with(" os=win:0.0 hw=pc gpu=- hybrid=-"), "{line}");
         assert_contract(&line);
     }
@@ -1112,6 +1176,7 @@ pub(crate) mod tests {
             .with(SummaryCapture(summaries.clone()));
         let shared = SharedControl::new(9876, 15_000_000);
         *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(subscriber, || {
             for (id, reason) in [(1, "vdd_only"), (2, "panel_lost")] {
                 note_session_start(id, &shared);

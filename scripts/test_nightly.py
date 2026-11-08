@@ -1,6 +1,7 @@
 """Beta channel builds must sort below the release they lead to and never touch other releases."""
 import copy
 import hashlib
+import http.client
 import itertools
 import os
 import pathlib
@@ -9,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import urllib.error
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import nightly  # noqa: E402
@@ -295,6 +297,110 @@ class FakeGitHub:
         self.call("sha256", url)
         data = self.served_asset(url)["data"]
         return hashlib.sha256(data + (b"x" if self.corrupt else b"")).hexdigest()
+
+
+class ScriptedDownloads:
+    """An asset URL that answers HEAD and the SHA-256 download from scripts, one
+    entry per call, then keeps answering with the last entry. An entry that is an
+    exception is raised."""
+
+    def __init__(self, heads, hashes=()):
+        self.heads, self.hashes = list(heads), list(hashes)
+        self.calls = []
+
+    @staticmethod
+    def answer(script):
+        entry = script.pop(0) if len(script) > 1 else script[0]
+        if isinstance(entry, BaseException):
+            raise entry
+        return entry
+
+    def head(self, url):
+        self.calls.append("head")
+        return self.answer(self.heads)
+
+    def sha256(self, url):
+        self.calls.append("sha256")
+        return self.answer(self.hashes)
+
+
+def http_error(code):
+    return urllib.error.HTTPError(URL, code, f"HTTP {code}", {}, None)
+
+
+URL = "https://github.com/o/r/releases/download/beta/EternalMonitor-Setup.exe"
+SIZE = 1234
+OK = (200, SIZE)
+
+
+class VerifyTest(unittest.TestCase):
+    """verify() rides out GitHub's 5xx spells but never accepts a different file."""
+
+    def verify(self, github, sha256=None):
+        waits = []
+        try:
+            nightly.verify(github, URL, SIZE, sha256, sleep=waits.append)
+        except nightly.PublishError as error:
+            return waits, str(error)
+        return waits, None
+
+    def test_a_5xx_spell_is_waited_out_with_growing_waits(self):
+        github = ScriptedDownloads([(504, -1)] * 11 + [OK], [HASH])
+        waits, failed = self.verify(github, HASH)
+        self.assertIsNone(failed)
+        self.assertEqual(waits, [5, 10, 15, 20, 25, 30, 30, 30, 30, 30, 30])
+
+    def test_a_5xx_spell_that_goes_on_fails_after_twelve_tries(self):
+        github = ScriptedDownloads([(502, -1)])
+        waits, failed = self.verify(github)
+        self.assertEqual(github.calls.count("head"), 12)
+        self.assertIn("HTTP 502", failed)
+
+    def test_rate_limits_and_dropped_connections_are_waited_out_too(self):
+        github = ScriptedDownloads([(429, -1), urllib.error.URLError("connection reset"),
+                                    TimeoutError("timed out"), OK])
+        self.assertEqual(self.verify(github), ([5, 10, 15], None))
+
+    def test_a_download_cut_off_partway_is_waited_out(self):
+        github = ScriptedDownloads([OK], [http.client.IncompleteRead(b"x" * 10, SIZE - 10),
+                                          http.client.RemoteDisconnected("closed"), HASH])
+        self.assertEqual(self.verify(github, HASH), ([5, 10], None))
+
+    def test_downloads_cut_off_every_time_fail_after_twelve_tries(self):
+        github = ScriptedDownloads([OK], [http.client.IncompleteRead(b"", SIZE)])
+        waits, failed = self.verify(github, HASH)
+        self.assertEqual(github.calls.count("sha256"), 12)
+        self.assertEqual(waits, [5, 10, 15, 20, 25, 30, 30, 30, 30, 30, 30])
+        self.assertIn("IncompleteRead", failed)
+
+    def test_a_5xx_while_hashing_is_waited_out(self):
+        github = ScriptedDownloads([OK], [http_error(504), http_error(503), HASH])
+        self.assertEqual(self.verify(github, HASH), ([5, 10], None))
+
+    def test_a_missing_file_has_the_short_window_it_had(self):
+        # A new or renamed asset can take a few seconds to show.
+        github = ScriptedDownloads([(404, -1)] * 3 + [OK])
+        self.assertEqual(self.verify(github), ([10, 10, 10], None))
+        github = ScriptedDownloads([(404, -1)])
+        waits, failed = self.verify(github)
+        self.assertEqual((len(waits), github.calls.count("head")), (5, 6))
+        self.assertIn("HTTP 404", failed)
+
+    def test_a_different_file_is_never_taken_for_a_server_error(self):
+        wrong_size = ScriptedDownloads([(200, SIZE + 1)])
+        waits, failed = self.verify(wrong_size, HASH)
+        self.assertEqual(wrong_size.calls.count("head"), 6)
+        self.assertNotIn("sha256", wrong_size.calls)
+        self.assertIn(f"{SIZE + 1} bytes", failed)
+        wrong_bytes = ScriptedDownloads([OK], ["cd" * 32])
+        waits, failed = self.verify(wrong_bytes, HASH)
+        self.assertEqual(wrong_bytes.calls.count("sha256"), 6)
+        self.assertIn("SHA-256 " + "cd" * 32, failed)
+        self.assertEqual(waits, [10] * 5)
+
+    def test_server_errors_do_not_use_up_the_window_for_a_late_file(self):
+        github = ScriptedDownloads([(504, -1)] * 4 + [(404, -1)] * 5 + [OK])
+        self.assertEqual(self.verify(github), ([5, 10, 15, 20] + [10] * 5, None))
 
 
 OLD_SHA, NEW_SHA = "1" * 40, "2" * 40

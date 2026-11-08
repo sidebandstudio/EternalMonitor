@@ -39,6 +39,12 @@ struct NoVideoFallback: Equatable {
         if framesSent > framesBeforeStep, sendingSince == nil { sendingSince = now }
     }
 
+    /// The session already runs at `size`: the steps go on with the sizes
+    /// below it.
+    mutating func skipSizes(downTo size: UInt16) {
+        sizesAsked = max(sizesAsked, Self.sizes.filter { $0 >= size }.count)
+    }
+
     /// The step to take at `now`, while there is no picture; nil while the
     /// PC sends nothing, or within `wait` of its sending.
     mutating func next(at now: TimeInterval) -> Step? {
@@ -91,12 +97,94 @@ enum NoVideoPaths {
         save(load().filter { $0.from != from })
     }
 
-    private static func digest(_ token: Data) -> String {
+    /// SHA-256 of a pairing token, in hex.
+    static func digest(_ token: Data) -> String {
         SHA256.hash(data: token).map { String(format: "%02x", $0) }.joined()
     }
 
     static func forgetAll() {
         UserDefaults.standard.removeObject(forKey: key)
+    }
+
+    private static func load() -> [Entry] {
+        guard let data = UserDefaults.standard.data(forKey: key) else { return [] }
+        return (try? JSONDecoder().decode([Entry].self, from: data)) ?? []
+    }
+
+    private static func save(_ entries: [Entry]) {
+        guard let data = try? JSONEncoder().encode(entries) else { return }
+        UserDefaults.standard.set(data, forKey: key)
+    }
+}
+
+/// The media datagram size a PC's video needed at an address, so the next
+/// session there starts with it instead of waiting through the steps again.
+/// Each entry is bound to the pairing by a digest of its token, and to the
+/// network this iPad reached the PC over: one address may keep a size per
+/// network. It lasts a week from when the size was last needed, and every
+/// size kept for the address goes as soon as a session there shows a
+/// picture at the PC's own size. Kept in UserDefaults.
+enum NoVideoSizes {
+    static let lifetime: TimeInterval = 7 * 24 * 60 * 60
+    private static let key = "noVideoSizes"
+    private static let kept = 16
+
+    /// A session's address, pairing and network.
+    struct Key: Equatable {
+        var address: NoVideoPaths.Address
+        var pairing: Data
+        /// `network(_:)` of this iPad's route to the address.
+        var network: String
+    }
+
+    private struct Entry: Codable {
+        var address: NoVideoPaths.Address
+        /// SHA-256 of the pairing token, in hex.
+        var pairing: String
+        var network: String
+        var size: UInt16
+        var at: Date
+    }
+
+    /// This iPad's side of a route: its interface, address and netmask.
+    static func network(_ route: MovedPC.Route?) -> String {
+        route.map { "\($0.interface) \($0.address)/\($0.netmask)" } ?? "-"
+    }
+
+    /// The size to start a session at `key` with: one kept for its address
+    /// and pairing, on the same network, less than `lifetime` old.
+    static func size(for key: Key, now: Date) -> UInt16? {
+        guard key.network != "-", let entry = load().last(where: { matches($0, key, network: true) }),
+              now >= entry.at, now.timeIntervalSince(entry.at) < lifetime else { return nil }
+        return entry.size
+    }
+
+    static func remember(_ size: UInt16, for key: Key, now: Date) {
+        var entries = load().filter { !matches($0, key, network: true) }
+        entries.append(Entry(address: key.address, pairing: NoVideoPaths.digest(key.pairing), network: key.network, size: size, at: now))
+        save(Array(entries.suffix(kept)))
+    }
+
+    /// Forgets the sizes kept for `key`'s address and pairing, on every
+    /// network; true if there was one.
+    @discardableResult
+    static func forget(_ key: Key) -> Bool {
+        let entries = load()
+        let kept = entries.filter { !matches($0, key, network: false) }
+        guard kept.count != entries.count else { return false }
+        save(kept)
+        return true
+    }
+
+    static func forgetAll() {
+        UserDefaults.standard.removeObject(forKey: key)
+    }
+
+    /// Whether `entry` is kept for `key`'s address and pairing, and for its
+    /// network when `network` says so.
+    private static func matches(_ entry: Entry, _ key: Key, network: Bool) -> Bool {
+        entry.address == key.address && entry.pairing == NoVideoPaths.digest(key.pairing)
+            && (!network || entry.network == key.network)
     }
 
     private static func load() -> [Entry] {
