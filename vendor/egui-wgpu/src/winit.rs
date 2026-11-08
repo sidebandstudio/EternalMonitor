@@ -109,8 +109,43 @@ fn block_on<F: core::future::Future>(future: F) -> F::Output {
     }
 }
 
-/// EternalMonitor patch: a replacement device being made on another thread.
-type Replacing = Answer<Result<crate::NewDevice, crate::WgpuError>>;
+/// EternalMonitor patch: a replacement being made on other threads, in two stages, each
+/// polled and timed out on its own. Neither thread gets the window or a surface.
+enum Replacing {
+    /// The adapter and the device, with the flag its handlers set when it is lost.
+    Device {
+        answer: Answer<Result<crate::NewDevice, crate::WgpuError>>,
+        lost: Arc<AtomicBool>,
+    },
+    /// egui's renderer for the device, while the window's thread keeps the device and the
+    /// surface it checked it against.
+    Renderer {
+        answer: Answer<renderer::Renderer>,
+        new: crate::NewDevice,
+        surface: wgpu::Surface<'static>,
+        format: wgpu::TextureFormat,
+        lost: Arc<AtomicBool>,
+    },
+}
+
+/// EternalMonitor patch: flag the loss of `device` in `lost`. An error wgpu reports outside
+/// an error scope flags it too, instead of panicking as wgpu's default handler does: a
+/// window whose device or surface fails is drawn again on a new one.
+fn watch(device: &wgpu::Device, lost: &Arc<AtomicBool>) {
+    let flag = Arc::clone(lost);
+    device.set_device_lost_callback(move |reason, message| {
+        log::warn!("The wgpu device was lost ({reason:?}): {message}");
+        flag.store(true, Ordering::SeqCst);
+    });
+    let flag = Arc::clone(lost);
+    device.on_uncaptured_error(Arc::new(move |error| {
+        if flag.swap(true, Ordering::SeqCst) {
+            log::debug!("wgpu error on the lost device: {error}");
+        } else {
+            log::error!("wgpu error; replacing the window's device: {error}");
+        }
+    }));
+}
 
 /// EternalMonitor patch: when the painter tries to replace a lost device, and when it
 /// stops trying.
@@ -227,6 +262,10 @@ pub struct Painter {
     /// The replacement being made, if any. Never more than one: a stuck one is waited
     /// for, not joined by another.
     replacing: Option<Replacing>,
+    /// The adapter that last drew on the window, which a replacement prefers.
+    preferred: Option<crate::AdapterKey>,
+    /// Adapters that couldn't draw on the window since the last replacement that could.
+    excluded: Vec<crate::AdapterKey>,
 }
 
 impl Painter {
@@ -273,6 +312,8 @@ impl Painter {
             restore_fonts: false,
             replacement: Replacement::default(),
             replacing: None,
+            preferred: None,
+            excluded: Vec::new(),
         }
     }
 
@@ -449,32 +490,14 @@ impl Painter {
             let render_state =
                 RenderState::create(&self.config, &self.instance, Some(&surface), self.options)
                     .await?;
-            self.watch_device(&render_state.device);
+            let lost = Arc::new(AtomicBool::new(false));
+            watch(&render_state.device, &lost);
+            self.device_lost = lost;
+            self.preferred = Some(crate::AdapterKey::of(&render_state.adapter.get_info()));
             self.render_state = Some(render_state);
         }
         self.install_surface(surface, viewport_id, size.width, size.height, false);
         Ok(())
-    }
-
-    /// EternalMonitor patch: flag the loss of `device`. An error wgpu reports outside an
-    /// error scope flags it too, instead of panicking as wgpu's default handler does: a
-    /// window whose device or surface fails is drawn again on a new one.
-    fn watch_device(&mut self, device: &wgpu::Device) {
-        let lost = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&lost);
-        device.set_device_lost_callback(move |reason, message| {
-            log::warn!("The wgpu device was lost ({reason:?}): {message}");
-            flag.store(true, Ordering::SeqCst);
-        });
-        let flag = Arc::clone(&lost);
-        device.on_uncaptured_error(Arc::new(move |error| {
-            if flag.swap(true, Ordering::SeqCst) {
-                log::debug!("wgpu error on the lost device: {error}");
-            } else {
-                log::error!("wgpu error; replacing the window's device: {error}");
-            }
-        }));
-        self.device_lost = lost;
     }
 
     /// EternalMonitor patch: forget a lost device and everything made on it. eframe calls
@@ -501,86 +524,163 @@ impl Painter {
 
     /// EternalMonitor patch: work towards a new device for a lost one, without blocking.
     ///
-    /// Listing adapters and making the device, where a driver can stall, run on another
-    /// thread, which this polls. That thread gets no window or surface, so one stuck in a
-    /// driver neither keeps the window alive (eframe ends its loop only once the window is
-    /// destroyed) nor touches it after it is gone. One that hasn't answered in
-    /// [`REPLACEMENT_TIMEOUT`] counts as a failed try, and no other starts while it is out;
-    /// its late device is still taken. On this thread the window's surface is then made,
-    /// checked against the new adapter and configured (DXGI sends the window messages while
-    /// it makes the swapchain), and the renderer is made; a mismatch is a failed try.
+    /// Two stages run on other threads, which this polls: listing adapters and making the
+    /// device ([`RenderState::new_device`], which installs the loss handlers before anything
+    /// is made on the device), then egui's renderer (buffers, shaders, the pipeline). A
+    /// driver can stall in either. Neither thread gets the window or a surface, so one stuck
+    /// in a driver neither keeps the window alive (eframe ends its loop only once the window
+    /// is destroyed) nor touches it after it is gone. A stage that hasn't answered in
+    /// [`REPLACEMENT_TIMEOUT`], or that panicked, is a failed try, and no other starts while
+    /// one is out; a late answer is still taken. Between the stages, this thread makes the
+    /// window's surface and checks the new adapter can draw on it (if not, the adapter is
+    /// left out of later tries); after them it configures the surface, as DXGI sends the
+    /// window messages while it makes the swapchain.
     fn replace_device(&mut self, viewport_id: ViewportId, window: Arc<winit::window::Window>) {
         let now = Instant::now();
-        if let Some(replacing) = &mut self.replacing {
-            match replacing.poll(now) {
-                Asked::Waiting => {}
-                Asked::TimedOut => self.replacement_failed(now, &"no new device within 10 s"),
+        match self.replacing.take() {
+            None => self.start_replacement(now),
+            Some(Replacing::Device { mut answer, lost }) => match answer.poll(now) {
+                Asked::Waiting => self.replacing = Some(Replacing::Device { answer, lost }),
+                Asked::TimedOut => {
+                    self.replacing = Some(Replacing::Device { answer, lost });
+                    self.replacement_failed(now, &"no new device within 10 s");
+                }
+                Asked::Ended => self.replacement_failed(now, &"the thread making the device ended"),
+                Asked::Answered(Err(err)) => self.replacement_failed(now, &err),
+                Asked::Answered(Ok(new)) => self.make_renderer(new, lost, &window, now),
+            },
+            Some(Replacing::Renderer {
+                mut answer,
+                new,
+                surface,
+                format,
+                lost,
+            }) => match answer.poll(now) {
+                Asked::Answered(renderer) => {
+                    self.adopt(new, surface, format, renderer, lost, viewport_id, &window);
+                    return;
+                }
+                Asked::Waiting => {
+                    self.replacing = Some(Replacing::Renderer {
+                        answer,
+                        new,
+                        surface,
+                        format,
+                        lost,
+                    });
+                }
+                Asked::TimedOut => {
+                    self.replacing = Some(Replacing::Renderer {
+                        answer,
+                        new,
+                        surface,
+                        format,
+                        lost,
+                    });
+                    self.replacement_failed(now, &"no renderer within 10 s");
+                }
                 Asked::Ended => {
-                    self.replacing = None;
-                    self.replacement_failed(now, &"the thread making it ended");
+                    self.replacement_failed(now, &"the thread making the renderer ended");
                 }
-                Asked::Answered(Ok(new)) => {
-                    self.replacing = None;
-                    match self.adopt(new, viewport_id, window) {
-                        Ok(()) => return,
-                        Err(err) => self.replacement_failed(now, &err),
-                    }
-                }
-                Asked::Answered(Err(err)) => {
-                    self.replacing = None;
-                    self.replacement_failed(now, &err);
-                }
-            }
-            if let Some(wait) = self.next_check(now) {
-                self.context.request_repaint_after(wait);
-            }
+            },
+        }
+        if let Some(wait) = self.next_check(now) {
+            self.context.request_repaint_after(wait);
+        }
+    }
+
+    /// EternalMonitor patch: start the first stage of a replacement when it is due.
+    fn start_replacement(&mut self, now: Instant) {
+        if self.replacement.wait(now) != Some(Duration::ZERO) {
             return;
         }
-        match self.replacement.wait(now) {
-            None => return,
-            Some(wait) if !wait.is_zero() => {
-                self.context.request_repaint_after(wait);
-                return;
-            }
-            Some(_) => {}
-        }
+        let lost = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&lost);
         let (config, instance) = (self.config.clone(), self.instance.clone());
+        let (preferred, excluded) = (self.preferred.clone(), self.excluded.clone());
         let asked = Answer::ask(REPLACEMENT_THREAD, now, REPLACEMENT_TIMEOUT, move || {
-            block_on(RenderState::new_device(&config, &instance))
+            block_on(RenderState::new_device(
+                &config,
+                &instance,
+                preferred.as_ref(),
+                &excluded,
+                |device| watch(device, &flag),
+            ))
         });
         match asked {
-            Ok(replacing) => {
-                self.replacing = Some(replacing);
-                self.context.request_repaint_after(REPLACEMENT_POLL);
+            Ok(answer) => self.replacing = Some(Replacing::Device { answer, lost }),
+            Err(err) => self.replacement_failed(now, &err),
+        }
+    }
+
+    /// EternalMonitor patch: on the window's thread, make the window's surface and check the
+    /// new adapter can draw on it, then start the renderer stage with the device, the format
+    /// and the options only.
+    fn make_renderer(
+        &mut self,
+        new: crate::NewDevice,
+        lost: Arc<AtomicBool>,
+        window: &Arc<winit::window::Window>,
+        now: Instant,
+    ) {
+        let surface = match self.instance.create_surface(Arc::clone(window)) {
+            Ok(surface) => surface,
+            Err(err) => return self.replacement_failed(now, &err),
+        };
+        let format = match RenderState::surface_format(&new, &surface) {
+            Ok(format) => format,
+            Err(err) => {
+                let key = new.adapter_key();
+                log::warn!(
+                    "Leaving out {} ({:?}) for the window: {err}",
+                    key.name,
+                    key.backend
+                );
+                self.excluded.push(key);
+                return self.replacement_failed(now, &err);
+            }
+        };
+        let (device, options) = (new.device().clone(), self.options);
+        let asked = Answer::ask(REPLACEMENT_THREAD, now, REPLACEMENT_TIMEOUT, move || {
+            renderer::Renderer::new(&device, format, options)
+        });
+        match asked {
+            Ok(answer) => {
+                self.replacing = Some(Replacing::Renderer {
+                    answer,
+                    new,
+                    surface,
+                    format,
+                    lost,
+                });
             }
             Err(err) => self.replacement_failed(now, &err),
         }
     }
 
-    /// EternalMonitor patch: on the window's thread, make the window's surface for a device
-    /// from the replacement thread, check them together and draw with them.
+    /// EternalMonitor patch: draw with a finished replacement.
+    #[expect(clippy::too_many_arguments)]
     fn adopt(
         &mut self,
         new: crate::NewDevice,
+        surface: wgpu::Surface<'static>,
+        format: wgpu::TextureFormat,
+        renderer: renderer::Renderer,
+        lost: Arc<AtomicBool>,
         viewport_id: ViewportId,
-        window: Arc<winit::window::Window>,
-    ) -> Result<(), crate::WgpuError> {
-        let size = window.inner_size();
-        let surface = self.instance.create_surface(window)?;
-        let render_state = RenderState::with_new_device(
-            new,
-            &self.config,
-            &self.instance,
-            &surface,
-            self.options,
-        )?;
-        self.watch_device(&render_state.device);
+        window: &Arc<winit::window::Window>,
+    ) {
+        self.preferred = Some(new.adapter_key());
+        self.excluded.clear();
+        let render_state =
+            RenderState::from_new_device(new, &self.config, &self.instance, format, renderer);
+        self.device_lost = lost;
         self.render_state = Some(render_state);
+        let size = window.inner_size();
         self.install_surface(surface, viewport_id, size.width, size.height, false);
         self.rebuilding = false;
         self.restore_fonts = true;
         log::info!("Replaced the lost wgpu device");
-        Ok(())
     }
 
     /// EternalMonitor patch: a try at a new device failed at `now`.

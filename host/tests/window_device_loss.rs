@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 use eframe::egui;
 use eframe::egui_wgpu::winit::{Answer, Asked, Replacement, REPLACEMENT_TIMEOUT};
 use eframe::egui_wgpu::{
-    RenderState, Renderer, RendererOptions, ScreenDescriptor, WgpuConfiguration,
+    replacement_candidates, AdapterKey, RenderState, Renderer, RendererOptions, ScreenDescriptor,
+    WgpuConfiguration,
 };
 use eframe::wgpu;
 
@@ -233,12 +234,26 @@ fn a_replacement_that_never_answers_ends_in_giving_up() {
 
 #[test]
 fn a_replacement_device_is_made_without_any_window_or_surface() {
-    // What the replacement thread runs gets the configuration and the
-    // instance only, so a thread stuck in a driver can't hold the window or
-    // touch it after it is gone.
+    // What the replacement thread runs gets the configuration, the instance and
+    // adapter identities only, so a thread stuck in a driver can't hold the
+    // window or touch it after it is gone.
     let config = WgpuConfiguration::default();
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let new = block_on(RenderState::new_device(&config, &instance)).expect("a device");
+    let drew_on = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+        .expect("a graphics adapter");
+    let preferred = AdapterKey::of(&drew_on.get_info());
+    let mut watched = false;
+    let new = block_on(RenderState::new_device(
+        &config,
+        &instance,
+        Some(&preferred),
+        &[],
+        |_| watched = true,
+    ))
+    .expect("a device");
+    // The loss handlers went on before anything was made on the device.
+    assert!(watched);
+    assert_eq!(new.adapter_key(), preferred);
     let buffer = new.device().create_buffer(&wgpu::BufferDescriptor {
         label: None,
         size: 256,
@@ -246,4 +261,53 @@ fn a_replacement_device_is_made_without_any_window_or_surface() {
         mapped_at_creation: false,
     });
     assert_eq!(buffer.size(), 256);
+}
+
+fn adapter(name: &str, backend: wgpu::Backend, vendor: u32) -> AdapterKey {
+    AdapterKey {
+        backend,
+        vendor,
+        device: 1,
+        device_type: wgpu::DeviceType::DiscreteGpu,
+        name: name.into(),
+        pci_bus: String::new(),
+    }
+}
+
+#[test]
+fn a_replacement_prefers_the_adapter_that_drew_and_moves_past_ones_that_cannot() {
+    use wgpu::Backend::{Dx12, Vulkan};
+    // A hybrid PC: the window started on the dGPU with DX12.
+    let igpu = adapter("iGPU", Dx12, 0x1002);
+    let dgpu = adapter("dGPU", Dx12, 0x10de);
+    let dgpu_vulkan = adapter("dGPU", Vulkan, 0x10de);
+    let listed = [igpu.clone(), dgpu.clone(), dgpu_vulkan.clone()];
+
+    // The adapter that drew is the only choice while it is listed.
+    assert_eq!(replacement_candidates(&listed, Some(&dgpu), &[]), [1]);
+    // Gone from the listing, as across a driver reset: any of the others.
+    assert_eq!(
+        replacement_candidates(&[igpu.clone(), dgpu_vulkan.clone()], Some(&dgpu), &[]),
+        [0, 1]
+    );
+    // Nothing left to try.
+    assert!(replacement_candidates(&listed, Some(&dgpu), &listed).is_empty());
+
+    // Each one the window can't draw on is left out, and the next try moves on,
+    // with the selector taking the first candidate.
+    let can_draw = |key: &AdapterKey| *key == dgpu_vulkan;
+    let mut excluded = Vec::new();
+    let mut tried = Vec::new();
+    let chosen = loop {
+        let candidates = replacement_candidates(&listed, Some(&dgpu), &excluded);
+        let key = listed[candidates[0]].clone();
+        tried.push(key.clone());
+        if can_draw(&key) {
+            break key;
+        }
+        excluded.push(key);
+        assert!(tried.len() <= listed.len());
+    };
+    assert_eq!(chosen, dgpu_vulkan);
+    assert_eq!(tried, [dgpu, igpu, dgpu_vulkan]);
 }

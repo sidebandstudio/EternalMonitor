@@ -296,9 +296,54 @@ impl RenderState {
     }
 }
 
+/// EternalMonitor patch: which adapter one is, across listings: wgpu's `AdapterInfo`
+/// carries no LUID, so the backend, the PCI ids, the type, the name and the PCI bus (when
+/// the backend reports one).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AdapterKey {
+    pub backend: wgpu::Backend,
+    pub vendor: u32,
+    pub device: u32,
+    pub device_type: wgpu::DeviceType,
+    pub name: String,
+    pub pci_bus: String,
+}
+
+impl AdapterKey {
+    pub fn of(info: &wgpu::AdapterInfo) -> Self {
+        Self {
+            backend: info.backend,
+            vendor: info.vendor,
+            device: info.device,
+            device_type: info.device_type,
+            name: info.name.clone(),
+            pci_bus: info.device_pci_bus_id.clone(),
+        }
+    }
+}
+
+/// EternalMonitor patch: the adapters, by index into `keys`, that a replacement may choose
+/// from: only `preferred` (the last one that drew on the window) while it is listed and
+/// not `excluded`, else every one not `excluded` (ones that couldn't draw on the window).
+pub fn replacement_candidates(
+    keys: &[AdapterKey],
+    preferred: Option<&AdapterKey>,
+    excluded: &[AdapterKey],
+) -> Vec<usize> {
+    let allowed = |key: &AdapterKey| !excluded.contains(key);
+    if let Some(preferred) = preferred.filter(|preferred| allowed(preferred))
+        && let Some(index) = keys.iter().position(|key| key == preferred)
+    {
+        return vec![index];
+    }
+    (0..keys.len())
+        .filter(|&index| allowed(&keys[index]))
+        .collect()
+}
+
 /// EternalMonitor patch: an adapter and device to replace a lost one, made without the
 /// window's surface: the thread that makes them, where a driver can stall, never touches
-/// the window. The window's thread finishes it with [`RenderState::with_new_device`].
+/// the window. The window's thread then checks the surface ([`RenderState::surface_format`]).
 #[cfg(not(target_arch = "wasm32"))]
 pub struct NewDevice {
     adapter: wgpu::Adapter,
@@ -312,16 +357,24 @@ impl NewDevice {
     pub fn device(&self) -> &wgpu::Device {
         &self.device
     }
+
+    pub fn adapter_key(&self) -> AdapterKey {
+        AdapterKey::of(&self.adapter.get_info())
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
 impl RenderState {
-    /// EternalMonitor patch: list adapters, choose one as [`Self::create`] does but with no
-    /// surface to check against, and make its device. Takes no window or surface, so it
-    /// can run on a thread that may outlive the window.
+    /// EternalMonitor patch: list adapters, choose among [`replacement_candidates`] as
+    /// [`Self::create`] does but with no surface to check against, and make the device.
+    /// `watch` gets the device before anything is made on it. Takes no window or surface,
+    /// so it can run on a thread that may outlive the window.
     pub async fn new_device(
         config: &WgpuConfiguration,
         instance: &wgpu::Instance,
+        preferred: Option<&AdapterKey>,
+        excluded: &[AdapterKey],
+        watch: impl FnOnce(&wgpu::Device),
     ) -> Result<NewDevice, WgpuError> {
         let WgpuSetup::CreateNew(create_new) = &config.wgpu_setup else {
             return Err(WgpuError::CustomNativeAdapterSelectionError(
@@ -331,21 +384,28 @@ impl RenderState {
         let available_adapters = instance
             .enumerate_adapters(create_new.instance_descriptor.backends)
             .await;
+        let keys: Vec<AdapterKey> = available_adapters
+            .iter()
+            .map(|adapter| AdapterKey::of(&adapter.get_info()))
+            .collect();
+        let candidates: Vec<wgpu::Adapter> = replacement_candidates(&keys, preferred, excluded)
+            .into_iter()
+            .map(|index| available_adapters[index].clone())
+            .collect();
+        if candidates.is_empty() {
+            return Err(WgpuError::CustomNativeAdapterSelectionError(
+                "no adapter left that could draw on the window".to_owned(),
+            ));
+        }
         let adapter = if let Some(selector) = &create_new.native_adapter_selector {
-            selector(&available_adapters, None)
-                .map_err(WgpuError::CustomNativeAdapterSelectionError)?
+            selector(&candidates, None).map_err(WgpuError::CustomNativeAdapterSelectionError)?
         } else {
-            request_adapter(
-                instance,
-                create_new.power_preference,
-                None,
-                &available_adapters,
-            )
-            .await?
+            request_adapter(instance, create_new.power_preference, None, &candidates).await?
         };
         let (device, queue) = adapter
             .request_device(&(*create_new.device_descriptor)(&adapter))
             .await?;
+        watch(&device);
         Ok(NewDevice {
             adapter,
             available_adapters,
@@ -354,26 +414,31 @@ impl RenderState {
         })
     }
 
-    /// EternalMonitor patch: finish `new` for the window's `surface`, on the window's
-    /// thread: the adapter must be able to draw on it, and the renderer is made for its
-    /// format.
-    pub fn with_new_device(
-        new: NewDevice,
-        config: &WgpuConfiguration,
-        instance: &wgpu::Instance,
+    /// EternalMonitor patch: on the window's thread, the format to draw on `surface` with
+    /// `new`'s adapter, or an error when that adapter can't draw on it.
+    pub fn surface_format(
+        new: &NewDevice,
         surface: &wgpu::Surface<'_>,
-        options: RendererOptions,
-    ) -> Result<Self, WgpuError> {
+    ) -> Result<wgpu::TextureFormat, WgpuError> {
         if !new.adapter.is_surface_supported(surface) {
             return Err(WgpuError::CustomNativeAdapterSelectionError(
                 "the new adapter can't draw on the window".to_owned(),
             ));
         }
+        preferred_framebuffer_format(&surface.get_capabilities(&new.adapter).formats)
+    }
+
+    /// EternalMonitor patch: the render state of a replacement, from its device and a
+    /// renderer made for `target_format`.
+    pub fn from_new_device(
+        new: NewDevice,
+        config: &WgpuConfiguration,
+        instance: &wgpu::Instance,
+        target_format: wgpu::TextureFormat,
+        renderer: Renderer,
+    ) -> Self {
         log_adapter_info(&new.adapter.get_info());
-        let target_format =
-            preferred_framebuffer_format(&surface.get_capabilities(&new.adapter).formats)?;
-        let renderer = Renderer::new(&new.device, target_format, options);
-        Ok(Self {
+        Self {
             instance: instance.clone(),
             adapter: new.adapter,
             available_adapters: new.available_adapters,
@@ -382,7 +447,7 @@ impl RenderState {
             target_format,
             renderer: Arc::new(RwLock::new(renderer)),
             surface_config: config.surface,
-        })
+        }
     }
 }
 

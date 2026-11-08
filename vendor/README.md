@@ -30,19 +30,29 @@ The patch:
   its own devices and is not affected. The new device's first frame uploads
   the font atlas again. Other textures are the app's to load again
   (`host/src/gui/renderer.rs` counts devices for that).
-- A replacement never blocks the window's thread. Listing adapters and
-  making the device, where a driver can stall, run on their own thread
-  (`winit::Answer`, `RenderState::new_device`), which the window polls each
-  frame. That thread gets no window or surface: the adapter is chosen as at
-  start but with no surface to check. So a thread stuck in a driver neither
-  keeps the window alive (eframe ends its loop only once the window is
-  destroyed) nor touches it after it is gone; a late answer after quitting is
-  dropped with the closed channel. One that hasn't answered in 10 s counts as
-  a failed try, and no other starts while it is out; a late device is still
-  taken. The window's thread then makes the surface, checks the new adapter
-  can draw on it (a failed try if not), makes the renderer for its format
-  (`RenderState::with_new_device`) and configures it. The swapchain stays on
-  that thread because DXGI sends the window messages while it makes one.
+- A replacement never blocks the window's thread. Two stages run on other
+  threads, which the window polls each frame:
+  - Listing adapters and making the device (`RenderState::new_device`). The
+    loss handlers go on the device before anything is made on it.
+  - egui's renderer (buffers, shaders, the pipeline), from the device, the
+    format and the options only.
+  - A driver can stall in either. Neither thread gets the window or a surface,
+    so a stuck one neither keeps the window alive (eframe ends its loop only
+    once the window is destroyed) nor touches it after it is gone. A late
+    answer after quitting is dropped with the closed channel.
+  - A stage that hasn't answered in 10 s, or that panicked, is a failed try,
+    and no other starts while one is out; a late answer is still taken.
+  - Between the stages, the window's thread makes the surface and checks the
+    new adapter can draw on it (`RenderState::surface_format`). After them it
+    configures the surface: DXGI sends the window messages while it makes the
+    swapchain.
+- With no surface to check against, a replacement could keep choosing an
+  adapter that can't draw on the window, as on a hybrid PC.
+  `replacement_candidates` gives the host's adapter choice only the adapter
+  that last drew on the window, starting with the one from start, while it is
+  listed. An adapter that can't draw on the window is left out of later tries
+  until a replacement works. Adapters are told apart by `AdapterKey` (backend,
+  PCI ids, type, name, PCI bus), because wgpu reports no LUID.
   The thread is named `winit::REPLACEMENT_THREAD`, so the host's panic hook
   treats a panic there as one failed try: it doesn't turn the virtual display
   off as it does for other background threads.
