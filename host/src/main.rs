@@ -343,6 +343,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eternal_host::power::watch(gui_control.shared.clone(), {
         let quit_once = std::sync::Arc::clone(&quit_once);
         Box::new(move || {
+            gui::quitting_from_outside();
             let quit = quit_once.lock().take();
             if let Some(quit) = quit {
                 quit(None);
