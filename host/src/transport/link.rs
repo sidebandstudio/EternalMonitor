@@ -402,8 +402,9 @@ pub fn tunnel_congestion_drops() -> u64 {
     TUNNEL_CONGESTION.load(Ordering::Relaxed)
 }
 
-/// What ended a tunnel first. Neither side used to say: a tunnel that
-/// closed on both sides at once looked the same whoever closed it.
+/// What this host saw end a tunnel first. Neither side used to say: a
+/// tunnel that closed on both sides at once looked the same whoever closed
+/// it. It is the first end seen here, not necessarily what started it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CloseCause {
     /// The other end (the iPad, or Apple's device service) ended the stream.
@@ -623,8 +624,8 @@ impl FramedLink {
         CloseGuard(Arc::clone(&self.state))
     }
 
-    /// What closed the tunnel, how long it was open and how long the other
-    /// end had been quiet. `None` while it is open.
+    /// What this host saw end the tunnel first, how long it was open and
+    /// how long the other end had been quiet. `None` while it is open.
     pub fn close_report(&self) -> Option<CloseReport> {
         let lifetime = self.state.lifetime.lock();
         let (cause, at) = lifetime.closed?;
