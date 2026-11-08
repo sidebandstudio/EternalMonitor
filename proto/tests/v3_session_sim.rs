@@ -1428,13 +1428,12 @@ fn sim_with_cookies(seed: u64, cookies: CookieMode) -> Sim {
     Sim::with_configs(seed, host, ClientConfig::new(HOST_ID))
 }
 
-/// The flood was load exactly when cookies were on.
+/// The flood was load when cookies were on. (With them off, cached answers
+/// to other addresses still ask for a cookie.)
 fn check_cookie_path(sim: &Sim, cookies: CookieMode) {
-    assert_eq!(
-        sim.host.cookie_replies() > 0,
-        cookies != CookieMode::Off,
-        "{cookies:?}"
-    );
+    if cookies != CookieMode::Off {
+        assert!(sim.host.cookie_replies() > 0, "{cookies:?}");
+    }
 }
 
 fn forged_for(dev_id: &eternal_wire::v3::Id16, count: u64) -> Vec<Vec<u8>> {
@@ -1661,9 +1660,9 @@ fn past_the_live_address_cap_the_reconnect_falls_back_to_the_per_source_path() {
 }
 
 /// The iPad's first message 1 is lost on its way, and an attacker who saw
-/// it replays it from 20 spoofed sources first, taking every per-source
-/// message 2 slot. The iPad's own retries still get message 2 through the
-/// shared overflow allowance.
+/// it replays it from 20 spoofed sources first. The first copy makes the
+/// pending session; the others get only cookie replies, and the iPad's own
+/// retries get message 2 through the cookie.
 #[test]
 fn spoofed_copies_taking_every_message_2_slot_never_lock_the_ipad_out() {
     let mut sim = Sim::new(143);
@@ -1683,4 +1682,8 @@ fn spoofed_copies_taking_every_message_2_slot_never_lock_the_ipad_out() {
         );
     }
     assert!(sim.run_until(Duration::from_secs(3), |s| s.both_live_on_same_session()));
+    assert!(
+        sim.host.cookie_replies() >= 19,
+        "the other copies got cookie replies"
+    );
 }

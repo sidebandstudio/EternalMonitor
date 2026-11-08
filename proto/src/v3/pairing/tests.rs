@@ -813,3 +813,48 @@ fn pairing_load_turns_on_with_arrivals_and_off_after_them() {
     let out = sends(&host.handle_datagram(T0 + Duration::from_secs(2), &ADDR, ipad.msg1(), &creds));
     assert_eq!(wire::classify(&out[0]), V3Kind::Handshake2);
 }
+
+/// Spoofed replays of the iPad's pairing message 1, ten a second, far below
+/// the load threshold: they get only cookie replies, and every retry of the
+/// iPad gets message 2, whether its own copy or a spoofed one came first.
+#[test]
+fn low_rate_spoofed_replays_never_take_the_ipads_message_2_resends() {
+    for spoofer_first in [false, true] {
+        let creds = Creds::default();
+        let mut host = host();
+        let qr = host.open(T0, addr());
+        let mut ipad = client(&qr, 77);
+        let first = if spoofer_first { 999 } else { ADDR };
+        // The first message 2 is lost.
+        assert_eq!(
+            sends(&host.handle_datagram(T0, &first, ipad.msg1(), &creds)).len(),
+            1
+        );
+        let mut received = 0;
+        for tick in 1..41u64 {
+            let at = T0 + ms(tick * 50);
+            if tick % 2 == 0 {
+                let out = sends(&host.handle_datagram(at, &998, ipad.msg1(), &creds));
+                assert!(
+                    out.len() == 1 && cookie::is_reply(&out[0]),
+                    "a cookie reply only"
+                );
+            }
+            if tick % 5 == 0 {
+                let msg1 = ipad.msg1().to_vec();
+                for d in sends(&host.handle_datagram(at + ms(1), &ADDR, &msg1, &creds)) {
+                    if let Some(again) = ipad.handle_cookie(&d) {
+                        // At once, with the cookie.
+                        let out = sends(&host.handle_datagram(at + ms(1), &ADDR, &again, &creds));
+                        received += out.len();
+                    } else {
+                        assert_eq!(wire::classify(&d), V3Kind::Handshake2);
+                        received += 1;
+                    }
+                }
+            }
+            assert!(!host.under_load(at));
+        }
+        assert_eq!(received, 8, "every retry; spoofer first: {spoofer_first}");
+    }
+}

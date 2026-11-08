@@ -324,14 +324,17 @@ impl CookieJar {
     }
 }
 
-/// When a host requires a cookie on message 1.
+/// When a host requires a cookie on every message 1. In every mode, a
+/// cached answer (message 2, or Stale, TooNew and PairAgain) goes to an
+/// address other than the one its message 1 came from only with a cookie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CookieMode {
     /// While the handshake is under load: the default.
     UnderLoad,
     /// Always, for tests of the cookie path.
     Always,
-    /// Never, for tests of the budgets beneath it. Never a host's setting.
+    /// Never for load, for tests of the budgets beneath it. Never a
+    /// host's setting.
     Off,
 }
 

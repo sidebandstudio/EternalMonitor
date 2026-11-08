@@ -35,7 +35,7 @@ use snow::HandshakeState;
 use super::client::ClientKey;
 use super::cookie::{self, CookieJar, CookieMode, CookieReply, LoadMeter};
 use super::handshake::{builder, map_snow, split};
-use super::host::{PeerAddr, SourceLimiter};
+use super::host::{PeerAddr, ResendSlots, SourceLimiter};
 use super::record::{Opener, RecordHeader, Sealer};
 use super::wire::{
     self, PairAccept, PairHello, PairMessage, SlotStatus, V3Kind, MAX_NOISE_MESSAGE,
@@ -386,7 +386,8 @@ struct Attempt<A> {
     /// The authenticated part of the message 1 it answered.
     msg1_noise: Vec<u8>,
     msg2: Vec<u8>,
-    last_msg2: Duration,
+    /// Where message 2 may be resent, and when it last was.
+    resends: ResendSlots<A>,
     session_id: u32,
     sealer: Sealer,
     opener: Opener,
@@ -546,6 +547,30 @@ impl<A: PeerAddr> PairingHost<A> {
         }
     }
 
+    /// A cookie reply to `msg1` (without its cookie) from `from`.
+    fn send_cookie(
+        &mut self,
+        now: Duration,
+        from: &A,
+        msg1: &[u8],
+        key: &Key32,
+        out: &mut Vec<PairOutput<A>>,
+    ) {
+        let reply = self.cookies.reply(
+            now,
+            &from.cookie_input(),
+            key,
+            EXT_PAIR_QR,
+            msg1,
+            self.rng.as_mut(),
+        );
+        self.cookie_replies += 1;
+        out.push(PairOutput::Send {
+            to: from.clone(),
+            datagram: reply,
+        });
+    }
+
     /// Handles a pairing message 1, or a record of the pairing in flight.
     /// Anything else is ignored.
     pub fn handle_datagram(
@@ -581,48 +606,50 @@ impl<A: PeerAddr> PairingHost<A> {
             return;
         };
         self.arrivals.record(now);
+        let verified = mac.is_some_and(|mac| {
+            self.cookies
+                .verify(now, &from.cookie_input(), &canon, &mac, self.rng.as_mut())
+        });
         // Under load, nothing answers or reads a message 1 without a valid
         // cookie for its exact source, retries of the pairing in flight
         // included: only a cookie reply goes back, sealed under a key only
         // the QR's holder can derive.
-        if self.under_load(now) {
-            let address = from.cookie_input();
-            let verified = mac.is_some_and(|mac| {
-                self.cookies
-                    .verify(now, &address, &canon, &mac, self.rng.as_mut())
-            });
-            if !verified {
-                let ctx = pairing_ctx(
-                    pair1.ipad_version,
-                    &self.host_version,
-                    &pair1.slot_id,
-                    &self.host_id,
-                    &pair1.nonce_i,
-                    &window.nonce_r,
-                );
-                let key = cookie::pairing_key(&qr_psk(&window.secret, &ctx));
-                let reply =
-                    self.cookies
-                        .reply(now, &address, &key, EXT_PAIR_QR, &canon, self.rng.as_mut());
-                self.cookie_replies += 1;
-                out.push(PairOutput::Send {
-                    to: from.clone(),
-                    datagram: reply,
-                });
+        let cookie_key = || {
+            let ctx = pairing_ctx(
+                pair1.ipad_version,
+                &self.host_version,
+                &pair1.slot_id,
+                &self.host_id,
+                &pair1.nonce_i,
+                &window.nonce_r,
+            );
+            cookie::pairing_key(&qr_psk(&window.secret, &ctx))
+        };
+        if self.under_load(now) && !verified {
+            let key = cookie_key();
+            self.send_cookie(now, from, &canon, &key, out);
+            return;
+        }
+        let resend = self
+            .attempt
+            .as_ref()
+            .filter(|a| a.msg1_noise == pair1.noise)
+            .map(|a| (a.step, a.resends.admitted(from)));
+        if let Some((step, admitted)) = resend {
+            // The same message 1 again: the same message 2, at most every
+            // 100 ms per address. An address other than the one it came
+            // from must show a cookie first, load or not, so spoofed copies
+            // can't take the iPad's resends.
+            if step != Step::AwaitingConfirm {
                 return;
             }
-        }
-        if let Some(attempt) = self
-            .attempt
-            .as_mut()
-            .filter(|a| a.msg1_noise == pair1.noise)
-        {
-            // The same message 1 again: the same message 2, at most every
-            // 100 ms.
-            if attempt.step == Step::AwaitingConfirm
-                && now.saturating_sub(attempt.last_msg2) >= Duration::from_millis(100)
-            {
-                attempt.last_msg2 = now;
+            if !admitted && !verified {
+                let key = cookie_key();
+                self.send_cookie(now, from, &canon, &key, out);
+                return;
+            }
+            let attempt = self.attempt.as_mut().expect("checked above");
+            if attempt.resends.due(from, now, Duration::from_millis(100)) {
                 out.push(PairOutput::Send {
                     to: from.clone(),
                     datagram: attempt.msg2.clone(),
@@ -710,7 +737,7 @@ impl<A: PeerAddr> PairingHost<A> {
         self.attempt = Some(Attempt {
             msg1_noise: pair1.noise.to_vec(),
             msg2,
-            last_msg2: now,
+            resends: ResendSlots::new(from.clone(), now),
             session_id,
             sealer,
             opener,
