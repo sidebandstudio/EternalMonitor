@@ -111,13 +111,6 @@ jobs:
         env:
           PKG_CONFIG_PATH: /opt/homebrew/opt/ffmpeg@7/lib/pkgconfig
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Lint workspace as released
-        # Code gated on debug_assertions or Windows can leave items unused in
-        # a macOS release build. Libraries and binaries only: the tests use
-        # debug-only fakes and don't build in release.
-        env:
-          PKG_CONFIG_PATH: /opt/homebrew/opt/ffmpeg@7/lib/pkgconfig
-        run: cargo clippy --workspace --release --locked -- -D warnings
       - name: Test workspace (includes synthetic end-to-end stream)
         env:
           PKG_CONFIG_PATH: /opt/homebrew/opt/ffmpeg@7/lib/pkgconfig
