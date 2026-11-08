@@ -257,15 +257,25 @@ enum Whose {
     AllPrograms,
     /// The program could not be read.
     Unknown,
+    /// A path with this exe's file name that names a variable the machine
+    /// has no value for: it may be this exe's.
+    Unresolved,
     Other,
+}
+
+pub(crate) fn ours(rule: &Rule, exe: &Path, lookup: impl Fn(&str) -> Option<String>) -> bool {
+    whose(rule, exe, lookup) == Whose::Ours
 }
 
 fn whose(rule: &Rule, exe: &Path, lookup: impl Fn(&str) -> Option<String>) -> Whose {
     match rule.program.as_deref() {
         None => Whose::Unknown,
         Some(program) if program.trim().is_empty() => Whose::AllPrograms,
-        Some(program) if same_program(program, exe, lookup) => Whose::Ours,
-        Some(_) => Whose::Other,
+        Some(program) => match expand_known(program, lookup) {
+            Some(path) if same_path(&path, exe) => Whose::Ours,
+            None if file_name(program) == file_name(&exe.to_string_lossy()) => Whose::Unresolved,
+            _ => Whose::Other,
+        },
     }
 }
 
@@ -285,6 +295,9 @@ pub enum Verdict {
     NoRule,
     /// Windows Firewall is off on this profile: another firewall may be on.
     Off,
+    /// An unscoped Block rule that may be this exe's: its path has this
+    /// exe's file name but names a variable the machine has no value for.
+    Uncertain,
 }
 
 impl Verdict {
@@ -296,6 +309,7 @@ impl Verdict {
             Verdict::BlocksAll => "blocks_all",
             Verdict::NoRule => "no_rule",
             Verdict::Off => "off",
+            Verdict::Uncertain => "uncertain",
         }
     }
 
@@ -345,7 +359,8 @@ impl Report {
     /// The whole picture in one word for the log.
     pub fn verdict(&self) -> &'static str {
         let blocking = self.profiles.iter().filter(|(_, v)| v.blocks()).count();
-        if blocking > 0 && self.bypass_rules > 0 {
+        let unsure = self.profiles.iter().any(|(_, v)| *v == Verdict::Uncertain);
+        if unsure || (blocking > 0 && self.bypass_rules > 0) {
             "uncertain"
         } else if !self.profiles.is_empty() && blocking == self.profiles.len() {
             "blocked"
@@ -417,9 +432,103 @@ pub fn profile_name(bit: u32) -> &'static str {
     }
 }
 
-/// `%NAME%` replaced with `lookup(NAME)`, as Windows stores a rule made in
-/// its own window (`%ProgramFiles%\...`). An unknown name stays as written.
-pub fn expand(path: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
+/// What `%name%` in a rule's program path stands for, from the machine's
+/// own settings only: the known folders for Program Files, the Windows
+/// folder and ProgramData, then the system environment in
+/// `HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment`.
+/// Never this process's environment, which any user can change for their
+/// own programs: a rule for another program must not look like this exe's,
+/// to the verdict or to the elevated fix. A system value that names other
+/// variables is expanded from these values too ([`resolve`]); one only a
+/// user has is unknown.
+#[cfg(windows)]
+pub fn machine_env(name: &str) -> Option<String> {
+    resolve(name, &windows_policy::machine_value)
+}
+
+/// Off Windows no rule has a path to expand.
+#[cfg(not(windows))]
+pub fn machine_env(_name: &str) -> Option<String> {
+    None
+}
+
+/// A machine value as stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Stored {
+    /// A known folder, or a REG_SZ value: as written, `%` and all.
+    Literal(String),
+    /// A REG_EXPAND_SZ value: its `%name%`s are machine values too.
+    Expand(String),
+}
+
+/// How deep REG_EXPAND_SZ values may name one another.
+pub const EXPAND_DEPTH: usize = 8;
+
+/// How many `%name%`s one [`resolve`] may follow, counting repeats.
+pub const MAX_REFERENCES: usize = 256;
+
+/// The most text one expansion may make, in bytes: more than any path
+/// Windows takes.
+pub const MAX_EXPANDED: usize = 32 * 1024;
+
+/// `name`'s value among the machine values `stored`, each REG_EXPAND_SZ
+/// value's own `%name%`s resolved the same way, each name once. `None` when
+/// `name`, or a value it names, has no machine value, when values name each
+/// other in a cycle, when more than [`EXPAND_DEPTH`] of them nest, or when
+/// it takes more than [`MAX_REFERENCES`] or makes more than
+/// [`MAX_EXPANDED`].
+pub fn resolve(name: &str, stored: &impl Fn(&str) -> Option<Stored>) -> Option<String> {
+    Resolving {
+        stored,
+        known: std::collections::HashMap::new(),
+        expanding: Vec::new(),
+        references: 0,
+    }
+    .value(name)
+}
+
+struct Resolving<'a, F> {
+    stored: &'a F,
+    /// Each name resolved so far. Any `None` fails the whole resolve, so
+    /// remembering one is never wrong.
+    known: std::collections::HashMap<String, Option<String>>,
+    expanding: Vec<String>,
+    references: usize,
+}
+
+impl<F: Fn(&str) -> Option<Stored>> Resolving<'_, F> {
+    fn value(&mut self, name: &str) -> Option<String> {
+        self.references += 1;
+        if self.references > MAX_REFERENCES {
+            return None;
+        }
+        let key = name.to_lowercase();
+        if let Some(known) = self.known.get(&key) {
+            return known.clone();
+        }
+        let value = match (self.stored)(name) {
+            None => None,
+            Some(Stored::Literal(value)) => Some(value),
+            Some(Stored::Expand(value)) => {
+                if self.expanding.len() >= EXPAND_DEPTH || self.expanding.contains(&key) {
+                    return None;
+                }
+                self.expanding.push(key.clone());
+                let expanded = expand_known(&value, |inner| self.value(inner));
+                self.expanding.pop();
+                expanded
+            }
+        };
+        self.known.insert(key, value.clone());
+        value
+    }
+}
+
+/// `path` with every `%NAME%` replaced with `lookup(NAME)`, as Windows
+/// stores a rule made in its own window (`%ProgramFiles%\...`), or `None` if
+/// one has no value or it would make more than [`MAX_EXPANDED`]. `%%` and a
+/// lone `%` stay as written.
+fn expand_known(path: &str, mut lookup: impl FnMut(&str) -> Option<String>) -> Option<String> {
     let mut out = String::new();
     let mut rest = path;
     while let Some(start) = rest.find('%') {
@@ -428,28 +537,47 @@ pub fn expand(path: &str, lookup: impl Fn(&str) -> Option<String>) -> String {
         };
         let name = &rest[start + 1..start + 1 + len];
         out.push_str(&rest[..start]);
-        match lookup(name).filter(|_| !name.is_empty()) {
-            Some(value) => out.push_str(&value),
-            None => out.push_str(&rest[start..start + len + 2]),
+        if name.is_empty() {
+            out.push_str("%%");
+        } else {
+            out.push_str(&lookup(name)?);
+        }
+        if out.len() > MAX_EXPANDED {
+            return None;
         }
         rest = &rest[start + len + 2..];
     }
     out.push_str(rest);
-    out
+    Some(out).filter(|out| out.len() <= MAX_EXPANDED)
+}
+
+/// A path as Windows compares it: no quotes or `\\?\`, backslashes, no case.
+fn plain(path: &str) -> String {
+    let path = path
+        .trim()
+        .trim_matches('"')
+        .replace('/', "\\")
+        .to_lowercase();
+    path.strip_prefix(r"\\?\")
+        .map(str::to_string)
+        .unwrap_or(path)
+}
+
+fn same_path(path: &str, exe: &Path) -> bool {
+    let exe = plain(&exe.to_string_lossy());
+    !exe.is_empty() && plain(path) == exe
+}
+
+/// The last part of a path, as Windows compares it.
+fn file_name(path: &str) -> String {
+    let path = plain(path);
+    path.rsplit('\\').next().unwrap_or_default().to_string()
 }
 
 /// Whether a rule's program is `exe`. Windows compares paths without case,
 /// and its prompt stores them in lower case.
 pub fn same_program(program: &str, exe: &Path, lookup: impl Fn(&str) -> Option<String>) -> bool {
-    let plain = |path: &str| {
-        path.trim()
-            .trim_matches('"')
-            .replace('/', "\\")
-            .to_lowercase()
-    };
-    let exe = plain(&exe.to_string_lossy());
-    let exe = exe.strip_prefix(r"\\?\").unwrap_or(&exe);
-    !exe.is_empty() && plain(&expand(program, lookup)) == exe
+    expand_known(program, lookup).is_some_and(|path| same_path(&path, exe))
 }
 
 /// The verdict on each profile for inbound UDP to `exe` on `port`. Windows
@@ -485,8 +613,11 @@ pub fn judge(
     let ours = |r: &Rule, whose, reach| !r.allow && whose == Whose::Ours && reach == Reach::All;
     let everyone =
         |r: &Rule, whose, reach| !r.allow && whose == Whose::AllPrograms && reach == Reach::All;
-    let unsure =
-        |r: &Rule, whose, reach| !r.allow && (whose == Whose::Unknown || reach == Reach::Some);
+    let unsure = |r: &Rule, whose, reach| {
+        !r.allow && (matches!(whose, Whose::Unknown | Whose::Unresolved) || reach == Reach::Some)
+    };
+    let maybe_ours =
+        |r: &Rule, whose, reach| !r.allow && whose == Whose::Unresolved && reach == Reach::All;
     // An Allow rule that asks for IPsec (SecureFlags) can come with
     // "Override block rules": IPsec-authenticated traffic then gets past
     // Block rules for the exe. iPads never authenticate, so it changes
@@ -514,6 +645,8 @@ pub fn judge(
                 Verdict::BlockedForAllApps
             } else if count(p.bit, &ours) > 0 {
                 Verdict::Blocked
+            } else if count(p.bit, &maybe_ours) > 0 {
+                Verdict::Uncertain
             } else if count(p.bit, &allows) > 0 {
                 Verdict::Allowed
             } else {
@@ -535,6 +668,32 @@ pub fn judge(
 }
 
 static LATEST: Mutex<Option<Report>> = Mutex::new(None);
+
+/// Set to read the policy again now rather than at the next [`RECHECK`].
+static RECHECK_NOW: (Mutex<bool>, std::sync::Condvar) =
+    (Mutex::new(false), std::sync::Condvar::new());
+
+/// Reads the policy again at once (after "Fix it" ran), on the thread
+/// [`watch`] started.
+pub fn recheck_now() {
+    let (wanted, wake) = &RECHECK_NOW;
+    if let Ok(mut wanted) = wanted.lock() {
+        *wanted = true;
+        wake.notify_all();
+    }
+}
+
+/// Waits up to `timeout`, or until [`recheck_now`].
+#[cfg(any(windows, test))]
+fn wait_for_recheck(timeout: Duration) {
+    let (wanted, wake) = &RECHECK_NOW;
+    let Ok(guard) = wanted.lock() else {
+        return;
+    };
+    if let Ok((mut guard, _)) = wake.wait_timeout_while(guard, timeout, |wanted| !*wanted) {
+        *guard = false;
+    }
+}
 
 /// The last reading, if the last read worked. `None` off Windows.
 pub fn latest() -> Option<Report> {
@@ -592,7 +751,7 @@ pub fn watch(port: u16) {
                     });
                     let read = windows_policy::read(&exe, port, lan).map_err(|e| e.to_string());
                     observe(read, &mut failed);
-                    std::thread::sleep(RECHECK);
+                    wait_for_recheck(RECHECK);
                 }
             });
     }
@@ -601,7 +760,7 @@ pub fn watch(port: u16) {
 }
 
 #[cfg(windows)]
-mod windows_policy {
+pub(crate) mod windows_policy {
     use std::path::Path;
 
     use windows::core::{IUnknown, Interface, VARIANT};
@@ -617,16 +776,16 @@ mod windows_policy {
     use windows::Win32::System::Ole::IEnumVARIANT;
 
     use super::{
-        judge, rule_from, Field, Profile, Report, Rule, RuleSource, DOMAIN, PRIVATE, PUBLIC,
+        judge, rule_from, Field, Profile, Report, Rule, RuleSource, Stored, DOMAIN, PRIVATE, PUBLIC,
     };
 
     /// VT_DISPATCH: what the rule enumerator hands out.
     const VT_DISPATCH: u16 = 9;
 
-    struct Apartment;
+    pub(crate) struct Apartment;
 
     impl Apartment {
-        fn new() -> windows::core::Result<Self> {
+        pub(crate) fn new() -> windows::core::Result<Self> {
             unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
             Ok(Self)
         }
@@ -642,6 +801,86 @@ mod windows_policy {
         let _apartment = Apartment::new()?;
         let policy: INetFwPolicy2 =
             unsafe { CoCreateInstance(&NetFwPolicy2, None, CLSCTX_INPROC_SERVER)? };
+        let profiles = current_profiles(&policy)?;
+        let rules = inbound_rules(&policy)?;
+        Ok(judge(&profiles, &rules, exe, port, lan, super::machine_env))
+    }
+
+    /// One machine value as stored, for [`super::resolve`].
+    pub(crate) fn machine_value(name: &str) -> Option<Stored> {
+        use windows::Win32::UI::Shell::{
+            FOLDERID_ProgramData, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesCommon,
+            FOLDERID_ProgramFilesCommonX64, FOLDERID_ProgramFilesCommonX86,
+            FOLDERID_ProgramFilesX64, FOLDERID_ProgramFilesX86, FOLDERID_Windows,
+        };
+        let folder = match name.to_ascii_lowercase().as_str() {
+            "programfiles" => FOLDERID_ProgramFiles,
+            "programw6432" => FOLDERID_ProgramFilesX64,
+            "programfiles(x86)" => FOLDERID_ProgramFilesX86,
+            "commonprogramfiles" => FOLDERID_ProgramFilesCommon,
+            "commonprogramw6432" => FOLDERID_ProgramFilesCommonX64,
+            "commonprogramfiles(x86)" => FOLDERID_ProgramFilesCommonX86,
+            "systemroot" | "windir" => FOLDERID_Windows,
+            "programdata" | "allusersprofile" => FOLDERID_ProgramData,
+            "systemdrive" => {
+                return known_folder(&FOLDERID_Windows)
+                    .and_then(|windows| windows.get(..2).map(str::to_string))
+                    .filter(|drive| drive.ends_with(':'))
+                    .map(Stored::Literal)
+            }
+            _ => return system_variable(name),
+        };
+        known_folder(&folder).map(Stored::Literal)
+    }
+
+    fn known_folder(id: &windows::core::GUID) -> Option<String> {
+        use windows::Win32::Foundation::HANDLE;
+        use windows::Win32::System::Com::CoTaskMemFree;
+        use windows::Win32::UI::Shell::{SHGetKnownFolderPath, KF_FLAG_DEFAULT};
+        let path = unsafe { SHGetKnownFolderPath(id, KF_FLAG_DEFAULT, HANDLE::default()) }.ok()?;
+        let text = unsafe { path.to_string() }.ok();
+        unsafe { CoTaskMemFree(Some(path.0 as *const _)) };
+        text
+    }
+
+    /// A value of the system environment as stored, never expanded by
+    /// Windows: that would use this process's environment.
+    fn system_variable(name: &str) -> Option<Stored> {
+        use windows::core::{w, PCWSTR};
+        use windows::Win32::Foundation::ERROR_SUCCESS;
+        use windows::Win32::System::Registry::{
+            RegGetValueW, HKEY_LOCAL_MACHINE, REG_EXPAND_SZ, REG_SZ, REG_VALUE_TYPE, RRF_NOEXPAND,
+            RRF_RT_REG_EXPAND_SZ, RRF_RT_REG_SZ,
+        };
+        let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        let mut value = [0u16; 1024];
+        let mut bytes = std::mem::size_of_val(&value) as u32;
+        let mut kind = REG_VALUE_TYPE::default();
+        let result = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                w!(r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"),
+                PCWSTR(name.as_ptr()),
+                RRF_RT_REG_SZ | RRF_RT_REG_EXPAND_SZ | RRF_NOEXPAND,
+                Some(&mut kind),
+                Some(value.as_mut_ptr().cast()),
+                Some(&mut bytes),
+            )
+        };
+        if result != ERROR_SUCCESS {
+            return None;
+        }
+        let length = value.iter().position(|&c| c == 0).unwrap_or(value.len());
+        let value = String::from_utf16_lossy(&value[..length]);
+        match kind {
+            REG_SZ => Some(Stored::Literal(value)),
+            REG_EXPAND_SZ => Some(Stored::Expand(value)),
+            _ => None,
+        }
+    }
+
+    /// The profiles of the networks in use now, as the verdict sees them.
+    pub(crate) fn current_profiles(policy: &INetFwPolicy2) -> windows::core::Result<Vec<Profile>> {
         let current = unsafe { policy.CurrentProfileTypes()? } as u32;
         let mut profiles = Vec::new();
         for bit in [DOMAIN, PRIVATE, PUBLIC] {
@@ -655,10 +894,7 @@ mod windows_policy {
                 block_all_inbound: unsafe { policy.get_BlockAllInboundTraffic(profile)? }.as_bool(),
             });
         }
-        let rules = inbound_rules(&policy)?;
-        Ok(judge(&profiles, &rules, exe, port, lan, |name| {
-            std::env::var(name).ok()
-        }))
+        Ok(profiles)
     }
 
     impl RuleSource for INetFwRule {
@@ -723,13 +959,27 @@ mod windows_policy {
 
     /// Every inbound rule, each with what could be read of it.
     fn inbound_rules(policy: &INetFwPolicy2) -> windows::core::Result<Vec<Rule>> {
-        let all = unsafe { policy.Rules()? };
-        let each: IEnumVARIANT = unsafe { all._NewEnum()? }.cast()?;
         let mut rules = Vec::new();
+        for_each_rule(policy, |rule| {
+            if let Some(rule) = rule_from(rule).map_err(|e| windows::core::Error::new(E_FAIL, e))? {
+                rules.push(rule);
+            }
+            Ok(())
+        })?;
+        Ok(rules)
+    }
+
+    /// Hands every rule of the policy, in any direction, to `each`.
+    pub(crate) fn for_each_rule(
+        policy: &INetFwPolicy2,
+        mut each: impl FnMut(&INetFwRule) -> windows::core::Result<()>,
+    ) -> windows::core::Result<()> {
+        let all = unsafe { policy.Rules()? };
+        let rules: IEnumVARIANT = unsafe { all._NewEnum()? }.cast()?;
         loop {
             let mut item = [VARIANT::default()];
             let mut fetched = 0;
-            unsafe { each.Next(&mut item, &mut fetched).ok()? };
+            unsafe { rules.Next(&mut item, &mut fetched).ok()? };
             if fetched == 0 {
                 break;
             }
@@ -750,13 +1000,9 @@ mod windows_policy {
             let Ok(rule) = unknown.cast::<INetFwRule>() else {
                 continue;
             };
-            if let Some(rule) =
-                rule_from(&rule).map_err(|e| windows::core::Error::new(E_FAIL, e))?
-            {
-                rules.push(rule);
-            }
+            each(&rule)?;
         }
-        Ok(rules)
+        Ok(())
     }
 }
 
@@ -767,6 +1013,26 @@ mod tests {
 
     const EXE: &str = r"C:\Program Files\EternalMonitor\EternalMonitor-host.exe";
     const PORT: u16 = 9876;
+
+    /// The machine's values come from the machine: a variable only this
+    /// process has, or only a user has, is unknown.
+    #[cfg(windows)]
+    #[test]
+    fn machine_values_never_come_from_this_process() {
+        const OWN: &str = "EM_FIREWALL_MACHINE_TEST";
+        std::env::set_var(OWN, r"C:\Program Files");
+        assert_eq!(machine_env(OWN), None);
+        std::env::remove_var(OWN);
+        for name in ["USERPROFILE", "LOCALAPPDATA", "APPDATA"] {
+            assert_eq!(machine_env(name), None, "{name}");
+        }
+        for name in ["ProgramFiles", "SystemRoot", "windir", "ProgramData"] {
+            let value = machine_env(name).unwrap_or_else(|| panic!("{name}"));
+            assert!(Path::new(&value).is_dir(), "{name}");
+        }
+        let drive = machine_env("SystemDrive").unwrap();
+        assert!(machine_env("SystemRoot").unwrap().starts_with(&drive));
+    }
 
     fn env(name: &str) -> Option<String> {
         match name.to_lowercase().as_str() {
@@ -1328,9 +1594,164 @@ mod tests {
     }
 
     #[test]
-    fn expansion_leaves_unknown_and_unpaired_names() {
-        assert_eq!(expand(r"%nope%\a%", env), r"%nope%\a%");
-        assert_eq!(expand(r"%%\%ProgramFiles%", env), r"%%\C:\Program Files");
+    fn expansion_refuses_unknown_names_and_keeps_unpaired_ones() {
+        assert_eq!(expand_known(r"%nope%\a", env), None);
+        assert_eq!(
+            expand_known(r"%%\%ProgramFiles%\a%", env).as_deref(),
+            Some(r"%%\C:\Program Files\a%")
+        );
+    }
+
+    /// Machine values as Windows stores them: known folders and REG_SZ
+    /// values as written, REG_EXPAND_SZ values naming others.
+    fn stored(name: &str) -> Option<Stored> {
+        let expand = |value: &str| Some(Stored::Expand(value.into()));
+        match name.to_lowercase().as_str() {
+            "systemdrive" => Some(Stored::Literal("C:".into())),
+            "programfiles" => Some(Stored::Literal(r"C:\Program Files".into())),
+            "emroot" => expand(r"%SystemDrive%\Apps"),
+            "literal" => Some(Stored::Literal(r"C:\100%\%SystemDrive%".into())),
+            "userish" => expand(r"%USERPROFILE%\Apps"),
+            "loop_a" => expand(r"%loop_b%\a"),
+            "loop_b" => expand(r"%LOOP_A%\b"),
+            "self" => expand(r"%self%"),
+            deep => {
+                // deep0 is a folder; each deepN names deepN-1.
+                let n: usize = deep.strip_prefix("deep")?.parse().ok()?;
+                if n == 0 {
+                    Some(Stored::Literal(r"C:\Deep".into()))
+                } else {
+                    expand(&format!(r"%deep{}%\{n}", n - 1))
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn machine_values_naming_others_are_expanded_from_machine_values_only() {
+        let value = |name| resolve(name, &stored);
+        assert_eq!(value("EMROOT").as_deref(), Some(r"C:\Apps"));
+        assert_eq!(value("ProgramFiles").as_deref(), Some(r"C:\Program Files"));
+        // A REG_SZ value is never expanded, as Windows doesn't.
+        assert_eq!(value("literal").as_deref(), Some(r"C:\100%\%SystemDrive%"));
+        // A value only a user has, or no value at all.
+        assert_eq!(value("userish"), None);
+        assert_eq!(value("nope"), None);
+        // Values naming each other, or themselves.
+        assert_eq!(value("loop_a"), None);
+        assert_eq!(value("self"), None);
+        // Up to EXPAND_DEPTH nested values, and no deeper.
+        let deepest = format!("deep{EXPAND_DEPTH}");
+        assert_eq!(value(&deepest).as_deref(), Some(r"C:\Deep\1\2\3\4\5\6\7\8"));
+        assert_eq!(value(&format!("deep{}", EXPAND_DEPTH + 1)), None);
+    }
+
+    /// Values that each name the next several times would grow fourfold a
+    /// level: each name is looked up once, and the expansion stops at its
+    /// size or reference limit.
+    #[test]
+    fn a_branching_expansion_stops_at_its_limits() {
+        let branching = |name: &str| {
+            // b0 is a folder; each bN names bN-1 four times.
+            let n: usize = name.strip_prefix('b')?.parse().ok()?;
+            Some(if n == 0 {
+                Stored::Literal("x".repeat(20))
+            } else {
+                Stored::Expand(format!("%b{0}%", n - 1).repeat(4))
+            })
+        };
+        let lookups = std::cell::Cell::new(0);
+        let counted = |name: &str| {
+            lookups.set(lookups.get() + 1);
+            branching(name)
+        };
+        // 4^8 × 20 bytes, 1.3 MB.
+        assert_eq!(resolve(&format!("b{EXPAND_DEPTH}"), &counted), None);
+        assert!(lookups.get() <= EXPAND_DEPTH + 1, "{}", lookups.get());
+        // 4^4 × 20 bytes is within the limits.
+        assert_eq!(
+            resolve("b4", &branching).map(|value| value.len()),
+            Some(4usize.pow(4) * 20)
+        );
+        // One value naming another too many times.
+        let wide = |name: &str| match name {
+            "wide" => Some(Stored::Expand("%leaf%".repeat(MAX_REFERENCES))),
+            "leaf" => Some(Stored::Literal("a".into())),
+            _ => None,
+        };
+        assert_eq!(resolve("wide", &wide), None);
+        let within = |name: &str| match name {
+            "wide" => Some(Stored::Expand("%leaf%".repeat(MAX_REFERENCES - 1))),
+            _ => wide(name),
+        };
+        assert_eq!(
+            resolve("wide", &within).map(|value| value.len()),
+            Some(MAX_REFERENCES - 1)
+        );
+        // Past the size limit, nothing more is looked up.
+        let after = std::cell::Cell::new(false);
+        let big = |name: &str| match name {
+            "both" => Some(Stored::Expand("%big%%after%".into())),
+            "big" => Some(Stored::Literal("x".repeat(MAX_EXPANDED + 1))),
+            _ => {
+                after.set(true);
+                Some(Stored::Literal(String::new()))
+            }
+        };
+        assert_eq!(resolve("both", &big), None);
+        assert!(!after.get());
+        // Text after the last name counts too.
+        let tail = |name: &str| match name {
+            "tail" => Some(Stored::Expand("%full%x".into())),
+            "full" => Some(Stored::Literal("x".repeat(MAX_EXPANDED))),
+            _ => None,
+        };
+        assert_eq!(
+            resolve("full", &tail).map(|value| value.len()),
+            Some(MAX_EXPANDED)
+        );
+        assert_eq!(resolve("tail", &tail), None);
+    }
+
+    /// A Block rule whose path names a machine value that names another
+    /// (`EMROOT=%SystemDrive%\Apps`) is this exe's block. One whose path
+    /// can't be resolved but has this exe's file name may be: never
+    /// "allowed", and never certain.
+    #[test]
+    fn a_block_through_nested_machine_values_counts_and_an_unresolved_one_is_uncertain() {
+        let exe = r"C:\Apps\EternalMonitor\EternalMonitor-host.exe";
+        let allow = Rule::unscoped(exe, true, 0x7fff_ffff);
+        let nested = Rule::unscoped(
+            r"%EMROOT%\EternalMonitor\EternalMonitor-host.exe",
+            false,
+            PUBLIC,
+        );
+        let judged = |rules: &[Rule]| {
+            judge(&[on(PUBLIC)], rules, Path::new(exe), PORT, true, |name| {
+                resolve(name, &stored)
+            })
+        };
+        let blocked = judged(&[allow.clone(), nested]);
+        assert_eq!(blocked.profiles, [(PUBLIC, Verdict::Blocked)]);
+        assert!(blocked.certain_block().is_some());
+
+        let unresolved = Rule::unscoped(
+            r"%USERISH%\EternalMonitor\EternalMonitor-host.exe",
+            false,
+            PUBLIC,
+        );
+        let unsure = judged(&[allow.clone(), unresolved]);
+        assert_eq!(unsure.profiles, [(PUBLIC, Verdict::Uncertain)]);
+        assert_eq!(unsure.verdict(), "uncertain");
+        assert_eq!(unsure.certain_block(), None);
+        assert_eq!(unsure.scoped_block_rules, 1);
+
+        // Another file name is another program's rule.
+        let other = Rule::unscoped(r"%USERISH%\Other\other.exe", false, PUBLIC);
+        assert_eq!(
+            judged(&[allow, other]).profiles,
+            [(PUBLIC, Verdict::Allowed)]
+        );
     }
 
     /// A read that fails drops the last reading, so a block that is gone
@@ -1457,6 +1878,26 @@ mod tests {
             verdicts(&[on(DOMAIN)], &after_setup(Vec::new(), app)),
             [Verdict::Allowed]
         );
+    }
+
+    /// After "Fix it", the policy is read again at once, not at the next
+    /// minute's check.
+    #[test]
+    fn a_recheck_wakes_the_watch_at_once() {
+        let started = std::time::Instant::now();
+        let waiting = std::thread::spawn(|| wait_for_recheck(Duration::from_secs(30)));
+        std::thread::sleep(Duration::from_millis(50));
+        recheck_now();
+        waiting.join().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        // Used up: the next wait waits its time.
+        let started = std::time::Instant::now();
+        wait_for_recheck(Duration::from_millis(100));
+        assert!(started.elapsed() >= Duration::from_millis(100));
     }
 
     #[test]
