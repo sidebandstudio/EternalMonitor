@@ -44,6 +44,9 @@ enum ConnectionProblem: Equatable {
     /// The PC answered but isn't streaming. This iPad keeps asking and
     /// connects as soon as it is.
     case pcNotStreaming(StreamWait)
+    /// The PC answered, but Windows won't let it capture its screen from the
+    /// graphics card EternalMonitor runs on, as on some laptops with two.
+    case pcGraphicsCard(PCGraphicsCard)
 
     enum StreamWait: Equatable {
         /// Someone clicked Stop on the PC.
@@ -132,6 +135,8 @@ enum ConnectionProblem: Equatable {
         case .pcNotStreaming(.stopped): return "Your PC isn't streaming"
         case .pcNotStreaming(.restarting): return "Your PC is restarting the stream…"
         case .pcNotStreaming(.failed): return "Your PC stopped streaming after repeated errors"
+        case .pcGraphicsCard(.screen): return "Your PC can't share its screen from its current graphics card"
+        case .pcGraphicsCard(.secondScreen): return "The second screen didn't start, and your PC can't share its main screen"
         }
     }
 
@@ -198,6 +203,12 @@ enum ConnectionProblem: Equatable {
         case .pcNotStreaming(.failed(let token)):
             let start = "Click Start streaming in EternalMonitor on the PC to try again. This iPad connects as soon as it starts."
             return StreamWait.failedReason(token).map { "\($0). \(start)" } ?? start
+        case .pcGraphicsCard(.screen):
+            return "Windows won't let EternalMonitor share the screen from the graphics card it runs on. "
+                + "The EternalMonitor window on the PC says how to switch it. Then try again."
+        case .pcGraphicsCard(.secondScreen):
+            return "Windows won't let EternalMonitor share the PC's main screen from the graphics card it runs on, "
+                + "so it can't mirror it instead. The EternalMonitor window on the PC says how to switch the card. Then try again."
         }
     }
 
@@ -266,7 +277,7 @@ enum ConnectionProblem: Equatable {
     static func afterReconnecting(lastAttempt: ConnectionProblem?) -> ConnectionProblem {
         switch lastAttempt {
         case .localNetworkBlocked, .noNetwork, .wifiOff, .badAddress, .usbFailed, .noPicture, .pcBusy, .pcEndedSession,
-             .pcEndedSessionOnError, .pcUpdating:
+             .pcEndedSessionOnError, .pcUpdating, .pcGraphicsCard:
             return lastAttempt ?? .reconnectFailed
         default:
             return .reconnectFailed
@@ -435,6 +446,34 @@ enum USBStatusText {
                 return L("Connected to \(name) over the cable.")
             }
             return status
+        }
+    }
+}
+
+/// Which screen Windows won't let the PC capture from its graphics card, as
+/// its heartbeats say.
+enum PCGraphicsCard: Equatable {
+    /// The screen it mirrors.
+    case screen
+    /// The main screen, in Second screen mode after the second screen
+    /// failed to start.
+    case secondScreen
+
+    /// From a heartbeat's notice; nil for any other.
+    init?(notice: UInt8) {
+        switch notice {
+        case Heartbeat.noticeUnsupportedGPU: self = .screen
+        case Heartbeat.noticeSecondScreenUnsupportedGPU: self = .secondScreen
+        default: return nil
+        }
+    }
+
+    /// What the iPad says while it waits, and over a held picture.
+    var short: String {
+        switch self {
+        case .screen: return L("Your PC can't share its screen from its current graphics card. Check the PC.")
+        case .secondScreen:
+            return L("The second screen didn't start, and your PC can't share its main screen from its current graphics card. Check the PC.")
         }
     }
 }

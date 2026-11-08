@@ -107,6 +107,34 @@ final class SessionSummaryTests: XCTestCase {
         XCTAssertTrue(summary(.cableUnplugged, usb: true).line.contains(" transport=usb "))
     }
 
+    /// The PC said Windows won't let it capture from its graphics card, and
+    /// the wait for a picture ran out: a capture failure, as the PC's own
+    /// summary says, not lost video. A picture that came later keeps its tokens.
+    func testATimeoutAfterThePCSaidItCantCaptureIsACaptureFailure() {
+        var refused = summary(.connectTimeout, duration: 10)
+        refused.captureRefused = true
+        XCTAssertEqual(tokens(refused.line), ["accepted", "no_picture", "capture_failed", "timeout"])
+        Self.assertContract(refused.line)
+        var streamed = summary(.pcStoppedResponding, firstFrame: 0.3, duration: 90)
+        streamed.captureRefused = true
+        XCTAssertEqual(tokens(streamed.line), ["steady", "streamed", "signal_lost", "liveness"])
+    }
+
+    /// Review r1: the PC sent video before Windows refused its card, and
+    /// none of it gave a picture. That is lost or undecodable video, as the
+    /// PC's summary says (it names a capture failure only when no video went
+    /// out), and the refusal mustn't hide it.
+    func testVideoThePCSentBeforeTheRefusalKeepsItsDeliveryFailure() {
+        var counted = summary(.connectTimeout, duration: 10)
+        (counted.captureRefused, counted.pcSentVideo) = (true, true)
+        XCTAssertEqual(tokens(counted.line), ["accepted", "no_picture", "no_video", "timeout"])
+        var arrived = summary(.connectTimeout, duration: 10)
+        (arrived.captureRefused, arrived.datagramsReceived) = (true, 12)
+        XCTAssertEqual(tokens(arrived.line), ["accepted", "no_picture", "no_frame", "timeout"])
+        Self.assertContract(counted.line)
+        Self.assertContract(arrived.line)
+    }
+
     func testOnlyTheUsersOwnActionSaysUserDisconnectToThePC() {
         XCTAssertEqual(AttemptEnd.userDisconnect.bye, .userDisconnect)
         XCTAssertEqual(AttemptEnd.usbTurnedOff.bye, .userDisconnect)

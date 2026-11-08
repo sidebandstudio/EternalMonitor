@@ -73,6 +73,10 @@ struct SessionSummary: Equatable {
     /// The PC asked for the pairing code and the attempt ended before a session.
     var awaitingPairing = false
     var datagramsReceived = 0
+    /// The PC said it can't capture its screen from its graphics card.
+    var captureRefused = false
+    /// The PC's heartbeats counted video frames sent this attempt.
+    var pcSentVideo = false
     /// Seconds from the start to the first decoded frame.
     var firstFrame: TimeInterval?
     var duration: TimeInterval
@@ -115,6 +119,9 @@ struct SessionSummary: Equatable {
     private var failure: String {
         switch end {
         case .connectTimeout where sessionId == nil, .pcMoved: return "no_reply"
+        // Only when no video went out, as the PC's summary has it: video
+        // that went out and gave no picture was lost or didn't decode.
+        case .connectTimeout where captureRefused && !pcSentVideo && datagramsReceived == 0: return "capture_failed"
         case .connectTimeout: return datagramsReceived == 0 ? "no_video" : "no_frame"
         case .noVideoPath: return datagramsReceived == 0 ? "no_video" : "no_frame"
         case .pcStoppedResponding: return "signal_lost"
