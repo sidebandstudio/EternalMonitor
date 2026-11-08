@@ -358,6 +358,12 @@ struct Heartbeat: Equatable {
     static let noticePCLocked: UInt8 = 1
     /// No display is on at the PC (a closed lid, screens off or unplugged).
     static let noticeNoDisplay: UInt8 = 2
+    /// Windows won't let EternalMonitor capture the PC's screen from the
+    /// graphics card it runs on. The PC's window says how to switch.
+    static let noticeUnsupportedGPU: UInt8 = 3
+    /// The same in Second screen mode, after the second screen failed to
+    /// start: the main screen it fell back to can't be captured either.
+    static let noticeSecondScreenUnsupportedGPU: UInt8 = 4
     /// Second screen needs Windows 11, so the PC shows its main screen
     /// instead. Sent for a few seconds, over a picture that works.
     static let noticeSecondScreenNeedsWindows11: UInt8 = 6

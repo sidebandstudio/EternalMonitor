@@ -286,10 +286,16 @@ pub const NOTICE_PC_LOCKED: u8 = 1;
 /// No display is attached to the PC's desktop (a closed lid, screens off or
 /// unplugged), so there is nothing to capture until one comes back.
 pub const NOTICE_NO_DISPLAY: u8 = 2;
+/// Windows won't let EternalMonitor capture the screen from the graphics
+/// card it runs on, as on a laptop whose screen is wired to its other card.
+/// The PC's window says how to switch; nothing changes until someone does.
+pub const NOTICE_UNSUPPORTED_GPU: u8 = 3;
+/// [`NOTICE_UNSUPPORTED_GPU`] in Second screen mode, once the second screen
+/// failed to start: the main screen it fell back to can't be captured either.
+pub const NOTICE_SECOND_SCREEN_UNSUPPORTED_GPU: u8 = 4;
 /// Second screen needs Windows 11, so the iPad shows the PC's main screen
 /// instead. Sent for a few seconds after the session starts mirroring for
-/// it, over a picture that works. (3 to 5 are kept for the graphics card and
-/// restart notices.)
+/// it, over a picture that works. (5 is kept for the restart notice.)
 pub const NOTICE_SECOND_SCREEN_NEEDS_WINDOWS_11: u8 = 6;
 
 /// Host → client, every heartbeat interval while a session is active.
@@ -1620,6 +1626,8 @@ mod tests {
         for notice in [
             NOTICE_PC_LOCKED,
             NOTICE_NO_DISPLAY,
+            NOTICE_UNSUPPORTED_GPU,
+            NOTICE_SECOND_SCREEN_UNSUPPORTED_GPU,
             NOTICE_SECOND_SCREEN_NEEDS_WINDOWS_11,
             0xC8,
         ] {

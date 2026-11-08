@@ -274,8 +274,21 @@ impl ConfigSource for SharedConfigSource<'_> {
     }
 
     fn notice(&self) -> u8 {
+        use crate::control::{CaptureTarget, VddStatus};
         use eternal_wire::v2::control::{NOTICE_NONE, NOTICE_SECOND_SCREEN_NEEDS_WINDOWS_11};
-        let notice = crate::capture::recovery::heartbeat_notice(*self.shared.capture_block.lock());
+        let block = *self.shared.capture_block.lock();
+        let second_screen_failed = *self.shared.capture_target.lock()
+            == CaptureTarget::VirtualExtended
+            && matches!(
+                *self.shared.vdd_status.lock(),
+                VddStatus::Failed | VddStatus::TaskFailed
+            );
+        let notice = crate::capture::recovery::heartbeat_notice(
+            block,
+            second_screen_failed,
+            &mut self.shared.gpu_refused_since.lock(),
+            std::time::Instant::now(),
+        );
         if notice == NOTICE_NONE && second_screen::windows_notice(self.shared, Instant::now()) {
             NOTICE_SECOND_SCREEN_NEEDS_WINDOWS_11
         } else {
@@ -2154,6 +2167,59 @@ mod tests {
             assert_eq!(second_screen::next_step(&shared, now), step, "{build}");
             assert_eq!(notices(), [notice], "{build}");
         }
+    }
+
+    /// A screen Windows won't share from this graphics card: the heartbeats
+    /// say so once it has lasted 2 s, and in Second screen mode, once the
+    /// second screen failed, that the main screen it fell back to can't be
+    /// shared either. While the second screen still starts, the mirror's
+    /// notice stays.
+    #[test]
+    fn heartbeats_say_which_screen_this_graphics_card_cannot_share() {
+        use crate::capture::recovery::CaptureBlock;
+        use crate::control::{CaptureTarget, VddStatus};
+        use eternal_wire::v2::control::{
+            NOTICE_NONE, NOTICE_SECOND_SCREEN_UNSUPPORTED_GPU, NOTICE_UNSUPPORTED_GPU,
+        };
+        let shared = SharedControl::new(9876, 15_000_000);
+        shared.pairing.lock().required = false;
+        let now = Instant::now();
+        repairable_session(&shared, "127.0.0.1:50000".parse().unwrap(), now);
+        let config = SharedConfigSource {
+            shared: &shared,
+            stream_epoch: 1,
+            pen_available: false,
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+        };
+        let notices = || {
+            let actions = shared.session.lock().tick(&config, true, now);
+            actions
+                .replies
+                .iter()
+                .filter_map(|(_, bytes)| match parse_control(bytes) {
+                    Ok((_, ControlMessage::Heartbeat(heartbeat))) => Some(heartbeat.notice),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        *shared.capture_block.lock() = Some(CaptureBlock::UnsupportedOnThisGpu);
+        assert_eq!(notices(), [NOTICE_NONE], "a refusal that just began");
+        *shared.gpu_refused_since.lock() = Some(Instant::now() - Duration::from_secs(3));
+        assert_eq!(notices(), [NOTICE_UNSUPPORTED_GPU]);
+        *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
+        *shared.vdd_status.lock() = VddStatus::Attaching;
+        assert_eq!(notices(), [NOTICE_UNSUPPORTED_GPU], "still starting");
+        for failed in [VddStatus::Failed, VddStatus::TaskFailed] {
+            *shared.vdd_status.lock() = failed;
+            assert_eq!(
+                notices(),
+                [NOTICE_SECOND_SCREEN_UNSUPPORTED_GPU],
+                "{failed:?}"
+            );
+        }
+        *shared.capture_block.lock() = None;
+        assert_eq!(notices(), [NOTICE_NONE]);
+        assert_eq!(*shared.gpu_refused_since.lock(), None);
     }
 
     /// A NACK of a session that ended for liveness, while another frame is

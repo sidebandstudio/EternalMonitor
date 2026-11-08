@@ -23,6 +23,8 @@ final class LocalizationTests: XCTestCase {
     /// English strings whose translations come in a separate pass. Until
     /// then every language shows them in English.
     private let awaitingTranslation: Set<String> = [
+        "Your PC can't share its screen from its current graphics card. Check the PC.",
+        "The second screen didn't start, and your PC can't share its main screen from its current graphics card. Check the PC.",
         "Second screen needs Windows 11. Showing your PC's screen instead.",
     ]
 
