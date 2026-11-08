@@ -85,21 +85,40 @@ pub enum StoreJob {
         session_id: u32,
         timestamp_us: u64,
         finalize: bool,
+        /// The record that Finalize retires, invalid in memory until this
+        /// job is done.
+        retires: Option<Id16>,
     },
-    /// A Finalize that conflicts: it retires the record.
+    /// A Finalize that conflicts: it retires the record, if it still
+    /// conflicts once the jobs ahead of it are done.
     Retire { dev_id: Id16, session_id: u32 },
     /// Remove, by the host user.
     Remove { dev_ids: Vec<Id16> },
-    /// Expire the pending records at least 7 days old at `now_s`.
-    Expire { now_s: u64 },
+    /// Expire the pending records at least 7 days old at `now_s`; `dev_ids`
+    /// are those this host ended at step 1.
+    Expire { now_s: u64, dev_ids: Vec<Id16> },
+}
+
+impl StoreJob {
+    /// The records this job holds invalid in memory until it's done.
+    fn holds(&self) -> &[Id16] {
+        match self {
+            Self::Commit { retires, .. } => retires.as_slice(),
+            Self::Retire { .. } => &[],
+            Self::Remove { dev_ids } | Self::Expire { dev_ids, .. } => dev_ids,
+        }
+    }
 }
 
 /// A job's result. `Debug` leaves the snapshot out.
 pub struct JobDone {
     pub job: StoreJob,
     pub result: Result<Option<Finalize>, StoreError>,
-    /// The store's snapshot after it.
+    /// The store's snapshot after it (and after any reopen it needed).
     pub snapshot: Arc<CredentialSnapshot>,
+    /// The store failed and couldn't be reopened: no pairing can be used
+    /// until the host restarts.
+    pub closed: bool,
 }
 
 impl std::fmt::Debug for JobDone {
@@ -125,15 +144,80 @@ pub fn run_job<D: eternal_credstore::Disk, K: eternal_credstore::Keyring>(
         } => store
             .persist_timestamp(dev_id, *timestamp_us)
             .and_then(|()| finalize.then(|| store.finalize(dev_id)).transpose()),
-        StoreJob::Retire { dev_id, .. } => store.finalize(dev_id).map(Some),
+        // Only while it still conflicts: a Finalize ahead of it that failed
+        // may have left the slot as it was.
+        StoreJob::Retire { dev_id, .. } if store.would_conflict(dev_id) => {
+            store.finalize(dev_id).map(Some)
+        }
+        StoreJob::Retire { .. } => Ok(None),
         StoreJob::Remove { dev_ids } => store.remove(dev_ids).map(|()| None),
-        StoreJob::Expire { now_s } => store.expire(*now_s).map(|_| None),
+        StoreJob::Expire { now_s, .. } => store.expire(*now_s).map(|_| None),
     };
     JobDone {
         job,
         result,
         snapshot: store.snapshot(),
+        closed: false,
     }
+}
+
+/// After a job that failed in a way only a reopen settles (`NeedsReopen`, an
+/// I/O error), reopens the store, as the writer does: the open finishes or
+/// undoes whatever the failed operation left. `done` then carries the
+/// reopened store's snapshot, or `closed` with an empty one if it can't
+/// reopen. `store` is `None` once closed; later jobs fail with
+/// `NeedsReopen`.
+pub fn settle<D: eternal_credstore::Disk, K: eternal_credstore::Keyring>(
+    store: &mut Option<eternal_credstore::CredentialStore<D, K>>,
+    done: &mut JobDone,
+    rng: Box<dyn Random + Send>,
+) {
+    if matches!(
+        done.result,
+        Err(StoreError::NeedsReopen | StoreError::Io(_))
+    ) {
+        if let Some(failed) = store.take() {
+            let (disk, keyring) = failed.into_parts();
+            match eternal_credstore::CredentialStore::open(disk, keyring, rng) {
+                Ok((reopened, report)) => {
+                    info!(recovery = ?report.recovery, "Credential store reopened");
+                    *store = Some(reopened);
+                }
+                Err(error) => {
+                    warn!(%error, "Credential store could not reopen; pairings are unavailable");
+                }
+            }
+        }
+    }
+    match store {
+        Some(open) => done.snapshot = open.snapshot(),
+        None => {
+            done.snapshot = Arc::default();
+            done.closed = true;
+        }
+    }
+}
+
+/// Runs `job` on `store`, or fails it with `NeedsReopen` once the store is
+/// closed, then [`settle`]s.
+pub fn run_and_settle<D: eternal_credstore::Disk, K: eternal_credstore::Keyring>(
+    store: &mut Option<eternal_credstore::CredentialStore<D, K>>,
+    job: StoreJob,
+    rng: impl FnOnce() -> Box<dyn Random + Send>,
+) -> JobDone {
+    let mut done = match store.as_mut() {
+        Some(open) => run_job(open, job),
+        None => JobDone {
+            job,
+            result: Err(StoreError::NeedsReopen),
+            snapshot: Arc::default(),
+            closed: true,
+        },
+    };
+    if !done.closed {
+        settle(store, &mut done, rng());
+    }
+    done
 }
 
 /// Whether the host can use its pairings.
@@ -150,15 +234,16 @@ pub enum Pairings {
 struct Credentials {
     snapshot: Arc<CredentialSnapshot>,
     accept: Accept,
-    /// Records invalid in memory since step 1 of their invalidation.
-    invalid: HashSet<Id16>,
+    /// Records invalid in memory since step 1 of their invalidation, with
+    /// how many queued jobs hold each: a job releases only its own hold.
+    invalid: HashMap<Id16, usize>,
     /// Committed timestamps not yet in the snapshot.
     timestamps: HashMap<Id16, u64>,
 }
 
 impl HostCredentials for Credentials {
     fn key(&self, dev_id: &Id16) -> Option<Zeroizing<Key32>> {
-        if self.invalid.contains(dev_id) {
+        if self.invalid.contains_key(dev_id) {
             return None;
         }
         self.snapshot.key(dev_id)
@@ -181,6 +266,13 @@ impl HostCredentials for Credentials {
     }
 }
 
+/// A Finalize the writer hasn't finished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Queued {
+    dev_id: Id16,
+    slot: Option<Id16>,
+}
+
 /// The v3 session [`Session`] streams to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Streaming {
@@ -198,6 +290,10 @@ pub struct V3Host {
     /// Decisions owed on confirms that wait for nothing: a busy host lets
     /// them time out.
     busy_logged: HashSet<u32>,
+    /// Finalizes handed to the writer and not yet done, oldest first: each
+    /// record, its slot, and the record it retires. Conflicts and expiry
+    /// are decided against these as well as the snapshot.
+    queued: Vec<Queued>,
     origin: Instant,
     /// The wall clock at `origin`, in µs since the Unix epoch.
     wall_origin_us: u64,
@@ -228,13 +324,14 @@ impl V3Host {
             creds: Credentials {
                 snapshot: snapshot.unwrap_or_default(),
                 accept: Accept::default(),
-                invalid: HashSet::new(),
+                invalid: HashMap::new(),
                 timestamps: HashMap::new(),
             },
             pairings,
             streaming: None,
             outbox: VecDeque::new(),
             busy_logged: HashSet::new(),
+            queued: Vec::new(),
             origin: now,
             wall_origin_us: wall_us,
             next_expire_check: now,
@@ -254,6 +351,11 @@ impl V3Host {
     /// The session table, for tests.
     pub fn table(&self) -> &HostSessions<PeerId> {
         &self.sessions
+    }
+
+    /// Records held invalid in memory, for tests.
+    pub fn held_invalid(&self) -> usize {
+        self.creds.invalid.len()
     }
 
     /// The jobs for the writer, oldest first.
@@ -297,11 +399,12 @@ impl V3Host {
     ) -> Actions {
         use eternal_wire::v3::wire::{classify, V3Kind};
         let mut actions = Actions::default();
-        if source.link != LinkId::Udp {
+        let kind = classify(datagram);
+        if source.link != LinkId::Udp && kind != V3Kind::Other {
             // v3 over the USB tunnel comes with sealed media (phase 5).
             return actions;
         }
-        match classify(datagram) {
+        match kind {
             // Message 2 carries the host's HelloAck fields.
             V3Kind::Handshake1 => self.refresh_accept(session, config),
             V3Kind::Sealed => {}
@@ -379,21 +482,33 @@ impl V3Host {
                     }
                     let entry = self.creds.timestamps.entry(dev_id).or_insert(0);
                     *entry = (*entry).max(timestamp_us);
-                    let finalize = self.creds.snapshot.is_pending(&dev_id);
-                    if let Some(old) = finalize
+                    let finalize = self.creds.snapshot.is_pending(&dev_id)
+                        && !self.queued.iter().any(|q| q.dev_id == dev_id);
+                    let retires = finalize
                         .then(|| self.creds.snapshot.replaces(&dev_id))
-                        .flatten()
-                    {
+                        .flatten();
+                    if let Some(old) = retires {
                         // Step 1 for the record this one replaces.
                         queue.extend(self.invalidate(session, &[old], now, actions));
+                    }
+                    if finalize {
+                        self.queued.push(Queued {
+                            dev_id,
+                            slot: self.creds.snapshot.slot_of(&dev_id),
+                        });
                     }
                     self.outbox.push_back(StoreJob::Commit {
                         dev_id,
                         session_id,
                         timestamp_us,
                         finalize,
+                        retires,
                     });
                     actions.merge(session.begin_v3(peer, session_id, &hello, now));
+                    // The session it replaced in this pass is not a lost
+                    // client: the stream goes on, to the new session.
+                    actions.client_lost = false;
+                    actions.end_cutover = false;
                     actions.cutover = Some(session_id);
                     self.streaming = Some(Streaming { dev_id, session_id });
                 }
@@ -457,7 +572,10 @@ impl V3Host {
         now: Instant,
     ) -> Vec<HostOutput<PeerId>> {
         let at = self.at(now);
-        if self.creds.snapshot.would_conflict(&dev_id) {
+        if self.pairings != Pairings::Ready {
+            return Vec::new();
+        }
+        if self.would_conflict(&dev_id) {
             if self.sessions.prepare_refusal(at, &dev_id, session_id) {
                 info!(
                     session_id,
@@ -482,6 +600,62 @@ impl V3Host {
         self.sessions.commit(at, &dev_id, session_id)
     }
 
+    /// Whether finalizing `dev_id` would conflict, counting the Finalizes
+    /// still being written: one queued for its slot makes that record the
+    /// slot's active one, so only a record replacing it may follow (the
+    /// first Finalize wins).
+    fn would_conflict(&self, dev_id: &Id16) -> bool {
+        let snapshot = &self.creds.snapshot;
+        if self.queued.iter().any(|q| q.dev_id == *dev_id) {
+            return false;
+        }
+        let slot = snapshot.slot_of(dev_id);
+        match self
+            .queued
+            .iter()
+            .rev()
+            .find(|q| slot.is_some() && q.slot == slot)
+        {
+            Some(newer) => snapshot.replaces(dev_id) != Some(newer.dev_id),
+            None => snapshot.would_conflict(dev_id),
+        }
+    }
+
+    /// Takes one hold on each record: invalid in memory until released.
+    fn hold(&mut self, dev_ids: &[Id16]) {
+        for dev_id in dev_ids {
+            *self.creds.invalid.entry(*dev_id).or_insert(0) += 1;
+        }
+    }
+
+    /// Releases one hold on each record.
+    fn release(&mut self, dev_ids: &[Id16]) {
+        for dev_id in dev_ids {
+            if let Some(count) = self.creds.invalid.get_mut(dev_id) {
+                *count -= 1;
+                if *count == 0 {
+                    self.creds.invalid.remove(dev_id);
+                }
+            }
+        }
+    }
+
+    /// Ends every session for `dev_id`, with a sealed BYE to a live one,
+    /// without changing what the store holds or what is invalid.
+    fn end_sessions(
+        &mut self,
+        session: &mut Session,
+        dev_id: &Id16,
+        now: Instant,
+        actions: &mut Actions,
+    ) -> Vec<HostOutput<PeerId>> {
+        if let Some(streaming) = self.streaming.filter(|s| s.dev_id == *dev_id) {
+            self.streaming = None;
+            actions.merge(session.end_v3(streaming.session_id, EndReason::Revoked, now));
+        }
+        self.sessions.revoke(self.at(now), dev_id)
+    }
+
     /// Whether two records are the same iPad's: they share a slot.
     fn same_slot(&self, a: &Id16, b: &Id16) -> bool {
         a == b
@@ -493,7 +667,8 @@ impl V3Host {
     }
 
     /// Step 1 of the invalidation procedure for `dev_ids`: from here they
-    /// are invalid in memory, and their sessions end.
+    /// are invalid in memory, held by the job the caller queues with them,
+    /// and their sessions end.
     fn invalidate(
         &mut self,
         session: &mut Session,
@@ -501,15 +676,10 @@ impl V3Host {
         now: Instant,
         actions: &mut Actions,
     ) -> Vec<HostOutput<PeerId>> {
-        let at = self.at(now);
+        self.hold(dev_ids);
         let mut out = Vec::new();
         for dev_id in dev_ids {
-            self.creds.invalid.insert(*dev_id);
-            out.extend(self.sessions.revoke(at, dev_id));
-            if let Some(streaming) = self.streaming.filter(|s| s.dev_id == *dev_id) {
-                self.streaming = None;
-                actions.merge(session.end_v3(streaming.session_id, EndReason::Revoked, now));
-            }
+            out.extend(self.end_sessions(session, dev_id, now, actions));
         }
         out
     }
@@ -543,15 +713,36 @@ impl V3Host {
         let mut actions = Actions::default();
         let at = self.at(now);
         self.creds.snapshot = done.snapshot;
-        // What the store now holds supersedes the overlays.
+        // What the store now holds supersedes what this job held in memory.
         let snapshot = &self.creds.snapshot;
         self.creds
             .timestamps
             .retain(|dev_id, ts| snapshot.last_committed_timestamp(dev_id) < *ts);
-        self.creds
-            .invalid
-            .retain(|dev_id| snapshot.key(dev_id).is_some());
+        self.release(done.job.holds());
+        if let StoreJob::Commit {
+            dev_id,
+            finalize: true,
+            ..
+        } = &done.job
+        {
+            if let Some(i) = self.queued.iter().position(|q| q.dev_id == *dev_id) {
+                self.queued.remove(i);
+            }
+        }
         let mut out = Vec::new();
+        if done.closed {
+            // The store is gone: no pairing can be used, and nothing more
+            // commits until the host restarts.
+            if self.pairings == Pairings::Ready {
+                warn!("The credential store closed: v3 pairings are unavailable");
+                self.pairings =
+                    Pairings::Unavailable("the credential store could not reopen".into());
+            }
+            self.queued.clear();
+            if let Some(streaming) = self.streaming {
+                out.extend(self.end_sessions(session, &streaming.dev_id, now, &mut actions));
+            }
+        }
         match (done.job, done.result) {
             (
                 StoreJob::Commit {
@@ -568,8 +759,7 @@ impl V3Host {
                     }
                     Err(error) => warn!(%error, "Could not store a committed session: ending it"),
                 }
-                out.extend(self.invalidate(session, &[dev_id], now, &mut actions));
-                self.creds.invalid.remove(&dev_id);
+                out.extend(self.end_sessions(session, &dev_id, now, &mut actions));
             }
             (
                 StoreJob::Retire {
@@ -585,7 +775,8 @@ impl V3Host {
                 }
             }
             (StoreJob::Remove { .. }, Err(error)) => {
-                warn!(%error, "Could not remove a pairing; it stays invalid until the store reopens");
+                // The reopen settled it: the snapshot says whether it's gone.
+                warn!(%error, "A pairing's removal failed; the store reopened to settle it");
             }
             (StoreJob::Expire { .. }, result) => {
                 self.expiring = false;
@@ -615,11 +806,22 @@ impl V3Host {
             let now_s = (self.wall_origin_us
                 + u64::try_from(self.at(now).as_micros()).unwrap_or(0))
                 / 1_000_000;
-            let expiring = self.creds.snapshot.expiring(now_s);
-            if !expiring.is_empty() {
+            // A record whose Finalize is being written is active once it
+            // lands (the writer runs jobs in order), so it doesn't expire.
+            let expiring: Vec<Id16> = self
+                .creds
+                .snapshot
+                .expiring(now_s)
+                .into_iter()
+                .filter(|dev_id| !self.queued.iter().any(|q| q.dev_id == *dev_id))
+                .collect();
+            if !expiring.is_empty() && self.pairings == Pairings::Ready {
                 self.expiring = true;
                 out.extend(self.invalidate(session, &expiring, now, &mut actions));
-                self.outbox.push_back(StoreJob::Expire { now_s });
+                self.outbox.push_back(StoreJob::Expire {
+                    now_s,
+                    dev_ids: expiring,
+                });
             }
         }
         self.apply(session, out, config, now, &mut actions);
@@ -782,36 +984,8 @@ impl Writer {
             .spawn(move || {
                 let mut rng = rng;
                 let mut store = Some(store);
-                let mut last = store.as_ref().map(|s| s.snapshot()).unwrap_or_default();
                 for job in job_rx {
-                    let done = match store.as_mut() {
-                        Some(open) => run_job(open, job),
-                        None => JobDone {
-                            job,
-                            result: Err(StoreError::NeedsReopen),
-                            snapshot: last.clone(),
-                        },
-                    };
-                    if matches!(done.result, Err(StoreError::NeedsReopen | StoreError::Io(_))) {
-                        // Settle whatever the failed operation left.
-                        if let Some(failed) = store.take() {
-                            let (disk, keyring) = failed.into_parts();
-                            match eternal_credstore::CredentialStore::open(disk, keyring, rng()) {
-                                Ok((reopened, report)) => {
-                                    info!(recovery = ?report.recovery, "Credential store reopened");
-                                    store = Some(reopened);
-                                }
-                                Err(error) => {
-                                    warn!(%error, "Credential store could not reopen; pairings are unavailable");
-                                }
-                            }
-                        }
-                    }
-                    last = store.as_ref().map_or(done.snapshot.clone(), |s| s.snapshot());
-                    let done = JobDone {
-                        snapshot: last.clone(),
-                        ..done
-                    };
+                    let done = run_and_settle(&mut store, job, &mut rng);
                     if done_tx.send(done).is_err() {
                         break;
                     }
@@ -1083,8 +1257,11 @@ pub fn enable_with<D, K>(
 }
 
 /// The keyring's place on Windows: a DPAPI-protected value under
-/// `HKCU\<KEYRING_SUBKEY>`.
-pub const KEYRING_SUBKEY: &str = r"Software\EternalMonitor\credstore";
+/// `HKCU\<KEYRING_SUBKEY>`. `Local Settings` never roams with a roaming
+/// profile, so an older copy of the blob can't come back from another
+/// machine (a keyring rollback), and it stays with the local database.
+pub const KEYRING_SUBKEY: &str =
+    r"Software\Classes\Local Settings\Software\EternalMonitor\credstore";
 pub const KEYRING_VALUE: &str = "keyring";
 
 /// The `transport_v3` setting: turns v3 on where this build can, or says

@@ -602,6 +602,32 @@ fn a_conflicting_record_is_refused_with_its_tombstone() {
     });
 }
 
+/// The same iPad finalizes its new record during a live session: the old
+/// session is superseded and video goes on, to the new one.
+#[test]
+fn video_follows_a_replacing_record_to_its_session() {
+    run(async {
+        let mut sim = Sim::start(&[(0x11, 1, None, true), (0x12, 1, Some(0x11), false)]).await;
+        sim.ipad.connect(0x11).await;
+        sim.run_for(Duration::from_secs(1)).await;
+        let old = sim.ipad.live().expect("live under the old record");
+        assert!(sim.ipad.video_of(old) > 0);
+        sim.ipad.connect(0x12).await;
+        sim.run_for(Duration::from_secs(1)).await;
+        let new = sim.ipad.live().expect("live under the new record");
+        assert_ne!(new, old);
+        assert_eq!(sim.state(0x12), Some(RecordState::Active));
+        assert_eq!(sim.state(0x11), None, "the old record is retired");
+        let before = sim.ipad.video_of(new);
+        sim.run_for(Duration::from_millis(500)).await;
+        assert!(
+            sim.ipad.video_of(new) > before + 10,
+            "video reaches the new session"
+        );
+        sim.stop().await;
+    });
+}
+
 /// v3 off, as shipped: a v3 message 1 gets exactly today's answer, a
 /// cleartext `VersionUnsupported` naming version 2, and nothing starts.
 #[test]

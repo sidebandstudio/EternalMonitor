@@ -82,12 +82,16 @@ fn world(records: &[(u8, u8, Option<u8>, bool, u64)]) -> World {
 struct Rig {
     host: V3Host,
     session: Session,
-    store: Store,
+    /// `None` once it couldn't reopen.
+    store: Option<Store>,
     live: Live,
     start: Instant,
     now: Duration,
     /// Jobs wait for [`Rig::pump`] instead of running at once.
     hold_jobs: bool,
+    /// A failed step is a passing fault: the writer's reopen succeeds.
+    /// Otherwise the store stays failed.
+    transient: bool,
     /// Everything the host decided, merged.
     actions: Vec<Actions>,
 }
@@ -113,11 +117,12 @@ impl Rig {
         Self {
             host,
             session,
-            store,
+            store: Some(store),
             live,
             start,
             now: Duration::ZERO,
             hold_jobs: false,
+            transient: true,
             actions: Vec::new(),
         }
     }
@@ -126,22 +131,41 @@ impl Rig {
         self.start + self.now
     }
 
-    /// Runs every job the host handed out, as the writer does.
+    /// The store, while it's open.
+    fn store(&self) -> &Store {
+        self.store.as_ref().expect("the store is open")
+    }
+
+    /// Runs every job the host handed out, as the writer does: in order,
+    /// reopening the store after a failure that needs it.
     fn pump(&mut self) -> Vec<(PeerId, Vec<u8>)> {
         let mut sends = Vec::new();
-        loop {
-            let jobs = self.host.take_jobs();
-            if jobs.is_empty() {
-                return sends;
-            }
-            for job in jobs {
-                let done = run_job(&mut self.store, job);
-                check_invariants(&self.store);
-                let at = self.at();
-                let actions = self.host.job_done(&mut self.session, done, &TestConfig, at);
-                sends.extend(self.take(actions));
-            }
+        while let Some(more) = self.pump_one() {
+            sends.extend(more);
         }
+        sends
+    }
+
+    /// Runs the oldest job only; `None` with none queued.
+    fn pump_one(&mut self) -> Option<Vec<(PeerId, Vec<u8>)>> {
+        let job = self.host.outbox.pop_front()?;
+        let done = match self.store.as_mut() {
+            Some(store) => {
+                let mut done = run_job(store, job);
+                if self.transient {
+                    self.live.steps.crash_at.set(None);
+                }
+                super::settle(&mut self.store, &mut done, Box::new(SeededRandom::new(11)));
+                done
+            }
+            None => run_and_settle(&mut self.store, job, || Box::new(SeededRandom::new(11))),
+        };
+        if let Some(store) = &self.store {
+            check_invariants(store);
+        }
+        let at = self.at();
+        let actions = self.host.job_done(&mut self.session, done, &TestConfig, at);
+        Some(self.take(actions))
     }
 
     fn take(&mut self, mut actions: Actions) -> Vec<(PeerId, Vec<u8>)> {
@@ -152,14 +176,14 @@ impl Rig {
     }
 
     fn receive(&mut self, from: SocketAddr, datagram: &[u8]) -> Vec<(PeerId, Vec<u8>)> {
+        self.receive_on(PeerId::udp(from), datagram)
+    }
+
+    fn receive_on(&mut self, from: PeerId, datagram: &[u8]) -> Vec<(PeerId, Vec<u8>)> {
         let at = self.at();
-        let actions = self.host.handle_datagram(
-            &mut self.session,
-            PeerId::udp(from),
-            datagram,
-            &TestConfig,
-            at,
-        );
+        let actions = self
+            .host
+            .handle_datagram(&mut self.session, from, datagram, &TestConfig, at);
         let mut sends = self.take(actions);
         if !self.hold_jobs {
             sends.extend(self.pump());
@@ -196,7 +220,7 @@ impl Rig {
     }
 
     fn state(&self, dev: u8) -> Option<RecordState> {
-        self.store
+        self.store()
             .records()
             .into_iter()
             .find(|r| r.dev_id == id(dev))
@@ -204,7 +228,7 @@ impl Rig {
     }
 
     fn tombstoned(&self, dev: u8) -> bool {
-        self.store
+        self.store()
             .tombstones()
             .iter()
             .any(|(_, ids)| ids.contains(&id(dev)))
@@ -380,7 +404,7 @@ fn a_commit_streams_at_once_and_acks_after_the_write() {
     // The write lands: Finalize made it active, and only now the ack.
     let sends = rig.pump();
     assert_eq!(rig.state(0x21), Some(RecordState::Active));
-    assert!(rig.store.snapshot().last_committed_timestamp(&id(0x21)) > 0);
+    assert!(rig.store().snapshot().last_committed_timestamp(&id(0x21)) > 0);
     to_pad(&mut rig, &mut pad, sends);
     assert_eq!(pad.live(), Some(session_id));
     assert!(pad.saw(|o| matches!(o, ClientOutput::Status { status, .. }
@@ -395,9 +419,9 @@ fn heartbeats_go_sealed_and_keep_a_quiet_session_alive() {
     connect(&mut rig, &mut pad, 0x21);
     let session_id = pad.live().expect("live");
 
-    // Ten quiet seconds: the iPad sends nothing at all, and its own 3 s
-    // liveness check never fires, because the host's heartbeat arrives
-    // sealed every second.
+    // Ten seconds with no input: the iPad's own 3 s liveness check, which
+    // counts only what the host sends, never fires, because the host's
+    // heartbeat arrives sealed every second.
     let sends = rig.tick(true);
     for (_, datagram) in &sends {
         assert_eq!(
@@ -408,8 +432,8 @@ fn heartbeats_go_sealed_and_keep_a_quiet_session_alive() {
     }
     to_pad(&mut rig, &mut pad, sends);
     let before = pad.delivered(PacketType::Heartbeat as u8);
-    // The iPad's uplink is quiet; reports keep the host's side alive, as the
-    // real iPad sends them every 500 ms.
+    // The iPad reports every 500 ms, as the real one does, which keeps the
+    // host's side alive.
     for _ in 0..20 {
         advance(&mut rig, &mut pad, Duration::from_millis(500));
         let report = eternal_wire::v2::control::ReceiverReport {
@@ -464,9 +488,7 @@ fn input_reaches_the_session_only_sealed() {
     assert!(!rig.any_action(|a| a.input.is_some()), "a replay");
 }
 
-#[test]
-fn a_v2_hello_is_turned_away_naming_version_3() {
-    let mut rig = Rig::new(&world(&[]));
+fn v2_hello() -> Vec<u8> {
     let hello = eternal_wire::v2::control::Hello2 {
         proto_min: 2,
         proto_max: 2,
@@ -485,8 +507,10 @@ fn a_v2_hello_is_turned_away_naming_version_3() {
         auth_token: [0; 16],
         pairing_code: 0,
     };
-    let datagram = encode_control(0, 1, &ControlMessage::Hello2(hello));
-    let sends = rig.receive(SocketAddr::from(([10, 0, 0, 9], 50_000)), &datagram);
+    encode_control(0, 1, &ControlMessage::Hello2(hello))
+}
+
+fn assert_version_3_refusal(sends: &[(PeerId, Vec<u8>)]) {
     assert_eq!(sends.len(), 1);
     let (_, ControlMessage::HelloAck(ack)) =
         eternal_wire::v2::control::parse_control(&sends[0].1).unwrap()
@@ -498,7 +522,237 @@ fn a_v2_hello_is_turned_away_naming_version_3() {
         eternal_wire::v2::control::HelloStatus::VersionUnsupported
     );
     assert_eq!(ack.accepted_version, 3);
+}
+
+#[test]
+fn a_v2_hello_is_turned_away_naming_version_3() {
+    let mut rig = Rig::new(&world(&[]));
+    let sends = rig.receive(SocketAddr::from(([10, 0, 0, 9], 50_000)), &v2_hello());
+    assert_version_3_refusal(&sends);
     assert!(!rig.session.is_active());
+}
+
+#[test]
+fn a_v2_hello_over_usb_is_turned_away_too() {
+    let mut rig = Rig::new(&world(&[]));
+    let usb = PeerId::usb(17);
+    let sends = rig.receive_on(usb, &v2_hello());
+    assert_eq!(sends[0].0, usb);
+    assert_version_3_refusal(&sends);
+    assert!(!rig.session.is_active());
+}
+
+#[test]
+fn a_failed_commit_write_keeps_a_queued_removal() {
+    let mut rig = Rig::new(&world(&[(0x21, 2, None, true, 0)]));
+    rig.hold_jobs = true;
+    let mut pad = Pad::new(50_000);
+    connect(&mut rig, &mut pad, 0x21); // its commit's write waits
+    let at = rig.at();
+    let actions = rig
+        .host
+        .remove(&mut rig.session, &[id(0x21)], &TestConfig, at);
+    rig.take(actions);
+
+    // The commit's write fails; the Remove behind it hasn't run.
+    let base = rig.live.steps.count.get();
+    rig.live.steps.crash_at.set(Some(base));
+    rig.pump_one().unwrap();
+    assert_eq!(
+        rig.state(0x21),
+        Some(RecordState::Active),
+        "not removed yet"
+    );
+    let handshakes = rig.host.table().handshakes_performed();
+    connect(&mut rig, &mut pad, 0x21);
+    assert_eq!(
+        rig.host.table().handshakes_performed(),
+        handshakes,
+        "still invalid: the Remove holds it"
+    );
+
+    rig.pump();
+    assert!(rig.tombstoned(0x21));
+    assert_eq!(rig.host.held_invalid(), 0);
+}
+
+#[test]
+fn a_second_finalize_conflicts_with_one_still_being_written() {
+    // Slot 1: active 0x11, and two pending records that both replace it.
+    let mut rig = Rig::new(&world(&[
+        (0x11, 1, None, true, 0),
+        (0x12, 1, Some(0x11), false, 0),
+        (0x13, 1, Some(0x11), false, 0),
+    ]));
+    rig.hold_jobs = true;
+    let mut first = Pad::new(50_000);
+    connect(&mut rig, &mut first, 0x12);
+    let streaming = rig.session.v3_session_id().expect("0x12 committed");
+
+    // 0x13 confirms before 0x12's Finalize is written.
+    let mut second = Pad::new(50_001);
+    connect(&mut rig, &mut second, 0x13);
+    assert_eq!(
+        rig.session.v3_session_id(),
+        Some(streaming),
+        "0x12 untouched"
+    );
+
+    let sends = rig.pump();
+    to_pad(&mut rig, &mut second, sends);
+    assert_eq!(rig.state(0x12), Some(RecordState::Active), "the first wins");
+    assert!(rig.tombstoned(0x11));
+    assert!(rig.tombstoned(0x13), "the second is retired");
+    assert!(
+        second.saw(|o| matches!(o, ClientOutput::Refused { dev_id, status }
+        if *dev_id == id(0x13) && status.tombstones.contains(&id(0x13))))
+    );
+    assert!(!second.saw(|o| matches!(o, ClientOutput::Closed { .. })));
+    assert_eq!(rig.session.v3_session_id(), Some(streaming));
+    assert!(rig.host.table().live_session(&id(0x12)).is_some());
+}
+
+#[test]
+fn an_expiry_check_racing_a_finalize_leaves_the_record_active() {
+    let mut rig = Rig::new(&world(&[(0x21, 2, None, false, 8)]));
+    rig.hold_jobs = true;
+    let mut pad = Pad::new(50_000);
+    connect(&mut rig, &mut pad, 0x21); // its Finalize waits
+    let streaming = rig.session.v3_session_id().expect("committed");
+    rig.tick(false); // the expiry check, on the old snapshot
+    assert_eq!(rig.session.v3_session_id(), Some(streaming), "not ended");
+    rig.pump();
+    assert_eq!(rig.session.v3_session_id(), Some(streaming));
+    assert!(rig.host.table().live_session(&id(0x21)).is_some());
+    assert_eq!(rig.state(0x21), Some(RecordState::Active));
+    assert!(!rig.tombstoned(0x21));
+    assert_eq!(rig.host.held_invalid(), 0);
+    rig.hold_jobs = false;
+    connect(&mut rig, &mut pad, 0x21);
+    assert!(pad.live().is_some(), "it still connects");
+}
+
+#[test]
+fn a_replacing_commit_keeps_the_stream_going_to_the_new_session() {
+    let mut rig = Rig::new(&world(&[
+        (0x11, 1, None, true, 0),
+        (0x12, 1, Some(0x11), false, 0),
+    ]));
+    let mut pad = Pad::new(50_000);
+    connect(&mut rig, &mut pad, 0x11);
+    rig.actions.clear();
+    connect(&mut rig, &mut pad, 0x12);
+    let session_id = rig.session.v3_session_id().expect("the new session");
+    let pass = rig
+        .actions
+        .iter()
+        .find(|a| a.cutover == Some(session_id))
+        .expect("the commit's pass");
+    assert_eq!(pass.new_target, Some(PeerId::udp(pad.addr)));
+    assert!(!pass.client_lost, "the stream goes on");
+    assert!(!pass.end_cutover);
+}
+
+#[test]
+fn a_takeover_of_a_held_session_keeps_the_stream_going() {
+    let mut rig = Rig::new(&world(&[
+        (0x11, 1, None, true, 0),
+        (0x21, 2, None, true, 0),
+    ]));
+    let mut first = Pad::new(50_000);
+    connect(&mut rig, &mut first, 0x11);
+    // A report with frames, so the session holds when it goes quiet.
+    let report = eternal_wire::v2::control::ReceiverReport {
+        frames_complete: 1,
+        ..Default::default()
+    };
+    let body =
+        &encode_control(0, 0, &ControlMessage::ReceiverReport(report))[CONTROL_HEADER_SIZE..];
+    let record = first
+        .client
+        .seal(rig.now, PacketType::ReceiverReport as u8, body)
+        .unwrap();
+    rig.receive(first.addr, &record);
+    for _ in 0..14 {
+        rig.now += Duration::from_millis(250);
+        rig.tick(false);
+    }
+    assert!(rig.session.on_hold());
+
+    let mut second = Pad::new(50_001);
+    second.addr = SocketAddr::from(([10, 0, 0, 6], 50_001));
+    rig.actions.clear();
+    connect(&mut rig, &mut second, 0x21);
+    let session_id = rig.session.v3_session_id().expect("taken over");
+    let pass = rig
+        .actions
+        .iter()
+        .find(|a| a.cutover == Some(session_id))
+        .expect("the commit's pass");
+    assert_eq!(pass.new_target, Some(PeerId::udp(second.addr)));
+    assert!(!pass.client_lost);
+}
+
+#[test]
+fn a_store_that_cant_reopen_makes_pairings_unavailable() {
+    let mut rig = Rig::new(&world(&[(0x21, 2, None, true, 0)]));
+    let mut pad = Pad::new(50_000);
+    connect(&mut rig, &mut pad, 0x21);
+    let session_id = pad.live().expect("live");
+
+    // Every store step fails from here, the reopen's too.
+    rig.transient = false;
+    let base = rig.live.steps.count.get();
+    rig.live.steps.crash_at.set(Some(base));
+    let sends = rig.remove(&[id(0x21)]);
+    to_pad(&mut rig, &mut pad, sends);
+    assert!(rig.store.is_none(), "it couldn't reopen");
+    assert!(matches!(rig.host.pairings(), Pairings::Unavailable(_)));
+    assert!(rig.host.snapshot().is_empty());
+    assert!(
+        pad.saw(|o| matches!(o, ClientOutput::Closed { session_id: s, .. } if *s == session_id))
+    );
+
+    // Nothing connects any more.
+    let handshakes = rig.host.table().handshakes_performed();
+    connect(&mut rig, &mut pad, 0x21);
+    assert_eq!(rig.host.table().handshakes_performed(), handshakes);
+    assert!(!rig.session.is_active());
+}
+
+/// The writer thread itself: a store that fails and can't reopen says so,
+/// and every later job fails at once.
+#[test]
+fn the_writer_reports_a_store_it_cant_reopen() {
+    use eternal_credstore::disk::MemDisk;
+    use eternal_credstore::CredentialStore;
+    let world = world(&[(0x21, 2, None, true, 0)]);
+    // How many disk calls an open makes, so the next one after it fails.
+    let calls = {
+        let mut disk = world.disk.clone();
+        disk.crash_at(usize::MAX);
+        let (store, _) =
+            CredentialStore::open(disk, world.keyring.clone(), Box::new(SeededRandom::new(1)))
+                .unwrap();
+        store.into_parts().0.calls()
+    };
+    let mut disk: MemDisk = world.disk.clone();
+    disk.crash_at(calls);
+    let (store, _) =
+        CredentialStore::open(disk, world.keyring.clone(), Box::new(SeededRandom::new(1))).unwrap();
+    let writer = Writer::spawn(store, || Box::new(SeededRandom::new(2))).unwrap();
+    for _ in 0..2 {
+        writer
+            .jobs
+            .send(StoreJob::Remove {
+                dev_ids: vec![id(0x21)],
+            })
+            .unwrap();
+        let done = writer.done.recv_timeout(Duration::from_secs(10)).unwrap();
+        assert!(done.result.is_err());
+        assert!(done.closed);
+        assert!(done.snapshot.is_empty());
+    }
 }
 
 #[test]
@@ -590,10 +844,16 @@ fn a_removed_key_is_refused_while_the_remove_is_still_being_written() {
     // Step 1 only: the store hasn't run the Remove yet.
     rig.hold_jobs = true;
     let at = rig.at();
-    let actions = rig.host.remove(&mut rig.session, &[id(0x21)], &TestConfig, at);
+    let actions = rig
+        .host
+        .remove(&mut rig.session, &[id(0x21)], &TestConfig, at);
     let sends = rig.take(actions);
     to_pad(&mut rig, &mut pad, sends);
-    assert_eq!(rig.state(0x21), Some(RecordState::Active), "not written yet");
+    assert_eq!(
+        rig.state(0x21),
+        Some(RecordState::Active),
+        "not written yet"
+    );
     let handshakes = rig.host.table().handshakes_performed();
     connect(&mut rig, &mut pad, 0x21);
     assert_eq!(
@@ -712,9 +972,10 @@ fn liveness_ends_the_v3_session_with_a_sealed_goodbye() {
     );
 }
 
-/// Kills the store at every step of a job, with the session live: the
-/// session never gets an ack for state that isn't durable, and after the
-/// store reopens the record is exactly before or after the job.
+/// Fails the store at every step of a job, with the session live. The store
+/// reopens as the writer does: the record is exactly before or after the
+/// job, nothing is left invalid in memory, the session never gets an ack
+/// for state that isn't durable, and a restart finds the same state.
 ///
 /// With `in_commit` the crash points are those of the commit itself;
 /// otherwise the session commits first and `job` is killed.
@@ -741,6 +1002,9 @@ fn crash_each_step(
         job(&mut rig, &mut pad);
         let crashed = rig.live.steps.count.get() > base + k;
         rig.live.steps.crash_at.set(None);
+        check_invariants(rig.store());
+        check(rig.store(), crashed);
+        assert_eq!(rig.host.held_invalid(), 0, "every job released its holds");
         let restarted = rig.live.same_boot();
         let (reopened, report, _) = restarted.open();
         check_invariants(&reopened);
@@ -831,8 +1095,13 @@ fn a_crash_in_a_remove_mid_session_ends_the_session_either_way() {
         },
         |store, crashed| {
             let held = store.records().iter().any(|r| r.dev_id == id(0x21));
+            let tombstoned = store
+                .tombstones()
+                .iter()
+                .any(|(_, ids)| ids.contains(&id(0x21)));
+            assert_ne!(held, tombstoned, "exactly before or after");
             if !crashed {
-                assert!(!held);
+                assert!(tombstoned);
             }
         },
     );
@@ -908,7 +1177,8 @@ fn on_windows_a_commit_goes_through_dpapi_and_the_writer() {
     use eternal_credstore::keyring::DpapiRegistry;
     use eternal_credstore::{CredentialStore, Keyring, StdDisk};
 
-    const SUBKEY: &str = r"Software\EternalMonitor-Test-V3\credstore";
+    const SUBKEY: &str =
+        r"Software\Classes\Local Settings\Software\EternalMonitor-Test-V3\credstore";
     struct Cleanup(std::path::PathBuf);
     impl Drop for Cleanup {
         fn drop(&mut self) {
@@ -917,7 +1187,10 @@ fn on_windows_a_commit_goes_through_dpapi_and_the_writer() {
             use windows::Win32::System::Registry::{RegDeleteTreeW, HKEY_CURRENT_USER};
             // SAFETY: a constant NUL-terminated key name.
             unsafe {
-                let _ = RegDeleteTreeW(HKEY_CURRENT_USER, w!(r"Software\EternalMonitor-Test-V3"));
+                let _ = RegDeleteTreeW(
+                    HKEY_CURRENT_USER,
+                    w!(r"Software\Classes\Local Settings\Software\EternalMonitor-Test-V3"),
+                );
             }
             let _ = std::fs::remove_dir_all(&self.0);
         }

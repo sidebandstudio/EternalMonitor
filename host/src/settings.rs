@@ -308,7 +308,10 @@ mod tests {
         let default = SettingsFile::default();
         assert!(!default.transport_v3);
         let json = serde_json::to_string(&default).unwrap();
-        assert!(!json.contains("transport_v3"), "today's file, byte for byte");
+        assert!(
+            !json.contains("transport_v3"),
+            "today's file, byte for byte"
+        );
         let on = SettingsFile {
             transport_v3: true,
             ..Default::default()
@@ -317,7 +320,11 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
         assert!(parsed.transport_v3);
         let old = r#"{"bitrate_mbps":15,"target_fps":60,"start_on_boot":false}"#;
-        assert!(!serde_json::from_str::<SettingsFile>(old).unwrap().transport_v3);
+        assert!(
+            !serde_json::from_str::<SettingsFile>(old)
+                .unwrap()
+                .transport_v3
+        );
     }
 
     #[test]
