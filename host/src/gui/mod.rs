@@ -366,6 +366,9 @@ pub struct AnalyzerApp {
     logo: Option<(f32, egui::TextureHandle)>,
     /// The saved language choice (see `i18n::resolve`).
     settings_language: Option<String>,
+    /// The saved `transport_v3` setting, kept as read: no control changes
+    /// it yet.
+    settings_transport_v3: bool,
     /// A language whose fonts were just installed; it shows from the next
     /// frame, when egui uses them.
     pending_language: Option<Lang>,
@@ -533,6 +536,7 @@ impl AnalyzerApp {
             quality: QualityMeter::default(),
             logo: None,
             settings_language: persisted.language,
+            settings_transport_v3: persisted.transport_v3,
             pending_language: None,
             setup: crate::settings::fresh_install().then(setup::Setup::default),
         }
@@ -583,6 +587,7 @@ impl AnalyzerApp {
             window_drawing: self.settings_window_drawing,
             gpu_switch: self.control.shared.gpu_switch.lock().clone(),
             language: self.settings_language.clone(),
+            transport_v3: self.settings_transport_v3,
         }
     }
 }

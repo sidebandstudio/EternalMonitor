@@ -5,6 +5,8 @@ edition = "2021"
 
 [dependencies]
 eternal-wire = { path = "../proto" }
+# The v3 credential store, used only with the transport_v3 setting on.
+eternal-credstore = { path = "../credstore" }
 eternal-updater = { path = "../updater" }
 ffmpeg-next = { version = "7", features = ["codec", "format", "software-scaling", "software-resampling"] }
 libc = "0.2"
@@ -68,6 +70,8 @@ pkg-config = "0.3"
 # Paused-clock simulations of the USB link.
 tokio = { version = "1", features = ["test-util"] }
 eternal-host = { path = ".", features = ["test-hooks"] }
+# Its in-memory keyring and crashing disk, for the v3 session tests.
+eternal-credstore = { path = "../credstore", features = ["test-hooks"] }
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 egui_kittest = { version = "0.36", features = ["eframe", "wgpu", "snapshot"] }

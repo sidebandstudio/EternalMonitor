@@ -303,6 +303,36 @@ pub fn check_invariants(store: &Store) {
         }
         let status = snapshot.slot_status(&r.dev_id);
         assert!(status.held.contains(&(r.dev_id, r.state)));
+        // What the session table decides from the snapshot is the store's.
+        assert_eq!(
+            snapshot.would_conflict(&r.dev_id),
+            store.would_conflict(&r.dev_id)
+        );
+        assert_eq!(snapshot.replaces(&r.dev_id), r.replaces);
+        assert_eq!(snapshot.slot_of(&r.dev_id), Some(r.slot_id));
+        assert_eq!(
+            snapshot.is_pending(&r.dev_id),
+            r.state == RecordState::Pending
+        );
+    }
+    for id in &tombstoned {
+        assert!(snapshot.would_conflict(id) && store.would_conflict(id));
+    }
+    // Expiry, at each record's boundary and just before it.
+    for r in &records {
+        let at = r.created_at_s + crate::store::PENDING_LIFETIME_S;
+        for now_s in [at - 1, at] {
+            let mut expected: Vec<Id16> = records
+                .iter()
+                .filter(|o| {
+                    o.state == RecordState::Pending
+                        && now_s.saturating_sub(o.created_at_s) >= crate::store::PENDING_LIFETIME_S
+                })
+                .map(|o| o.dev_id)
+                .collect();
+            expected.sort_unstable();
+            assert_eq!(snapshot.expiring(now_s), expected);
+        }
     }
     for (_, ids) in store.tombstones() {
         assert!(ids.len() <= 8);

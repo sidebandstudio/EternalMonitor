@@ -69,6 +69,10 @@ pub struct SettingsFile {
     /// when the installer's choice applies (see `i18n::resolve`).
     #[serde(default)]
     pub language: Option<String>,
+    /// The v3 transport, for testing it. Off by default, and not written
+    /// while off, so the file stays as it was.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub transport_v3: bool,
 }
 
 fn default_true() -> bool {
@@ -161,6 +165,7 @@ impl Default for SettingsFile {
             window_drawing: Default::default(),
             gpu_switch: None,
             language: None,
+            transport_v3: false,
         }
     }
 }
@@ -297,6 +302,23 @@ fn holds_nothing(dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_v3_setting_is_off_by_default_and_unwritten_while_off() {
+        let default = SettingsFile::default();
+        assert!(!default.transport_v3);
+        let json = serde_json::to_string(&default).unwrap();
+        assert!(!json.contains("transport_v3"), "today's file, byte for byte");
+        let on = SettingsFile {
+            transport_v3: true,
+            ..Default::default()
+        };
+        let parsed: SettingsFile =
+            serde_json::from_str(&serde_json::to_string(&on).unwrap()).unwrap();
+        assert!(parsed.transport_v3);
+        let old = r#"{"bitrate_mbps":15,"target_fps":60,"start_on_boot":false}"#;
+        assert!(!serde_json::from_str::<SettingsFile>(old).unwrap().transport_v3);
+    }
 
     #[test]
     fn old_settings_default_packet_size_and_new_settings_round_trip() {

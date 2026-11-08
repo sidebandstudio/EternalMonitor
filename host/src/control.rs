@@ -97,6 +97,10 @@ pub struct SharedControl {
     /// transport resumes streaming to the same session and the epoch bump
     /// resets the client's reassembly.
     pub session: Arc<Mutex<crate::transport::session::Session>>,
+    /// v3, when the `transport_v3` setting turned it on: the session table
+    /// and its credential store. `None` is v2, as shipped. Locked before
+    /// `session` when both are needed.
+    pub v3: Arc<Mutex<Option<crate::transport::v3::V3Runtime>>>,
     pub pairing: Arc<Mutex<crate::pairing::Pairing>>,
     /// Which network the next stream listens on.
     pub listen_on: Arc<Mutex<crate::network::ListenOn>>,
@@ -201,6 +205,7 @@ impl SharedControl {
                     .build_hasher()
                     .finish() as u32
             }))),
+            v3: Arc::new(Mutex::new(None)),
         }
     }
 

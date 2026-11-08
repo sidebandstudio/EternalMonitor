@@ -1044,6 +1044,15 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
                 .timestamps
                 .insert(r.dev_id, r.committed_timestamp_us);
             snapshot.slot_of.insert(r.dev_id, r.slot_id);
+            snapshot.meta.insert(
+                r.dev_id,
+                RecordMeta {
+                    slot_id: r.slot_id,
+                    state: r.state,
+                    replaces: r.replaces,
+                    created_at_s: r.created_at_s,
+                },
+            );
         }
         for (slot, ids) in &self.tombstones {
             for id in ids {
@@ -1088,6 +1097,16 @@ pub struct CredentialSnapshot {
     timestamps: HashMap<Id16, u64>,
     slot_of: HashMap<Id16, Id16>,
     statuses: HashMap<Id16, SlotStatus>,
+    meta: HashMap<Id16, RecordMeta>,
+}
+
+/// What the snapshot keeps of each record besides its key.
+#[derive(Clone, Copy)]
+struct RecordMeta {
+    slot_id: Id16,
+    state: RecordState,
+    replaces: Option<Id16>,
+    created_at_s: u64,
 }
 
 impl CredentialSnapshot {
@@ -1107,6 +1126,62 @@ impl CredentialSnapshot {
             .and_then(|slot| self.statuses.get(slot))
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// [`CredentialStore::would_conflict`] from the snapshot: whether
+    /// finalizing `dev_id` would conflict. The session table decides commit
+    /// or refuse with this, without waiting for the writer; Finalize checks
+    /// again.
+    pub fn would_conflict(&self, dev_id: &Id16) -> bool {
+        let Some(r) = self.meta.get(dev_id) else {
+            return true;
+        };
+        if r.state == RecordState::Active {
+            return false;
+        }
+        let active = self
+            .meta
+            .iter()
+            .find(|(_, m)| m.slot_id == r.slot_id && m.state == RecordState::Active)
+            .map(|(id, _)| *id);
+        match r.replaces {
+            Some(old) => active != Some(old),
+            None => active.is_some(),
+        }
+    }
+
+    /// The slot `dev_id` belongs or belonged to: one iPad's place on this
+    /// host.
+    pub fn slot_of(&self, dev_id: &Id16) -> Option<Id16> {
+        self.slot_of.get(dev_id).copied()
+    }
+
+    /// Whether `dev_id` is a pending record.
+    pub fn is_pending(&self, dev_id: &Id16) -> bool {
+        self.meta
+            .get(dev_id)
+            .is_some_and(|m| m.state == RecordState::Pending)
+    }
+
+    /// The record a pending `dev_id` replaces, if any.
+    pub fn replaces(&self, dev_id: &Id16) -> Option<Id16> {
+        self.meta.get(dev_id).and_then(|m| m.replaces)
+    }
+
+    /// The pending records [`CredentialStore::expire`] would retire at
+    /// `now_s`.
+    pub fn expiring(&self, now_s: u64) -> Vec<Id16> {
+        let mut ids: Vec<Id16> = self
+            .meta
+            .iter()
+            .filter(|(_, m)| {
+                m.state == RecordState::Pending
+                    && now_s.saturating_sub(m.created_at_s) >= PENDING_LIFETIME_S
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 
     /// Records held.
