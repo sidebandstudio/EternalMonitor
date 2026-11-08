@@ -21,7 +21,9 @@
 //!
 //! Canonical outputs: `hello`, `status`, `msg2_payload` re-encode the
 //! parsed value; `session` is `[1, inner_type] || body` for a session
-//! message, `[2]` for another inner type (an empty input is rejected);
+//! message, and for any other inner type `[2]` if it is application data
+//! ([`wire::is_application`]) or `[3]` if it is a protocol type the client
+//! drops (an empty input is rejected);
 //! `msg1` is `dev_id || client_nonce || noise`; `msg2` the Noise message;
 //! `record_header` `session_id || counter`; `classify` one byte (0
 //! handshake 1, 1 handshake 2, 2 sealed, 3 other) and never rejects.
@@ -121,7 +123,7 @@ fn session(input: &[u8]) -> Option<Vec<u8>> {
             out.extend(message.encode_body());
             Some(out)
         }
-        None => Some(vec![2]),
+        None => Some(vec![if wire::is_application(inner) { 2 } else { 3 }]),
     }
 }
 

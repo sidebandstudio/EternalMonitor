@@ -82,7 +82,7 @@ final class FuzzTests: XCTestCase {
                  guard let inner = input.first else { return nil }
                  switch Result(catching: { try SessionMessage.parse(innerType: inner, body: Array(input.dropFirst())) }) {
                  case .success(.some(let message)): return [1, message.innerType] + message.encodeBody()
-                 case .success(.none): return [2]
+                 case .success(.none): return [V3.isApplication(inner) ? 2 : 3]
                  case .failure: return nil
                  }
              }),
