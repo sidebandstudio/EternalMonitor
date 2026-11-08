@@ -8,6 +8,7 @@ pub mod retransmit;
 pub mod session;
 pub mod usb;
 pub mod usbmuxd;
+pub mod v3;
 
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -269,7 +270,10 @@ pub async fn start_sender(
         fault,
         input_relay,
         abr,
+        v3: shared.v3.lock().is_some(),
     };
+    // Wakes the loop when the credential store finished a job (v3 only).
+    let v3_jobs = shared.v3.lock().as_ref().and_then(|v3| v3.notify());
     let mut audio_sender = audio::AudioSender::default();
     let pacing_clock = PacingClock::new()?;
 
@@ -320,8 +324,14 @@ pub async fn start_sender(
                 }
             }
             _ = heartbeat.tick() => {
-                let actions = shared.session.lock().tick(&config, true, now());
+                let actions = v3::on_tick(&shared, &config, true, now())
+                    .unwrap_or_else(|| shared.session.lock().tick(&config, true, now()));
                 act(actions, &mut state, &links, &shared, &config, &supervisor_tx).await;
+            }
+            _ = async { match &v3_jobs { Some(jobs) => jobs.notified().await, None => std::future::pending().await } } => {
+                if let Some(actions) = v3::on_jobs_done(&shared, &config, now()) {
+                    act(actions, &mut state, &links, &shared, &config, &supervisor_tx).await;
+                }
             }
             _ = network_check.tick(), if listen_on != crate::network::ListenOn::All => {
                 if !shared.client_connected() && crate::network::listen_ip_now(&listen_on) != bind_ip {
@@ -338,7 +348,8 @@ pub async fn start_sender(
                     info!("Transport loop stopping on running=false");
                     break;
                 }
-                let actions = shared.session.lock().tick(&config, false, now());
+                let actions = v3::on_tick(&shared, &config, false, now())
+                    .unwrap_or_else(|| shared.session.lock().tick(&config, false, now()));
                 act(actions, &mut state, &links, &shared, &config, &supervisor_tx).await;
             }
 
@@ -354,6 +365,14 @@ pub async fn start_sender(
                             probe::taken(addr);
                         }
                         let datagram = datagram.as_slice();
+                        if state.v3 && !matches!(classify(datagram), Classified::LegacyHello) {
+                            // Every v3 datagram, and HELLO2 to turn it away;
+                            // no other cleartext control.
+                            if let Some(actions) = v3::on_datagram(&shared, src, datagram, &config, now()) {
+                                act(actions, &mut state, &links, &shared, &config, &supervisor_tx).await;
+                            }
+                            continue;
+                        }
                         match classify(datagram) {
                             Classified::Control(_) => {
                                 match eternal_wire::v2::control::parse_control(datagram) {
@@ -525,7 +544,7 @@ pub async fn start_sender(
 
     // Every way out of the loop comes here, before the links close: an update
     // that just stopped the stream must still tell the iPad.
-    let goodbye = shared.session.lock().take_goodbye();
+    let goodbye = v3::take_goodbye(&shared, now());
     if let Some(goodbye) = goodbye {
         say_goodbye(&links, goodbye).await;
     }
@@ -673,7 +692,8 @@ async fn repair_while_pacing(
             _ = &mut timer => break,
             received = links.udp.socket.recv_from(&mut bytes) => {
                 let Ok((len, peer)) = received else { break; };
-                if let Ok((header, message @ ControlMessage::Nack(_))) = parse_control(&bytes[..len]) {
+                // In v3 a NACK comes sealed: it waits with the rest.
+                if let (false, Ok((header, message @ ControlMessage::Nack(_)))) = (state.v3, parse_control(&bytes[..len])) {
                     #[cfg(feature = "test-hooks")]
                     probe::taken(peer);
                     let actions = shared.session.lock().handle_datagram(PeerId::udp(peer), &header,
@@ -693,6 +713,8 @@ struct LoopState {
     fault: FaultInjector,
     input_relay: crate::input::InputRelay,
     abr: AbrController,
+    /// v3 is on: input lands only for the session the relay cut over to.
+    v3: bool,
 }
 
 /// Carries out everything the session decided. Every path that feeds the
@@ -714,12 +736,22 @@ async fn act(
     if actions.new_target.is_some() || actions.client_lost || actions.release_input {
         state.input_relay.reset();
     }
+    if let Some(session_id) = actions.cutover.take() {
+        state.input_relay.cutover(session_id);
+    }
+    if actions.end_cutover {
+        state.input_relay.end_cutover();
+    }
     if let Some(nack) = actions.retransmit.take() {
         send_repairs(&links.udp.socket, &mut state.retransmit_ring, shared, &nack).await;
     }
     if let Some((session_id, event)) = actions.input.take() {
         if let Some(geometry) = *shared.capture_geometry.lock() {
-            if actions.input_late {
+            if state.v3 {
+                state
+                    .input_relay
+                    .relay_committed(session_id, &event, geometry, actions.input_late);
+            } else if actions.input_late {
                 state.input_relay.relay_late(session_id, &event, geometry);
             } else {
                 state.input_relay.relay(session_id, &event, geometry);
@@ -766,6 +798,7 @@ async fn act(
             // One immediate notify; the 1s heartbeat's embedded config
             // self-heals any loss.
             let notify = shared.session.lock().stream_config_notify(config);
+            let notify = v3::seal_replies(shared, notify, now());
             for (destination, datagram) in notify {
                 let _ = links.send_to(&datagram, destination).await;
             }
@@ -816,6 +849,11 @@ async fn execute_actions(
         if *shared.capture_target.lock() == CaptureTarget::VirtualExtended {
             second_screen::note_connected(shared, now());
         }
+    }
+
+    if let Some(target) = actions.moved_target {
+        *shared.target_addr.lock() = target;
+        PIPELINE_STATS.lock().set_target_addr(target.to_string());
     }
 
     if let Some(goodbye) = actions.goodbye {
@@ -1136,6 +1174,7 @@ mod tests {
             fault: FaultInjector::new(0.0, 0.0, Duration::ZERO),
             input_relay: crate::input::InputRelay::default(),
             abr: AbrController::new(15_000_000, true),
+            v3: false,
         }
     }
 

@@ -99,6 +99,50 @@ pub struct Actions {
     /// A session, or a HELLO2 the host turned down, ended: its summary line
     /// is due (`crate::diagnostics::log_session_end`).
     pub ended: Option<SessionEnd>,
+    /// A v3 session committed: the input relay cuts over to it
+    /// (`InputRelay::cutover`).
+    pub cutover: Option<u32>,
+    /// The v3 session ended: the relay takes no input until the next
+    /// cutover.
+    pub end_cutover: bool,
+    /// The live v3 session moved to a new address: media follows, and
+    /// nothing else changes.
+    pub moved_target: Option<PeerId>,
+}
+
+impl Actions {
+    /// Adds `other`'s decisions to these. One pass carries at most one
+    /// input event and one report.
+    pub fn merge(&mut self, other: Actions) {
+        self.replies.extend(other.replies);
+        self.new_target = other.new_target.or(self.new_target);
+        self.force_idr |= other.force_idr;
+        self.client_lost |= other.client_lost;
+        self.release_input |= other.release_input;
+        debug_assert!(self.report.is_none() || other.report.is_none());
+        self.report = other.report.or(self.report);
+        debug_assert!(self.input.is_none() || other.input.is_none());
+        if other.input.is_some() {
+            self.input = other.input;
+            self.input_late = other.input_late;
+        }
+        self.retransmit = other.retransmit.or(self.retransmit.take());
+        self.goodbye = other.goodbye.or(self.goodbye.take());
+        match (&self.ended, other.ended) {
+            (None, ended) => self.ended = ended,
+            (Some(_), Some(later)) => {
+                // Two sessions ended in one pass: the earlier one's line goes
+                // out now.
+                if let Some(earlier) = self.ended.replace(later) {
+                    tracing::debug!(?earlier.reason, "Session ended in the same pass as another");
+                }
+            }
+            (Some(_), None) => {}
+        }
+        self.cutover = other.cutover.or(self.cutover);
+        self.end_cutover |= other.end_cutover;
+        self.moved_target = other.moved_target.or(self.moved_target);
+    }
 }
 
 /// How far a session got and how it ended, for its support summary.
@@ -176,6 +220,9 @@ struct ActiveSession {
     bye: Option<ByeReason>,
     /// The msg_seq of input packets taken in this session.
     input_seqs: SeqWindow,
+    /// Committed by the v3 session table, not by a HELLO2: its credential
+    /// is the v3 record, not the pairing token.
+    v3: bool,
 }
 
 /// What a client sent last, for the liveness log lines.
@@ -311,6 +358,10 @@ pub struct Session {
     /// derived from process entropy.
     next_session_id: u32,
     legacy_client_warned: bool,
+    /// v3 is on: every HELLO2 is answered `VersionUnsupported` with
+    /// `accepted_version` 3, and sessions start only through
+    /// [`Self::begin_v3`].
+    v3_only: bool,
 }
 
 impl Session {
@@ -326,7 +377,135 @@ impl Session {
             refusal_minute: None,
             next_session_id: session_id_seed.max(1),
             legacy_client_warned: false,
+            v3_only: false,
         }
+    }
+
+    /// Turns v3 on for this host: from here every HELLO2 is turned away
+    /// with `VersionUnsupported` naming version 3.
+    pub fn require_v3(&mut self) {
+        self.v3_only = true;
+    }
+
+    /// Starts the session the v3 session table committed for `source`. The
+    /// HelloAck went in message 2, so nothing is sent here. A live session
+    /// of the same device is superseded; the caller has ended any other.
+    pub fn begin_v3(
+        &mut self,
+        source: PeerId,
+        session_id: u32,
+        hello: &eternal_wire::v3::wire::HelloPayload,
+        now: Instant,
+    ) -> Actions {
+        let mut actions = Actions {
+            ended: self.end(EndReason::Superseded, now),
+            ..Actions::default()
+        };
+        let accepted_hello = eternal_wire::v2::control::Hello2 {
+            proto_min: eternal_wire::v3::PROTOCOL_VERSION,
+            proto_max: eternal_wire::v3::PROTOCOL_VERSION,
+            client_nonce: 0,
+            listen_port: hello.listen_port,
+            decoder_caps: hello.decoder_caps,
+            feature_caps: hello.feature_caps,
+            screen_px_w: hello.screen_px_w,
+            screen_px_h: hello.screen_px_h,
+            screen_pt_w: hello.screen_pt_w,
+            screen_pt_h: hello.screen_pt_h,
+            refresh_hz: hello.refresh_hz,
+            device_name: hello.device_name.clone(),
+            device_id: hello.device_id,
+            preferred_fps: hello.preferred_fps,
+            auth_token: [0; 16],
+            pairing_code: 0,
+        };
+        crate::telemetry::note_client_device(&hello.device_name);
+        info!(
+            peer = %source,
+            session_id,
+            device = %hello.device_name,
+            screen = format!("{}x{}", hello.screen_px_w, hello.screen_px_h),
+            screen_points = format!("{}x{}", hello.screen_pt_w, hello.screen_pt_h),
+            refresh_hz = hello.refresh_hz,
+            preferred_fps = hello.preferred_fps,
+            decoder_caps = hello.decoder_caps,
+            feature_caps = hello.feature_caps,
+            "Client session established (v3)"
+        );
+        self.active = Some(ActiveSession {
+            session_id,
+            accepted_hello,
+            ack: Vec::new(),
+            auth_token: [0; 16],
+            peer: source,
+            info: ClientInfo {
+                device_name: hello.device_name.clone(),
+                device_id: hello.device_id,
+                screen_px: (hello.screen_px_w, hello.screen_px_h),
+                refresh_hz: hello.refresh_hz,
+                preferred_fps: hello.preferred_fps,
+                decoder_caps: hello.decoder_caps,
+                feature_caps: hello.feature_caps,
+                connected_at: now,
+            },
+            liveness_deadline: now + LIVENESS_TIMEOUT,
+            heard: (now, Heard::Hello),
+            held_since: None,
+            client_clock: None,
+            late_input: LateInput::default(),
+            awaiting_takeover: false,
+            last_keyframe_grant: None,
+            last_report: None,
+            msg_seq_out: 0,
+            first_video_at: None,
+            frames_received: false,
+            bye: None,
+            input_seqs: SeqWindow::default(),
+            v3: true,
+        });
+        actions.new_target = Some(media_target(source, hello.listen_port));
+        actions.force_idr = true;
+        actions
+    }
+
+    /// The v3 session table moved `session_id`'s destination to `source`
+    /// (a newer authenticated record came from there): control and media
+    /// follow it, to that exact address, where the iPad now receives.
+    pub fn move_v3_peer(&mut self, session_id: u32, source: PeerId) -> Actions {
+        let mut actions = Actions::default();
+        if let Some(session) = self
+            .active
+            .as_mut()
+            .filter(|s| s.v3 && s.session_id == session_id && s.peer != source)
+        {
+            info!(from = %session.peer, to = %source, session_id, "Client moved to a new address");
+            session.peer = source;
+            actions.moved_target = Some(source);
+        }
+        actions
+    }
+
+    /// The v3 session table ended `session_id` (the iPad's BYE, its age or
+    /// counter limit, a Remove): the stream stops for it.
+    pub fn end_v3(&mut self, session_id: u32, reason: EndReason, now: Instant) -> Actions {
+        if self
+            .active
+            .as_ref()
+            .is_none_or(|s| !s.v3 || s.session_id != session_id)
+        {
+            return Actions::default();
+        }
+        let ended = self.end(reason, now);
+        Actions {
+            client_lost: true,
+            ended,
+            ..Actions::default()
+        }
+    }
+
+    /// The live session's id, if v3 committed it.
+    pub fn v3_session_id(&self) -> Option<u32> {
+        self.active.as_ref().filter(|s| s.v3).map(|s| s.session_id)
     }
 
     pub fn is_active(&self) -> bool {
@@ -630,6 +809,9 @@ impl Session {
             crate::updates::note_ipad_protocol(hello.proto_min, hello.proto_max);
             return self.refuse(source, HelloStatus::VersionUnsupported, &hello, config, now);
         }
+        if self.v3_only {
+            return self.refuse(source, HelloStatus::VersionUnsupported, &hello, config, now);
+        }
 
         // An update is about to close the host: don't start a stream it would cut.
         // The iPad shows Busy ("already streaming"); a retry after the restart works.
@@ -766,6 +948,7 @@ impl Session {
             frames_received: false,
             bye: None,
             input_seqs: SeqWindow::default(),
+            v3: false,
         });
 
         // Only a new pairing carries the token. iPads keep the token they
@@ -912,10 +1095,11 @@ impl Session {
             return actions;
         };
 
-        let revoked = config.pairing().is_some_and(|state| {
-            let state = state.lock();
-            state.required && session.auth_token != state.token()
-        });
+        let revoked = !session.v3
+            && config.pairing().is_some_and(|state| {
+                let state = state.lock();
+                state.required && session.auth_token != state.token()
+            });
         if revoked {
             info!(peer = %session.peer, "Pairing credentials changed — reconnect required");
             actions.ended = self.end(EndReason::Revoked, now);
@@ -1142,7 +1326,11 @@ impl Session {
         let msg_seq = self.next_msg_seq();
         let ack = ControlMessage::HelloAck(HelloAck {
             status,
-            accepted_version: 2,
+            accepted_version: if self.v3_only {
+                eternal_wire::v3::PROTOCOL_VERSION
+            } else {
+                2
+            },
             client_nonce,
             session_id,
             heartbeat_interval_ms: HEARTBEAT_INTERVAL.as_millis() as u16,
@@ -1300,6 +1488,24 @@ impl ActiveSession {
         } else {
             session_peer_matches(self, source)
         }
+    }
+}
+
+/// Where media goes: the client's advertised listen port at its source IP
+/// (normally the source port; 0 means use the source's).
+fn media_target(source: PeerId, listen_port: u16) -> PeerId {
+    PeerId {
+        link: source.link,
+        addr: source.addr.map(|addr| {
+            SocketAddr::new(
+                addr.ip(),
+                if listen_port != 0 {
+                    listen_port
+                } else {
+                    addr.port()
+                },
+            )
+        }),
     }
 }
 

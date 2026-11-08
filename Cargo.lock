@@ -1307,6 +1307,7 @@ dependencies = [
  "cc",
  "eframe",
  "egui_kittest",
+ "eternal-credstore",
  "eternal-host",
  "eternal-updater",
  "eternal-wire",

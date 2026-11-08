@@ -487,6 +487,8 @@ fn log_injections(injections: &[Injection]) {
 #[derive(Debug, Default)]
 pub struct InputRelay {
     session: Option<(u32, EventDeduper)>,
+    /// A v3 session's id from its [`Self::cutover`]: only its events land.
+    cutover_session: Option<u32>,
     held: HeldInputs,
     dropped: DroppedPresses,
     pen_sequence: Option<u32>,
@@ -847,6 +849,46 @@ impl InputRelay {
     /// Dedupe, map, and inject one session-validated event.
     pub fn relay(&mut self, session_id: u32, event: &InputEvent, output: CaptureGeometry) {
         self.relay_event(session_id, event, output, false);
+    }
+
+    /// A v3 session committed: releases what the PC holds, once, and starts
+    /// a fresh deduper and pen sequence for `session_id`. From here on
+    /// [`Self::relay_committed`] takes only its events.
+    pub fn cutover(&mut self, session_id: u32) {
+        self.reset();
+        self.session = Some((session_id, EventDeduper::default()));
+        self.cutover_session = Some(session_id);
+    }
+
+    /// The v3 session ended: no event lands until the next cutover.
+    pub fn end_cutover(&mut self) {
+        self.reset();
+        self.cutover_session = None;
+    }
+
+    /// [`Self::relay`] for v3: an event of any session but the one of the
+    /// last [`Self::cutover`] is dropped. A stray late event can never reset
+    /// the deduper or release what the PC holds a second time.
+    pub fn relay_committed(
+        &mut self,
+        session_id: u32,
+        event: &InputEvent,
+        output: CaptureGeometry,
+        late: bool,
+    ) {
+        if self.cutover_session != Some(session_id) {
+            return;
+        }
+        if self
+            .session
+            .as_ref()
+            .is_none_or(|(id, _)| *id != session_id)
+        {
+            // Released while on hold: the same session goes on, nothing to
+            // release again.
+            self.session = Some((session_id, EventDeduper::default()));
+        }
+        self.relay_event(session_id, event, output, late);
     }
 
     /// [`Self::relay`] for an event that arrived late (see
@@ -1297,6 +1339,61 @@ mod tests {
         // Nothing is held: dropping the relay releases nothing.
         drop(relay);
         assert!(recorder::take().is_empty());
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn cutover_releases_once_and_drops_every_other_session() {
+        let mut relay = InputRelay::default();
+        let mut e = event(KIND_TOUCH, PHASE_BEGAN, 10, 10);
+        e.event_id = 1;
+        relay.relay_committed(7, &e, OUTPUT, false);
+        assert!(recorder::take().is_empty(), "nothing before a cutover");
+
+        relay.cutover(7);
+        relay.relay_committed(7, &e, OUTPUT, false); // MoveAbs + LeftDown
+        relay.relay_committed(7, &e, OUTPUT, false); // duplicate edge: dropped
+        assert_eq!(recorder::take().len(), 2);
+
+        // A late event of another session neither lands nor resets: the
+        // press stays held and its deduper stays.
+        relay.relay_committed(6, &e, OUTPUT, false);
+        relay.relay_committed(8, &e, OUTPUT, false);
+        relay.relay_committed(7, &e, OUTPUT, false);
+        assert!(recorder::take().is_empty());
+
+        // The next cutover releases it, exactly once.
+        relay.cutover(8);
+        assert!(matches!(
+            recorder::take().as_slice(),
+            [Injection::LeftUp { .. }]
+        ));
+        relay.relay_committed(7, &e, OUTPUT, false);
+        assert!(recorder::take().is_empty(), "the old session is gone");
+        relay.relay_committed(8, &e, OUTPUT, false); // fresh deduper
+        assert_eq!(recorder::take().len(), 2);
+
+        // A hold releases, and the same session carries on.
+        relay.reset();
+        assert!(matches!(
+            recorder::take().as_slice(),
+            [Injection::LeftUp { .. }]
+        ));
+        e.event_id = 2;
+        relay.relay_committed(8, &e, OUTPUT, false);
+        assert_eq!(recorder::take().len(), 2);
+
+        relay.end_cutover();
+        assert!(matches!(
+            recorder::take().as_slice(),
+            [Injection::LeftUp { .. }]
+        ));
+        e.event_id = 3;
+        relay.relay_committed(8, &e, OUTPUT, false);
+        assert!(
+            recorder::take().is_empty(),
+            "nothing after the session ends"
+        );
     }
 
     #[cfg(not(windows))]

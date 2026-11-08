@@ -178,6 +178,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         pairing.log_code();
         pairing.warn_if_off();
     }
+    if persisted.transport_v3 {
+        eternal_host::transport::v3::enable(&shared);
+    }
     // Each Troubleshooting knob: an environment variable (developers, CI)
     // wins, then the saved setting, then Automatic.
     let overrides = eternal_host::troubleshooting::Overrides::from_process(&persisted)

@@ -706,6 +706,12 @@ impl<A: PeerAddr> HostSessions<A> {
             .map(|l| l.session_id)
     }
 
+    /// Where the live session for `dev_id` sends: the source of its newest
+    /// authenticated record.
+    pub fn live_peer(&self, dev_id: &Id16) -> Option<&A> {
+        self.devices.get(dev_id)?.live.as_ref().map(|l| &l.peer)
+    }
+
     /// The pending session for `dev_id`, if any.
     pub fn pending_session(&self, dev_id: &Id16) -> Option<u32> {
         self.devices
@@ -1350,6 +1356,16 @@ impl<A: PeerAddr> HostSessions<A> {
         out
     }
 
+    /// Ends every session for `dev_id` on the host's own decision (the
+    /// caller's liveness rule, or the end of the stream), with the sealed
+    /// BYE `reason` sends: `HostShuttingDown` for [`CloseReason::Shutdown`],
+    /// `Error` for `Revoked`, `Liveness` and `Expired`, none otherwise.
+    pub fn end(&mut self, now: Duration, dev_id: &Id16, reason: CloseReason) -> Vec<HostOutput<A>> {
+        let mut out = Vec::new();
+        self.close(now, dev_id, reason, &mut out);
+        out
+    }
+
     /// Ends every session, for shutdown.
     pub fn shutdown(&mut self, now: Duration) -> Vec<HostOutput<A>> {
         let mut out = Vec::new();
@@ -1690,6 +1706,44 @@ mod tests {
         host.commit(at, &DEV, sid);
         host.ack(at, &DEV, sid, creds);
         (sealer, opener, sid)
+    }
+
+    #[test]
+    fn end_follows_its_reason_and_live_peer_follows_the_newest_record() {
+        let (mut host, creds) = setup();
+        let (mut sealer, opener, sid) = live(&mut host, &creds, 10, T0);
+        assert_eq!(host.live_peer(&DEV), Some(&ADDR));
+        let ping = sealer
+            .seal(crate::v2::PacketType::Ping as u8, &[0; 8])
+            .unwrap();
+        host.handle_datagram(T0 + ms(10), &2, &ping, &creds);
+        assert_eq!(host.live_peer(&DEV), Some(&2), "moved by a newer record");
+
+        let out = host.end(T0 + ms(20), &DEV, CloseReason::Liveness);
+        let bye = sends(&out);
+        assert_eq!(bye.len(), 1);
+        let opened = opener.open(&bye[0]).unwrap();
+        assert_eq!(
+            (opened.inner_type, opened.body),
+            (wire::INNER_BYE, vec![ByeReason::Error as u8])
+        );
+        assert!(out.contains(&HostOutput::Closed {
+            dev_id: DEV,
+            session_id: sid,
+            reason: CloseReason::Liveness,
+        }));
+        assert_eq!(host.live_session(&DEV), None);
+        assert_eq!(host.live_peer(&DEV), None);
+
+        let (_, _, sid) = live(&mut host, &creds, 20, T0 + ms(30));
+        let out = host.end(T0 + ms(40), &DEV, CloseReason::Superseded);
+        assert!(sends(&out).is_empty(), "no BYE on supersede");
+        assert!(out.contains(&HostOutput::Closed {
+            dev_id: DEV,
+            session_id: sid,
+            reason: CloseReason::Superseded,
+        }));
+        host.check_invariants();
     }
 
     #[test]
