@@ -1057,7 +1057,7 @@ mod tests {
     /// overflow behind it. Cutting it short sent the iPad a partial keyframe
     /// over a lossless cable: lost fragments in its report, and another
     /// keyframe request.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn bounded_writer_finishes_the_frame_in_flight_and_recovers_with_a_keyframe() {
         let (host, mut client) = tokio::io::duplex(64);
         let force_idr = Arc::new(AtomicBool::new(false));
@@ -1109,7 +1109,7 @@ mod tests {
     /// A link that overflows again right after a keyframe waits before it
     /// asks for the next one, and still asks once the wait is over, even if
     /// no other frame comes.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn overflow_right_after_a_keyframe_defers_the_next_request() {
         let (host, mut client) = tokio::io::duplex(64);
         let force_idr = Arc::new(AtomicBool::new(false));
