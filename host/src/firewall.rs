@@ -464,37 +464,70 @@ pub enum Stored {
 /// How deep REG_EXPAND_SZ values may name one another.
 pub const EXPAND_DEPTH: usize = 8;
 
+/// How many `%name%`s one [`resolve`] may follow, counting repeats.
+pub const MAX_REFERENCES: usize = 256;
+
+/// The most text one expansion may make, in bytes: more than any path
+/// Windows takes.
+pub const MAX_EXPANDED: usize = 32 * 1024;
+
 /// `name`'s value among the machine values `stored`, each REG_EXPAND_SZ
-/// value's own `%name%`s resolved the same way. `None` when `name`, or a
-/// value it names, has no machine value, when values name each other in a
-/// cycle, or when more than [`EXPAND_DEPTH`] of them nest.
+/// value's own `%name%`s resolved the same way, each name once. `None` when
+/// `name`, or a value it names, has no machine value, when values name each
+/// other in a cycle, when more than [`EXPAND_DEPTH`] of them nest, or when
+/// it takes more than [`MAX_REFERENCES`] or makes more than
+/// [`MAX_EXPANDED`].
 pub fn resolve(name: &str, stored: &impl Fn(&str) -> Option<Stored>) -> Option<String> {
-    resolve_within(name, stored, &mut Vec::new())
+    Resolving {
+        stored,
+        known: std::collections::HashMap::new(),
+        expanding: Vec::new(),
+        references: 0,
+    }
+    .value(name)
 }
 
-fn resolve_within(
-    name: &str,
-    stored: &impl Fn(&str) -> Option<Stored>,
-    expanding: &mut Vec<String>,
-) -> Option<String> {
-    match stored(name)? {
-        Stored::Literal(value) => Some(value),
-        Stored::Expand(value) => {
-            let key = name.to_lowercase();
-            if expanding.len() >= EXPAND_DEPTH || expanding.contains(&key) {
-                return None;
-            }
-            expanding.push(key);
-            let value = expand_known(&value, |inner| resolve_within(inner, stored, expanding));
-            expanding.pop();
-            value
+struct Resolving<'a, F> {
+    stored: &'a F,
+    /// Each name resolved so far. Any `None` fails the whole resolve, so
+    /// remembering one is never wrong.
+    known: std::collections::HashMap<String, Option<String>>,
+    expanding: Vec<String>,
+    references: usize,
+}
+
+impl<F: Fn(&str) -> Option<Stored>> Resolving<'_, F> {
+    fn value(&mut self, name: &str) -> Option<String> {
+        self.references += 1;
+        if self.references > MAX_REFERENCES {
+            return None;
         }
+        let key = name.to_lowercase();
+        if let Some(known) = self.known.get(&key) {
+            return known.clone();
+        }
+        let value = match (self.stored)(name) {
+            None => None,
+            Some(Stored::Literal(value)) => Some(value),
+            Some(Stored::Expand(value)) => {
+                if self.expanding.len() >= EXPAND_DEPTH || self.expanding.contains(&key) {
+                    return None;
+                }
+                self.expanding.push(key.clone());
+                let expanded = expand_known(&value, |inner| self.value(inner));
+                self.expanding.pop();
+                expanded
+            }
+        };
+        self.known.insert(key, value.clone());
+        value
     }
 }
 
 /// `path` with every `%NAME%` replaced with `lookup(NAME)`, as Windows
 /// stores a rule made in its own window (`%ProgramFiles%\...`), or `None` if
-/// one has no value. `%%` and a lone `%` stay as written.
+/// one has no value or it would make more than [`MAX_EXPANDED`]. `%%` and a
+/// lone `%` stay as written.
 fn expand_known(path: &str, mut lookup: impl FnMut(&str) -> Option<String>) -> Option<String> {
     let mut out = String::new();
     let mut rest = path;
@@ -509,10 +542,13 @@ fn expand_known(path: &str, mut lookup: impl FnMut(&str) -> Option<String>) -> O
         } else {
             out.push_str(&lookup(name)?);
         }
+        if out.len() > MAX_EXPANDED {
+            return None;
+        }
         rest = &rest[start + len + 2..];
     }
     out.push_str(rest);
-    Some(out)
+    Some(out).filter(|out| out.len() <= MAX_EXPANDED)
 }
 
 /// A path as Windows compares it: no quotes or `\\?\`, backslashes, no case.
@@ -1608,6 +1644,73 @@ mod tests {
         let deepest = format!("deep{EXPAND_DEPTH}");
         assert_eq!(value(&deepest).as_deref(), Some(r"C:\Deep\1\2\3\4\5\6\7\8"));
         assert_eq!(value(&format!("deep{}", EXPAND_DEPTH + 1)), None);
+    }
+
+    /// Values that each name the next several times would grow fourfold a
+    /// level: each name is looked up once, and the expansion stops at its
+    /// size or reference limit.
+    #[test]
+    fn a_branching_expansion_stops_at_its_limits() {
+        let branching = |name: &str| {
+            // b0 is a folder; each bN names bN-1 four times.
+            let n: usize = name.strip_prefix('b')?.parse().ok()?;
+            Some(if n == 0 {
+                Stored::Literal("x".repeat(20))
+            } else {
+                Stored::Expand(format!("%b{0}%", n - 1).repeat(4))
+            })
+        };
+        let lookups = std::cell::Cell::new(0);
+        let counted = |name: &str| {
+            lookups.set(lookups.get() + 1);
+            branching(name)
+        };
+        // 4^8 × 20 bytes, 1.3 MB.
+        assert_eq!(resolve(&format!("b{EXPAND_DEPTH}"), &counted), None);
+        assert!(lookups.get() <= EXPAND_DEPTH + 1, "{}", lookups.get());
+        // 4^4 × 20 bytes is within the limits.
+        assert_eq!(
+            resolve("b4", &branching).map(|value| value.len()),
+            Some(4usize.pow(4) * 20)
+        );
+        // One value naming another too many times.
+        let wide = |name: &str| match name {
+            "wide" => Some(Stored::Expand("%leaf%".repeat(MAX_REFERENCES))),
+            "leaf" => Some(Stored::Literal("a".into())),
+            _ => None,
+        };
+        assert_eq!(resolve("wide", &wide), None);
+        let within = |name: &str| match name {
+            "wide" => Some(Stored::Expand("%leaf%".repeat(MAX_REFERENCES - 1))),
+            _ => wide(name),
+        };
+        assert_eq!(
+            resolve("wide", &within).map(|value| value.len()),
+            Some(MAX_REFERENCES - 1)
+        );
+        // Past the size limit, nothing more is looked up.
+        let after = std::cell::Cell::new(false);
+        let big = |name: &str| match name {
+            "both" => Some(Stored::Expand("%big%%after%".into())),
+            "big" => Some(Stored::Literal("x".repeat(MAX_EXPANDED + 1))),
+            _ => {
+                after.set(true);
+                Some(Stored::Literal(String::new()))
+            }
+        };
+        assert_eq!(resolve("both", &big), None);
+        assert!(!after.get());
+        // Text after the last name counts too.
+        let tail = |name: &str| match name {
+            "tail" => Some(Stored::Expand("%full%x".into())),
+            "full" => Some(Stored::Literal("x".repeat(MAX_EXPANDED))),
+            _ => None,
+        };
+        assert_eq!(
+            resolve("full", &tail).map(|value| value.len()),
+            Some(MAX_EXPANDED)
+        );
+        assert_eq!(resolve("tail", &tail), None);
     }
 
     /// A Block rule whose path names a machine value that names another
