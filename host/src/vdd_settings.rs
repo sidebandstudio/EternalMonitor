@@ -384,18 +384,19 @@ pub fn with_gpu(xml: &str, gpu: &str) -> Option<String> {
 }
 
 /// Point the settings file the host does not otherwise write at `gpu`.
-/// True when it changed. A missing file stays missing: without one the
-/// driver offers its built-in modes, and a document holding only a GPU
-/// would leave it none. A file that does not parse as expected is left
-/// alone, and the error says why.
+/// True when it changed: a file read from a code page is written back as
+/// UTF-8 even when it already names `gpu`. A missing file stays missing:
+/// without one the driver offers its built-in modes, and a document holding
+/// only a GPU would leave it none. A file that does not parse as expected
+/// is left alone, and the error says why.
 pub fn pin_gpu_in(path: &Path, gpu: &str) -> io::Result<bool> {
     let (current, legacy) = read_settings(path)?;
     let updated = gpu_edit(&current, gpu)
         .map_err(|reason| io::Error::new(io::ErrorKind::InvalidData, reason))?;
-    if updated == current {
+    if updated == current && !legacy {
         return Ok(false);
     }
-    replace_settings(path, legacy, &updated)?;
+    write_settings(path, legacy, || replace(path, &updated))?;
     Ok(true)
 }
 
@@ -543,7 +544,9 @@ pub fn remember_pins(record: &Path, names: &[&str]) -> io::Result<()> {
 /// Make the settings file at `path` name `wanted`, changing only the card,
 /// under the rules of `pin_change`. `record` holds the names this host
 /// recorded writing. A missing file stays missing, and one that does not
-/// parse as expected is left alone; the error says why.
+/// parse as expected is left alone; the error says why. A file read from a
+/// code page is written back as UTF-8 even when its card stays, so the
+/// driver reads all of it.
 pub fn apply_pin(
     path: &Path,
     record: &Path,
@@ -555,16 +558,22 @@ pub fn apply_pin(
     let named = named_gpu(&current).map_err(invalid)?;
     let ours = recorded_pins(record);
     let ours: Vec<&str> = ours.iter().map(String::as_str).collect();
+    let unchanged = |outcome| {
+        if legacy {
+            write_settings(path, legacy, || replace(path, &current))?;
+        }
+        Ok(outcome)
+    };
     let (name, outcome) = match pin_change(named.as_deref(), wanted, owned, &ours) {
-        PinChange::Leave => return Ok(PinOutcome::Unchanged),
-        PinChange::Refuse(reason) => return Ok(PinOutcome::Kept(reason)),
+        PinChange::Leave => return unchanged(PinOutcome::Unchanged),
+        PinChange::Refuse(reason) => return unchanged(PinOutcome::Kept(reason)),
         PinChange::Write(card) => (card, PinOutcome::Named),
         PinChange::Reset => ("default".to_string(), PinOutcome::Reset),
     };
     let updated = gpu_edit(&current, &name).map_err(invalid)?;
     let new_record = (outcome == PinOutcome::Named).then_some(name.as_str());
     record_around(record, new_record, &ours, || {
-        replace_settings(path, legacy, &updated)
+        write_settings(path, legacy, || replace(path, &updated))
     })?;
     Ok(outcome)
 }
@@ -641,12 +650,7 @@ pub fn write_with_pin(
         PinChange::Write(card) => (Some(card), PinOutcome::Named),
         PinChange::Reset => (None, PinOutcome::Reset),
     };
-    let write = || {
-        if legacy {
-            back_up(path)?;
-        }
-        write_to(path, modes, name.as_deref())
-    };
+    let write = || write_settings(path, legacy, || write_to(path, modes, name.as_deref()));
     match outcome {
         PinOutcome::Named => record_around(record, name.as_deref(), &ours, write)?,
         PinOutcome::Reset => record_around(record, None, &ours, write)?,
@@ -741,12 +745,17 @@ fn decode_text(bytes: &[u8], ansi: u32) -> Option<(String, bool)> {
 /// Bytes in an 8-bit encoding: UTF-8, or the code page the declaration
 /// names. Without one, bytes that are not UTF-8 are in code page `ansi`;
 /// so are bytes declared UTF-8 that are not, as Notepad leaves the driver's
-/// file when it saves it as ANSI.
+/// file when it saves it as ANSI. A UTF-8 file with stray bytes is neither:
+/// one with a byte order mark, or, in a single-byte code page, one that
+/// still holds UTF-8 beyond ASCII, which that code page's text all but
+/// never does. Read in the code page, its UTF-8 text would be garbled.
 fn decode_bytes(bytes: &[u8], ansi: u32) -> Option<(String, bool)> {
     let label = encoding_label(bytes).map(|label| bytes[label].to_ascii_lowercase());
     let code_page = match label.as_deref() {
         None | Some(b"utf-8") => match String::from_utf8(bytes.to_vec()) {
             Ok(text) => return Some((text, false)),
+            Err(_) if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) => return None,
+            Err(_) if single_byte(ansi) && holds_utf8(bytes) => return None,
             Err(_) => ansi,
         },
         Some(label) => match std::str::from_utf8(label).ok().and_then(code_page) {
@@ -803,6 +812,24 @@ fn decode_code_page(_bytes: &[u8], _code_page: u32) -> Option<String> {
     None
 }
 
+/// Whether Windows code page `code_page` has one byte per character.
+#[cfg(windows)]
+fn single_byte(code_page: u32) -> bool {
+    use windows::Win32::Globalization::{GetCPInfo, CPINFO};
+    let mut info = CPINFO::default();
+    unsafe { GetCPInfo(code_page, &mut info) }.is_ok() && info.MaxCharSize == 1
+}
+
+#[cfg(not(windows))]
+fn single_byte(_code_page: u32) -> bool {
+    false
+}
+
+/// Whether `bytes` hold a UTF-8 character beyond ASCII anywhere.
+fn holds_utf8(bytes: &[u8]) -> bool {
+    bytes.utf8_chunks().any(|chunk| !chunk.valid().is_ascii())
+}
+
 /// Where the XML declaration at the start of `xml` names its encoding.
 fn encoding_label(xml: &[u8]) -> Option<std::ops::Range<usize>> {
     let end = xml
@@ -824,16 +851,34 @@ fn declared_utf8(xml: String) -> String {
     }
 }
 
-/// Keep a file read from a code page as it was, beside it, before its
-/// first replacement on a day: `vdd_settings.xml.bak-<YYYYMMDD>`.
-fn back_up(path: &Path) -> io::Result<()> {
-    let mut backup = path.as_os_str().to_owned();
-    backup.push(format!(".bak-{}", utc_date(std::time::SystemTime::now())));
-    let backup = std::path::PathBuf::from(backup);
-    if backup.exists() {
-        return Ok(());
+/// Keep the file at `path` as it is, beside it, as
+/// `vdd_settings.xml.bak-<YYYYMMDD>`, or `-2`, `-3`… when today's backups
+/// hold something else; one that holds the same bytes is kept as it is.
+/// The backup's file name.
+fn back_up(path: &Path) -> io::Result<String> {
+    use std::io::Write;
+    let original = std::fs::read(path)?;
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let date = utc_date(std::time::SystemTime::now());
+    let mut n = 1;
+    loop {
+        let backup = match n {
+            1 => format!("{name}.bak-{date}"),
+            n => format!("{name}.bak-{date}-{n}"),
+        };
+        let at = path.with_file_name(&backup);
+        match std::fs::read(&at) {
+            Ok(held) if held == original => return Ok(backup),
+            Ok(_) => n += 1,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let mut file = std::fs::File::create_new(&at)?;
+                file.write_all(&original)?;
+                file.sync_all()?;
+                return Ok(backup);
+            }
+            Err(error) => return Err(error),
+        }
     }
-    std::fs::copy(path, backup).map(drop)
 }
 
 /// `time`'s UTC date as `YYYYMMDD` (Howard Hinnant's civil_from_days).
@@ -853,13 +898,22 @@ fn utc_date(time: std::time::SystemTime) -> String {
     format!("{year:04}{month:02}{day:02}")
 }
 
-/// Replace the settings file with `contents`, backing it up first when it
-/// was read from a code page (`legacy`).
-fn replace_settings(path: &Path, legacy: bool, contents: &str) -> io::Result<()> {
-    if legacy {
-        back_up(path)?;
+/// Replace the settings file with `write`. One read from a code page
+/// (`legacy`) is backed up first, and its conversion logged once done.
+fn write_settings(
+    path: &Path,
+    legacy: bool,
+    write: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    let backup = legacy.then(|| back_up(path)).transpose()?;
+    write()?;
+    if let Some(backup) = backup {
+        tracing::info!(
+            backup,
+            "Wrote vdd_settings.xml as UTF-8; the original is kept beside it"
+        );
     }
-    replace(path, contents)
+    Ok(())
 }
 
 /// Write atomically (tmp + rename) so the driver never reads a torn file.
@@ -1891,13 +1945,13 @@ mod tests {
             dir.join("app").join("vdd-pin.txt"),
         );
         // Not UTF-8, in an encoding this host does not know.
-        let unknown = VENDOR
-            .replace("encoding='utf-8'", "encoding='x-unknown'")
-            .replace(">default<", ">Radeon\u{AE}<")
-            .replace('\u{AE}', "");
-        let mut unknown = unknown.into_bytes();
-        let at = unknown.windows(7).position(|w| w == b"Radeon<").unwrap() + 6;
-        unknown.insert(at, 0xAE);
+        let unknown = stray_byte(&VENDOR.replace("encoding='utf-8'", "encoding='x-unknown'"));
+        // UTF-8 with a stray byte: after a byte order mark, or with UTF-8
+        // beyond ASCII after it (the vendor file's comments) or before it.
+        let bom = [&[0xEF, 0xBB, 0xBF][..], &stray_byte(VENDOR)].concat();
+        let mixed_after = stray_byte(VENDOR_FILE);
+        let mixed_before =
+            stray_byte(&VENDOR.replace("<vdd_settings>", "<vdd_settings><!-- \u{E9} -->"));
         // A double-byte character cut short.
         let mut broken = declared(CP949, "euc-kr");
         let at = broken.iter().position(|&b| b >= 0x80).unwrap();
@@ -1906,12 +1960,21 @@ mod tests {
         odd.push(b' ');
         let mut lone = utf16(VENDOR, false, true);
         lone.extend_from_slice(&0xD800u16.to_le_bytes());
+        // Off Windows no code page is read; on it, the system's code page
+        // reads this (a_file_in_the_systems_code_page_is_written_back_as_utf8).
+        let ansi = cfg!(not(windows)).then(|| ("ansi", stray_byte(VENDOR)));
         for (name, bytes) in [
             ("unknown encoding", unknown),
+            ("utf-8 bom, stray byte", bom),
+            ("utf-8 after a stray byte", mixed_after),
+            ("utf-8 before a stray byte", mixed_before),
             ("broken code page", broken),
             ("odd utf-16", odd),
             ("lone surrogate", lone),
-        ] {
+        ]
+        .into_iter()
+        .chain(ansi)
+        {
             std::fs::write(&path, &bytes).unwrap();
             let pinned = apply_pin(&path, &record, false, Some("Intel(R) HD Graphics 630"));
             let error = pinned.expect_err(name);
@@ -1928,6 +1991,15 @@ mod tests {
             assert_eq!(backups(&dir), Vec::<Vec<u8>>::new(), "{name}");
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `text` naming the card `Radeon` followed by the byte 0xAE, which is
+    /// `®` in code page 1252 and not UTF-8.
+    fn stray_byte(text: &str) -> Vec<u8> {
+        let mut bytes = text.replace(">default<", ">Radeon<").into_bytes();
+        let at = bytes.windows(7).position(|w| w == b"Radeon<").unwrap() + 6;
+        bytes.insert(at, 0xAE);
+        bytes
     }
 
     /// The driver's file saved in code page 949 as Notepad's ANSI does: its
@@ -2071,6 +2143,25 @@ mod tests {
                 );
                 assert_eq!(backups(&dir), vec![declared.clone()], "{label}");
 
+                // When the card stays, another app's or the driver's choice,
+                // the file is still written as UTF-8, so the driver reads it
+                // to the end.
+                for (wanted, outcome) in [
+                    (Some(INTEL), PinOutcome::Kept(NAMED_ELSEWHERE)),
+                    (Some(card), PinOutcome::Unchanged),
+                    (None, PinOutcome::Unchanged),
+                ] {
+                    fresh();
+                    let pinned = apply_pin(&path, &record, false, wanted);
+                    assert_eq!(pinned.ok(), Some(outcome), "{label} {wanted:?}");
+                    assert_eq!(std::fs::read_to_string(&path).unwrap(), utf8, "{label}");
+                    assert_eq!(backups(&dir), vec![declared.clone()], "{label}");
+                }
+                fresh();
+                assert_eq!(pin_gpu_in(&path, card).ok(), Some(true), "{label}");
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), utf8, "{label}");
+                assert_eq!(backups(&dir), vec![declared.clone()], "{label}");
+
                 // Match the iPad's resolution writes the whole file, keeping
                 // the card another app named.
                 fresh();
@@ -2085,6 +2176,112 @@ mod tests {
                 assert_eq!(backups(&dir), vec![declared.clone()], "{label}");
             }
         }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Review r1: the system's code page, which reads a file declared UTF-8
+    /// that is not or declaring nothing, had no test of its own. Here it is
+    /// the driver's file saved as ANSI on a system whose code page is 1252,
+    /// as on CI and the test PC, naming a card outside ASCII. Another code
+    /// page reads these bytes as other characters, so the test needs 1252.
+    #[cfg(windows)]
+    #[test]
+    fn a_file_in_the_systems_code_page_is_written_back_as_utf8() {
+        let ansi_code_page = unsafe { windows::Win32::Globalization::GetACP() };
+        if ansi_code_page != 1252 {
+            eprintln!("skipped: the system's code page is {ansi_code_page}, not 1252");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("vdd-encoding-acp-{}", std::process::id()));
+        let (path, record) = (
+            dir.join("vdd_settings.xml"),
+            dir.join("app").join("vdd-pin.txt"),
+        );
+        const INTEL: &str = "Intel(R) HD Graphics 630";
+        const CARD: &str = "Radeon\u{AE}";
+        let text = VENDOR_FILE.replace(">default<", &format!(">{CARD}<"));
+        // As Notepad saves it: `®` is 0xAE and the comments' `’` 0x92.
+        let ansi: Vec<u8> = text
+            .chars()
+            .map(|c| match c {
+                '\u{AE}' => 0xAE,
+                '\u{2019}' => 0x92,
+                c => u8::try_from(c).ok().filter(u8::is_ascii).unwrap(),
+            })
+            .collect();
+        let fresh = || {
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&path, &ansi).unwrap();
+        };
+        assert_eq!(decode_settings(&ansi, ANSI), Some((text.clone(), true)));
+
+        // The card another app named stays, or this one, or the driver's
+        // choice; the file is written as UTF-8 all the same.
+        for (owned, wanted, outcome, card) in [
+            (false, Some(INTEL), PinOutcome::Kept(NAMED_ELSEWHERE), CARD),
+            (false, Some(CARD), PinOutcome::Unchanged, CARD),
+            (true, Some(INTEL), PinOutcome::Named, INTEL),
+        ] {
+            fresh();
+            let pinned = apply_pin(&path, &record, owned, wanted);
+            assert_eq!(pinned.ok(), Some(outcome), "{wanted:?}");
+            let written = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(written, text.replace(CARD, card), "{wanted:?}");
+            assert_eq!(backups(&dir), vec![ansi.clone()], "{wanted:?}");
+        }
+
+        // Match the iPad's resolution writes the whole file.
+        fresh();
+        let modes = modes_for_client(1640, 2360, 60);
+        let written = write_with_pin(&path, &record, false, &modes, Some(INTEL));
+        assert_eq!(written.ok(), Some(PinOutcome::Kept(NAMED_ELSEWHERE)));
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, render(&modes, Some(CARD)));
+        assert_eq!(backups(&dir), vec![ansi.clone()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Review r1: UTF-8 with a stray byte read in a single-byte code page
+    /// garbles its UTF-8 text. A double-byte code page's text may hold
+    /// what reads as UTF-8, so only single-byte code pages refuse it.
+    #[cfg(windows)]
+    #[test]
+    fn utf8_with_a_stray_byte_is_not_read_in_a_single_byte_code_page() {
+        let text = VENDOR.replace(">default<", ">Radeon\u{AE}<");
+        assert_eq!(
+            decode_settings(&stray_byte(VENDOR), 1252),
+            Some((text, true))
+        );
+        let bom = [&[0xEF, 0xBB, 0xBF][..], &stray_byte(VENDOR)].concat();
+        assert_eq!(decode_settings(&bom, 1252), None);
+        assert_eq!(decode_settings(&stray_byte(VENDOR_FILE), 1252), None);
+        assert!(single_byte(1252) && !single_byte(949) && !single_byte(936));
+    }
+
+    /// Review r1: a second conversion the same day kept no copy of the file
+    /// it replaced.
+    #[test]
+    fn each_original_of_a_day_is_backed_up_once() {
+        let dir = std::env::temp_dir().join(format!("vdd-backup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vdd_settings.xml");
+        let date = utc_date(std::time::SystemTime::now());
+        let mut names = Vec::new();
+        for original in ["one", "two", "one", "three", "two"] {
+            std::fs::write(&path, original).unwrap();
+            names.push(back_up(&path).unwrap());
+        }
+        let name = |suffix: &str| format!("vdd_settings.xml.bak-{date}{suffix}");
+        assert_eq!(
+            names,
+            [name(""), name("-2"), name(""), name("-3"), name("-2")]
+        );
+        assert_eq!(
+            backups(&dir),
+            [b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
