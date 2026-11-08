@@ -1687,8 +1687,10 @@ mod tests {
         let shared = SharedControl::new(0, 1);
         connect_viewer(&shared);
         let mut machine = crate::supervisor::Machine::new(1);
-        let mut picture = Picture::default();
-        picture.seen_image = true;
+        let mut picture = Picture {
+            seen_image: true,
+            ..Picture::default()
+        };
         picture.cached();
         let lost = Instant::now();
         picture.recreated(lost);
