@@ -1088,12 +1088,12 @@ fn a_restart_longer_than_the_ipads_liveness_keeps_its_session() {
 /// is restarting.
 #[test]
 fn a_restart_past_the_hold_limit_tells_the_ipad_to_connect_again() {
-    eternal_host::transport::session::TEST_RESTART_HOLD_MS.store(2_000, Ordering::SeqCst);
-    let host = Host::start_with(
-        GpuInfo::software_fallback(),
-        10_000,
-        fail_the_encoder_once(240),
-    );
+    // Set under the lock Host takes: another test's Host resets it on drop.
+    let fail = fail_the_encoder_once(240);
+    let host = Host::start_with(GpuInfo::software_fallback(), 10_000, |shared| {
+        eternal_host::transport::session::TEST_RESTART_HOLD_MS.store(2_000, Ordering::SeqCst);
+        fail(shared);
+    });
     let ipad = FakeIpad::new(&host, 1, NEW);
     let id = ipad.connect(1).session_id;
     let heard = ipad.stream(id, Duration::from_secs(60), |heard| {

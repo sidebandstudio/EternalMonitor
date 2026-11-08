@@ -330,8 +330,11 @@ struct ActiveSession {
     /// while the PC restarts carry again.
     last_stream_config: Option<StreamConfig>,
     /// Since when it has been kept alive through restarts without a frame
-    /// ([`RESTART_HOLD_LIMIT`]).
+    /// ([`RESTART_HOLD_LIMIT`]): its last frame, or the restart if none.
+    /// Cleared by the next frame.
     restart_held_since: Option<Instant>,
+    /// When the last frame was let through to it.
+    last_frame_at: Option<Instant>,
 }
 
 /// What a client sent last, for the liveness log lines.
@@ -588,6 +591,7 @@ impl Session {
             return true;
         };
         session.restart_held_since = None;
+        session.last_frame_at = Some(now);
         if session.answered {
             session.frames_sent = session.frames_sent.saturating_add(1);
             return true;
@@ -1194,6 +1198,7 @@ impl Session {
             withheld: false,
             last_stream_config: None,
             restart_held_since: None,
+            last_frame_at: None,
         });
 
         // Only a new pairing carries the token. iPads keep the token they
@@ -1436,6 +1441,27 @@ impl Session {
             return actions;
         }
 
+        // Kept alive through a restart and no frame since: past the limit,
+        // even once the next generation runs, tell the iPad to connect again.
+        if let Some(since) = session
+            .restart_held_since
+            .filter(|since| now.saturating_duration_since(*since) >= restart_hold_limit())
+        {
+            info!(
+                session_id = session.session_id,
+                held_ms = now.saturating_duration_since(since).as_millis() as u64,
+                "The stream is taking too long to restart: telling the iPad to connect again"
+            );
+            actions.ended = self.end_saying(
+                ByeReason::Error,
+                EndReason::Failed(StageFailure::Other),
+                now,
+            );
+            actions.goodbye = self.take_goodbye();
+            actions.client_lost = true;
+            return actions;
+        }
+
         if now >= session.liveness_deadline {
             // A client that had a picture may only have lost its uplink: it
             // keeps the session, on hold, until the hold limit. One that
@@ -1504,10 +1530,11 @@ impl Session {
     /// standby responder holds the port. A session kept across the restart
     /// stays alive: its iPad gets heartbeats as from a running stream, so it
     /// holds its last picture instead of losing the signal, and its silence
-    /// still expires it. Only an iPad that has answered gets them. After
-    /// [`RESTART_HOLD_LIMIT`] without a frame, the session ends with the
-    /// goodbye that tells its iPad to connect again. Does nothing unless the
-    /// PC is restarting.
+    /// still expires it. Only an iPad that has answered gets them. Once
+    /// [`RESTART_HOLD_LIMIT`] has passed since its last frame, the session
+    /// ends with the goodbye that tells its iPad to connect again, on this
+    /// tick or the next stream's ([`Self::tick`]) until a frame goes out.
+    /// Does nothing unless the PC is restarting.
     pub fn restart_tick(&mut self, config: &impl ConfigSource, now: Instant) -> Actions {
         if self.not_streaming != Some(NotStreaming::Restarting) {
             return Actions::default();
@@ -1515,25 +1542,9 @@ impl Session {
         let Some(session) = self.active.as_mut() else {
             return self.tick(config, false, now);
         };
-        let since = *session.restart_held_since.get_or_insert(now);
-        if now.saturating_duration_since(since) >= restart_hold_limit() {
-            info!(
-                session_id = session.session_id,
-                held_ms = now.saturating_duration_since(since).as_millis() as u64,
-                "The stream is taking too long to restart: telling the iPad to connect again"
-            );
-            let ended = self.end_saying(
-                ByeReason::Error,
-                EndReason::Failed(StageFailure::Other),
-                now,
-            );
-            return Actions {
-                goodbye: self.take_goodbye(),
-                ended,
-                client_lost: true,
-                ..Actions::default()
-            };
-        }
+        // Counted from the last frame, so a restart ladder keeps counting.
+        let last_frame = session.last_frame_at.unwrap_or(now);
+        session.restart_held_since.get_or_insert(last_frame);
         let answered = session.answered;
         self.tick(config, answered, now)
     }
@@ -5725,5 +5736,34 @@ mod tests {
             parse_ack(&answer.replies[0].1).status,
             HelloStatus::Restarting
         );
+    }
+
+    /// The supervisor clears the restart before the new generation sends a
+    /// frame. A slow start still ends at the hold limit, counted from the
+    /// last frame, on the stream's own tick.
+    #[test]
+    fn the_hold_limit_holds_after_the_stream_resumes_without_a_frame() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let (mut session, id) = restarting_session(peer, now);
+        assert!(session.may_send_media(id, 1000, now));
+        session.restart_tick(&RestartConfig, now + Duration::from_secs(1));
+        // The next generation starts; it hasn't sent a frame yet.
+        session.set_not_streaming(None);
+        session.transport_resumed(now + Duration::from_secs(2), false);
+        let before = now + restart_hold_limit() - Duration::from_millis(1);
+        session.handle_control_authed(peer, report(10), &TestConfig, before);
+        assert!(!session.tick(&TestConfig, true, before).client_lost);
+        let at = now + restart_hold_limit();
+        session.handle_control_authed(peer, report(10), &TestConfig, at);
+        let actions = session.tick(&TestConfig, true, at);
+        assert!(
+            actions.client_lost && !session.is_active(),
+            "still held past the limit"
+        );
+        assert!(matches!(
+            eternal_wire::v2::control::parse_control(&actions.goodbye.expect("a goodbye").1),
+            Ok((_, ControlMessage::Bye(ByeReason::Error)))
+        ));
     }
 }
