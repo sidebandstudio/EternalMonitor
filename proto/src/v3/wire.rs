@@ -659,6 +659,16 @@ impl Msg2Payload {
 
 /// Inner types of the session messages sealed in records. Values below 0x40
 /// are the v2 [`PacketType`] of the message carried (its v2 body follows).
+/// Values at 0x40 and above are the protocol's own; one either side doesn't
+/// know is dropped, and never counts as application data.
+pub const FIRST_PROTOCOL_INNER_TYPE: u8 = 0x40;
+
+/// Whether `inner_type` carries an application message (a v2 control
+/// message): below [`FIRST_PROTOCOL_INNER_TYPE`].
+pub fn is_application(inner_type: u8) -> bool {
+    inner_type < FIRST_PROTOCOL_INNER_TYPE
+}
+
 pub const INNER_SESSION_CONFIRM: u8 = 0x50;
 pub const INNER_SESSION_CONFIRM_ACK: u8 = 0x51;
 pub const INNER_SESSION_REFUSED: u8 = 0x52;

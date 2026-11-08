@@ -613,7 +613,9 @@ impl Client {
                         self.attempt = Attempt::Idle;
                         out.push(ClientOutput::Busy { dev_id });
                     }
-                    Ok(None) => {
+                    // Only an application record is proof of a commit; an
+                    // unknown protocol type is dropped.
+                    Ok(None) if wire::is_application(opened.inner_type) => {
                         let Attempt::Confirming {
                             started, last_sent, ..
                         } = self.attempt
@@ -634,7 +636,7 @@ impl Client {
                             draining: false,
                         });
                     }
-                    Ok(Some(_)) | Err(_) => {}
+                    Ok(_) | Err(_) => {}
                 }
                 return;
             }
@@ -663,7 +665,7 @@ impl Client {
                     self.abandoned.remove(index);
                     out.push(ClientOutput::Busy { dev_id });
                 }
-                Ok(None) => {
+                Ok(None) if wire::is_application(opened.inner_type) => {
                     if !self.promote_abandoned(now, index, out) {
                         return;
                     }
@@ -675,7 +677,7 @@ impl Client {
                         draining: false,
                     });
                 }
-                Ok(Some(_)) | Err(_) => {}
+                Ok(_) | Err(_) => {}
             }
             return;
         }
@@ -686,13 +688,15 @@ impl Client {
             };
             live.last_rx = now;
             match SessionMessage::parse(opened.inner_type, &opened.body) {
-                Ok(None) => out.push(ClientOutput::Deliver {
-                    session_id,
-                    counter: opened.counter,
-                    inner_type: opened.inner_type,
-                    body: opened.body,
-                    draining: false,
-                }),
+                Ok(None) if wire::is_application(opened.inner_type) => {
+                    out.push(ClientOutput::Deliver {
+                        session_id,
+                        counter: opened.counter,
+                        inner_type: opened.inner_type,
+                        body: opened.body,
+                        draining: false,
+                    })
+                }
                 Ok(Some(SessionMessage::ConfirmAck(status))) => {
                     if matches!(self.attempt, Attempt::Acking { session_id: s, .. } if s == session_id)
                     {
@@ -715,7 +719,7 @@ impl Client {
                         reason: ClientClose::HostBye(reason),
                     });
                 }
-                Ok(Some(_)) | Err(_) => {}
+                Ok(_) | Err(_) => {}
             }
             return;
         }
@@ -728,7 +732,10 @@ impl Client {
             let Ok(opened) = drain.opener.open(datagram) else {
                 return;
             };
-            if let Ok(None) = SessionMessage::parse(opened.inner_type, &opened.body) {
+            if let (Ok(None), true) = (
+                SessionMessage::parse(opened.inner_type, &opened.body),
+                wire::is_application(opened.inner_type),
+            ) {
                 out.push(ClientOutput::Deliver {
                     session_id,
                     counter: opened.counter,
@@ -1037,6 +1044,61 @@ mod tests {
         ipad.handle_datagram(T0, &record, 1_000);
         assert_eq!(ipad.live_session(), Some(77));
         (ipad, host_sealer)
+    }
+
+    /// The host's halves of a confirming attempt for `session_id`.
+    fn confirming_client(ipad: &mut Client, at: Duration, clock: u64, session_id: u32) -> Sealer {
+        let msg1 = sent(&ipad.connect(at, key(), clock)).remove(0);
+        let parsed = wire::parse_msg1(&msg1).unwrap();
+        let host = Responder::read_msg1(&parsed, &key().k_dev, &HOST).unwrap();
+        let accept = Msg2Payload::Accept(Accept {
+            session_id,
+            ..Default::default()
+        });
+        let (msg2, keys) = host.write_msg2(&accept).unwrap();
+        let (host_sealer, _) = keys.unwrap().responder(session_id);
+        ipad.handle_datagram(at, &msg2, clock);
+        assert!(ipad.is_confirming());
+        host_sealer
+    }
+
+    #[test]
+    fn only_application_types_count_as_proof_of_a_commit() {
+        // Confirming: an unknown protocol type changes nothing.
+        let mut ipad = client();
+        let mut host = confirming_client(&mut ipad, T0, 1_000, 81);
+        for unknown in [0x40, 0x5F, 0xFF] {
+            let record = host.seal(unknown, &[1, 2, 3]).unwrap();
+            let out = ipad.handle_datagram(T0, &record, 1_000);
+            assert!(out.is_empty(), "type {unknown:#x}");
+            assert!(ipad.is_confirming());
+            assert_eq!(ipad.live_session(), None);
+        }
+        // An application record is proof.
+        let record = host.seal(PacketType::Ping as u8, &[0; 8]).unwrap();
+        let out = ipad.handle_datagram(T0, &record, 1_000);
+        assert_eq!(ipad.live_session(), Some(81));
+        assert!(out
+            .iter()
+            .any(|o| matches!(o, ClientOutput::Deliver { inner_type, .. } if *inner_type == PacketType::Ping as u8)));
+
+        // Live: an unknown type isn't delivered.
+        let record = host.seal(0x60, &[9]).unwrap();
+        assert!(!ipad
+            .handle_datagram(T0, &record, 1_000)
+            .iter()
+            .any(|o| matches!(o, ClientOutput::Deliver { .. })));
+
+        // Abandoned: an unknown type doesn't promote it either.
+        let mut ipad = client();
+        let mut host = confirming_client(&mut ipad, T0, 1_000, 82);
+        let later = T0 + ipad.config.confirm_window;
+        ipad.poll(later, 3_000);
+        assert_eq!(ipad.abandoned_count(), 1);
+        let record = host.seal(0x5F, &[]).unwrap();
+        assert!(ipad.handle_datagram(later, &record, 3_000).is_empty());
+        assert_eq!(ipad.live_session(), None);
+        assert_eq!(ipad.abandoned_count(), 1);
     }
 
     #[test]
