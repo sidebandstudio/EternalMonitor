@@ -419,6 +419,15 @@ pub fn session_summary(
         EndReason::LinkLost => "other",
         EndReason::Liveness | EndReason::Goodbye(ByeReason::Error) if !streamed => "no_video",
         EndReason::Liveness => "signal_lost",
+        // The iPad gave up on video that went out: none of it arrived, or
+        // no frame of it completed.
+        EndReason::Goodbye(ByeReason::Error) if !end.frames_received => {
+            if end.frags_received {
+                "no_frame"
+            } else {
+                "no_video"
+            }
+        }
         EndReason::Goodbye(ByeReason::Error) => "other",
         EndReason::Failed(StageFailure::Capture) => "capture_failed",
         EndReason::Failed(StageFailure::Encoder) => "encoder_failed",
@@ -706,6 +715,7 @@ pub(crate) mod tests {
             reason,
             first_video: first_video_ms.map(Duration::from_millis),
             frames_received: first_video_ms.is_some(),
+            frags_received: first_video_ms.is_some(),
             duration: Duration::from_millis(duration_ms),
         }
     }
@@ -777,6 +787,24 @@ pub(crate) mod tests {
             (
                 end(Goodbye(ByeReason::Error), Some(500), 30_000),
                 ["steady", "streamed", "other", "goodbye"],
+            ),
+            // The iPad gave up on video that went out: none of it arrived,
+            // or no frame of it completed.
+            (
+                SessionEnd {
+                    frames_received: false,
+                    frags_received: false,
+                    ..end(Goodbye(ByeReason::Error), Some(300), 10_000)
+                },
+                ["video_sent", "streamed", "no_video", "goodbye"],
+            ),
+            (
+                SessionEnd {
+                    frames_received: false,
+                    frags_received: true,
+                    ..end(Goodbye(ByeReason::Error), Some(300), 10_000)
+                },
+                ["video_sent", "streamed", "no_frame", "goodbye"],
             ),
             (
                 end(Liveness, None, 3_000),

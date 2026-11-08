@@ -63,6 +63,8 @@ final class SessionSummaryTests: XCTestCase {
     func testEachWayAnAttemptEndsHasItsSummary() {
         var noFrame = summary(.connectTimeout, duration: 10)
         noFrame.datagramsReceived = 12
+        var movedNoFrame = summary(.noVideoPath, duration: 7)
+        movedNoFrame.datagramsReceived = 3
         var pairing = summary(.userDisconnect, session: nil, duration: 30)
         pairing.awaitingPairing = true
         var retried = summary(.retriedWithCode, session: nil, duration: 4)
@@ -82,6 +84,10 @@ final class SessionSummaryTests: XCTestCase {
             (summary(.otherPC), ["accepted", "error", "other", "error"]),
             (summary(.connectTimeout, duration: 10), ["accepted", "no_picture", "no_video", "timeout"]),
             (noFrame, ["accepted", "no_picture", "no_frame", "timeout"]),
+            // Moved to the PC's other address: as the PC says, nothing came,
+            // or no frame of what came completed.
+            (summary(.noVideoPath, duration: 7), ["accepted", "no_picture", "no_video", "superseded"]),
+            (movedNoFrame, ["accepted", "no_picture", "no_frame", "superseded"]),
             (summary(.pcStoppedResponding, firstFrame: 0.3, duration: 90), ["steady", "streamed", "signal_lost", "liveness"]),
             (summary(.pictureStalled, firstFrame: 0.3, duration: 90), ["steady", "streamed", "other", "error"]),
             (summary(.cableUnplugged, usb: true, firstFrame: 0.3), ["first_frame", "streamed", "usb_lost", "error"]),
