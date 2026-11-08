@@ -1507,6 +1507,15 @@ impl Session {
             let session_id = session.session_id;
             let frames_sent = (session.info.feature_caps & FEATURE_MEDIA_SIZE != 0)
                 .then_some(session.frames_sent);
+            // Held through a restart, until the first new frame: an iPad
+            // that understands it says the picture comes back by itself.
+            let notice = if session.restart_held_since.is_some()
+                && session.info.feature_caps & FEATURE_STANDBY_STATUS != 0
+            {
+                eternal_wire::v2::control::NOTICE_RESTARTING
+            } else {
+                config.notice()
+            };
             let stream_config = match self.not_streaming {
                 // No stream: the config of the one the iPad last had.
                 Some(_) => session
@@ -1521,7 +1530,7 @@ impl Session {
             let heartbeat = ControlMessage::Heartbeat(eternal_wire::v2::control::Heartbeat {
                 host_time_us: crate::clock::host_now_us(),
                 stream_config,
-                notice: config.notice(),
+                notice,
                 frames_sent,
             });
             actions.replies.push((
@@ -5831,5 +5840,72 @@ mod tests {
             }
         }
         assert_eq!(ended, Some(EndReason::Goodbye(ByeReason::Superseded)));
+    }
+
+    fn notices(actions: &Actions) -> Vec<u8> {
+        actions
+            .replies
+            .iter()
+            .filter_map(
+                |(_, bytes)| match eternal_wire::v2::control::parse_control(bytes) {
+                    Ok((_, ControlMessage::Heartbeat(hb))) => Some(hb.notice),
+                    _ => None,
+                },
+            )
+            .collect()
+    }
+
+    /// While a session is held through a restart, its heartbeats say so to
+    /// an iPad that understands it, on the standby's ticks and on the next
+    /// stream's until its first frame; then they stop saying it.
+    #[test]
+    fn a_held_session_hears_that_the_pc_is_restarting() {
+        use eternal_wire::v2::control::{NOTICE_NONE, NOTICE_RESTARTING};
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut session = Session::new(1234);
+        let ControlMessage::Hello2(mut hello) = hello(1, 50000) else {
+            unreachable!()
+        };
+        hello.feature_caps |= FEATURE_STANDBY_STATUS;
+        session.handle_control_authed(peer, ControlMessage::Hello2(hello), &TestConfig, now);
+        session.handle_control_authed(peer, report(10), &TestConfig, now);
+        let id = session.session_id().unwrap();
+        assert_eq!(
+            notices(&session.tick(&TestConfig, true, now)),
+            [NOTICE_NONE]
+        );
+
+        session.set_not_streaming(Some(NotStreaming::Restarting));
+        let at = now + Duration::from_secs(1);
+        assert_eq!(
+            notices(&session.restart_tick(&RestartConfig, at)),
+            [NOTICE_RESTARTING]
+        );
+        // The next stream runs, with no frame yet.
+        session.set_not_streaming(None);
+        let at = now + Duration::from_secs(2);
+        session.handle_control_authed(peer, report(10), &TestConfig, at);
+        assert_eq!(
+            notices(&session.tick(&TestConfig, true, at)),
+            [NOTICE_RESTARTING]
+        );
+        // Its first frame.
+        assert!(session.may_send_media(id, 1000, at));
+        assert_eq!(notices(&session.tick(&TestConfig, true, at)), [NOTICE_NONE]);
+    }
+
+    /// A 0.3.4 iPad, without the feature bit, gets the heartbeats with no
+    /// notice, as from a running stream.
+    #[test]
+    fn an_old_ipad_held_through_a_restart_gets_no_notice() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let (mut session, _) = restarting_session(peer, now);
+        let at = now + Duration::from_secs(1);
+        assert_eq!(
+            notices(&session.restart_tick(&RestartConfig, at)),
+            [eternal_wire::v2::control::NOTICE_NONE]
+        );
     }
 }

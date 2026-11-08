@@ -109,6 +109,50 @@ final class StreamRecoveryTests: XCTestCase {
         XCTAssertFalse(manager.pcLocked, "the next session starts without it")
     }
 
+    /// The PC restarts its stream and holds this session: once the picture
+    /// has been held a moment, the iPad says so, still connected, and the
+    /// first new frame clears it.
+    func testARestartingPCIsShownOnceThePictureIsHeldAWhile() async throws {
+        let host = FakeUDPHost()
+        let manager = try await streaming(host)
+        let lastFrame = Date()
+        host.sendHeartbeat(notice: Heartbeat.noticeRestarting)
+        try await Task.sleep(nanoseconds: 700_000_000)
+        host.sendHeartbeat(notice: Heartbeat.noticeRestarting)
+        XCTAssertFalse(manager.pcRestarting, "shown before the picture was held a moment")
+        try await until("the PC says it is restarting") { manager.pcRestarting }
+        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(lastFrame), 1.3)
+        XCTAssertEqual(manager.state, .connected)
+        // The restart is over: the first new frame clears it.
+        host.sendHeartbeat(notice: Heartbeat.noticeRestarting)
+        let units = try twoGOPs()
+        host.sendFrame(units[4], seq: 5, isKeyframe: true)
+        try await until("the picture is back") { !manager.pcRestarting }
+        XCTAssertEqual(manager.state, .connected)
+        manager.cancel()
+        XCTAssertFalse(manager.pcRestarting, "the next session starts without it")
+    }
+
+    /// A quick restart, whose new frame comes before the picture was held a
+    /// moment, shows nothing; nor does a notice that stops.
+    func testAQuickRestartShowsNothing() async throws {
+        let host = FakeUDPHost()
+        let manager = try await streaming(host)
+        host.sendHeartbeat(notice: Heartbeat.noticeRestarting)
+        try await Task.sleep(nanoseconds: 400_000_000)
+        let units = try twoGOPs()
+        host.sendFrame(units[4], seq: 5, isKeyframe: true)
+        let deadline = Date().addingTimeInterval(2.5)
+        while Date() < deadline {
+            XCTAssertFalse(manager.pcRestarting, "a quick restart showed the pill")
+            try await Task.sleep(nanoseconds: 50_000_000)
+        }
+        host.sendHeartbeat(notice: Heartbeat.noticeRestarting)
+        host.sendHeartbeat()
+        try await Task.sleep(nanoseconds: 2_500_000_000)
+        XCTAssertFalse(manager.pcRestarting, "a notice that stopped still showed")
+    }
+
     /// A closed lid or screens that are off leave the PC nothing to
     /// capture. Its heartbeats say so, and the iPad says so over the held
     /// picture, still connected, until a display comes back.

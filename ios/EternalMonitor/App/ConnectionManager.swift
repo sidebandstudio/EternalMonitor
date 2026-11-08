@@ -122,6 +122,14 @@ final class ConnectionManager: ObservableObject {
     /// The PC has no display turned on, so there is nothing to capture and
     /// the picture is held. Its heartbeats say so until one comes back.
     @Published var pcNoDisplay = false
+    /// The PC is restarting its stream and kept this session, and no new
+    /// frame has come for `Timing.restartNoticeSeconds`. The first new frame
+    /// clears it.
+    @Published private(set) var pcRestarting = false
+    /// When the last frame was decoded, by the system uptime clock.
+    private var lastFrameAt: TimeInterval?
+    /// Shows the restarting pill once the picture has been held long enough.
+    private var restartNoticeTask: Task<Void, Never>?
     /// Nonzero while an automatic reconnect cycle is running.
     @Published private(set) var reconnectAttempt = 0
 
@@ -249,6 +257,9 @@ final class ConnectionManager: ObservableObject {
         /// How long video the PC says it sent may go missing before the
         /// next no-video step (see `NoVideoFallback`).
         var noVideoStepSeconds = 1.5
+        /// How long the picture is held through a PC's stream restart before
+        /// the iPad says so. A quick restart shows nothing.
+        var restartNoticeSeconds = 1.5
     }
     var timing: Timing
     /// The Wi-Fi link to a host's port. Tests pass a fake one, or replace it
@@ -552,6 +563,7 @@ final class ConnectionManager: ObservableObject {
         signalLost = false
         pcLocked = false
         pcNoDisplay = false
+        clearRestartNotice()
         degradedSinceUs = nil
         prevCounters = FrameAssembler.Counters()
         diagnostics.removeAll()
@@ -623,6 +635,9 @@ final class ConnectionManager: ObservableObject {
                 guard self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 self.debugState.decodedFrames += 1
                 self.debugState.lastDecodedTimestampUs = ts
+                self.lastFrameAt = ProcessInfo.processInfo.systemUptime
+                if self.pcRestarting { self.record(.info, "ctrl", "Picture back after the PC's stream restart") }
+                self.clearRestartNotice()
                 if self.debugState.decodedFrames == 1 {
                     self.firstFrameAt = ProcessInfo.processInfo.systemUptime
                     self.record(.info, "decode", "First frame decoded successfully" + self.attemptTimings)
@@ -962,6 +977,11 @@ final class ConnectionManager: ObservableObject {
                     self.pcLocked = locked
                     self.record(.info, "ctrl", locked ? "PC locked: holding the picture" : "PC unlocked")
                 }
+                if heartbeat.notice == Heartbeat.noticeRestarting {
+                    self.noteRestartNotice()
+                } else {
+                    self.clearRestartNotice()
+                }
                 let noDisplay = heartbeat.notice == Heartbeat.noticeNoDisplay
                 if noDisplay != self.pcNoDisplay {
                     self.pcNoDisplay = noDisplay
@@ -1202,6 +1222,29 @@ final class ConnectionManager: ObservableObject {
             degradedSinceUs = nil
             record(.info, "ctrl", "Signal recovered")
         }
+    }
+
+    /// The PC said it is restarting its stream and holds this session. Once
+    /// the picture has been held `restartNoticeSeconds` since its last
+    /// frame, say so; a frame first means a quick restart, and nothing shows.
+    private func noteRestartNotice() {
+        guard state == .connected, !pcRestarting, restartNoticeTask == nil else { return }
+        let heldFor = ProcessInfo.processInfo.systemUptime - (lastFrameAt ?? ProcessInfo.processInfo.systemUptime)
+        let wait = max(0, timing.restartNoticeSeconds - heldFor)
+        let frameAt = lastFrameAt
+        restartNoticeTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(wait))
+            guard !Task.isCancelled, let self, self.state == .connected, self.lastFrameAt == frameAt else { return }
+            self.restartNoticeTask = nil
+            self.pcRestarting = true
+            self.record(.info, "ctrl", "PC is restarting its stream: holding the picture")
+        }
+    }
+
+    private func clearRestartNotice() {
+        restartNoticeTask?.cancel()
+        restartNoticeTask = nil
+        pcRestarting = false
     }
 
     /// Ends the session that `reason` interrupted (`end` when it was not
@@ -1724,6 +1767,7 @@ final class ConnectionManager: ObservableObject {
         pictureRestoring = false
         pcLocked = false
         pcNoDisplay = false
+        clearRestartNotice()
         degradedSinceUs = nil
         prevCounters = FrameAssembler.Counters()
         hostInfo = nil

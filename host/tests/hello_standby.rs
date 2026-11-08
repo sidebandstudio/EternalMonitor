@@ -945,6 +945,8 @@ mod identify {
 struct Heard {
     /// When each heartbeat for the session came.
     heartbeats: Vec<Instant>,
+    /// Each heartbeat's notice, with when it came.
+    notices: Vec<(Instant, u8)>,
     /// Each media datagram for the session: when, its epoch, and whether
     /// it was part of a keyframe.
     media: Vec<(Instant, u32, bool)>,
@@ -980,10 +982,11 @@ impl FakeIpad {
             let at = Instant::now();
             match eternal_wire::v2::classify(bytes) {
                 eternal_wire::v2::Classified::Control(_) => match parse_control(bytes) {
-                    Ok((header, ControlMessage::Heartbeat(_)))
+                    Ok((header, ControlMessage::Heartbeat(hb)))
                         if header.session_id == session_id =>
                     {
-                        heard.heartbeats.push(at)
+                        heard.heartbeats.push(at);
+                        heard.notices.push((at, hb.notice));
                     }
                     Ok((header, ControlMessage::Bye(reason)))
                         if header.session_id == session_id =>
@@ -1081,6 +1084,25 @@ fn a_restart_longer_than_the_ipads_liveness_keeps_its_session() {
         "{longest:?} without a heartbeat in a {gap:?} restart"
     );
     assert_eq!(host.shared.session.lock().session_id(), Some(id));
+    // This iPad understands it: the heartbeats said the PC was restarting
+    // until the picture came back.
+    use eternal_wire::v2::control::{NOTICE_NONE, NOTICE_RESTARTING};
+    assert!(
+        heard.notices.iter().any(|(at, notice)| *at > last_before
+            && *at < resumed.0
+            && *notice == NOTICE_RESTARTING),
+        "{:?}",
+        heard.notices
+    );
+    let after = ipad.stream(id, Duration::from_secs(5), |heard| heard.notices.len() >= 2);
+    assert!(
+        after
+            .notices
+            .iter()
+            .all(|(_, notice)| *notice == NOTICE_NONE),
+        "still restarting after the picture came back: {:?}",
+        after.notices
+    );
 }
 
 /// A restart that outlasts the hold limit ends the session with the goodbye

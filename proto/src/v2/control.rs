@@ -286,6 +286,11 @@ pub const NOTICE_PC_LOCKED: u8 = 1;
 /// No display is attached to the PC's desktop (a closed lid, screens off or
 /// unplugged), so there is nothing to capture until one comes back.
 pub const NOTICE_NO_DISPLAY: u8 = 2;
+/// The PC is restarting its stream and keeps the session meanwhile: the
+/// picture comes back by itself. Sent only to iPads that set
+/// [`FEATURE_STANDBY_STATUS`]. (3 and 4 are taken by the graphics card
+/// notices.)
+pub const NOTICE_RESTARTING: u8 = 5;
 
 /// Host → client, every heartbeat interval while a session is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
