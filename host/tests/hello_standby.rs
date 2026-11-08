@@ -572,15 +572,23 @@ mod identify {
             }
             None
         }
+
+        /// Asks up to 8 times, 250 ms apart, as an iPad's check does, and
+        /// returns the first answer.
+        fn check(&self, nonce: [u8; 16]) -> Option<Identity> {
+            (0..8).find_map(|_| {
+                self.identify(nonce);
+                self.identity(nonce, Duration::from_millis(250))
+            })
+        }
     }
 
     /// The address the test PC lists as its home network's. It listens on
     /// every address, so an iPad that found it there reaches it on loopback.
     const HOME: std::net::Ipv4Addr = std::net::Ipv4Addr::new(192, 168, 1, 20);
 
-    /// Lists [`HOME`] as the PC's only home network address, and waits until a
-    /// fresh listing has it.
-    fn list_home_address() {
+    /// Makes [`HOME`] the PC's only home network address.
+    fn set_home_adapter() {
         set_test_adapters(Some(vec![Adapter {
             name: "Wi-Fi".into(),
             kind: Kind::Wifi,
@@ -588,6 +596,12 @@ mod identify {
             gateway: true,
             ipv4: vec![HOME],
         }]));
+    }
+
+    /// Makes [`HOME`] the PC's only home network address, and waits until a
+    /// fresh listing has it.
+    fn list_home_address() {
+        set_home_adapter();
         let deadline = Instant::now() + Duration::from_secs(10);
         while home_addresses() != [HOME] {
             assert!(
@@ -626,9 +640,8 @@ mod identify {
         let token = host.shared.pairing.lock().token();
 
         list_home_address();
-        ipad.identify([1; 16]);
         let identity = ipad
-            .identity([1; 16], Duration::from_secs(2))
+            .check([1; 16])
             .expect("a stopped PC must answer IDENTIFY");
         let asked = std::net::SocketAddrV4::new(HOME, host.port);
         assert!(
@@ -660,28 +673,43 @@ mod identify {
         let token = host.shared.pairing.lock().token();
         let forwarder = UdpSocket::bind("127.0.0.1:0").unwrap();
         forwarder
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_millis(20)))
             .unwrap();
         let std::net::SocketAddr::V4(forwarder_addr) = forwarder.local_addr().unwrap() else {
             unreachable!()
         };
         let mut ipad = FakeIpad::new(&host, 1, NEW);
         ipad.host = forwarder_addr.to_string();
+        // Passes what the iPad sends on to the PC, and the PC's answers back.
+        let relaying = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let relay = {
+            let relaying = relaying.clone();
+            let pc = std::net::SocketAddr::from(([127, 0, 0, 1], host.port));
+            std::thread::spawn(move || {
+                let mut buffer = [0; 2048];
+                let mut asker = None;
+                while relaying.load(Ordering::SeqCst) {
+                    let Ok((len, from)) = forwarder.recv_from(&mut buffer) else {
+                        continue;
+                    };
+                    let to = if from == pc {
+                        asker
+                    } else {
+                        asker = Some(from);
+                        Some(pc)
+                    };
+                    if let Some(to) = to {
+                        let _ = forwarder.send_to(&buffer[..len], to);
+                    }
+                }
+            })
+        };
 
         list_home_address();
-        ipad.identify([1; 16]);
-        let mut buffer = [0; 2048];
-        let (len, from) = forwarder.recv_from(&mut buffer).unwrap();
-        forwarder
-            .send_to(&buffer[..len], ("127.0.0.1", host.port))
-            .unwrap();
-        let (len, _) = forwarder
-            .recv_from(&mut buffer)
-            .expect("a stopped PC must answer a forwarded IDENTIFY");
-        forwarder.send_to(&buffer[..len], from).unwrap();
-        let identity = ipad
-            .identity([1; 16], Duration::from_secs(2))
-            .expect("the forwarder passed the answer back");
+        let identity = ipad.check([1; 16]);
+        relaying.store(false, Ordering::SeqCst);
+        relay.join().unwrap();
+        let identity = identity.expect("a stopped PC must answer a forwarded IDENTIFY");
 
         // It is the PC's real answer, for the PC's own address...
         let pc = std::net::SocketAddrV4::new(HOME, host.port);
@@ -749,5 +777,38 @@ mod identify {
             .identity([2; 16], Duration::from_secs(2))
             .expect("never answered from a fresh listing");
         assert_eq!(identity.addresses, [HOME.octets()]);
+    }
+
+    /// The standby lists the home network addresses as it starts on every
+    /// address, as the stream does, so the first IDENTIFY after Stop is
+    /// answered though the stream's listing expired long ago.
+    #[test]
+    fn the_first_identify_after_stop_is_answered() {
+        let host = Host::start_with(GpuInfo::software_fallback(), 500, |shared| {
+            shared.pairing.lock().required = true;
+            set_home_adapter();
+        });
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !host.streaming() {
+            assert!(Instant::now() < deadline, "never streamed");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(2200));
+        host.send(SupervisorCommand::Stop);
+        host.wait_until_stopped();
+        let mut ipad = FakeIpad::new(&host, 1, NEW);
+        ipad.auth_token = host.shared.pairing.lock().token();
+        // Answered: the standby holds the port. Its listing runs on a
+        // thread of its own: give it a moment.
+        let ack = ipad
+            .ask_until_answered(1, Duration::from_secs(10))
+            .expect("a stopped PC must answer");
+        assert_eq!(ack.status, HelloStatus::Stopped);
+        std::thread::sleep(Duration::from_millis(300));
+        ipad.identify([1; 16]);
+        assert!(
+            ipad.identity([1; 16], Duration::from_secs(2)).is_some(),
+            "the first IDENTIFY after Stop went unanswered"
+        );
     }
 }

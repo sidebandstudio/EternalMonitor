@@ -407,6 +407,9 @@ pub struct HomeCache {
 struct HomeState {
     listed: Option<(Instant, Vec<Ipv4Addr>)>,
     listing: bool,
+    /// Bumped each time debug builds clear the cache: a listing begun
+    /// before that is dropped.
+    cleared: u64,
 }
 
 impl HomeCache {
@@ -432,9 +435,12 @@ impl HomeCache {
             let addresses = fresh.map(|(_, addresses)| addresses.clone());
             let start = addresses.is_none() && !state.listing;
             state.listing |= start;
-            (addresses.unwrap_or_default(), start)
+            (
+                addresses.unwrap_or_default(),
+                start.then_some(state.cleared),
+            )
         };
-        if start {
+        if let Some(cleared) = start {
             let (list, ttl, listing) = (self.list, self.ttl, HomeListing(self.state.clone()));
             // A thread that can't start drops the closure, and with it the guard.
             let _ = std::thread::Builder::new()
@@ -444,12 +450,22 @@ impl HomeCache {
                     let addresses = list()
                         .map(|adapters| home_addresses_of(&adapters))
                         .unwrap_or_default();
-                    if started.elapsed() < ttl {
-                        listing.0.lock().listed = Some((started, addresses));
+                    let mut state = listing.0.lock();
+                    if started.elapsed() < ttl && state.cleared == cleared {
+                        state.listed = Some((started, addresses));
                     }
                 });
         }
         addresses
+    }
+
+    /// Debug builds only: forgets the last listing, and any listing under
+    /// way, so the next one reads the adapters as they are now.
+    #[cfg(debug_assertions)]
+    fn clear(&self) {
+        let mut state = self.state.lock();
+        state.listed = None;
+        state.cleared += 1;
     }
 }
 
@@ -470,10 +486,11 @@ fn listed_home() -> Option<Vec<Adapter>> {
 /// This PC's home network addresses (see [`home_addresses_of`] and
 /// [`HomeCache`]).
 pub fn home_addresses() -> Vec<Ipv4Addr> {
-    static HOME: std::sync::LazyLock<HomeCache> =
-        std::sync::LazyLock::new(|| HomeCache::with(listed_home, HOME_TTL));
     HOME.get()
 }
+
+static HOME: std::sync::LazyLock<HomeCache> =
+    std::sync::LazyLock::new(|| HomeCache::with(listed_home, HOME_TTL));
 
 /// What kind of interface a Unix name and flags say: network cards are
 /// named en*, eth* or wl*; point-to-point interfaces are tunnels.
@@ -594,12 +611,15 @@ pub fn log_addresses() {
 #[cfg(debug_assertions)]
 static TEST_ADAPTERS: Mutex<Option<Vec<Adapter>>> = Mutex::new(None);
 
-/// Debug builds only: has the Address row's hint read `adapters` instead of
-/// the PC's, until called with `None`.
+/// Debug builds only: has the Address row's hint and the home network
+/// addresses read `adapters` instead of the PC's, until called with `None`.
+/// The last listing of home network addresses is forgotten each time, so no
+/// test hears another's.
 #[cfg(debug_assertions)]
 #[doc(hidden)]
 pub fn set_test_adapters(adapters: Option<Vec<Adapter>>) {
     *TEST_ADAPTERS.lock() = adapters;
+    HOME.clear();
 }
 
 fn listed() -> Option<Vec<Adapter>> {
@@ -1225,6 +1245,58 @@ mod tests {
         }
         assert_eq!(cache.get(), [ip([192, 168, 1, 20])]);
         assert_eq!(HOME_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    static SWITCHED_GATE: Mutex<()> = Mutex::new(());
+    static SWITCHED_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static SWITCHED_IP: Mutex<[u8; 4]> = Mutex::new([192, 168, 1, 20]);
+
+    fn switched_home() -> Option<Vec<Adapter>> {
+        let listed = *SWITCHED_IP.lock();
+        SWITCHED_CALLS.fetch_add(1, Ordering::SeqCst);
+        let _open = SWITCHED_GATE.lock();
+        Some(vec![adapter(Kind::Wifi, true, listed)])
+    }
+
+    /// Clearing forgets a fresh listing at once, and drops one that was
+    /// under way when the adapters changed: a test never hears the
+    /// addresses of the adapters it replaced.
+    #[cfg(debug_assertions)]
+    #[test]
+    fn a_cleared_cache_never_gives_the_old_addresses() {
+        let cache = HomeCache::with(switched_home, HOME_TTL);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while cache.get() != [ip([192, 168, 1, 20])] {
+            assert!(Instant::now() < deadline, "never listed");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // The get after clearing starts a listing of the old adapters; the
+        // adapters change and the cache is cleared again while it runs.
+        let closed = SWITCHED_GATE.lock();
+        cache.clear();
+        assert!(cache.get().is_empty(), "a cleared listing was given out");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while SWITCHED_CALLS.load(Ordering::SeqCst) < 2 {
+            assert!(Instant::now() < deadline, "no listing started");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        *SWITCHED_IP.lock() = [192, 168, 1, 30];
+        cache.clear();
+        drop(closed);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let addresses = cache.get();
+            assert_ne!(
+                addresses,
+                [ip([192, 168, 1, 20])],
+                "the old listing came back"
+            );
+            if addresses == [ip([192, 168, 1, 30])] {
+                break;
+            }
+            assert!(Instant::now() < deadline, "the new addresses never came");
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     #[cfg(unix)]

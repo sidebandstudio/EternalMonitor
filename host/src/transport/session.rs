@@ -62,8 +62,9 @@ const IDENTIFY_OVERALL: u32 = 32;
 /// Asking addresses tracked in a window; more get no answer until it ends.
 const IDENTIFY_SOURCES: usize = 16;
 
-/// Bounds what IDENTIFY costs: each answer is an HMAC, an address listing
-/// and a datagram, and anyone on the network may ask.
+/// Bounds what IDENTIFY costs: each answer is an HMAC and a datagram, and
+/// anyone on the network may ask. Only answers count: a request left
+/// unanswered for want of addresses to sign uses up nothing.
 #[derive(Debug, Default)]
 struct IdentifyLimiter {
     overall: Option<(Instant, u32)>,
@@ -1095,14 +1096,15 @@ impl Session {
         let Some(pairing) = config.pairing() else {
             return actions;
         };
-        if request.version != eternal_wire::v2::control::IDENTIFY_VERSION
-            || !self.identify_limiter.allow(asker.ip(), now)
-        {
+        if request.version != eternal_wire::v2::control::IDENTIFY_VERSION {
             return actions;
         }
         let Some((port, addresses)) = config.identity_endpoints() else {
             return actions;
         };
+        if !self.identify_limiter.allow(asker.ip(), now) {
+            return actions;
+        }
         let addresses: Vec<[u8; 4]> = addresses
             .into_iter()
             .take(eternal_wire::v2::control::IDENTITY_MAX_ADDRESSES)
@@ -2821,6 +2823,23 @@ mod tests {
             assert!(session.session_id().is_none());
             assert_eq!(session.not_streaming(), Some(state));
         }
+    }
+
+    /// Requests that get no answer, while the PC has no addresses to sign,
+    /// use up none of the asker's answers.
+    #[test]
+    fn unanswered_identify_uses_up_no_answers() {
+        let mut session = Session::new(100);
+        let now = Instant::now();
+        let asker = addr([192, 0, 2, 9], 50100);
+        for _ in 0..IDENTIFY_OVERALL {
+            assert!(!answered(&mut session, asker, &pair_config(true), now));
+        }
+        let config = identify_config(true);
+        let answers = (0..IDENTIFY_PER_SOURCE * 2)
+            .filter(|_| answered(&mut session, asker, &config, now))
+            .count();
+        assert_eq!(answers, IDENTIFY_PER_SOURCE as usize);
     }
 
     /// A burst from one address gets 8 answers in 10 s, and the PC 32 in
