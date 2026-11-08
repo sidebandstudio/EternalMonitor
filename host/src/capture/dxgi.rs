@@ -19,9 +19,9 @@ use super::recovery::{
 use super::{
     acquired, client_connected, composite_pointer, frame_budget_for, frame_buffer, heartbeat,
     idle_heartbeat, keepalive_allowed, keepalive_due, pointer_apart, pointer_place,
-    read_back_image, reconcile_virtual_display, recovery_poll, resolve_target, Acquired, FrameSlot,
-    FrameUse, IdleGate, OutputInfo, Picture, PointerPlace, RawFrame, ACQUIRE_TIMEOUT_MS,
-    FPS_WINDOW, FRAME_PADDING, PICTURE_HOLD,
+    read_back_image, reconcile_virtual_display, recovery_poll, redraw_cached, resolve_target,
+    Acquired, FrameSlot, FrameUse, IdleGate, OutputInfo, Picture, PointerPlace, RawFrame, Redraw,
+    ACQUIRE_TIMEOUT_MS, FPS_WINDOW, FRAME_PADDING, PICTURE_HOLD,
 };
 use crate::control::{CaptureTarget, SharedControl};
 use crate::gpu_preference::Outcome;
@@ -391,36 +391,50 @@ pub fn run_capture_loop(
         let draws_pointer = pointer_apart(shared.client_draws_pointer(), place);
         if picture.seen_image && last_frame_has_pointer == draws_pointer {
             let mut pixel_buf = frame_buffer(frame_bytes);
-            copy_staging(
-                &device_context,
-                &staging_texture,
-                tex_height,
-                row_bytes,
-                &mut pixel_buf,
+            // A lost duplication goes to the handler below, which keeps the
+            // cache; the rebuild is tried again after it.
+            let copied = redraw_cached(
+                lost_after_acquire.is_some(),
+                || {
+                    copy_staging(
+                        &device_context,
+                        &staging_texture,
+                        tex_height,
+                        row_bytes,
+                        &mut pixel_buf,
+                    )
+                },
+                |error| error.code() == DXGI_ERROR_ACCESS_LOST,
             )?;
-            if composite_pointer(draws_pointer, place, cursor_visible, cursor.has_shape) {
-                draw_cursor(
-                    &mut pixel_buf,
-                    tex_width,
-                    tex_height,
-                    row_bytes,
-                    &cursor,
-                    cursor_x,
-                    cursor_y,
-                );
-            }
-            spare = None;
-            last_frame = Arc::new(pixel_buf);
-            last_frame_has_pointer = !draws_pointer;
-            if client_connected(&shared) {
-                resend_last_frame(
-                    slot,
-                    &shared,
-                    frame_number,
-                    &mut last_send,
-                    &last_frame,
-                    (tex_width, tex_height),
-                );
+            match copied {
+                Redraw::Later => {}
+                Redraw::Lost(error) => lost_after_acquire = Some(error),
+                Redraw::Copied => {
+                    if composite_pointer(draws_pointer, place, cursor_visible, cursor.has_shape) {
+                        draw_cursor(
+                            &mut pixel_buf,
+                            tex_width,
+                            tex_height,
+                            row_bytes,
+                            &cursor,
+                            cursor_x,
+                            cursor_y,
+                        );
+                    }
+                    spare = None;
+                    last_frame = Arc::new(pixel_buf);
+                    last_frame_has_pointer = !draws_pointer;
+                    if client_connected(&shared) {
+                        resend_last_frame(
+                            slot,
+                            &shared,
+                            frame_number,
+                            &mut last_send,
+                            &last_frame,
+                            (tex_width, tex_height),
+                        );
+                    }
+                }
             }
         }
 

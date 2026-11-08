@@ -205,6 +205,41 @@ pub(crate) fn acquired(last_present_time: i64, seen_image: bool, draws_pointer: 
     }
 }
 
+/// What the cached-frame rebuild for a changed pointer answer does with its
+/// copy of the staging texture.
+#[cfg(any(windows, test))]
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Redraw<E> {
+    /// Copied: draw the pointer as the answer wants and keep the frame.
+    Copied,
+    /// A lost duplication is waiting for the loop's handler: rebuild after
+    /// it, with the cache kept as it is.
+    Later,
+    /// The copy hit ACCESS_LOST: hand it to the loop's handler, which
+    /// re-creates the duplication and keeps the cached picture.
+    Lost(E),
+}
+
+/// Copies the staging texture for the rebuild (`copy`), unless a loss is
+/// pending. ACCESS_LOST (`access_lost`) goes to the loop's handler as one
+/// after an acquire does; any other error, such as DEVICE_REMOVED, ends
+/// the capture loop so the pipeline re-creates the device.
+#[cfg(any(windows, test))]
+pub(crate) fn redraw_cached<E>(
+    pending_loss: bool,
+    copy: impl FnOnce() -> Result<(), E>,
+    access_lost: impl FnOnce(&E) -> bool,
+) -> Result<Redraw<E>, E> {
+    if pending_loss {
+        return Ok(Redraw::Later);
+    }
+    match copy() {
+        Ok(()) => Ok(Redraw::Copied),
+        Err(error) if access_lost(&error) => Ok(Redraw::Lost(error)),
+        Err(error) => Err(error),
+    }
+}
+
 pub(crate) fn frame_budget_for(target_fps: u32) -> Duration {
     let fps = target_fps.max(1) as u64;
     Duration::from_micros(1_000_000 / fps)
@@ -1461,6 +1496,40 @@ mod tests {
             assert_eq!(pointer_apart(true, place), place == Apart);
             assert!(!pointer_apart(false, place), "an older iPad");
         }
+    }
+
+    /// Review r7: an ACCESS_LOST from the rebuild's copy goes to the loop's
+    /// handler, which keeps the cached picture, instead of ending the
+    /// capture loop; a pending loss is handled before the rebuild is tried
+    /// again; any other error still ends the loop.
+    #[test]
+    fn a_lost_duplication_during_the_pointer_rebuild_goes_to_the_handler() {
+        const ACCESS_LOST: u32 = 0x887A_0026;
+        const DEVICE_REMOVED: u32 = 0x887A_0005;
+        let lost = |code: &u32| *code == ACCESS_LOST;
+        assert_eq!(redraw_cached(false, || Ok(()), lost), Ok(Redraw::Copied));
+        assert_eq!(
+            redraw_cached(false, || Err(ACCESS_LOST), lost),
+            Ok(Redraw::Lost(ACCESS_LOST))
+        );
+        assert_eq!(
+            redraw_cached(false, || Err(DEVICE_REMOVED), lost),
+            Err(DEVICE_REMOVED),
+            "the device itself goes: the pipeline re-creates it"
+        );
+        let mut copied = false;
+        assert_eq!(
+            redraw_cached(
+                true,
+                || {
+                    copied = true;
+                    Ok::<(), u32>(())
+                },
+                lost
+            ),
+            Ok(Redraw::Later)
+        );
+        assert!(!copied, "not tried while a loss waits for the handler");
     }
 
     /// One pointer, never none and never two. Review r3: with the pointer
