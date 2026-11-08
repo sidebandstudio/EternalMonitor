@@ -1,0 +1,69 @@
+name: Proto fuzz
+
+# Builds the cargo-fuzz targets in proto/fuzz and runs each one briefly.
+# Longer runs happen locally; this keeps the targets compiling and catches
+# shallow crashes on every change to proto.
+
+on:
+  pull_request:
+    paths:
+      - "proto/**"
+      - ".github/workflows/proto-fuzz.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: proto-fuzz-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # cargo-fuzz needs nightly; pinned so a nightly regression can't fail CI.
+  FUZZ_TOOLCHAIN: nightly-2026-11-06
+
+jobs:
+  fuzz:
+    name: Proto fuzz targets (build, then 30 s each)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install the pinned nightly
+        run: rustup toolchain install "$FUZZ_TOOLCHAIN" --profile minimal
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: proto/fuzz
+      - name: Install cargo-fuzz
+        run: cargo "+$FUZZ_TOOLCHAIN" install cargo-fuzz --version 0.13.2 --locked
+      - name: Build fuzz targets
+        working-directory: proto/fuzz
+        run: cargo "+$FUZZ_TOOLCHAIN" fuzz build
+      - name: Run each target for 30 s
+        working-directory: proto/fuzz
+        # The repository is public: libFuzzer's output names and encodes the
+        # crashing input, so it goes to a file that is never printed or
+        # uploaded. A crash is reported by target name only.
+        run: |
+          set -uo pipefail
+          targets="v3_handshake v3_parsers v3_record_open v3_replay_window v3_session_sim"
+          listed=$(cargo "+$FUZZ_TOOLCHAIN" fuzz list | sort | tr '\n' ' ' | sed 's/ $//')
+          if [ "$listed" != "$targets" ]; then
+            echo "::error::fuzz targets are '$listed', expected '$targets'"
+            exit 1
+          fi
+          failed=0
+          for target in $targets; do
+            sanitizer=address
+            # Safe Rust only; it runs far faster without the sanitizer.
+            if [ "$target" = v3_session_sim ]; then sanitizer=none; fi
+            log="$RUNNER_TEMP/fuzz-$target.log"
+            if cargo "+$FUZZ_TOOLCHAIN" fuzz run -s "$sanitizer" "$target" -- -max_total_time=30 > "$log" 2>&1; then
+              echo "$target: $(grep -E '^Done [0-9]+ runs' "$log" || echo 'finished')"
+            else
+              echo "::error::crash in $target, reproduce locally with cargo fuzz run $target"
+              failed=1
+            fi
+          done
+          exit "$failed"

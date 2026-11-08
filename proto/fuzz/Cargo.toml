@@ -1,0 +1,51 @@
+[package]
+name = "eternal-wire-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+eternal-wire = { path = "..", features = ["test-hooks"] }
+
+# Its own workspace: nightly-only, never built by the main workspace or CI.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "v3_parsers"
+path = "fuzz_targets/v3_parsers.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "v3_replay_window"
+path = "fuzz_targets/v3_replay_window.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "v3_record_open"
+path = "fuzz_targets/v3_record_open.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "v3_handshake"
+path = "fuzz_targets/v3_handshake.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "v3_session_sim"
+path = "fuzz_targets/v3_session_sim.rs"
+test = false
+doc = false
+bench = false
