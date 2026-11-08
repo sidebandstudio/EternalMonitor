@@ -14,7 +14,7 @@ final class SessionSummaryTests: XCTestCase {
             + #" transport=(usb|wifi) mode=(mirror|second_screen|unknown)"#
             + #" stage=(started|hello_sent|accepted|video_sent|first_frame|steady)"#
             + #" outcome=(streamed|no_reply|no_picture|pairing|user_ended|app_ended|error)"#
-            + #" failure=(none|no_reply|no_video|no_frame|vdd_enable_failed|vdd_attach_timeout|vdd_not_attached|capture_failed|encoder_failed|usb_lost|signal_lost|no_network|other)"#
+            + #" failure=(none|no_reply|no_video|no_frame|vdd_enable_failed|vdd_attach_timeout|vdd_not_attached|capture_failed|encoder_failed|usb_lost|signal_lost|no_network|pc_busy|old_pc|other)"#
             + #" fallback=(none|attach_timeout|enable_failed|no_driver|no_frames|duplication_failed|remembered|other)"#
             + #" end=(goodbye|liveness|superseded|shutdown|timeout|user|background|error)"#
             + #" ttff_ms=(0|[1-9][0-9]{0,5}|-) duration_ms=(0|[1-9][0-9]{0,9})"#
@@ -78,7 +78,9 @@ final class SessionSummaryTests: XCTestCase {
             (summary(.pcGoodbye), ["accepted", "app_ended", "none", "goodbye"]),
             (summary(.pcRefused, session: nil), ["hello_sent", "error", "other", "error"]),
             (pairing, ["hello_sent", "pairing", "none", "user"]),
-            (summary(.legacyPC, session: nil), ["hello_sent", "error", "other", "error"]),
+            (summary(.pcBusy, session: nil), ["hello_sent", "error", "pc_busy", "error"]),
+            (summary(.oldPC, session: nil), ["hello_sent", "error", "old_pc", "error"]),
+            (summary(.legacyPC, session: nil), ["hello_sent", "error", "old_pc", "error"]),
             (summary(.connectTimeout, session: nil, duration: 10), ["hello_sent", "no_reply", "no_reply", "timeout"]),
             (summary(.pcMoved, session: nil, duration: 3), ["hello_sent", "no_reply", "no_reply", "superseded"]),
             (summary(.otherPC), ["accepted", "error", "other", "error"]),
@@ -112,7 +114,7 @@ final class SessionSummaryTests: XCTestCase {
         XCTAssertEqual(AttemptEnd.usbTurnedOff.bye, .userDisconnect)
         XCTAssertEqual(AttemptEnd.appBackground.bye, .appBackground)
         XCTAssertEqual(AttemptEnd.superseded.bye, .superseded)
-        for end in [AttemptEnd.pcGoodbye, .pcRefused, .legacyPC, .connectTimeout, .pcStoppedResponding,
+        for end in [AttemptEnd.pcGoodbye, .pcRefused, .pcBusy, .oldPC, .legacyPC, .connectTimeout, .pcStoppedResponding,
                     .pictureStalled, .cableUnplugged, .usbLinkFailed, .closedBeforePicture, .linkFailed,
                     .noNetwork, .receiverFailed, .retriedWithCode] {
             XCTAssertEqual(end.bye, .error, "\(end)")

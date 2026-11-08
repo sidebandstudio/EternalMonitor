@@ -618,6 +618,170 @@ final class USBLinkFailureTests: XCTestCase {
         XCTAssertEqual(manager.reconnectAttempt, 0)
     }
 
+    // MARK: - A PC that turns the cable down
+
+    /// Answers the iPad's HELLO2 on the cable's far end `fd` with `status`,
+    /// reporting protocol `version`. False after five quiet seconds.
+    nonisolated private static func refuseSession(on fd: Int32, status: HelloStatus, version: UInt8 = 2) -> Bool {
+        var timeout = timeval(tv_sec: 0, tv_usec: 300_000)
+        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, socklen_t(MemoryLayout<timeval>.size))
+        var framer = EMLinkFramer(expectsPreamble: false)
+        var buffer = [UInt8](repeating: 0, count: 4096)
+        let deadline = Date().addingTimeInterval(5)
+        while Date() < deadline {
+            let count = recv(fd, &buffer, buffer.count, 0)
+            guard count > 0, let datagrams = try? framer.append(Data(buffer.prefix(count))) else { continue }
+            for datagram in datagrams {
+                guard case .hello2(let hello) = Wire.parseControl(datagram)?.message,
+                      let framed = try? EMLinkFramer.encode(FakeUDPHost.ack(nonce: hello.clientNonce, status: status,
+                                                                           acceptedVersion: version)) else { continue }
+                return framed.withUnsafeBytes { Darwin.send(fd, $0.baseAddress, $0.count, 0) } == framed.count
+            }
+        }
+        return false
+    }
+
+    /// The newest cable's PC turns the iPad down with `status`.
+    private func refuse(_ status: HelloStatus, version: UInt8 = 2) async {
+        let fd = peer
+        let refused = await Task.detached { Self.refuseSession(on: fd, status: status, version: version) }.value
+        XCTAssertTrue(refused, "the iPad never sent HELLO2")
+    }
+
+    /// The summary lines recorded so far.
+    private func summaries(_ manager: ConnectionManager) -> [String] {
+        manager.diagnostics.map(\.message).filter { $0.hasPrefix("session_summary ") }
+    }
+
+    /// Offers the PC's dial every 100 ms until the iPad takes one; the
+    /// seconds from `since` until it did.
+    private func dialUntilTaken(_ manager: ConnectionManager, since: Date, cables: inout [FramedLink]) async throws -> Double {
+        let deadline = Date().addingTimeInterval(30)
+        while Date() < deadline {
+            cables.append(try await plugIn(manager))
+            if manager.state == .connecting { return Date().timeIntervalSince(since) }
+            try await Task.sleep(nanoseconds: 100_000_000)
+        }
+        XCTFail("no dial was taken in 30 s")
+        return .infinity
+    }
+
+    /// The wait after each Busy in a row: 30 s, doubling, at most 5 minutes.
+    func testTheBusyWaitDoublesUpToFiveMinutes() {
+        XCTAssertEqual((1...8).map(CableHold.busySeconds), [30, 60, 120, 240, 300, 300, 300, 300])
+        XCTAssertEqual(CableHold.busySeconds(0), 30)
+        XCTAssertEqual(CableHold.busySeconds(.max), 300)
+        let at = Date(timeIntervalSince1970: 1_800_000_000)
+        let hold = CableHold(reason: .busy, until: at.addingTimeInterval(30))
+        XCTAssertTrue(hold.holds(at: at.addingTimeInterval(29.9)))
+        XCTAssertFalse(hold.holds(at: at.addingTimeInterval(30)))
+        XCTAssertTrue(CableHold(reason: .version, until: nil).holds(at: .distantFuture))
+    }
+
+    /// A PC streaming to another device turns the cable down as Busy, then
+    /// dials it again a second later. The iPad shows why and doesn't take
+    /// the cable again until the wait ends, a longer wait after each Busy in
+    /// a row, back to the first after a session. Each attempt's summary
+    /// names the refusal.
+    func testABusyPCOnTheCableIsAnsweredOnlyAfterAGrowingWait() async throws {
+        let previousUSB = UserDefaults.standard.object(forKey: "allowUSB")
+        defer { UserDefaults.standard.set(previousUSB, forKey: "allowUSB") }
+        // The end of a wait must not open the app's real USB listener port.
+        UserDefaults.standard.set(false, forKey: "allowUSB")
+        var waits: [Int] = []
+        var timing = answering
+        timing.cableBusyHoldSeconds = { count in waits.append(count); return Double(count) * 0.8 }
+        let (manager, first) = try await connectOverCable(timing: timing)
+        var cables = [first]
+        defer { cables.forEach { $0.stop() }; manager.cancel() }
+
+        await refuse(.busy)
+        try await until("the refusal shows") { manager.state == .disconnected && manager.problem == .pcBusy }
+        let refusedAt = Date()
+        XCTAssertEqual(manager.usbStatus, "USB: disconnected")
+        XCTAssertTrue(summaries(manager).last?.contains(" stage=hello_sent outcome=error failure=pc_busy fallback=none end=error ") == true,
+                      summaries(manager).joined(separator: "\n"))
+        // The PC dials again and again within the wait: none is taken.
+        for _ in 1...5 {
+            cables.append(try await plugIn(manager))
+            XCTAssertEqual(manager.state, .disconnected, "the cable isn't taken during the wait")
+        }
+        XCTAssertEqual(manager.problem, .pcBusy, "the reason stays up")
+        XCTAssertEqual(summaries(manager).count, 1, "one attempt")
+
+        // The PC dials every 100 ms: the first taken comes once the wait
+        // ended, and the next Busy waits longer.
+        let firstWait = try await dialUntilTaken(manager, since: refusedAt, cables: &cables)
+        XCTAssertGreaterThanOrEqual(firstWait, 0.7, "the 0.8 s wait, less the time to see the refusal")
+        await refuse(.busy)
+        try await until("the second refusal") { manager.state == .disconnected }
+        let secondWait = try await dialUntilTaken(manager, since: Date(), cables: &cables)
+        XCTAssertGreaterThanOrEqual(secondWait, 1.5, "the 1.6 s wait")
+
+        // A session resets the count: the next Busy waits the first wait.
+        await answer()
+        try await until("the session") { manager.hostInfo != nil }
+        manager.cancel()
+        manager.resumeUSBConnections()
+        cables.append(try await plugIn(manager))
+        await refuse(.busy)
+        try await until("the third refusal") { manager.state == .disconnected }
+        XCTAssertEqual(waits, [1, 2, 1])
+        XCTAssertEqual(summaries(manager).filter { $0.contains(" failure=pc_busy ") }.count, 1,
+                       "the list holds the latest attempt's lines")
+    }
+
+    /// Try again during the wait takes the PC's next dial at once.
+    func testTryAgainEndsTheBusyWait() async throws {
+        let previousUSB = UserDefaults.standard.object(forKey: "allowUSB")
+        defer { UserDefaults.standard.set(previousUSB, forKey: "allowUSB") }
+        UserDefaults.standard.set(false, forKey: "allowUSB")
+        let (manager, first) = try await connectOverCable(timing: answering)
+        var cables = [first]
+        defer { cables.forEach { $0.stop() }; manager.cancel() }
+        await refuse(.busy)
+        try await until("the refusal shows") { manager.problem == .pcBusy }
+        XCTAssertEqual(manager.problem?.actions, [.retry])
+        cables.append(try await plugIn(manager))
+        XCTAssertEqual(manager.state, .disconnected)
+        manager.retry()
+        cables.append(try await plugIn(manager))
+        XCTAssertEqual(manager.state, .connecting, "Try again takes the cable at once")
+    }
+
+    /// A PC too old for this app, or one so old it doesn't answer HELLO2,
+    /// can't connect until someone updates it: the iPad shows that, and
+    /// takes the cable again only after Try again or Connect USB, not when
+    /// it comes back to the foreground. Each names an old PC in its summary.
+    func testAnOldPCOnTheCableWaitsForTheUser() async throws {
+        let previousUSB = UserDefaults.standard.object(forKey: "allowUSB")
+        defer { UserDefaults.standard.set(previousUSB, forKey: "allowUSB") }
+        UserDefaults.standard.set(false, forKey: "allowUSB")
+        let (manager, first) = try await connectOverCable(timing: answering)
+        var cables = [first]
+        defer { cables.forEach { $0.stop() }; manager.cancel() }
+        await refuse(.versionUnsupported, version: 1)
+        try await until("the refusal shows") { manager.state == .disconnected && manager.versionMismatch == .pcOlder }
+        XCTAssertEqual(manager.connectionError, VersionMismatch.pcOlder.message)
+        XCTAssertEqual(manager.usbStatus, "USB: disconnected", "Connect USB is offered")
+        XCTAssertTrue(summaries(manager).last?.contains(" stage=hello_sent outcome=error failure=old_pc fallback=none end=error ") == true,
+                      summaries(manager).joined(separator: "\n"))
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+        cables.append(try await plugIn(manager))
+        XCTAssertEqual(manager.state, .disconnected, "no wait ends it")
+        manager.handleAppBackgrounded()
+        manager.handleAppForegrounded()
+        cables.append(try await plugIn(manager))
+        XCTAssertEqual(manager.state, .disconnected, "coming back to the app doesn't end it")
+
+        manager.resumeUSBConnections()
+        cables.append(try await plugIn(manager))
+        XCTAssertEqual(manager.state, .connecting, "Connect USB takes the cable again")
+        // The PC was updated: it connects as any other.
+        await answer()
+        try await until("the session") { manager.hostInfo != nil }
+    }
+
     /// The PC still holds this iPad's cable session and answers the Wi-Fi
     /// fallback with Busy, then frees up.
     func testBusyDuringTheFallbackRetriesUntilThePCIsFree() async throws {
