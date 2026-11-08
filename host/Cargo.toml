@@ -105,7 +105,6 @@ features = [
     "Win32_System_Registry",
     "Win32_System_StationsAndDesktops",
     "Win32_System_SystemInformation",
-    "Win32_System_TaskScheduler",
     "Win32_System_IO",
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
