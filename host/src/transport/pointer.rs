@@ -55,6 +55,8 @@ pub struct PointerSender {
     shape_due: bool,
     /// The image the iPad's last report said it holds, and when it came.
     client_shape: Option<(u32, Instant)>,
+    /// A visible position went this session.
+    shown: bool,
 }
 
 impl PointerSender {
@@ -83,6 +85,15 @@ impl PointerSender {
     /// Send the current position again at the next poll.
     pub fn refresh(&mut self, now: Instant) {
         self.repeat_at = Some(now);
+    }
+
+    /// Capture withholds the pointer (`PointerFeed::set_withheld`): no
+    /// image goes, and only hidden positions to an iPad that was shown
+    /// one this session. Whether to poll at all.
+    pub fn withhold(&mut self) -> bool {
+        self.pending = None;
+        self.retry_at = None;
+        self.shown
     }
 
     pub fn report(&mut self, pointer_shape_id: u32, now: Instant) {
@@ -149,6 +160,7 @@ impl PointerSender {
             let changed = self.sent.is_none_or(|(sent, _)| sent != state);
             self.repeat_at = changed.then_some(now + REPEAT_AFTER);
             self.sent = Some((state, now));
+            self.shown |= position.visible;
             out.push(Send::State(PointerState {
                 host_time_us: position.host_time_us,
                 ..state
@@ -451,6 +463,42 @@ mod tests {
         sender.refresh(now);
         assert_eq!(sender.next_poll(BUDGET, latest.1, Some(1)), Some(now));
         assert_eq!(states(&poll_all(&mut sender, now, BUDGET, latest)), [5]);
+    }
+
+    /// Review r4: where capture can't tell where Windows puts the pointer,
+    /// an iPad that was never shown one gets no pointer messages, and one
+    /// that was (the mirror before a second screen) only hidden positions.
+    #[test]
+    fn a_withheld_pointer_sends_nothing_but_a_hidden_state_to_clear_one() {
+        let start = Instant::now();
+        let mut sender = PointerSender::default();
+        sender.serve(Some(1));
+        assert!(!sender.withhold(), "never shown: nothing to send");
+        let hidden = Position {
+            visible: false,
+            ..at(5)
+        };
+        poll_all(&mut sender, start, BUDGET, (None, Some(hidden)));
+        assert!(!sender.withhold(), "a hidden position shows nothing");
+
+        let mut sender = PointerSender::default();
+        sender.serve(Some(1));
+        let sent = sender.poll(start, BUDGET, (Some(shape(1)), Some(at(5))));
+        assert!(matches!(sent[0], Send::Shape(_, 0)), "{sent:?}");
+        assert!(sender.withhold(), "shown: the hidden state is owed");
+        let later = start + BUDGET;
+        let sent = poll_all(&mut sender, later, BUDGET, (None, Some(hidden)));
+        assert_eq!(
+            sent,
+            [Send::State(PointerState {
+                flags: 0,
+                shape_id: 0,
+                x: 5,
+                y: 0,
+                host_time_us: 5,
+            })],
+            "no image, not even the one under way"
+        );
     }
 
     #[test]

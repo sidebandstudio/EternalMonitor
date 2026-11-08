@@ -17,9 +17,10 @@ use super::recovery::{
 };
 use super::{
     acquired, client_connected, composite_pointer, frame_budget_for, frame_buffer, heartbeat,
-    idle_heartbeat, keepalive_allowed, keepalive_due, pointer_apart, pointer_in_picture,
+    idle_heartbeat, keepalive_allowed, keepalive_due, pointer_apart, pointer_place,
     read_back_image, reconcile_virtual_display, recovery_poll, resolve_target, Acquired, FrameSlot,
-    FrameUse, IdleGate, OutputInfo, RawFrame, ACQUIRE_TIMEOUT_MS, FPS_WINDOW, FRAME_PADDING,
+    FrameUse, IdleGate, OutputInfo, PointerPlace, RawFrame, ACQUIRE_TIMEOUT_MS, FPS_WINDOW,
+    FRAME_PADDING,
 };
 use crate::control::{CaptureTarget, SharedControl};
 use crate::gpu_preference::Outcome;
@@ -319,17 +320,20 @@ pub fn run_capture_loop(
     // Whether `last_frame` has the pointer drawn in: it has unless the
     // client draws the pointer itself (`SharedControl::client_draws_pointer`).
     let mut last_frame_has_pointer = true;
-    // Windows draws the pointer into the picture itself: on the second
-    // screen without the driver's hardware cursor, or for an image too
-    // large for it. Then nothing else draws one (`composite_pointer`).
-    let in_picture = |cursor: &CursorState| {
-        pointer_in_picture(
-            second_screen,
-            shared.vdd_hardware_cursor.load(Ordering::Relaxed),
-            cursor.size(),
-        )
+    // Where Windows puts the pointer (`pointer_place`): into the picture on
+    // the second screen without the driver's hardware cursor, or for an
+    // image too large for it, and then nothing else draws one. Where the
+    // running driver can't be told, as 0.3.4: no pointer messages.
+    let driver = if second_screen {
+        super::running_driver_cursor()
+    } else {
+        crate::vdd_settings::DriverCursor::Unknown
     };
-    let mut pointer_in_image;
+    shared
+        .pointer
+        .set_withheld(second_screen && driver == crate::vdd_settings::DriverCursor::Unknown);
+    let place_of = |cursor: &CursorState| pointer_place(second_screen, driver, cursor.size());
+    let mut place;
     {
         // The feed outlives this capture: a position from the output
         // captured before (the mirror a second screen starts from) would be
@@ -376,8 +380,8 @@ pub fn run_capture_loop(
         // other client, or none, one with it. The staging texture still
         // holds the last desktop image, so the cached frame is redrawn from
         // it when the connected client's answer differs from the cache's.
-        pointer_in_image = in_picture(&cursor);
-        let draws_pointer = pointer_apart(shared.client_draws_pointer(), pointer_in_image);
+        place = place_of(&cursor);
+        let draws_pointer = pointer_apart(shared.client_draws_pointer(), place);
         if seen_image && last_frame_has_pointer == draws_pointer {
             let mut pixel_buf = frame_buffer(frame_bytes);
             copy_staging(
@@ -387,12 +391,7 @@ pub fn run_capture_loop(
                 row_bytes,
                 &mut pixel_buf,
             )?;
-            if composite_pointer(
-                draws_pointer,
-                pointer_in_image,
-                cursor_visible,
-                cursor.has_shape,
-            ) {
+            if composite_pointer(draws_pointer, place, cursor_visible, cursor.has_shape) {
                 draw_cursor(
                     &mut pixel_buf,
                     tex_width,
@@ -469,8 +468,8 @@ pub fn run_capture_loop(
                 // draws it into the picture.
                 let new_shape = frame_info.PointerShapeBufferSize > 0
                     && cursor.update_shape(dupl, frame_info.PointerShapeBufferSize);
-                pointer_in_image = in_picture(&cursor);
-                if new_shape && !pointer_in_image {
+                place = place_of(&cursor);
+                if new_shape && place == PointerPlace::Apart {
                     if let Some(image) = super::pointer::convert_shape(
                         cursor.shape_type,
                         cursor.width,
@@ -489,8 +488,8 @@ pub fn run_capture_loop(
                         cursor_y = frame_info.PointerPosition.Position.y;
                     }
                     shared.pointer.set_position(super::pointer::Position {
-                        // A picture with the pointer in it has none apart.
-                        visible: cursor_visible && !pointer_in_image,
+                        // Only a pointer Windows keeps apart is shown apart.
+                        visible: cursor_visible && place == PointerPlace::Apart,
                         x: cursor_x,
                         y: cursor_y,
                         host_time_us: crate::clock::host_now_us(),
@@ -594,7 +593,7 @@ pub fn run_capture_loop(
                                 // Composite the mouse cursor into the BGRA frame.
                                 if composite_pointer(
                                     draws_pointer,
-                                    pointer_in_image,
+                                    place,
                                     cursor_visible,
                                     cursor.has_shape,
                                 ) {

@@ -3764,6 +3764,7 @@ fn the_pointer_moves_without_video_frames_for_an_ipad_that_draws_it() {
         let (mut frames, mut highest, mut states) = (0u32, 0u32, Vec::new());
         let mut shape: Option<(u32, Vec<u8>, usize)> = None;
         let mut held_shape = 0;
+        let mut hidden_at_start = 0u32;
         let mut window_start: Option<Instant> = None;
         let deadline = Instant::now() + DEADLINE;
         while window_start.is_none_or(|at| at.elapsed() < WINDOW) {
@@ -3806,6 +3807,12 @@ fn the_pointer_moves_without_video_frames_for_an_ipad_that_draws_it() {
                     }
                 }
                 Classified::Control(_) => match parse_control(bytes).map(|(_, m)| m) {
+                    Ok(
+                        message @ (ControlMessage::PointerState(_)
+                        | ControlMessage::PointerShape(_)),
+                    ) if !draws => {
+                        panic!("an older iPad got a pointer message: {message:?}")
+                    }
                     Ok(ControlMessage::PointerState(state))
                         if state.flags & POINTER_VISIBLE != 0 =>
                     {
@@ -3815,7 +3822,16 @@ fn the_pointer_moves_without_video_frames_for_an_ipad_that_draws_it() {
                         }
                         window_start.get_or_insert_with(Instant::now);
                     }
-                    Ok(ControlMessage::PointerState(_)) => {}
+                    // Hidden only while the session starts: until the iPad's
+                    // report names the image, the pointer stays in the video.
+                    // The synthetic pointer never hides.
+                    Ok(ControlMessage::PointerState(state)) => {
+                        assert!(
+                            window_start.is_none(),
+                            "a hidden state after the pointer went apart: {state:?}"
+                        );
+                        hidden_at_start += 1;
+                    }
                     Ok(ControlMessage::PointerShape(chunk)) => {
                         let (id, bytes, got) = shape.get_or_insert_with(|| {
                             (chunk.shape_id, vec![0; chunk.total_len as usize], 0)
@@ -3838,7 +3854,8 @@ fn the_pointer_moves_without_video_frames_for_an_ipad_that_draws_it() {
         let distinct: std::collections::HashSet<_> = states.iter().collect();
         let load = std::fs::read_to_string("/proc/loadavg").unwrap_or_default();
         eprintln!(
-            "draws={draws}: {frames} frames, {} pointer states ({} distinct) in {WINDOW:?} {load}",
+            "draws={draws}: {frames} frames, {} pointer states ({} distinct) in {WINDOW:?}, \
+             {hidden_at_start} hidden before {load}",
             states.len(),
             distinct.len()
         );

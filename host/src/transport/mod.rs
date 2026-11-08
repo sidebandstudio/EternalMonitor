@@ -915,7 +915,8 @@ async fn act(
 }
 
 /// The pointer to send: hidden until the iPad holds its image, while
-/// capture still draws it into the video (`client_draws_pointer`).
+/// capture still draws it into the video (`client_draws_pointer`). No image
+/// and hidden while capture withholds it (`PointerFeed::set_withheld`).
 fn pointer_latest(
     shared: &SharedControl,
 ) -> (
@@ -923,12 +924,13 @@ fn pointer_latest(
     Option<crate::capture::pointer::Position>,
 ) {
     let (shape, position) = shared.pointer.latest();
-    let shown = shared.client_draws_pointer();
+    let withheld = shared.pointer.withheld();
+    let shown = shared.client_draws_pointer() && !withheld;
     let position = position.map(|position| crate::capture::pointer::Position {
         visible: position.visible && shown,
         ..position
     });
-    (shape, position)
+    (shape.filter(|_| !withheld), position)
 }
 
 /// Sends what [`pointer::PointerSender`] says is due, to a client that
@@ -946,7 +948,7 @@ async fn send_pointer(
         );
     }
     sender.serve(session_id);
-    if session_id.is_none() {
+    if session_id.is_none() || (shared.pointer.withheld() && !sender.withhold()) {
         return;
     }
     let budget = crate::capture::frame_budget_for(shared.effective_fps());

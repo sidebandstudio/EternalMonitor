@@ -1670,22 +1670,33 @@ struct WindowsDriver<'a> {
 
 #[cfg(windows)]
 impl WindowsDriver<'_> {
-    /// Whether the running driver gives Windows a hardware cursor, after a
-    /// driver change (`vdd_settings::cursor_in_effect`).
-    fn note_cursor(&self, enabled: bool, done: bool) {
+    /// After an Enable that succeeded: a driver that started in it read
+    /// the file `prepare` wrote, so keep what that file gives the pointer
+    /// (`vdd_settings::record_after_enable`). One already running keeps the
+    /// record of its own start.
+    fn note_start(&self) {
         let request = self.request.borrow();
-        let request = request.as_ref();
-        let flag = &self.shared.vdd_hardware_cursor;
-        let now = flag.load(std::sync::atomic::Ordering::Relaxed);
-        let in_effect = crate::vdd_settings::cursor_in_effect(
-            now,
-            enabled,
-            done,
-            request.is_some_and(|request| request.device_off),
-            request.is_some_and(|request| request.hardware_cursor),
+        let Some(request) = request.as_ref() else {
+            return;
+        };
+        let after = crate::vdd_device::instance();
+        let record = crate::vdd_settings::record_after_enable(
+            request.instance,
+            after,
+            request.settings.as_deref(),
+            request.cursor,
         );
-        flag.store(in_effect, std::sync::atomic::Ordering::Relaxed);
-        info!(hardware_cursor = in_effect, "The virtual display's pointer");
+        info!(
+            started = record.is_some(),
+            running = after.is_some(),
+            "The virtual display's driver after the Enable"
+        );
+        let (Some(record), Some(path)) = (record, super::cursor_record_path()) else {
+            return;
+        };
+        if let Err(error) = crate::vdd_settings::save_record(&path, &record) {
+            warn!(%error, "Could not keep the virtual display's pointer record");
+        }
     }
 }
 
@@ -1701,13 +1712,17 @@ impl Driver for WindowsDriver<'_> {
 
     fn set_enabled(&self, enabled: bool) -> bool {
         let done = crate::vdd::set_enabled(enabled, || {});
-        self.note_cursor(enabled, done);
+        if enabled && done {
+            self.note_start();
+        }
         done
     }
 
     fn enable(&self) -> Result<(), EnableReport> {
         let result = crate::vdd::enable(|| {});
-        self.note_cursor(true, result.is_ok());
+        if result.is_ok() {
+            self.note_start();
+        }
         result
     }
 

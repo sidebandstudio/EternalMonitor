@@ -164,6 +164,7 @@ struct FeedState {
     shape: Option<Arc<Shape>>,
     position: Option<Position>,
     last_id: u32,
+    withheld: bool,
 }
 
 impl PointerFeed {
@@ -190,6 +191,19 @@ impl PointerFeed {
     pub fn set_position(&self, position: Position) {
         self.state.lock().position = Some(position);
         self.changed.notify_one();
+    }
+
+    /// Capture can't tell where Windows puts the pointer
+    /// (`capture::PointerPlace::Unknown`): it stays in the video, and no
+    /// pointer messages go to the iPad but a hidden state to clear one it
+    /// was drawing.
+    pub fn set_withheld(&self, withheld: bool) {
+        self.state.lock().withheld = withheld;
+        self.changed.notify_one();
+    }
+
+    pub fn withheld(&self) -> bool {
+        self.state.lock().withheld
     }
 
     pub fn latest(&self) -> (Option<Arc<Shape>>, Option<Position>) {

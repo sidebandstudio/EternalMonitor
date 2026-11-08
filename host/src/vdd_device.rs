@@ -140,83 +140,164 @@ pub fn from_task_stderr(stderr: &str) -> Option<DeviceState> {
 /// Read the driver's device from Configuration Manager.
 #[cfg(windows)]
 pub fn query() -> DeviceState {
-    use windows::core::{w, PCWSTR};
     use windows::Win32::Devices::DeviceAndDriverInstallation::{
-        CM_Get_Child, CM_Get_DevNode_Registry_PropertyW, CM_Get_DevNode_Status,
-        CM_Get_Device_ID_ListW, CM_Get_Device_ID_List_SizeW, CM_Locate_DevNodeW,
-        CM_DEVNODE_STATUS_FLAGS, CM_DRP_DRIVER, CM_DRP_HARDWAREID, CM_GETIDLIST_FILTER_ENUMERATOR,
-        CM_GETIDLIST_FILTER_PRESENT, CM_LOCATE_DEVNODE_NORMAL, CM_PROB, CR_BUFFER_SMALL,
-        CR_SUCCESS,
+        CM_Get_Child, CM_DRP_DRIVER, CR_SUCCESS,
     };
 
-    let status = |devinst: u32| {
-        let (mut status, mut problem) = (CM_DEVNODE_STATUS_FLAGS(0), CM_PROB(0));
-        (unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, devinst, 0) } == CR_SUCCESS)
-            .then_some((status.0, problem.0))
+    let Some(devnodes) = driver_devnodes() else {
+        return DeviceState::Missing;
     };
-    let property = |devinst: u32, which: u32| -> Option<Vec<u16>> {
-        let mut bytes = 0u32;
-        let result =
-            unsafe { CM_Get_DevNode_Registry_PropertyW(devinst, which, None, None, &mut bytes, 0) };
-        if result != CR_BUFFER_SMALL || bytes == 0 {
-            return None;
-        }
-        let mut buffer = vec![0u16; bytes.div_ceil(2) as usize];
-        (unsafe {
-            CM_Get_DevNode_Registry_PropertyW(
-                devinst,
-                which,
-                None,
-                Some(buffer.as_mut_ptr().cast()),
-                &mut bytes,
-                0,
-            )
-        } == CR_SUCCESS)
-            .then_some(buffer)
+    let states = devnodes.into_iter().filter_map(|devinst| {
+        let (flags, problem) = devnode_status(devinst)?;
+        let mut child = 0u32;
+        let monitor = (unsafe { CM_Get_Child(&mut child, devinst, 0) } == CR_SUCCESS).then(|| {
+            devnode_status(child)
+                .is_some_and(|(flags, _)| flags & DN_STARTED != 0 && flags & DN_HAS_PROBLEM == 0)
+        });
+        let has_driver = registry_property(devinst, CM_DRP_DRIVER).is_some();
+        Some(DeviceState::from_devnode(
+            flags, problem, has_driver, monitor,
+        ))
+    });
+    DeviceState::best(states)
+}
+
+/// The running driver's start (`vdd_settings::DriverInstance`): this boot
+/// and its device's last arrival. `None` when no one device of the driver
+/// runs, or Windows doesn't say.
+#[cfg(windows)]
+pub fn instance() -> Option<crate::vdd_settings::DriverInstance> {
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{
+        CM_Get_DevNode_PropertyW, CR_SUCCESS,
+    };
+    use windows::Win32::Devices::Properties::{
+        DEVPKEY_Device_LastArrivalDate, DEVPROPTYPE, DEVPROP_TYPE_FILETIME,
+    };
+
+    let mut running = driver_devnodes()?.into_iter().filter(|&devinst| {
+        devnode_status(devinst)
+            .is_some_and(|(flags, _)| flags & DN_STARTED != 0 && flags & DN_HAS_PROBLEM == 0)
+    });
+    let devinst = match (running.next(), running.next()) {
+        (Some(devinst), None) => devinst,
+        _ => return None,
+    };
+    let (mut arrival, mut kind, mut size) = (0u64, DEVPROPTYPE(0), 8u32);
+    let result = unsafe {
+        CM_Get_DevNode_PropertyW(
+            devinst,
+            &DEVPKEY_Device_LastArrivalDate,
+            &mut kind,
+            Some((&mut arrival as *mut u64).cast()),
+            &mut size,
+            0,
+        )
+    };
+    if result != CR_SUCCESS || kind != DEVPROP_TYPE_FILETIME || size != 8 || arrival == 0 {
+        return None;
+    }
+    Some(crate::vdd_settings::DriverInstance {
+        boot_id: boot_id()?,
+        arrival,
+    })
+}
+
+/// Windows' count of boots, which the kernel raises at each one.
+#[cfg(windows)]
+fn boot_id() -> Option<u32> {
+    use windows::core::w;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD};
+    let (mut value, mut bytes) = (0u32, 4u32);
+    unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            w!(r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters"),
+            w!("BootId"),
+            RRF_RT_REG_DWORD,
+            None,
+            Some((&mut value as *mut u32).cast()),
+            Some(&mut bytes),
+        )
+    }
+    .is_ok()
+    .then_some(value)
+}
+
+/// The present root devices with the driver's hardware ID, or `None` when
+/// Windows can't list them.
+#[cfg(windows)]
+fn driver_devnodes() -> Option<Vec<u32>> {
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{
+        CM_Get_Device_ID_ListW, CM_Get_Device_ID_List_SizeW, CM_Locate_DevNodeW, CM_DRP_HARDWAREID,
+        CM_GETIDLIST_FILTER_ENUMERATOR, CM_GETIDLIST_FILTER_PRESENT, CM_LOCATE_DEVNODE_NORMAL,
+        CR_SUCCESS,
     };
 
     let flags = CM_GETIDLIST_FILTER_ENUMERATOR | CM_GETIDLIST_FILTER_PRESENT;
     let mut len = 0u32;
     if unsafe { CM_Get_Device_ID_List_SizeW(&mut len, w!("ROOT"), flags) } != CR_SUCCESS {
-        return DeviceState::Missing;
+        return None;
     }
     let mut ids = vec![0u16; len as usize];
     if unsafe { CM_Get_Device_ID_ListW(w!("ROOT"), &mut ids, flags) } != CR_SUCCESS {
-        return DeviceState::Missing;
+        return None;
     }
-    let states = ids
-        .split(|&unit| unit == 0)
-        .filter(|id| !id.is_empty())
-        .filter_map(|id| {
-            let id: Vec<u16> = id.iter().copied().chain(Some(0)).collect();
-            let mut devinst = 0u32;
-            if unsafe {
-                CM_Locate_DevNodeW(&mut devinst, PCWSTR(id.as_ptr()), CM_LOCATE_DEVNODE_NORMAL)
-            } != CR_SUCCESS
-            {
-                return None;
-            }
-            let hardware_ids = property(devinst, CM_DRP_HARDWAREID)?;
-            hardware_ids
-                .split(|&unit| unit == 0)
-                .any(|hwid| String::from_utf16_lossy(hwid).eq_ignore_ascii_case(HARDWARE_ID))
-                .then_some(devinst)
-        })
-        .filter_map(|devinst| {
-            let (flags, problem) = status(devinst)?;
-            let mut child = 0u32;
-            let monitor =
-                (unsafe { CM_Get_Child(&mut child, devinst, 0) } == CR_SUCCESS).then(|| {
-                    status(child).is_some_and(|(flags, _)| {
-                        flags & DN_STARTED != 0 && flags & DN_HAS_PROBLEM == 0
-                    })
-                });
-            let has_driver = property(devinst, CM_DRP_DRIVER).is_some();
-            Some(DeviceState::from_devnode(
-                flags, problem, has_driver, monitor,
-            ))
-        });
-    DeviceState::best(states)
+    Some(
+        ids.split(|&unit| unit == 0)
+            .filter(|id| !id.is_empty())
+            .filter_map(|id| {
+                let id: Vec<u16> = id.iter().copied().chain(Some(0)).collect();
+                let mut devinst = 0u32;
+                if unsafe {
+                    CM_Locate_DevNodeW(&mut devinst, PCWSTR(id.as_ptr()), CM_LOCATE_DEVNODE_NORMAL)
+                } != CR_SUCCESS
+                {
+                    return None;
+                }
+                let hardware_ids = registry_property(devinst, CM_DRP_HARDWAREID)?;
+                hardware_ids
+                    .split(|&unit| unit == 0)
+                    .any(|hwid| String::from_utf16_lossy(hwid).eq_ignore_ascii_case(HARDWARE_ID))
+                    .then_some(devinst)
+            })
+            .collect(),
+    )
+}
+
+#[cfg(windows)]
+fn devnode_status(devinst: u32) -> Option<(u32, u32)> {
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{
+        CM_Get_DevNode_Status, CM_DEVNODE_STATUS_FLAGS, CM_PROB, CR_SUCCESS,
+    };
+    let (mut status, mut problem) = (CM_DEVNODE_STATUS_FLAGS(0), CM_PROB(0));
+    (unsafe { CM_Get_DevNode_Status(&mut status, &mut problem, devinst, 0) } == CR_SUCCESS)
+        .then_some((status.0, problem.0))
+}
+
+#[cfg(windows)]
+fn registry_property(devinst: u32, which: u32) -> Option<Vec<u16>> {
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{
+        CM_Get_DevNode_Registry_PropertyW, CR_BUFFER_SMALL, CR_SUCCESS,
+    };
+    let mut bytes = 0u32;
+    let result =
+        unsafe { CM_Get_DevNode_Registry_PropertyW(devinst, which, None, None, &mut bytes, 0) };
+    if result != CR_BUFFER_SMALL || bytes == 0 {
+        return None;
+    }
+    let mut buffer = vec![0u16; bytes.div_ceil(2) as usize];
+    (unsafe {
+        CM_Get_DevNode_Registry_PropertyW(
+            devinst,
+            which,
+            None,
+            Some(buffer.as_mut_ptr().cast()),
+            &mut bytes,
+            0,
+        )
+    } == CR_SUCCESS)
+        .then_some(buffer)
 }
 
 /// Set the mode of the virtual display `device` (a GDI name like

@@ -108,43 +108,72 @@ pub(crate) fn frame_has_image(last_present_time: i64, seen_image: bool) -> bool 
     last_present_time != 0 || seen_image
 }
 
-/// Whether Windows draws the pointer into the captured picture: on the
-/// second screen, unless the virtual display driver runs with a hardware
-/// cursor (`vdd_settings::cursor_in_effect`), and then too for an image
-/// larger than that cursor takes (`vdd_settings::CURSOR_MAX`). Without
-/// one, measured on the reference PC, every pointer move there was a new
-/// image and Desktop Duplication kept reporting the pointer at one stale
-/// position.
+/// Where Windows puts the pointer on a captured output.
 #[cfg(any(windows, test))]
-pub(crate) fn pointer_in_picture(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PointerPlace {
+    /// Apart from the picture, as Desktop Duplication reports it.
+    Apart,
+    /// Windows draws it into the picture.
+    InPicture,
+    /// The second screen's driver can't be told (`DriverCursor::Unknown`).
+    /// The pointer is handled as in 0.3.4: no pointer messages, and capture
+    /// draws the reported pointer when Desktop Duplication reports it
+    /// visible with an image.
+    Unknown,
+}
+
+/// Where Windows puts the pointer: apart, except on the second screen,
+/// where the running driver decides (`vdd_settings::running_cursor`).
+/// With its hardware cursor, an image larger than its caps goes into the
+/// picture; without one, every image does. Measured on the reference PC,
+/// a pointer in the picture made every move a new image, and Desktop
+/// Duplication kept reporting a stale position.
+#[cfg(any(windows, test))]
+pub(crate) fn pointer_place(
     second_screen: bool,
-    driver_cursor: bool,
+    driver: crate::vdd_settings::DriverCursor,
     shape: Option<(u32, u32)>,
-) -> bool {
-    let max = crate::vdd_settings::CURSOR_MAX;
-    second_screen && (!driver_cursor || shape.is_some_and(|(w, h)| w > max || h > max))
+) -> PointerPlace {
+    use crate::vdd_settings::DriverCursor;
+    match driver {
+        _ if !second_screen => PointerPlace::Apart,
+        DriverCursor::Hardware(caps) if shape.is_none_or(|size| caps.takes(size)) => {
+            PointerPlace::Apart
+        }
+        DriverCursor::Hardware(_) | DriverCursor::Software => PointerPlace::InPicture,
+        DriverCursor::Unknown => PointerPlace::Unknown,
+    }
 }
 
 /// Whether capture draws the pointer into the video: for a client that
 /// doesn't draw it, unless Windows already drew it there. Drawing the
 /// reported pointer over Windows' own put a second, frozen pointer at the
-/// stale position.
+/// stale position. Where that can't be told, as 0.3.4 did: whenever
+/// Desktop Duplication reports it visible with an image, which it doesn't
+/// for a pointer Windows drew in (on the reference PC's second screen
+/// without the driver's cursor it reported it hidden from the first frame).
 #[cfg(any(windows, test))]
 pub(crate) fn composite_pointer(
     client_draws_pointer: bool,
-    pointer_in_picture: bool,
+    place: PointerPlace,
     visible: bool,
     has_shape: bool,
 ) -> bool {
-    !client_draws_pointer && !pointer_in_picture && visible && has_shape
+    let drawn_elsewhere = match place {
+        PointerPlace::Apart => client_draws_pointer,
+        PointerPlace::InPicture => true,
+        PointerPlace::Unknown => false,
+    };
+    !drawn_elsewhere && visible && has_shape
 }
 
 /// Whether the pointer goes apart from the video for this capture: to an
-/// iPad that draws it, unless Windows draws it into the picture. Then it
-/// stays in the video, as before, and the iPad is told it is hidden.
+/// iPad that draws it, when Windows keeps it apart. Otherwise it stays in
+/// the video, as before, and the iPad is told it is hidden.
 #[cfg(any(windows, test))]
-pub(crate) fn pointer_apart(client_draws_pointer: bool, pointer_in_picture: bool) -> bool {
-    client_draws_pointer && !pointer_in_picture
+pub(crate) fn pointer_apart(client_draws_pointer: bool, place: PointerPlace) -> bool {
+    client_draws_pointer && place == PointerPlace::Apart
 }
 
 /// What the capture loop does with an acquired frame.
@@ -495,11 +524,12 @@ struct VddRequest {
     mode: Option<crate::vdd_settings::VddMode>,
     /// The adapters' LUIDs before the Enable, to find the driver's own.
     before: Vec<u64>,
-    /// The driver was off, so the Enable that follows starts it with this
-    /// file (see `vdd_settings::cursor_in_effect`).
-    device_off: bool,
-    /// And it will give Windows a hardware cursor when it starts.
-    hardware_cursor: bool,
+    /// The driver's start before the Enable, if it was running, and what
+    /// an Enable that starts it gives Windows for the pointer, from the
+    /// file it reads (see `vdd_settings::record_after_enable`).
+    instance: Option<crate::vdd_settings::DriverInstance>,
+    settings: Option<String>,
+    cursor: crate::vdd_settings::DriverCursor,
 }
 
 /// Before each enable: name the main screen's graphics card for the driver
@@ -585,30 +615,62 @@ fn prepare_vdd_settings(shared: &SharedControl, outputs: &[OutputInfo]) -> VddRe
         }
         Err(_) => {}
     }
-    // The driver reads this file when it starts. A driver already on keeps
-    // what it read then; one found off forgets anything this host knew.
-    let device_off = crate::vdd_device::query() == crate::vdd_device::DeviceState::Problem(22);
-    if device_off {
-        shared
-            .vdd_hardware_cursor
-            .store(false, std::sync::atomic::Ordering::Relaxed);
-    }
-    let reads_cursor = owned
-        || crate::vdd_settings::driver_version()
-            .is_some_and(|version| crate::vdd_settings::driver_reads_cursor(&version));
-    let file_cursor =
-        std::fs::read_to_string(path).is_ok_and(|xml| crate::vdd_settings::hardware_cursor(&xml));
+    // The driver reads this file when it starts; a driver already running
+    // keeps what it read then.
+    let settings = std::fs::read_to_string(path).ok();
+    let reads_cursor = if owned {
+        Some(true)
+    } else {
+        crate::vdd_settings::driver_version()
+            .and_then(|version| crate::vdd_settings::driver_reads_cursor(&version))
+    };
+    let overridden = crate::vdd_settings::registry_overrides_cursor();
+    let cursor =
+        crate::vdd_settings::starting_cursor(settings.as_deref(), reads_cursor, overridden);
+    let instance = crate::vdd_device::instance();
     info!(
-        device_off,
-        reads_cursor, file_cursor, "The virtual display's pointer settings"
+        running = instance.is_some(),
+        ?reads_cursor,
+        overridden,
+        ?cursor,
+        "The virtual display's pointer settings"
     );
     VddRequest {
         pin: crate::vdd_settings::pin_result(wanted, &applied),
         mode,
         before,
-        device_off,
-        hardware_cursor: reads_cursor && file_cursor,
+        instance,
+        settings,
+        cursor,
     }
+}
+
+/// Where the record of the driver's last start is kept.
+#[cfg(windows)]
+pub(crate) fn cursor_record_path() -> Option<std::path::PathBuf> {
+    crate::settings::app_data_dir().map(|dir| dir.join(crate::vdd_settings::CURSOR_RECORD))
+}
+
+/// What the running driver does with the pointer, from the record of its
+/// start (`vdd_settings::running_cursor`).
+#[cfg(windows)]
+pub(crate) fn running_driver_cursor() -> crate::vdd_settings::DriverCursor {
+    let record = cursor_record_path().and_then(|path| crate::vdd_settings::load_record(&path));
+    let running = crate::vdd_device::instance();
+    let cursor = crate::vdd_settings::running_cursor(record.as_ref(), running);
+    info!(
+        recorded = record.is_some(),
+        same_start = record
+            .as_ref()
+            .zip(running)
+            .is_some_and(|(record, running)| record.instance == running),
+        settings_sha256 = record
+            .as_ref()
+            .map_or("", |record| record.settings_sha256.as_str()),
+        ?cursor,
+        "The running virtual display's pointer"
+    );
+    cursor
 }
 
 /// Bring a freshly attached second screen to the mode asked for, when
@@ -1235,53 +1297,87 @@ mod tests {
     }
 
     /// #183 is a second screen report: with the driver's hardware cursor
-    /// the second screen sends the pointer apart, as Mirror does. Without
-    /// it, or for an image over the cursor's size, Windows draws the
-    /// pointer into the picture.
+    /// the second screen sends the pointer apart, as Mirror does. Review
+    /// r4: an image goes into the picture when it is larger than the caps
+    /// the running driver started with, the user's own (64, 256) as well as
+    /// this host's 128.
     #[test]
-    fn the_second_screen_sends_the_pointer_apart_with_the_drivers_cursor() {
-        let small = Some((32, 32));
-        let large = Some((crate::vdd_settings::CURSOR_MAX + 1, 32));
-        for (second_screen, driver_cursor, shape, in_picture) in [
-            (false, false, small, false),
-            (false, true, large, false),
-            (true, true, small, false),
-            (true, true, None, false),
-            (true, true, large, true),
-            (true, false, small, true),
+    fn the_second_screen_places_the_pointer_by_the_running_drivers_caps() {
+        use crate::vdd_settings::{CursorCaps, DriverCursor};
+        use PointerPlace::{Apart, InPicture, Unknown};
+        let caps = |max| {
+            DriverCursor::Hardware(CursorCaps {
+                max_x: max,
+                max_y: max,
+                alpha: true,
+                xor: 2,
+            })
+        };
+        for (second_screen, driver, shape, place) in [
+            (false, DriverCursor::Software, Some((300, 300)), Apart),
+            (false, DriverCursor::Unknown, Some((32, 32)), Apart),
+            (true, caps(128), Some((32, 32)), Apart),
+            (true, caps(128), None, Apart),
+            (true, caps(128), Some((128, 128)), Apart),
+            (true, caps(128), Some((129, 32)), InPicture),
+            (true, caps(128), Some((32, 129)), InPicture),
+            (true, caps(64), Some((64, 64)), Apart),
+            (true, caps(64), Some((65, 64)), InPicture),
+            (true, caps(64), Some((96, 96)), InPicture),
+            (true, caps(256), Some((160, 160)), Apart),
+            (true, caps(256), Some((256, 256)), Apart),
+            (true, caps(256), Some((257, 32)), InPicture),
+            (true, DriverCursor::Software, Some((32, 32)), InPicture),
+            (true, DriverCursor::Software, None, InPicture),
+            (true, DriverCursor::Unknown, Some((32, 32)), Unknown),
         ] {
             assert_eq!(
-                pointer_in_picture(second_screen, driver_cursor, shape),
-                in_picture,
-                "second_screen={second_screen} driver_cursor={driver_cursor} shape={shape:?}"
+                pointer_place(second_screen, driver, shape),
+                place,
+                "second_screen={second_screen} driver={driver:?} shape={shape:?}"
             );
-            assert_eq!(pointer_apart(true, in_picture), !in_picture);
-            assert!(!pointer_apart(false, in_picture), "an older iPad");
+            assert_eq!(pointer_apart(true, place), place == Apart);
+            assert!(!pointer_apart(false, place), "an older iPad");
         }
     }
 
-    /// Review r3: with the pointer in the picture Desktop Duplication still
-    /// reports it visible, with a shape, at a stale spot. Drawing that over
-    /// Windows' own pointer left a second, frozen one in every frame.
+    /// One pointer, never none and never two. Review r3: with the pointer
+    /// in the picture Desktop Duplication can still report it visible,
+    /// with a shape, at a stale spot, and drawing that over Windows' own
+    /// left a second, frozen one. Review r4: where the driver can't be
+    /// told, capture draws what Desktop Duplication reports, as 0.3.4 did,
+    /// whoever the client is.
     #[test]
     fn capture_draws_the_pointer_only_when_nobody_else_does() {
+        use PointerPlace::{Apart, InPicture, Unknown};
         assert!(
-            composite_pointer(false, false, true, true),
+            composite_pointer(false, Apart, true, true),
             "Mirror, an older iPad"
         );
         assert!(
-            !composite_pointer(true, false, true, true),
+            !composite_pointer(true, Apart, true, true),
             "the iPad draws it"
         );
-        assert!(
-            !composite_pointer(false, true, true, true),
-            "Windows drew it into the picture"
-        );
-        assert!(!composite_pointer(false, false, false, true), "hidden");
-        assert!(
-            !composite_pointer(false, false, true, false),
-            "no shape yet"
-        );
+        for client_draws in [false, true] {
+            assert!(
+                !composite_pointer(client_draws, InPicture, true, true),
+                "Windows drew it into the picture"
+            );
+            assert!(
+                composite_pointer(client_draws, Unknown, true, true),
+                "a driver that can't be told: as 0.3.4"
+            );
+            for place in [Apart, InPicture, Unknown] {
+                assert!(
+                    !composite_pointer(client_draws, place, false, true),
+                    "hidden"
+                );
+                assert!(
+                    !composite_pointer(client_draws, place, true, false),
+                    "no shape yet"
+                );
+            }
+        }
     }
 
     pub(super) fn connect_viewer(shared: &SharedControl) {

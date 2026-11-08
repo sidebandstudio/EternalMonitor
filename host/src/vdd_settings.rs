@@ -17,6 +17,8 @@ use std::io;
 use std::ops::Range;
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 /// A display mode for the virtual display's mode list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VddMode {
@@ -142,73 +144,259 @@ const CURSOR: &str = "    <cursor>\n        <HardwareCursor>true</HardwareCursor
                       <AlphaCursorSupport>true</AlphaCursorSupport>\n        \
                       <XorCursorSupportLevel>2</XorCursorSupportLevel>\n    </cursor>\n";
 
-/// The largest pointer image, in pixels a side, the cursor block lets the
-/// driver take as a hardware cursor. Windows draws a larger one into the
-/// picture itself.
-pub const CURSOR_MAX: u32 = 128;
+/// The hardware cursor a driver gives Windows when it starts, as its
+/// settings set it. Windows draws a pointer image larger than this into
+/// the picture itself (measured on the reference PC with a 160 px pointer
+/// and a 128 px cap).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorCaps {
+    pub max_x: u32,
+    pub max_y: u32,
+    /// `AlphaCursorSupport`, and the XOR level as the driver reads it.
+    pub alpha: bool,
+    pub xor: i32,
+}
 
-/// Whether a settings document turns the driver's hardware cursor on, read
-/// as the driver reads it (`EnabledQuery` in its `Driver.cpp`): the first
-/// `<HardwareCursor>` element whose first child is text decides, and only
-/// the exact text `true` turns it on. Comments are not elements. Stricter
-/// than the driver, a document that is not well-formed counts as off, so
-/// the pointer is taken to be in the picture.
-pub fn hardware_cursor(xml: &str) -> bool {
-    use quick_xml::events::Event;
-    let mut reader = quick_xml::Reader::from_str(xml);
-    reader.config_mut().trim_text(false);
-    let (mut in_element, mut on) = (false, None);
-    loop {
-        match reader.read_event() {
-            Ok(Event::Start(tag)) => in_element = tag.local_name().as_ref() == b"HardwareCursor",
-            Ok(Event::Text(text)) if in_element && on.is_none() => {
-                on = Some(text.as_ref() == b"true");
-                in_element = false;
-            }
-            // The whole document must be well-formed for the answer to count.
-            Ok(Event::Eof) => return on.unwrap_or(false),
-            Err(_) => return false,
-            Ok(_) => in_element = false,
-        }
+impl CursorCaps {
+    /// Whether a pointer image of this size goes to the hardware cursor.
+    pub fn takes(&self, (width, height): (u32, u32)) -> bool {
+        width <= self.max_x && height <= self.max_y
     }
 }
 
-/// Whether the running driver gives Windows a hardware cursor, after this
-/// host turned the driver on (`enabled`) or off, and the change is `done`.
-/// Only an Enable that started the driver from off (`device_off`) made it
-/// read the file just written, which turns the cursor on
-/// (`file_cursor`: the file says so and the driver reads `<cursor>`). An
-/// Enable that found it on changes nothing it read, and a driver turned off
-/// has no cursor. When unsure, the answer is no: the pointer is then taken
-/// to be in the picture and left there.
-pub fn cursor_in_effect(
-    before: bool,
-    enabled: bool,
-    done: bool,
-    device_off: bool,
-    file_cursor: bool,
-) -> bool {
-    match (enabled, done) {
-        (false, true) => false,
-        (true, true) if device_off => file_cursor,
-        (true, true) => before,
-        (_, false) => before && !device_off,
+/// What the running driver does with the pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DriverCursor {
+    /// It gives Windows a hardware cursor with these caps, which takes
+    /// every pointer type up to their size.
+    Hardware(CursorCaps),
+    /// It has none: Windows draws the pointer into the picture.
+    Software,
+    /// This host can't tell. Then the pointer is handled as in 0.3.4
+    /// (`capture::PointerPlace::Unknown`).
+    Unknown,
+}
+
+/// The cursor a settings document gives the driver, read as the driver
+/// reads it (`EnabledQuery` and `GetIntegerSetting` in its `Driver.cpp`):
+/// for each setting, the first element of that name whose first child is
+/// text decides. Only the text `true` turns a switch on, and numbers are
+/// read as `std::stoi` reads them, a missing or unreadable one as -1. A
+/// document that is not well-formed is `Unknown`.
+///
+/// Only a cursor that takes every pointer type counts as `Hardware`: with
+/// alpha off, or XOR support off (the driver reads the level but, in
+/// 25.5.2, always gives full support), Windows' choice for the types it
+/// doesn't take isn't documented, and so is a size the driver can't use.
+pub fn cursor_set_by(xml: &str) -> DriverCursor {
+    use quick_xml::events::Event;
+    const NAMES: [&[u8]; 5] = [
+        b"HardwareCursor",
+        b"AlphaCursorSupport",
+        b"CursorMaxX",
+        b"CursorMaxY",
+        b"XorCursorSupportLevel",
+    ];
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut values: [Option<String>; 5] = Default::default();
+    let mut current = None;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(tag)) => {
+                current = NAMES
+                    .iter()
+                    .position(|name| tag.local_name().as_ref() == *name);
+            }
+            // XmlLite reads white space alone as another kind of node.
+            Ok(Event::Text(text)) if text.iter().all(u8::is_ascii_whitespace) => current = None,
+            Ok(Event::Text(text)) => {
+                if let Some(slot) = current.take().filter(|&slot| values[slot].is_none()) {
+                    values[slot] = Some(String::from_utf8_lossy(text.as_ref()).into_owned());
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => return DriverCursor::Unknown,
+            Ok(_) => current = None,
+        }
     }
+    let switch = |slot: usize| values[slot].as_deref() == Some("true");
+    let number = |slot: usize| values[slot].as_deref().map_or(-1, stoi);
+    if !switch(0) {
+        return DriverCursor::Software;
+    }
+    let xor = match number(4) {
+        level @ 0..=3 => level,
+        // The driver's default for a level it doesn't know: full support.
+        _ => 2,
+    };
+    match (u32::try_from(number(2)), u32::try_from(number(3))) {
+        (Ok(max_x @ 1..), Ok(max_y @ 1..)) if switch(1) && matches!(xor, 2 | 3) => {
+            DriverCursor::Hardware(CursorCaps {
+                max_x,
+                max_y,
+                alpha: true,
+                xor,
+            })
+        }
+        _ => DriverCursor::Unknown,
+    }
+}
+
+/// `std::stoi` as the driver uses it: leading white space, a sign and
+/// digits, ignoring what follows them; -1 (the driver's "unset") when
+/// there are no digits or the number doesn't fit.
+fn stoi(text: &str) -> i32 {
+    let text = text.trim_start();
+    let (sign, digits) = match text.as_bytes().first() {
+        Some(b'-') => (-1, &text[1..]),
+        Some(b'+') => (1, &text[1..]),
+        _ => (1, text),
+    };
+    let end = digits
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(digits.len());
+    digits[..end]
+        .parse::<i64>()
+        .ok()
+        .and_then(|value| i32::try_from(sign * value).ok())
+        .unwrap_or(-1)
+}
+
+/// One start of the driver: the boot, and the device's last arrival
+/// (`DEVPKEY_Device_LastArrivalDate`, a FILETIME). On the reference PC each
+/// Enable changed the arrival and a driver turned off kept it; an arrival
+/// only counts with the boot it came in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriverInstance {
+    pub boot_id: u32,
+    pub arrival: u64,
+}
+
+/// What a driver start read, kept on disk so a relaunched host knows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorRecord {
+    pub instance: DriverInstance,
+    /// SHA-256 of the settings file it started with, for the logs.
+    pub settings_sha256: String,
+    pub cursor: DriverCursor,
+}
+
+/// What the driver starts with when this host's Enable starts it: the
+/// file's cursor (`cursor_set_by`), if the driver reads `<cursor>`
+/// (`reads_cursor`, `None` when its version can't tell) and no registry
+/// value overrides the file.
+pub fn starting_cursor(
+    xml: Option<&str>,
+    reads_cursor: Option<bool>,
+    overridden: bool,
+) -> DriverCursor {
+    match (xml, reads_cursor) {
+        _ if overridden => DriverCursor::Unknown,
+        (_, Some(false)) => DriverCursor::Software,
+        (Some(xml), Some(true)) => cursor_set_by(xml),
+        _ => DriverCursor::Unknown,
+    }
+}
+
+/// The record to keep after an Enable that succeeded: a driver running
+/// after it (`after`) that was not running before it (`before`) started
+/// in this Enable, with the file this host just wrote (`xml`, read as
+/// `starting_cursor`). An Enable that found it running (AlreadyDone, or a
+/// relaunch with the driver left on) changes nothing it read: no record,
+/// and the one on disk decides (`running_cursor`).
+pub fn record_after_enable(
+    before: Option<DriverInstance>,
+    after: Option<DriverInstance>,
+    xml: Option<&str>,
+    cursor: DriverCursor,
+) -> Option<CursorRecord> {
+    let instance = after.filter(|after| before != Some(*after))?;
+    Some(CursorRecord {
+        instance,
+        settings_sha256: xml.map_or_else(String::new, |xml| {
+            let digest = ring::digest::digest(&ring::digest::SHA256, xml.as_bytes());
+            digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+        }),
+        cursor,
+    })
+}
+
+/// What the running driver does with the pointer: what the record says,
+/// when it is of this very start of the driver (same boot, same arrival);
+/// `Unknown` for any other, and when the driver is not running.
+pub fn running_cursor(
+    record: Option<&CursorRecord>,
+    running: Option<DriverInstance>,
+) -> DriverCursor {
+    match (record, running) {
+        (Some(record), Some(running)) if record.instance == running => record.cursor,
+        _ => DriverCursor::Unknown,
+    }
+}
+
+/// Where the record is kept, beside the app's other files.
+pub const CURSOR_RECORD: &str = "vdd-cursor.json";
+
+pub fn load_record(path: &Path) -> Option<CursorRecord> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+pub fn save_record(path: &Path, record: &CursorRecord) -> io::Result<()> {
+    replace(
+        path,
+        &serde_json::to_string(record).map_err(io::Error::other)?,
+    )
 }
 
 /// Whether the installed driver reads `<cursor>` at all: releases from
 /// 24.10.27 on do. `version` is its installer's display version, such as
-/// `25.05.03`.
-pub fn driver_reads_cursor(version: &str) -> bool {
+/// `25.05.03`; `None` when it doesn't read as one.
+pub fn driver_reads_cursor(version: &str) -> Option<bool> {
     let parts: Option<Vec<u32>> = version
         .trim()
         .split('.')
         .map(|part| part.parse().ok())
         .collect();
     match parts.as_deref() {
-        Some([year, month, day, ..]) => (*year, *month, *day) >= (24, 10, 27),
-        _ => false,
+        Some([year, month, day, ..]) => Some((*year, *month, *day) >= (24, 10, 27)),
+        _ => None,
     }
+}
+
+/// Whether a value under the driver's registry key can override the
+/// file's cursor settings: the driver reads that key first.
+#[cfg(windows)]
+pub fn registry_overrides_cursor() -> bool {
+    use windows::core::PCWSTR;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_ANY};
+    let key: Vec<u16> = r"SOFTWARE\MikeTheTech\VirtualDisplayDriver"
+        .encode_utf16()
+        .chain(Some(0))
+        .collect();
+    [
+        "HARDWARECURSOR",
+        "ALPHACURSORSUPPORT",
+        "CURSORMAXX",
+        "CURSORMAXY",
+        "XORCURSORSUPPORTLEVEL",
+    ]
+    .iter()
+    .any(|name| {
+        let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+        unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                PCWSTR(key.as_ptr()),
+                PCWSTR(name.as_ptr()),
+                RRF_RT_ANY,
+                None,
+                None,
+                None,
+            )
+        }
+        .is_ok()
+    })
 }
 
 fn escape(text: &str) -> String {
@@ -873,8 +1061,9 @@ mod tests {
              <refresh_rate>120</refresh_rate>"
         ));
         assert!(xml.ends_with("</vdd_settings>\n"));
-        assert!(
-            hardware_cursor(&xml),
+        assert_ne!(
+            cursor_set_by(&xml),
+            DriverCursor::Unknown,
             "the second screen's pointer is reported apart"
         );
         assert!(xml.contains(
@@ -885,15 +1074,31 @@ mod tests {
         ));
     }
 
+    /// A settings file with this cursor block.
+    fn with_cursor(block: &str) -> String {
+        format!("<?xml version=\"1.0\"?>\n<vdd_settings><monitors><count>1</count></monitors><cursor>{block}</cursor></vdd_settings>")
+    }
+
+    fn hardware(max_x: u32, max_y: u32) -> DriverCursor {
+        DriverCursor::Hardware(CursorCaps {
+            max_x,
+            max_y,
+            alpha: true,
+            xor: 2,
+        })
+    }
+
     /// The driver turns its hardware cursor on only when the file says so;
     /// a file from before this version, or the vendor's with it off, keeps
     /// the pointer in the second screen's picture. Read as the driver reads
-    /// it: comments don't count, and only the text `true` does.
+    /// it: comments don't count, only the text `true` does, and numbers as
+    /// `std::stoi` reads them.
     #[test]
-    fn the_hardware_cursor_is_read_as_the_driver_reads_it() {
-        assert!(!hardware_cursor(VENDOR));
+    fn the_cursor_is_read_as_the_driver_reads_it() {
+        assert_eq!(cursor_set_by(VENDOR), DriverCursor::Software);
         let v032 = render(&modes_for_client(1668, 2420, 60), None).replace(CURSOR, "");
-        assert!(!hardware_cursor(&v032));
+        assert_eq!(cursor_set_by(&v032), DriverCursor::Software);
+        let caps = "<CursorMaxX>128</CursorMaxX><CursorMaxY>128</CursorMaxY><AlphaCursorSupport>true</AlphaCursorSupport>";
         for (text, on) in [
             ("true", true),
             (" true", false),
@@ -901,59 +1106,209 @@ mod tests {
             ("false", false),
             ("TRUE", false),
         ] {
-            let xml = format!("<vdd_settings><cursor><HardwareCursor>{text}</HardwareCursor></cursor></vdd_settings>");
-            assert_eq!(hardware_cursor(&xml), on, "{text:?}");
+            let xml = with_cursor(&format!("<HardwareCursor>{text}</HardwareCursor>{caps}"));
+            assert_eq!(cursor_set_by(&xml) == hardware(128, 128), on, "{text:?}");
         }
-        let commented = "<vdd_settings><!-- <HardwareCursor>true</HardwareCursor> --><cursor><HardwareCursor>false</HardwareCursor></cursor></vdd_settings>";
-        assert!(
-            !hardware_cursor(commented),
+        let commented = format!("<vdd_settings><!-- <HardwareCursor>true</HardwareCursor> --><cursor><HardwareCursor>false</HardwareCursor>{caps}</cursor></vdd_settings>");
+        assert_eq!(
+            cursor_set_by(&commented),
+            DriverCursor::Software,
             "a commented-out line is not a setting"
         );
-        let first_wins = "<vdd_settings><HardwareCursor>false</HardwareCursor><HardwareCursor>true</HardwareCursor></vdd_settings>";
-        assert!(!hardware_cursor(first_wins));
-        assert!(
-            !hardware_cursor("<vdd_settings><HardwareCursor>true</vdd_settings>"),
+        let first_wins = format!("<vdd_settings><HardwareCursor>false</HardwareCursor><HardwareCursor>true</HardwareCursor>{caps}</vdd_settings>");
+        assert_eq!(cursor_set_by(&first_wins), DriverCursor::Software);
+        let blank_skipped = format!("<vdd_settings><HardwareCursor> </HardwareCursor><HardwareCursor>true</HardwareCursor>{caps}</vdd_settings>");
+        assert_eq!(
+            cursor_set_by(&blank_skipped),
+            hardware(128, 128),
+            "white space alone is not text to XmlLite"
+        );
+        assert_eq!(
+            cursor_set_by("<vdd_settings><HardwareCursor>true</vdd_settings>"),
+            DriverCursor::Unknown,
             "not well-formed"
+        );
+        for (x, y, cursor) in [
+            ("64", "64", hardware(64, 64)),
+            ("256", "256", hardware(256, 256)),
+            (" 96px", "+48", hardware(96, 48)),
+            ("0", "128", DriverCursor::Unknown),
+            ("-64", "128", DriverCursor::Unknown),
+            ("big", "128", DriverCursor::Unknown),
+            ("99999999999", "128", DriverCursor::Unknown),
+        ] {
+            let xml = with_cursor(&format!("<HardwareCursor>true</HardwareCursor><CursorMaxX>{x}</CursorMaxX><CursorMaxY>{y}</CursorMaxY><AlphaCursorSupport>true</AlphaCursorSupport>"));
+            assert_eq!(cursor_set_by(&xml), cursor, "{x:?} x {y:?}");
+        }
+        let missing = with_cursor("<HardwareCursor>true</HardwareCursor><CursorMaxX>64</CursorMaxX><AlphaCursorSupport>true</AlphaCursorSupport>");
+        assert_eq!(
+            cursor_set_by(&missing),
+            DriverCursor::Unknown,
+            "a missing size reads as -1"
+        );
+        let no_alpha = with_cursor("<HardwareCursor>true</HardwareCursor><CursorMaxX>64</CursorMaxX><CursorMaxY>64</CursorMaxY><AlphaCursorSupport>false</AlphaCursorSupport>");
+        assert_eq!(
+            cursor_set_by(&no_alpha),
+            DriverCursor::Unknown,
+            "not every pointer type"
+        );
+        for (level, cursor) in [
+            ("1", DriverCursor::Unknown),
+            ("0", DriverCursor::Unknown),
+            (
+                "3",
+                DriverCursor::Hardware(CursorCaps {
+                    max_x: 64,
+                    max_y: 64,
+                    alpha: true,
+                    xor: 3,
+                }),
+            ),
+            ("7", hardware(64, 64)),
+        ] {
+            let xml = with_cursor(&format!("<HardwareCursor>true</HardwareCursor><CursorMaxX>64</CursorMaxX><CursorMaxY>64</CursorMaxY><AlphaCursorSupport>true</AlphaCursorSupport><XorCursorSupportLevel>{level}</XorCursorSupportLevel>"));
+            assert_eq!(cursor_set_by(&xml), cursor, "XOR level {level}");
+        }
+    }
+
+    #[test]
+    fn this_hosts_file_gives_a_128_px_cursor_that_takes_every_pointer_type() {
+        let xml = render(&modes_for_client(1668, 2420, 60), None);
+        assert_eq!(cursor_set_by(&xml), hardware(128, 128));
+        assert_eq!(
+            starting_cursor(Some(&xml), Some(true), false),
+            hardware(128, 128)
+        );
+        assert_eq!(
+            starting_cursor(Some(&xml), Some(false), false),
+            DriverCursor::Software,
+            "a driver that doesn't read <cursor>"
+        );
+        assert_eq!(
+            starting_cursor(Some(&xml), None, false),
+            DriverCursor::Unknown,
+            "a driver version that doesn't tell"
+        );
+        assert_eq!(
+            starting_cursor(Some(&xml), Some(true), true),
+            DriverCursor::Unknown,
+            "the driver's registry key overrides the file"
+        );
+        assert_eq!(
+            starting_cursor(None, Some(true), false),
+            DriverCursor::Unknown,
+            "no file read"
         );
     }
 
-    /// Review r3: the flag comes from what the driver read when it last
-    /// started, not from the file alone.
+    /// Review r4: what the running driver does with the pointer is tied to
+    /// its start (boot and device arrival), kept on disk.
     #[test]
-    fn the_cursor_counts_only_when_an_enable_started_the_driver_with_it() {
-        // An Enable that started the driver from off: the file decides.
-        assert!(cursor_in_effect(false, true, true, true, true));
-        assert!(!cursor_in_effect(true, true, true, true, false));
-        // The driver was already on (AlreadyDone, or the task found it on):
-        // it keeps what it read when it started.
-        assert!(
-            !cursor_in_effect(false, true, true, false, true),
-            "never started with it"
+    fn the_cursor_record_belongs_to_one_start_of_the_driver() {
+        let dir = std::env::temp_dir().join(format!("vdd-cursor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(CURSOR_RECORD);
+        let start = |arrival| DriverInstance {
+            boot_id: 205,
+            arrival,
+        };
+        let ours = render(&modes_for_client(1668, 2420, 60), None);
+        let cursor = starting_cursor(Some(&ours), Some(true), false);
+
+        // Enable from off: the driver started with the file just written.
+        let record = record_after_enable(None, Some(start(10)), Some(&ours), cursor).unwrap();
+        assert_eq!(record.cursor, hardware(128, 128));
+        assert_eq!(record.settings_sha256.len(), 64);
+        save_record(&path, &record).unwrap();
+        assert_eq!(
+            running_cursor(load_record(&path).as_ref(), Some(start(10))),
+            hardware(128, 128)
         );
-        assert!(
-            cursor_in_effect(true, true, true, false, true),
-            "a quick reconnect"
+
+        // AlreadyDone with a matching record: the driver kept what it read,
+        // whatever the file says now.
+        let vendor = starting_cursor(Some(VENDOR), Some(true), false);
+        assert_eq!(
+            record_after_enable(Some(start(10)), Some(start(10)), Some(VENDOR), vendor),
+            None
         );
-        // Turned off, or a failed Enable from off: no cursor.
-        assert!(!cursor_in_effect(true, false, true, false, true));
-        assert!(!cursor_in_effect(true, true, false, true, true));
-        assert!(
-            cursor_in_effect(true, true, false, false, true),
-            "a failed Enable that found it on"
+        assert_eq!(
+            running_cursor(load_record(&path).as_ref(), Some(start(10))),
+            hardware(128, 128)
         );
+
+        // AlreadyDone with a changed arrival: someone else restarted it.
+        assert_eq!(
+            running_cursor(load_record(&path).as_ref(), Some(start(11))),
+            DriverCursor::Unknown
+        );
+
+        // Relaunch: a new host reads the record from disk. Same start, same
+        // answer; after a reboot the same arrival counts for nothing; with
+        // no record, or the driver off, nothing is known.
+        let relaunched = load_record(&path);
+        assert_eq!(
+            running_cursor(relaunched.as_ref(), Some(start(10))),
+            hardware(128, 128)
+        );
+        let rebooted = DriverInstance {
+            boot_id: 206,
+            arrival: 10,
+        };
+        assert_eq!(
+            running_cursor(relaunched.as_ref(), Some(rebooted)),
+            DriverCursor::Unknown
+        );
+        assert_eq!(running_cursor(None, Some(start(10))), DriverCursor::Unknown);
+        assert_eq!(
+            running_cursor(relaunched.as_ref(), None),
+            DriverCursor::Unknown
+        );
+
+        // An Enable that restarted it, with the user's own caps of 64 and
+        // then 256: each start keeps its own.
+        for (arrival, max) in [(12, 64), (13, 256)] {
+            let users = with_cursor(&format!("<HardwareCursor>true</HardwareCursor><CursorMaxX>{max}</CursorMaxX><CursorMaxY>{max}</CursorMaxY><AlphaCursorSupport>true</AlphaCursorSupport>"));
+            let cursor = starting_cursor(Some(&users), Some(true), false);
+            let record = record_after_enable(
+                Some(start(arrival - 1)),
+                Some(start(arrival)),
+                Some(&users),
+                cursor,
+            )
+            .unwrap();
+            save_record(&path, &record).unwrap();
+            let running = running_cursor(load_record(&path).as_ref(), Some(start(arrival)));
+            assert_eq!(running, hardware(max, max));
+            let DriverCursor::Hardware(caps) = running else {
+                unreachable!()
+            };
+            assert!(caps.takes((max, max)));
+            assert!(!caps.takes((max + 1, 1)));
+        }
+
+        // A start with a file that leaves the cursor off is kept as such.
+        let record = record_after_enable(None, Some(start(14)), Some(VENDOR), vendor).unwrap();
+        assert_eq!(record.cursor, DriverCursor::Software);
+        // A driver that is not running after the Enable keeps no record.
+        assert_eq!(record_after_enable(None, None, Some(&ours), cursor), None);
+        // A damaged record is no record.
+        std::fs::write(&path, "{").unwrap();
+        assert_eq!(load_record(&path), None);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn only_drivers_that_read_the_cursor_block_are_trusted_with_it() {
         for (version, reads) in [
-            ("25.05.03", true),
-            ("24.10.27", true),
-            ("24.12.24", true),
-            ("24.10.16", false),
-            ("23.12.2", false),
-            ("24.10", false),
-            ("", false),
-            ("beta", false),
+            ("25.05.03", Some(true)),
+            ("24.10.27", Some(true)),
+            ("24.12.24", Some(true)),
+            ("24.10.16", Some(false)),
+            ("23.12.2", Some(false)),
+            ("24.10", None),
+            ("", None),
+            ("beta", None),
         ] {
             assert_eq!(driver_reads_cursor(version), reads, "{version:?}");
         }

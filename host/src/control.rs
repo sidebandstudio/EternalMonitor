@@ -72,10 +72,6 @@ pub struct SharedControl {
     pub(crate) vdd_worker: Arc<crate::capture::second_screen::Worker>,
     /// Output owned by the enabled driver, retained across pipeline restarts.
     pub(crate) vdd_output: Arc<Mutex<Option<String>>>,
-    /// The virtual display driver was given a hardware cursor, so the
-    /// second screen's pointer is reported apart from its picture.
-    #[cfg_attr(not(windows), allow(dead_code))]
-    pub(crate) vdd_hardware_cursor: Arc<AtomicBool>,
     /// Second screen timing across pipeline restarts: the pending switch onto
     /// it, the grace period after its viewer left, the last driver change.
     pub(crate) second_screen: Arc<Mutex<crate::capture::second_screen::State>>,
@@ -210,7 +206,6 @@ impl SharedControl {
             handoff: Default::default(),
             vdd_worker: Arc::new(Default::default()),
             vdd_output: Arc::new(Mutex::new(None)),
-            vdd_hardware_cursor: Arc::new(AtomicBool::new(false)),
             second_screen: Arc::new(Mutex::new(Default::default())),
             hb_capture_loop_ms: Arc::new(AtomicU64::new(0)),
             hb_capture_frame_ms: Arc::new(AtomicU64::new(0)),
