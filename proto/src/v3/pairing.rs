@@ -317,10 +317,21 @@ impl Default for PairingConfig {
     }
 }
 
+/// Message 1s one QR window remembers having handled. Each needs the QR's
+/// secret to authenticate, so only its holder can fill it; once full, the
+/// window takes no new pairing.
+const MAX_HANDLED_MSG1: usize = 256;
+
 struct Window {
+    /// Which `open` made it: a write finishing for an earlier window never
+    /// uses up a later one.
+    generation: u64,
     secret: Zeroizing<Key32>,
     nonce_r: Id16,
     expires: Duration,
+    /// SHA-256 of the Noise part of every message 1 that started a pairing
+    /// under this window: a replay of one starts nothing.
+    handled: Vec<[u8; 32]>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -349,6 +360,20 @@ struct Attempt<A> {
     step: Step,
     deadline: Duration,
     last_answer: Option<Duration>,
+    /// The window it came from, and when that window's QR expires. Until a
+    /// confirm authorizes the write, the attempt expires with it.
+    window: u64,
+    qr_expires: Duration,
+    /// A valid confirm arrived before the QR expired: the write may go on
+    /// (and be retried after a failure) past the QR's expiry.
+    authorized: bool,
+}
+
+impl<A> Attempt<A> {
+    /// Unconfirmed, and past its own deadline or its QR's expiry.
+    fn expired(&self, now: Duration) -> bool {
+        !self.authorized && (now >= self.deadline || now >= self.qr_expires)
+    }
 }
 
 /// The host's side of QR pairing, as a sans-IO state machine like
@@ -361,6 +386,8 @@ pub struct PairingHost<A: Clone> {
     host_name: String,
     rng: Box<dyn Random + Send>,
     window: Option<Window>,
+    /// The generation the next window gets.
+    next_generation: u64,
     attempt: Option<Attempt<A>>,
     /// Message 1 reads in the current second: (start, count).
     reads: (Duration, u32),
@@ -382,25 +409,31 @@ impl<A: Clone> PairingHost<A> {
             host_name: host_name.to_string(),
             rng,
             window: None,
+            next_generation: 1,
             attempt: None,
             reads: (Duration::ZERO, 0),
         }
     }
 
     /// Opens the pairing window with a fresh QR for `addr`. Any earlier QR's
-    /// secret stops working, and a pairing under it that isn't being stored
-    /// ends.
+    /// secret stops working, and a pairing under it that no confirm has
+    /// authorized ends; one already authorized finishes its write, and only
+    /// its own window is used up when it does.
     pub fn open(&mut self, now: Duration, addr: SocketAddr) -> QrPayload {
         let mut secret = Zeroizing::new([0u8; 32]);
         self.rng.fill(&mut *secret);
         let mut nonce_r = [0u8; 16];
         self.rng.fill(&mut nonce_r);
+        let generation = self.next_generation;
+        self.next_generation += 1;
         self.window = Some(Window {
+            generation,
             secret: secret.clone(),
             nonce_r,
             expires: now + QR_LIFETIME,
+            handled: Vec::new(),
         });
-        self.attempt.take_if(|a| a.step == Step::AwaitingConfirm);
+        self.attempt.take_if(|a| !a.authorized);
         QrPayload {
             addr,
             host_id: self.host_id,
@@ -415,15 +448,24 @@ impl<A: Clone> PairingHost<A> {
         self.host_name = host_name.to_string();
     }
 
-    /// Closes the window: its secret stops working.
+    /// Closes the window: its secret stops working, and a pairing under it
+    /// that no confirm has authorized ends.
     pub fn close(&mut self) {
         self.window = None;
-        self.attempt.take_if(|a| a.step == Step::AwaitingConfirm);
+        self.attempt.take_if(|a| !a.authorized);
     }
 
     /// Whether a QR is open.
     pub fn is_open(&self) -> bool {
         self.window.is_some()
+    }
+
+    /// Whether a pairing is waiting for its confirm or being written at
+    /// `now`: one a new message 1 can't replace.
+    pub fn in_flight(&self, now: Duration) -> bool {
+        self.attempt.as_ref().is_some_and(|a| {
+            !a.expired(now) && matches!(a.step, Step::AwaitingConfirm | Step::Storing)
+        })
     }
 
     /// The `session_id` of the pairing in flight, if any: its records go to
@@ -483,12 +525,24 @@ impl<A: Clone> PairingHost<A> {
             }
             return;
         }
+        // One pairing at a time: one waiting for its confirm or being
+        // written stays until it ends; a message 1 never displaces it. One
+        // that's only answering retries gives way to a new pairing.
+        self.attempt.take_if(|a| a.expired(now));
         if self
             .attempt
             .as_ref()
-            .is_some_and(|a| a.step != Step::AwaitingConfirm)
+            .is_some_and(|a| matches!(a.step, Step::AwaitingConfirm | Step::Storing))
         {
-            // One pairing at a time: the one being stored or answered stays.
+            return;
+        }
+        // A message 1 that already started a pairing under this QR starts
+        // nothing again, even once that pairing is over.
+        let digest: [u8; 32] = ring::digest::digest(&ring::digest::SHA256, pair1.noise)
+            .as_ref()
+            .try_into()
+            .expect("32 bytes");
+        if window.handled.contains(&digest) || window.handled.len() >= MAX_HANDLED_MSG1 {
             return;
         }
         if now.saturating_sub(self.reads.0) >= Duration::from_secs(1) {
@@ -544,6 +598,9 @@ impl<A: Clone> PairingHost<A> {
         let keys = split(&mut state);
         let h = *keys.handshake_hash();
         let (sealer, opener) = keys.responder(session_id);
+        let window = self.window.as_mut().expect("checked above");
+        window.handled.push(digest);
+        let (generation, qr_expires) = (window.generation, window.expires);
         out.push(PairOutput::Send {
             to: from.clone(),
             datagram: msg2.clone(),
@@ -564,6 +621,9 @@ impl<A: Clone> PairingHost<A> {
             step: Step::AwaitingConfirm,
             deadline: now + self.config.confirm_lifetime,
             last_answer: None,
+            window: generation,
+            qr_expires,
+            authorized: false,
         });
     }
 
@@ -575,6 +635,9 @@ impl<A: Clone> PairingHost<A> {
         creds: &dyn PairCredentials,
         out: &mut Vec<PairOutput<A>>,
     ) {
+        // An unconfirmed pairing ends with its QR, or its own deadline,
+        // before any record of it is read.
+        self.attempt.take_if(|a| a.expired(now));
         let Some(attempt) = self.attempt.as_mut() else {
             return;
         };
@@ -606,6 +669,7 @@ impl<A: Clone> PairingHost<A> {
                                 .then_some(old)
                         });
                         attempt.step = Step::Storing;
+                        attempt.authorized = true;
                         out.push(PairOutput::Store(PendingPairing {
                             dev_id: attempt.dev_id,
                             slot_id: attempt.slot_id,
@@ -678,7 +742,9 @@ impl<A: Clone> PairingHost<A> {
             StoreResult::Stored => {
                 attempt.step = Step::Stored;
                 attempt.deadline = now + self.config.answered_lifetime;
-                self.window = None;
+                // Its own QR is used up; a newer one opened meanwhile stays.
+                let generation = attempt.window;
+                self.window.take_if(|w| w.generation == generation);
                 Self::answer(now, attempt, creds, &mut out);
                 out.push(PairOutput::Paired {
                     dev_id: *dev_id,
@@ -706,7 +772,7 @@ impl<A: Clone> PairingHost<A> {
             self.window = None;
         }
         self.attempt
-            .take_if(|a| a.step != Step::Storing && now >= a.deadline);
+            .take_if(|a| a.expired(now) || (a.step != Step::Storing && now >= a.deadline));
     }
 }
 

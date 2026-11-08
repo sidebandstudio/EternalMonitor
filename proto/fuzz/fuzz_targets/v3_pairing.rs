@@ -6,6 +6,9 @@
 //! What must hold:
 //! - a record is handed to the store only after a genuine confirm, with the
 //!   `dev_id` and key the iPad was given, and at most one store is in flight;
+//! - a confirm authorizes a write only before the QR the pairing came from
+//!   expires (a write authorized earlier may be retried after it);
+//! - a replayed message 1 never replaces a pairing in flight;
 //! - `replaces` is set only to the slot's active record, and only when the
 //!   iPad proved it holds that record's key;
 //! - the iPad hears `PairDone` only after the write succeeded, and
@@ -20,7 +23,7 @@ use std::time::Duration;
 use eternal_wire::v3::client::ClientKey;
 use eternal_wire::v3::pairing::{
     PairCredentials, PairOutput, PairResult, PairingClient, PairingConfig, PairingHost,
-    PendingPairing, QrPayload, StoreResult,
+    PendingPairing, QrPayload, StoreResult, QR_LIFETIME,
 };
 use eternal_wire::v3::wire::SlotStatus;
 use eternal_wire::v3::{Id16, Key32, SeededRandom, Zeroizing};
@@ -62,10 +65,12 @@ fuzz_target!(|data: &[u8]| {
     let addr = SocketAddr::from(([10, 0, 0, 1], 47_700));
     let mut now = Duration::from_secs(10);
     let mut qr: QrPayload = host.open(now, addr);
+    let mut qr_expires = now + QR_LIFETIME;
     let mut rng = SeededRandom::new(99);
     let mut ipad: Option<PairingClient> = None;
-    // What the iPad was given, once it read message 2.
-    let mut given: Option<(Id16, Key32)> = None;
+    // What each pairing gave its iPad in message 2: the key, the expiry of
+    // the QR it came from, and whether a confirm authorized its write.
+    let mut given: Vec<(Id16, Key32, Duration, bool)> = Vec::new();
     // The record in the store's hands, and what the store said.
     let mut storing: Option<PendingPairing> = None;
     let mut written = false;
@@ -78,20 +83,21 @@ fuzz_target!(|data: &[u8]| {
                    now: Duration,
                    datagram: &[u8],
                    ipad: &mut Option<PairingClient>,
-                   given: &mut Option<(Id16, Key32)>,
+                   given: &mut Vec<(Id16, Key32, Duration, bool)>,
                    storing: &mut Option<PendingPairing>,
                    written: bool,
                    refused: bool,
                    paired: &mut Vec<Id16>,
                    seen: &mut Vec<Vec<u8>>,
-                   proved: bool| {
+                   proved: bool,
+                   qr_expires: Duration| {
         for output in host.handle_datagram(now, &1, datagram, &creds) {
             match output {
                 PairOutput::Send { datagram, .. } => {
                     seen.push(datagram.clone());
                     if let Some(client) = ipad.as_mut() {
                         if let Ok(accept) = client.read_msg2(&datagram) {
-                            *given = Some((accept.dev_id, *accept.k_new));
+                            given.push((accept.dev_id, *accept.k_new, qr_expires, false));
                         }
                         match client.handle_record(&datagram) {
                             Some(PairResult::Done(_)) => {
@@ -104,8 +110,16 @@ fuzz_target!(|data: &[u8]| {
                 }
                 PairOutput::Store(pending) => {
                     assert!(storing.is_none(), "one store at a time");
-                    let (dev_id, key) = given.expect("a store only after message 2");
-                    assert_eq!((pending.dev_id, **pending.key), (dev_id, key));
+                    let entry = given
+                        .iter_mut()
+                        .find(|(dev_id, ..)| *dev_id == pending.dev_id)
+                        .expect("a store only for a dev_id given in message 2");
+                    assert_eq!(**pending.key, entry.1, "the key the iPad was given");
+                    assert!(
+                        now < entry.2 || entry.3,
+                        "a write authorized after its QR expired"
+                    );
+                    entry.3 = true;
                     assert_eq!(pending.slot_id, SLOT);
                     if let Some(old) = pending.replaces {
                         assert_eq!(old, OLD);
@@ -132,7 +146,6 @@ fuzz_target!(|data: &[u8]| {
                 let msg1 = client.msg1().to_vec();
                 seen.push(msg1.clone());
                 ipad = Some(client);
-                given = None;
                 deliver(
                     &mut host,
                     now,
@@ -145,6 +158,7 @@ fuzz_target!(|data: &[u8]| {
                     &mut paired,
                     &mut seen,
                     false,
+                    qr_expires,
                 );
             }
             1 => {
@@ -162,6 +176,7 @@ fuzz_target!(|data: &[u8]| {
                         &mut paired,
                         &mut seen,
                         false,
+                        qr_expires,
                     );
                 }
             }
@@ -193,6 +208,7 @@ fuzz_target!(|data: &[u8]| {
                         &mut paired,
                         &mut seen,
                         proved,
+                        qr_expires,
                     );
                 }
             }
@@ -210,6 +226,7 @@ fuzz_target!(|data: &[u8]| {
                         &mut paired,
                         &mut seen,
                         false,
+                        qr_expires,
                     );
                 }
             }
@@ -253,6 +270,7 @@ fuzz_target!(|data: &[u8]| {
                         let at = usize::from(b) % datagram.len();
                         datagram[at] ^= 1 << (b % 8);
                     }
+                    let held = host.in_flight(now).then(|| host.session_id());
                     deliver(
                         &mut host,
                         now,
@@ -265,7 +283,11 @@ fuzz_target!(|data: &[u8]| {
                         &mut paired,
                         &mut seen,
                         false,
+                        qr_expires,
                     );
+                    if let Some(session) = held {
+                        assert_eq!(host.session_id(), session, "a replay replaced a pairing");
+                    }
                 }
             }
             7 => {
@@ -285,6 +307,7 @@ fuzz_target!(|data: &[u8]| {
             8 => {
                 if b & 1 == 0 {
                     qr = host.open(now, addr);
+                    qr_expires = now + QR_LIFETIME;
                 } else {
                     host.close();
                 }

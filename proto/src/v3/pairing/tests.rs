@@ -519,3 +519,118 @@ fn one_pairing_at_a_time_while_one_is_being_stored() {
     host.open(T0 + ms(1), addr());
     assert_eq!(host.session_id(), session);
 }
+
+#[test]
+fn a_replayed_message_1_never_displaces_a_pairing() {
+    let creds = Creds::default();
+    let mut host = host();
+    let qr = host.open(T0, addr());
+    // An earlier attempt under this QR, never confirmed; its message 1 is
+    // captured.
+    let earlier = client(&qr, 31);
+    let captured = earlier.msg1().to_vec();
+    assert_eq!(
+        sends(&host.handle_datagram(T0, &ADDR, &captured, &creds)).len(),
+        1
+    );
+    host.poll(T0 + Duration::from_secs(5));
+    assert_eq!(host.session_id(), None);
+
+    // The real iPad's pairing is waiting for its confirm.
+    let mut ipad = client(&qr, 32);
+    let at = T0 + Duration::from_secs(6);
+    let msg2 = sends(&host.handle_datagram(at, &ADDR, ipad.msg1(), &creds));
+    ipad.read_msg2(&msg2[0]).unwrap();
+    let session = host.session_id();
+
+    // The replay answers nothing and changes nothing; nor does a new
+    // message 1, even a genuine one.
+    assert!(host
+        .handle_datagram(at + ms(10), &2, &captured, &creds)
+        .is_empty());
+    assert!(host
+        .handle_datagram(at + ms(15), &2, client(&qr, 35).msg1(), &creds)
+        .is_empty());
+    assert_eq!(host.session_id(), session);
+    let confirm = ipad.confirm(None).unwrap();
+    assert!(store_of(host.handle_datagram(at + ms(20), &ADDR, &confirm, &creds)).is_some());
+
+    // Nor once that pairing is over.
+    let mut host = self::host();
+    let qr = host.open(T0, addr());
+    let mut ipad = to_msg2(&mut host, &qr, &creds);
+    let captured = ipad.msg1().to_vec();
+    let abort = ipad.abort().unwrap();
+    host.handle_datagram(T0, &ADDR, &abort, &creds);
+    assert_eq!(host.session_id(), None);
+    assert!(
+        host.handle_datagram(T0 + ms(10), &2, &captured, &creds)
+            .is_empty(),
+        "the same message 1 starts nothing again"
+    );
+    assert_eq!(host.session_id(), None);
+}
+
+#[test]
+fn a_confirm_after_the_qr_expired_is_refused_but_an_authorized_write_completes() {
+    let creds = Creds::default();
+    let late = T0 + QR_LIFETIME - Duration::from_secs(1);
+    // Message 2 just before expiry, the confirm just after: no write.
+    let mut host = host();
+    let qr = host.open(T0, addr());
+    let mut ipad = client(&qr, 7);
+    let msg2 = sends(&host.handle_datagram(late, &ADDR, ipad.msg1(), &creds));
+    ipad.read_msg2(&msg2[0]).unwrap();
+    let confirm = ipad.confirm(None).unwrap();
+    let after = T0 + QR_LIFETIME + ms(100);
+    assert!(store_of(host.handle_datagram(after, &ADDR, &confirm, &creds)).is_none());
+    assert_eq!(host.session_id(), None);
+
+    // Confirmed before expiry: the write completes after it, even a retry
+    // of a write that failed.
+    let mut host = self::host();
+    let qr = host.open(T0, addr());
+    let mut ipad = client(&qr, 8);
+    let msg2 = sends(&host.handle_datagram(late, &ADDR, ipad.msg1(), &creds));
+    ipad.read_msg2(&msg2[0]).unwrap();
+    let confirm = ipad.confirm(None).unwrap();
+    let pending = store_of(host.handle_datagram(late + ms(500), &ADDR, &confirm, &creds)).unwrap();
+    host.stored(after, &pending.dev_id, StoreResult::Failed, &creds);
+    let retry = ipad.confirm(None).unwrap();
+    let pending = store_of(host.handle_datagram(after + ms(50), &ADDR, &retry, &creds))
+        .expect("authorized before expiry");
+    let done = sends(&host.stored(after + ms(60), &pending.dev_id, StoreResult::Stored, &creds));
+    assert!(matches!(
+        ipad.handle_record(&done[0]),
+        Some(PairResult::Done(_))
+    ));
+}
+
+#[test]
+fn an_older_write_never_uses_up_a_newer_qr() {
+    let creds = Creds::default();
+    let mut host = host();
+    let first = host.open(T0, addr());
+    let mut ipad = to_msg2(&mut host, &first, &creds);
+    let confirm = ipad.confirm(None).unwrap();
+    let pending = store_of(host.handle_datagram(T0, &ADDR, &confirm, &creds)).unwrap();
+    // A new QR while the first write runs.
+    let second = host.open(T0 + ms(10), addr());
+    let done = sends(&host.stored(T0 + ms(20), &pending.dev_id, StoreResult::Stored, &creds));
+    assert!(matches!(
+        ipad.handle_record(&done[0]),
+        Some(PairResult::Done(_))
+    ));
+    assert!(host.is_open(), "the newer QR stays");
+
+    // And it pairs.
+    let mut other = client(&second, 33);
+    let msg2 = sends(&host.handle_datagram(T0 + ms(30), &ADDR, other.msg1(), &creds));
+    other.read_msg2(&msg2[0]).unwrap();
+    let confirm = other.confirm(None).unwrap();
+    assert!(store_of(host.handle_datagram(T0 + ms(40), &ADDR, &confirm, &creds)).is_some());
+    // The first QR stopped working when the second opened.
+    assert!(host
+        .handle_datagram(T0 + ms(50), &ADDR, client(&first, 34).msg1(), &creds)
+        .is_empty());
+}
