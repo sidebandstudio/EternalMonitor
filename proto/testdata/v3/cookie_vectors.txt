@@ -1,0 +1,29 @@
+# Return-routability cookie vectors. One `name<space>lowercase-hex` per line.
+# Written by cookie_vectors.py (independent of the Rust code); message 1, k_dev
+# and dev_id are session_golden.txt's. Addresses are the IP (4 or 16 bytes,
+# v4-mapped IPv6 as IPv4) then the port, little-endian. cookie.v4/v6 are
+# HMAC-SHA-256(secret, dev_id || address)[..16] (a session cookie);
+# cookie.pair_v4 is HMAC-SHA-256(secret, nonce_r || address)[..16] (pairing).
+# The iPad treats a cookie as opaque. key.session is HKDF(salt "EM v3 cookie",
+# k_dev, info dev_id), key.pairing HKDF(salt, pair_psk, info "pair");
+# msg1.with_cookie is message 1 with EXT_COOKIE carrying msg1.mac2 under
+# cookie.v4; reply.* seal cookie.v4 with AAD msg1.digest.
+# Consumed by `cargo test -p eternal-wire --lib v3::cookie` and, from phase 3,
+# by the iOS tests. Regenerate only on a deliberate wire change.
+input.secret c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf
+input.address_v4 c000020a50c3
+input.address_v6 20010db800000000000000000000000150c3
+input.pair_psk 505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f
+input.nonce_r 303132333435363738393a3b3c3d3e3f
+input.nonce_session 0102030405060708090a0b0c
+input.nonce_pair 1112131415161718191a1b1c
+cookie.v4 abf64a22893536117a31a0a2469ad8d7
+cookie.v6 3a6c75a0ef865b80132edb133d48ad01
+cookie.pair_v4 36f72e9cd2c21cb9fe5f5d5a2168c969
+key.session 436c023aa1d5860964056150cbbd372a81b586a96917c5d4aaad3f0599ab118e
+key.pairing ac86452d1cb196443b385343b085d2201686fd0e28ca67790cdba349a1d23bbb
+msg1.digest 5db3e630cad3c7dbd4fa60b90442e5067e567f1162a1f78893a0dba5f31c6997
+msg1.mac2 954c010237f795fd3373458b335008e2
+msg1.with_cookie 454d02100000b50000000000010000000303d4c3b2a1cbc30000000000000000000000000000000000000000000000000000000000000000000000000000000000000001006a00d0d3d6d9dcdfe2e5e8ebeef1f4f7fafd93f0b6e180f3b43d8a422040f863ef12bfeeb14c03b1f304e73cca999426ab5d3a7ab33ae01cda93610712ce93e9fdfd37e921ea8471848b5f521643592de04f429ca0e88a8c1f17c5a2997270cee460a5eb6c237bc7c1afd52eff001000954c010237f795fd3373458b335008e2
+reply.session 454d024200003000000000000000000001002c000102030405060708090a0b0c093e5ad69439573de512f966d8f67f4e0a2009a28892706a2ff9c29822c17afb
+reply.pairing 454d024200003000000000000000000002002c001112131415161718191a1b1cc89d2943a64af10de327fa3cd9082f1bbf79d76cec0886dce2f1060843ae7009

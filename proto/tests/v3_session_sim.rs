@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use eternal_wire::v2::PacketType;
 use eternal_wire::v3::client::{ClientClose, ClientConfig, ClientKey};
+use eternal_wire::v3::cookie::CookieMode;
 use eternal_wire::v3::host::{CloseReason, HostConfig};
 use v3_sim::*;
 
@@ -1170,8 +1171,11 @@ fn a_clock_far_ahead_of_the_host_still_connects() {
 fn floods_never_block_a_reconnect_from_the_live_address() {
     use eternal_wire::v3::handshake::Initiator;
     use eternal_wire::v3::wire::HelloPayload;
-    for known in [false, true] {
-        let mut sim = Sim::new(116 + u64::from(known));
+    for (known, cookies) in [false, true]
+        .into_iter()
+        .flat_map(|k| [(k, CookieMode::Off), (k, CookieMode::UnderLoad)])
+    {
+        let mut sim = sim_with_cookies(116 + u64::from(known), cookies);
         if known {
             connect_live(&mut sim);
         }
@@ -1211,7 +1215,8 @@ fn floods_never_block_a_reconnect_from_the_live_address() {
                 break;
             }
         }
-        assert!(done, "known dev_id: {known}");
+        assert!(done, "known dev_id: {known}, {cookies:?}");
+        check_cookie_path(&sim, cookies);
     }
 }
 
@@ -1413,6 +1418,24 @@ fn connect_behind_bursts(sim: &mut Sim, mut burst: impl FnMut(&mut Sim)) -> bool
     false
 }
 
+/// A sim whose host requires cookies as `cookies` says: `Off` tests the
+/// budgets beneath the cookie, the default tests the cookie round trip.
+fn sim_with_cookies(seed: u64, cookies: CookieMode) -> Sim {
+    let host = HostConfig {
+        cookies,
+        ..HostConfig::new(HOST_ID)
+    };
+    Sim::with_configs(seed, host, ClientConfig::new(HOST_ID))
+}
+
+/// The flood was load when cookies were on. (With them off, cached answers
+/// to other addresses still ask for a cookie.)
+fn check_cookie_path(sim: &Sim, cookies: CookieMode) {
+    if cookies != CookieMode::Off {
+        assert!(sim.host.cookie_replies() > 0, "{cookies:?}");
+    }
+}
+
 fn forged_for(dev_id: &eternal_wire::v3::Id16, count: u64) -> Vec<Vec<u8>> {
     use eternal_wire::v3::handshake::Initiator;
     use eternal_wire::v3::wire::HelloPayload;
@@ -1573,7 +1596,13 @@ fn a_disconnected_client_switching_keys_keeps_the_intent_on_failure() {
 /// get no answer; those are remembered, and their replays cost no crypto.
 #[test]
 fn genuine_replayed_message_1s_never_starve_a_fresh_connect() {
-    let mut sim = Sim::new(141);
+    for cookies in [CookieMode::Off, CookieMode::UnderLoad] {
+        genuine_replays_behind(cookies);
+    }
+}
+
+fn genuine_replays_behind(cookies: CookieMode) {
+    let mut sim = sim_with_cookies(141, cookies);
     for _ in 0..31 {
         connect_live(&mut sim);
     }
@@ -1607,7 +1636,8 @@ fn genuine_replayed_message_1s_never_starve_a_fresh_connect() {
         }
         round += 1;
     });
-    assert!(ok);
+    assert!(ok, "{cookies:?}");
+    check_cookie_path(&sim, cookies);
 }
 
 /// Forged message 1s from the live address above its 2,000/s pre-crypto
@@ -1615,21 +1645,24 @@ fn genuine_replayed_message_1s_never_starve_a_fresh_connect() {
 /// instead of being dropped.
 #[test]
 fn past_the_live_address_cap_the_reconnect_falls_back_to_the_per_source_path() {
-    let mut sim = Sim::new(142);
-    connect_live(&mut sim);
-    let forged = forged_for(&sim.key.dev_id, 100);
-    let ok = connect_behind_bursts(&mut sim, |sim| {
-        for i in 0..2010 {
-            sim.inject_from(IPAD, &forged[i % forged.len()]);
-        }
-    });
-    assert!(ok);
+    for cookies in [CookieMode::Off, CookieMode::UnderLoad] {
+        let mut sim = sim_with_cookies(142, cookies);
+        connect_live(&mut sim);
+        let forged = forged_for(&sim.key.dev_id, 100);
+        let ok = connect_behind_bursts(&mut sim, |sim| {
+            for i in 0..2010 {
+                sim.inject_from(IPAD, &forged[i % forged.len()]);
+            }
+        });
+        assert!(ok, "{cookies:?}");
+        check_cookie_path(&sim, cookies);
+    }
 }
 
 /// The iPad's first message 1 is lost on its way, and an attacker who saw
-/// it replays it from 20 spoofed sources first, taking every per-source
-/// message 2 slot. The iPad's own retries still get message 2 through the
-/// shared overflow allowance.
+/// it replays it from 20 spoofed sources first. The first copy makes the
+/// pending session; the others get only cookie replies, and the iPad's own
+/// retries get message 2 through the cookie.
 #[test]
 fn spoofed_copies_taking_every_message_2_slot_never_lock_the_ipad_out() {
     let mut sim = Sim::new(143);
@@ -1649,4 +1682,8 @@ fn spoofed_copies_taking_every_message_2_slot_never_lock_the_ipad_out() {
         );
     }
     assert!(sim.run_until(Duration::from_secs(3), |s| s.both_live_on_same_session()));
+    assert!(
+        sim.host.cookie_replies() >= 19,
+        "the other copies got cookie replies"
+    );
 }

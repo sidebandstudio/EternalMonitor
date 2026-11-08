@@ -38,6 +38,7 @@ use std::time::{Duration, Instant};
 use eternal_credstore::{CredentialSnapshot, Finalize, StoreError};
 use eternal_wire::v2::control::{ByeReason, ControlMessage, CONTROL_HEADER_SIZE};
 use eternal_wire::v2::{CommonPrefix, PacketType};
+use eternal_wire::v3::cookie::CookieMode;
 use eternal_wire::v3::host::{
     CloseReason, HostConfig, HostCredentials, HostOutput, HostSessions, PeerAddr,
 };
@@ -60,6 +61,18 @@ impl PeerAddr for PeerId {
     /// The link and the source IP, as [`std::net::SocketAddr`]'s bucket.
     fn rate_bucket(&self) -> Self::Bucket {
         (self.link, self.addr.map(|addr| addr.rate_bucket()))
+    }
+
+    /// The link, then the source's IP and port if it has one.
+    fn cookie_input(&self) -> Vec<u8> {
+        let mut out = match self.link {
+            LinkId::Udp => vec![0],
+            LinkId::Usb { device_id } => [&[1][..], &device_id.to_le_bytes()].concat(),
+        };
+        if let Some(addr) = self.addr {
+            out.extend(addr.cookie_input());
+        }
+        out
     }
 }
 
@@ -383,8 +396,32 @@ impl V3Host {
         now: Instant,
         wall_us: u64,
     ) -> Self {
+        Self::with_cookies(
+            host_id,
+            snapshot,
+            pairings,
+            rng,
+            now,
+            wall_us,
+            CookieMode::UnderLoad,
+        )
+    }
+
+    /// [`new`](Self::new), with message 1's cookies required as `cookies`
+    /// says on both handshakes: tests run the cookie path with `Always`.
+    pub(super) fn with_cookies(
+        host_id: Id16,
+        snapshot: Option<Arc<CredentialSnapshot>>,
+        pairings: Pairings,
+        rng: Box<dyn Random + Send>,
+        now: Instant,
+        wall_us: u64,
+        cookies: CookieMode,
+    ) -> Self {
+        let mut config = host_config(host_id);
+        config.cookies = cookies;
         Self {
-            sessions: HostSessions::new(host_config(host_id), rng, Duration::ZERO, wall_us),
+            sessions: HostSessions::new(config, rng, Duration::ZERO, wall_us),
             creds: Credentials {
                 snapshot: snapshot.unwrap_or_default(),
                 accept: Accept::default(),
@@ -395,7 +432,10 @@ impl V3Host {
             streaming: None,
             outbox: VecDeque::new(),
             pairing: PairingHost::new(
-                PairingConfig::default(),
+                PairingConfig {
+                    cookies,
+                    ..PairingConfig::default()
+                },
                 host_id,
                 env!("CARGO_PKG_VERSION"),
                 "",

@@ -52,6 +52,13 @@ doc = false
 bench = false
 
 [[bin]]
+name = "v3_cookie"
+path = "fuzz_targets/v3_cookie.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "v3_session_sim"
 path = "fuzz_targets/v3_session_sim.rs"
 test = false
