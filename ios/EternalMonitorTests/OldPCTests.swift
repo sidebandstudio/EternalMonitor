@@ -1,3 +1,4 @@
+import Darwin
 import XCTest
 @testable import EternalMonitor
 
@@ -84,6 +85,13 @@ final class OldPCTests: XCTestCase {
         return defaults
     }
 
+    private let tokenA = Data(1...16), tokenB = Data(17...32), tokenC = Data(33...48)
+    private let oldCaps: UInt16 = 0x000F, currentCaps: UInt16 = 0x002F
+
+    private func service(_ pc: String, at address: String?, version: String?) -> DiscoveredHost {
+        DiscoveredHost(name: "EternalMonitor (\(pc))", address: address, port: 9876, finding: address == nil, version: version)
+    }
+
     /// At most once per PC every three days, on an injected clock, across
     /// launches; a clock that was ahead doesn't hold it back.
     func testTheCardShowsOncePerPCEveryThreeDays() {
@@ -93,20 +101,20 @@ final class OldPCTests: XCTestCase {
         var lines: [String] = []
         let make = { OldPCPrompt(defaults: store, now: { now }, log: { lines.append($0) }) }
         var prompt = make()
-        let old = HelloAck.hostCapNack
+        let studio = OldPCPrompt.key(hostName: "Studio", pairingToken: tokenA, service: nil)
 
         prompt.show()
         XCTAssertNil(prompt.card, "nothing seen yet")
-        prompt.saw(pc: "Studio", announced: "0.3.2", hostCaps: nil)
+        prompt.answered(hostName: "Studio", pairingToken: tokenA, hostCaps: oldCaps, address: nil)
         XCTAssertNil(prompt.card, "waits for the Connect screen")
         prompt.show()
-        XCTAssertEqual(prompt.card, OldPCPrompt.Card(pc: "Studio", version: "0.3.2"))
-        XCTAssertEqual(lines, ["old_pc_prompt shown=true version=0.3.2"])
+        XCTAssertEqual(prompt.card, OldPCPrompt.Card(key: studio, pc: "Studio", version: nil))
+        XCTAssertEqual(lines, ["old_pc_prompt shown=true version=unknown"])
         prompt.show()
         XCTAssertEqual(lines.count, 1, "one line per showing")
 
         // Another old PC waits while a card is up, and isn't kept.
-        prompt.saw(pc: "Office", announced: nil, hostCaps: old)
+        prompt.discovered([service("Office", at: "192.0.2.20", version: "0.3.2")])
         prompt.close()
         XCTAssertNil(prompt.card)
         prompt.show()
@@ -115,37 +123,162 @@ final class OldPCTests: XCTestCase {
         // The same PC again, later that day and in a new launch: no card.
         now = start + 3_600
         prompt = make()
-        prompt.saw(pc: "Studio", announced: nil, hostCaps: old)
+        prompt.answered(hostName: "Studio", pairingToken: tokenA, hostCaps: oldCaps, address: nil)
         prompt.show()
         XCTAssertNil(prompt.card)
 
-        // Another PC has its own three days. Known only by its HELLO_ACK.
-        prompt.saw(pc: "Office", announced: nil, hostCaps: old)
+        // Another PC has its own three days. Known only by its TXT record.
+        prompt.discovered([service("Office", at: "192.0.2.20", version: "0.3.2")])
         prompt.show()
-        XCTAssertEqual(prompt.card, OldPCPrompt.Card(pc: "Office", version: nil))
-        XCTAssertEqual(lines.last, "old_pc_prompt shown=true version=unknown")
+        XCTAssertEqual(prompt.card, OldPCPrompt.Card(key: OldPCPrompt.serviceKey("EternalMonitor (Office)"),
+                                                     pc: "Office", version: "0.3.2"))
+        XCTAssertEqual(lines.last, "old_pc_prompt shown=true version=0.3.2")
         prompt.close()
 
         now = start + OldPCPrompt.interval - 1
-        prompt.saw(pc: "Studio", announced: "0.3.2", hostCaps: nil)
+        prompt.answered(hostName: "Studio", pairingToken: tokenA, hostCaps: oldCaps, address: nil)
         prompt.show()
         XCTAssertNil(prompt.card, "a second short of three days")
         now = start + OldPCPrompt.interval
-        prompt.saw(pc: "Studio", announced: "0.3.2", hostCaps: nil)
+        prompt.answered(hostName: "Studio", pairingToken: tokenA, hostCaps: oldCaps, address: nil)
         prompt.show()
-        XCTAssertEqual(prompt.card?.pc, "Studio")
+        XCTAssertEqual(prompt.card?.key, studio)
         prompt.close()
 
         // Shown "tomorrow" by a clock that was ahead, then the clock is fixed.
         now = start + 30 * 86_400
-        prompt.saw(pc: "Lab", announced: "0.3.3", hostCaps: nil)
+        prompt.discovered([service("Lab", at: "192.0.2.30", version: "0.3.3")])
         prompt.show()
         prompt.close()
         now = start + 29 * 86_400
-        prompt.saw(pc: "Lab", announced: "0.3.3", hostCaps: nil)
+        prompt.discovered([service("Lab", at: "192.0.2.30", version: "0.3.3")])
         prompt.show()
         XCTAssertEqual(prompt.card?.pc, "Lab")
         XCTAssertEqual(lines.count, 5)
+    }
+
+    /// r1 P1: a PC whose accepted HELLO_ACK proved it current gets no card
+    /// from a Bonjour record that says otherwise afterwards, in this launch
+    /// or a later one.
+    func testProofThatAPCIsCurrentOutlastsItsSession() {
+        let store = defaults()
+        var lines: [String] = []
+        var prompt = OldPCPrompt(defaults: store, now: { Date() }, log: { lines.append($0) })
+        // Tapped in the list: the HELLO_ACK says current, then the TXT 0.3.3.
+        prompt.connecting(service: "EternalMonitor (Studio)", address: "192.0.2.10")
+        prompt.answered(hostName: "Studio", pairingToken: tokenA, hostCaps: currentCaps, address: "192.0.2.10")
+        prompt.discovered([service("Studio", at: "192.0.2.10", version: "0.3.3")])
+        prompt.show()
+        XCTAssertNil(prompt.card)
+
+        prompt = OldPCPrompt(defaults: store, now: { Date() }, log: { lines.append($0) })
+        prompt.discovered([service("Studio", at: "192.0.2.10", version: "0.3.3")])
+        prompt.show()
+        XCTAssertNil(prompt.card, "a new launch")
+
+        // Typed address, while the search lists that PC there; no pairing.
+        prompt.discovered([service("Lab", at: "192.0.2.11", version: nil)])
+        prompt.answered(hostName: "Lab", pairingToken: Data(count: 16), hostCaps: currentCaps, address: "192.0.2.11")
+        prompt.discovered([service("Lab", at: "192.0.2.11", version: "0.3.2")])
+        prompt.show()
+        XCTAssertNil(prompt.card)
+        XCTAssertEqual(lines, [])
+
+        // Only those PCs: another old one still gets its card.
+        prompt.discovered([service("Lab", at: "192.0.2.11", version: "0.3.2"),
+                           service("Office", at: "192.0.2.12", version: "0.3.3")])
+        prompt.show()
+        XCTAssertEqual(prompt.card?.pc, "Office")
+        XCTAssertEqual(lines, ["old_pc_prompt shown=true version=0.3.3"])
+    }
+
+    /// r1 P2: a version stays with the service whose TXT record announced it.
+    /// A service first seen over IPv6 keeps its own version when its IPv4
+    /// address resolves, and a service at an address another PC used before
+    /// never takes that PC's version.
+    func testAVersionStaysWithItsOwnService() async throws {
+        var addr = sockaddr_in6()
+        addr.sin6_len = UInt8(MemoryLayout<sockaddr_in6>.size)
+        addr.sin6_family = sa_family_t(AF_INET6)
+        inet_pton(AF_INET6, "fe80::1", &addr.sin6_addr)
+        let ipv6 = withUnsafeBytes(of: &addr) { Data($0) }
+
+        // An old PC was found at 192.0.2.40 earlier and left.
+        PCVersions.record("0.3.2", name: "EternalMonitor (Gone)", address: "192.0.2.40")
+        let scanner = NetworkScanner()
+        scanner.resolveIPv4 = { _ in "192.0.2.40" }
+        let beta = DiscoveredHost.resolved(name: "EternalMonitor (New)", port: 9876, addresses: [ipv6],
+                                           version: "0.3.4-beta.20261107.1")
+        XCTAssertNil(beta.address)
+        scanner.merge(beta)
+        scanner.lookUpIPv4(hostName: "new.local.", service: beta)
+        let deadline = Date().addingTimeInterval(10)
+        while scanner.hosts.first?.address == nil, Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertEqual(scanner.hosts.map(\.address), ["192.0.2.40"])
+        XCTAssertEqual(scanner.hosts.first?.version, "0.3.4-beta.20261107.1")
+
+        let prompt = OldPCPrompt(defaults: defaults(), now: { Date() }, log: { _ in })
+        prompt.discovered(scanner.hosts)
+        prompt.show()
+        XCTAssertNil(prompt.card, "a beta at a reused address")
+        prompt.discovered([service("Quiet", at: "192.0.2.40", version: nil)])
+        prompt.show()
+        XCTAssertNil(prompt.card, "no TXT version at a reused address")
+
+        // The same path keeps an old version too.
+        let old = DiscoveredHost.resolved(name: "EternalMonitor (Old)", port: 9876, addresses: [ipv6], version: "0.3.2")
+        scanner.resolveIPv4 = { _ in "192.0.2.41" }
+        scanner.merge(old)
+        scanner.lookUpIPv4(hostName: "old.local.", service: old)
+        while scanner.hosts.first(where: { $0.name == old.name })?.address == nil, Date() < deadline {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        prompt.discovered(scanner.hosts)
+        prompt.show()
+        XCTAssertEqual(prompt.card?.pc, "Old")
+        XCTAssertEqual(prompt.card?.version, "0.3.2")
+    }
+
+    /// r1 P3: a PC is its pairing, not its name. Two PCs with one name each
+    /// get a card; a renamed PC doesn't get another; Bonjour's collision
+    /// suffix names a second PC, and a session links it to its pairing.
+    func testAPCIsItsPairingNotItsName() {
+        let prompt = OldPCPrompt(defaults: defaults(), now: { Date() }, log: { _ in })
+        prompt.answered(hostName: "Studio", pairingToken: tokenA, hostCaps: oldCaps, address: nil)
+        prompt.show()
+        XCTAssertEqual(prompt.card?.pc, "Studio")
+        prompt.close()
+        prompt.answered(hostName: "Studio", pairingToken: tokenB, hostCaps: oldCaps, address: nil)
+        prompt.show()
+        XCTAssertNotNil(prompt.card, "another PC with the same name")
+        prompt.close()
+        prompt.answered(hostName: "Studio Renamed", pairingToken: tokenA, hostCaps: oldCaps, address: nil)
+        prompt.show()
+        XCTAssertNil(prompt.card, "the first PC, renamed")
+
+        // Two PCs called Lab on one network: Bonjour lists the second as "Lab (2)".
+        let lab = service("Lab", at: "192.0.2.50", version: "0.3.2")
+        let lab2 = DiscoveredHost(name: "EternalMonitor (Lab) (2)", address: "192.0.2.51", port: 9876, version: "0.3.2")
+        prompt.discovered([lab])
+        prompt.show()
+        XCTAssertEqual(prompt.card?.key, OldPCPrompt.serviceKey(lab.name))
+        prompt.close()
+        prompt.discovered([lab, lab2])
+        prompt.show()
+        XCTAssertEqual(prompt.card?.key, OldPCPrompt.serviceKey(lab2.name), "the second Lab is another PC")
+        prompt.close()
+        // Connecting to the second links its service to its pairing: no new card.
+        prompt.connecting(service: lab2.name, address: "192.0.2.51")
+        prompt.answered(hostName: "Lab", pairingToken: tokenC, hostCaps: oldCaps, address: "192.0.2.51")
+        prompt.show()
+        XCTAssertNil(prompt.card, "shown already, as its service")
+        let memory = prompt.memory
+        let keyC = OldPCPrompt.key(hostName: "Lab", pairingToken: tokenC, service: nil)
+        XCTAssertEqual(memory.services[lab2.name], keyC)
+        XCTAssertNotNil(memory.pcs[keyC]?.shownAt)
+        XCTAssertNil(memory.pcs[OldPCPrompt.serviceKey(lab2.name)])
+        XCTAssertFalse(memory.pcs.keys.contains { $0.contains(tokenC.map { String(format: "%02x", $0) }.joined()) },
+                       "the token itself isn't kept")
     }
 
     /// A current PC never gets a card, and its answer takes a waiting or
@@ -153,60 +286,95 @@ final class OldPCTests: XCTestCase {
     func testACurrentPCTakesItsCardAway() {
         var lines: [String] = []
         let prompt = OldPCPrompt(defaults: defaults(), now: { Date() }, log: { lines.append($0) })
-        let current = HelloAck.hostCapNack | HelloAck.hostCapContiguousFrameSeq
-        prompt.saw(pc: "Studio", announced: "0.3.4", hostCaps: nil)
-        prompt.saw(pc: "Office", announced: nil, hostCaps: current)
+        prompt.discovered([service("Studio", at: "192.0.2.10", version: "0.3.4")])
+        prompt.answered(hostName: "Office", pairingToken: tokenB, hostCaps: currentCaps, address: nil)
         prompt.show()
         XCTAssertNil(prompt.card)
 
-        prompt.saw(pc: "Studio", announced: "0.3.3", hostCaps: nil)
-        prompt.saw(pc: "Studio", announced: nil, hostCaps: current)
+        prompt.discovered([service("Studio", at: "192.0.2.10", version: "0.3.3")])
+        prompt.discovered([service("Studio", at: "192.0.2.10", version: "0.3.4")])
         prompt.show()
         XCTAssertNil(prompt.card, "updated before the card showed")
 
-        prompt.saw(pc: "Office", announced: "0.3.2", hostCaps: nil)
+        prompt.discovered([service("Office", at: "192.0.2.20", version: "0.3.2")])
         prompt.show()
         XCTAssertNotNil(prompt.card)
-        prompt.saw(pc: "Office", announced: nil, hostCaps: current)
+        prompt.connecting(service: "EternalMonitor (Office)", address: "192.0.2.20")
+        prompt.answered(hostName: "Office", pairingToken: tokenB, hostCaps: currentCaps, address: "192.0.2.20")
         XCTAssertNil(prompt.card)
         XCTAssertEqual(lines, ["old_pc_prompt shown=true version=0.3.2"])
     }
 
-    /// Only the last showings of a few PCs are kept.
-    func testTheShowingsKeptAreBounded() {
-        let store = defaults()
+    /// Only the last few PCs are kept, with their links.
+    func testTheMemoryIsBounded() {
         var now = Date(timeIntervalSince1970: 1_000_000)
-        let prompt = OldPCPrompt(defaults: store, now: { now }, log: { _ in })
+        let prompt = OldPCPrompt(defaults: defaults(), now: { now }, log: { _ in })
         for index in 0..<(OldPCPrompt.kept + 4) {
             now += 60
-            prompt.saw(pc: "PC \(index)", announced: "0.3.2", hostCaps: nil)
+            prompt.connecting(service: "EternalMonitor (PC \(index))", address: "192.0.2.\(index)")
+            prompt.answered(hostName: "PC \(index)", pairingToken: Data(repeating: UInt8(index + 1), count: 16),
+                            hostCaps: oldCaps, address: "192.0.2.\(index)")
             prompt.show()
             prompt.close()
         }
-        let kept = store.dictionary(forKey: OldPCPrompt.defaultsKey) ?? [:]
-        XCTAssertEqual(kept.count, OldPCPrompt.kept)
-        XCTAssertNil(kept["PC 0"])
-        XCTAssertNotNil(kept["PC \(OldPCPrompt.kept + 3)"])
+        let memory = prompt.memory
+        XCTAssertEqual(memory.pcs.count, OldPCPrompt.kept)
+        XCTAssertEqual(memory.services.count, OldPCPrompt.kept)
+        XCTAssertNil(memory.services["EternalMonitor (PC 0)"])
+        XCTAssertNotNil(memory.services["EternalMonitor (PC \(OldPCPrompt.kept + 3))"])
     }
 
-    /// A session's HELLO_ACK reaches the prompt: an old PC's card waits for
-    /// the Connect screen, a current PC's doesn't.
+    /// One session with `host`, answered with `status` and `caps`.
+    private func session(_ manager: ConnectionManager, _ host: FakeUDPHost, status: HelloStatus = .ok,
+                         caps: UInt16) async throws {
+        manager.connect(host: "127.0.0.1", port: host.port)
+        let accepted = await Task.detached { host.acceptSession(status: status, hostCaps: caps) }.value
+        XCTAssertTrue(accepted, "the iPad never sent HELLO2")
+        let deadline = Date().addingTimeInterval(10)
+        if status == .ok {
+            while manager.hostInfo == nil, Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
+            XCTAssertEqual(manager.hostInfo?.hostCaps, caps)
+        } else {
+            try await Task.sleep(nanoseconds: 300_000_000)
+            XCTAssertNil(manager.hostInfo)
+        }
+        manager.cancel()
+    }
+
+    /// A session's accepted HELLO_ACK reaches the prompt: an old PC's card
+    /// waits for the Connect screen, a current PC's doesn't.
     func testASessionsAnswerReachesThePrompt() async throws {
-        for (caps, old) in [(UInt16(0x000F), true), (UInt16(0x002F), false)] {
+        for (caps, old) in [(oldCaps, true), (currentCaps, false)] {
             let prompt = OldPCPrompt(defaults: defaults(), now: { Date() }, log: { _ in })
             let manager = ConnectionManager()
             manager.oldPCPrompt = prompt
             addTeardownBlock { await MainActor.run { manager.cancel() } }
-            let host = FakeUDPHost()
-            manager.connect(host: "127.0.0.1", port: host.port)
-            let accepted = await Task.detached { host.acceptSession(hostCaps: caps) }.value
-            XCTAssertTrue(accepted, "the iPad never sent HELLO2")
-            let deadline = Date().addingTimeInterval(10)
-            while manager.hostInfo == nil, Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
-            XCTAssertEqual(manager.hostInfo?.hostCaps, caps)
-            manager.cancel()
+            try await session(manager, FakeUDPHost(), caps: caps)
             prompt.show()
-            XCTAssertEqual(prompt.card, old ? OldPCPrompt.Card(pc: "Test PC", version: nil) : nil, "caps \(caps)")
+            XCTAssertEqual(prompt.card?.pc, old ? "Test PC" : nil, "caps \(caps)")
+            XCTAssertEqual(prompt.card?.key.hasPrefix("pair:"), old ? true : nil)
+            XCTAssertEqual(prompt.memory.pcs.values.map(\.current), [!old])
         }
+    }
+
+    /// Refusals and not-streaming replies may carry no caps at all (the PC
+    /// keeps them within the HELLO2's size), so they say nothing about the
+    /// PC's age either way.
+    func testRefusalsAndNotStreamingRepliesCountForNothing() async throws {
+        let prompt = OldPCPrompt(defaults: defaults(), now: { Date() }, log: { _ in })
+        let manager = ConnectionManager()
+        manager.oldPCPrompt = prompt
+        addTeardownBlock { await MainActor.run { manager.cancel() } }
+        for status in [HelloStatus.stopped, .busy, .unauthorized] {
+            try await session(manager, FakeUDPHost(), status: status, caps: 0)
+        }
+        prompt.show()
+        XCTAssertNil(prompt.card)
+        XCTAssertEqual(prompt.memory, OldPCPrompt.Memory())
+
+        // The same PC accepting a session is what counts.
+        try await session(manager, FakeUDPHost(), caps: oldCaps)
+        prompt.show()
+        XCTAssertEqual(prompt.card?.pc, "Test PC")
     }
 }

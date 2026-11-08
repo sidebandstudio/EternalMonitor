@@ -53,8 +53,9 @@ pub const HOSTCAP_PEN: u16 = 1 << 4;
 /// Media `frame_seq` counts the access units sent in a stream epoch without
 /// gaps, so a forward gap is a frame lost in transit. Without it, numbers
 /// may skip frames that were never sent. Older iPads ignore the bit.
-/// Every 0.3.4 and later host sets it, and iPads read an answer without it
-/// as a PC to update, so it stays set.
+/// Every 0.3.4 and later host sets it in every reply that accepts a
+/// session, and iPads read an accepted reply without it as a PC to update,
+/// so it stays set there.
 pub const HOSTCAP_CONTIGUOUS_FRAME_SEQ: u16 = 1 << 5;
 
 /// [`StreamConfig::flags`] bits.

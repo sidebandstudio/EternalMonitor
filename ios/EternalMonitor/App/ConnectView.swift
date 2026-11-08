@@ -712,6 +712,7 @@ struct ConnectView: View {
                         guard let address = host.address else { return }
                         hostIP = address
                         port = "\(host.port)"
+                        oldPC.connecting(service: host.name, address: address)
                         connectionManager.connect(host: address, port: host.port, found: true)
                     } label: {
                         hostRow(
@@ -746,13 +747,11 @@ struct ConnectView: View {
             : "Couldn't get its address. Type the Address shown on the PC."
     }
 
-    /// Notes the PCs the search found and shows a waiting old-PC card
-    /// while nothing is streaming and setup is closed.
+    /// Notes the PCs the search lists, each with its own TXT version, and
+    /// shows a waiting old-PC card while nothing is streaming and setup is
+    /// closed.
     private func offerOldPC() {
-        for host in scanner.hosts {
-            oldPC.saw(pc: OldPC.pcName(bonjour: host.name),
-                      announced: PCVersions.version(address: host.address, name: host.name), hostCaps: nil)
-        }
+        oldPC.discovered(scanner.hosts)
         if connectionManager.state == .disconnected && !showSetup { oldPC.show() }
     }
 

@@ -79,10 +79,8 @@ final class ConnectScreenTests: UITestCase {
         XCTAssertTrue(app.buttons["connect.button"].isEnabled, "connecting isn't blocked")
         let shot = XCTAttachment(screenshot: app.screenshot())
         shot.name = "old-pc-card"; shot.lifetime = .keepAlways; add(shot)
-        let close = app.buttons["connect.oldPCClose"]
-        close.tap()
-        if !gone(card, within: 5), close.exists { close.tap() }
-        XCTAssertTrue(gone(card, within: 5), "Close did not hide the card")
+        app.buttons["connect.oldPCClose"].tap()
+        XCTAssertTrue(gone(card, within: 5), "one tap on Close hides the card")
     }
 
     private func gone(_ element: XCUIElement, within timeout: TimeInterval) -> Bool {

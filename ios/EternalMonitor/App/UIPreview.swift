@@ -72,7 +72,7 @@ enum UIPreview {
         case "pairing":
             manager.pairingPrompt = PairingSheetModel()
         case "old-pc":
-            OldPCPrompt.shared.preview(OldPCPrompt.Card(pc: "Studio PC", version: "0.3.2"))
+            OldPCPrompt.shared.preview(OldPCPrompt.Card(key: "preview", pc: "Studio PC", version: "0.3.2"))
         case "recent":
             RecentConnectionStore.shared.add(host: "192.168.1.20", port: 9876, isUSB: false)
             RecentConnectionStore.shared.add(host: "Studio PC", port: 9877, isUSB: true)
