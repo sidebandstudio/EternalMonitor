@@ -17,6 +17,13 @@ eternal-credstore = { path = "../../credstore", features = ["test-hooks"] }
 members = ["."]
 
 [[bin]]
+name = "v3_pairing"
+path = "fuzz_targets/v3_pairing.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
 name = "v3_parsers"
 path = "fuzz_targets/v3_parsers.rs"
 test = false

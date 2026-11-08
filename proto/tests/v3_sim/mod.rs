@@ -274,6 +274,9 @@ pub enum Event {
     IpadPairAgain {
         at: Duration,
     },
+    IpadBusy {
+        at: Duration,
+    },
     IpadDelivered {
         at: Duration,
         session_id: u32,
@@ -300,6 +303,7 @@ impl Event {
             | Event::IpadRefused { at, .. }
             | Event::IpadAttemptFailed { at }
             | Event::IpadPairAgain { at }
+            | Event::IpadBusy { at }
             | Event::IpadDelivered { at, .. }
             | Event::IpadClosed { at, .. } => *at,
         }
@@ -761,6 +765,7 @@ impl Sim {
                 ClientOutput::Refused { status, .. } => Event::IpadRefused { at: now, status },
                 ClientOutput::AttemptFailed { .. } => Event::IpadAttemptFailed { at: now },
                 ClientOutput::PairAgain { .. } => Event::IpadPairAgain { at: now },
+                ClientOutput::Busy { .. } => Event::IpadBusy { at: now },
                 ClientOutput::Deliver {
                     session_id,
                     draining,
