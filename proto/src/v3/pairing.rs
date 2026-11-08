@@ -935,6 +935,8 @@ pub struct PairingClient {
     cookie_key: Zeroizing<Key32>,
     /// Message 1 with the host's newest cookie, once one came.
     with_cookie: Option<Vec<u8>>,
+    /// A cookie reply already made it send at once.
+    cookie_resent: bool,
     session: Option<(Sealer, Opener, [u8; 32])>,
     accept: Option<PairAccept>,
 }
@@ -1000,6 +1002,7 @@ impl PairingClient {
             msg1,
             cookie_key: cookie::pairing_key(&psk),
             with_cookie: None,
+            cookie_resent: false,
             session: None,
             accept: None,
         })
@@ -1011,9 +1014,11 @@ impl PairingClient {
         self.with_cookie.as_deref().unwrap_or(&self.msg1)
     }
 
-    /// A cookie reply to this message 1, before message 2: keeps the cookie
-    /// and gives back message 1 to send again at once. A copy of a cookie
-    /// already held, and anything else, is `None` and changes nothing.
+    /// A cookie reply to this message 1, before message 2: keeps the newest
+    /// cookie (which [`msg1`](Self::msg1) then carries), and the first time
+    /// gives back message 1 to send again at once. After that, and for
+    /// anything else, `None`: copies of replies, or recorded ones replayed
+    /// in turn, never make the iPad send more than its own retries do.
     pub fn handle_cookie(&mut self, datagram: &[u8]) -> Option<Vec<u8>> {
         self.state.as_ref()?;
         let reply = CookieReply::parse(datagram).ok()?;
@@ -1022,10 +1027,10 @@ impl PairingClient {
         }
         let value = cookie::open(&self.cookie_key, &reply, &cookie::msg1_digest(&self.msg1))?;
         let msg1 = cookie::attach(&self.msg1, &value);
-        if self.with_cookie.as_ref() == Some(&msg1) {
+        self.with_cookie = Some(msg1.clone());
+        if std::mem::replace(&mut self.cookie_resent, true) {
             return None;
         }
-        self.with_cookie = Some(msg1.clone());
         Some(msg1)
     }
 

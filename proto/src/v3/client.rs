@@ -245,6 +245,8 @@ enum Attempt {
         started: Duration,
         last_sent: Duration,
         stale_retried: bool,
+        /// When a cookie reply last made it send at once.
+        cookie_resent: Option<Duration>,
     },
     Confirming {
         key: ClientKey,
@@ -505,6 +507,7 @@ impl Client {
             started: now,
             last_sent: now,
             stale_retried,
+            cookie_resent: None,
         };
     }
 
@@ -527,15 +530,17 @@ impl Client {
         out
     }
 
-    /// A cookie reply for the message 1 being sent: keep the cookie and
-    /// send message 1 again with it at once, unless it's the cookie already
-    /// held. Anything else is dropped: a
-    /// reply opens only under this attempt's key and its exact message 1.
+    /// A cookie reply for the message 1 being sent: keep the newest cookie,
+    /// and send message 1 again with it at once, at most once per retry
+    /// interval. Anything else is dropped: a reply opens only under this
+    /// attempt's key and its exact message 1.
     fn handle_cookie(&mut self, now: Duration, datagram: &[u8], out: &mut Vec<ClientOutput>) {
+        let interval = self.config.msg1_retry_interval;
         let Attempt::Connecting {
             initiator,
             key,
             last_sent,
+            cookie_resent,
             ..
         } = &mut self.attempt
         else {
@@ -551,19 +556,24 @@ impl Client {
         let Some(value) = cookie::open(&k, &reply, &cookie::msg1_digest(initiator.msg1())) else {
             return;
         };
-        // The cookie it already holds: its next retry carries it. Copies of
-        // a reply never make the iPad send more.
+        // The cookie it already holds: its next retry carries it.
         if self
             .cookie
             .is_some_and(|c| c.cookie == value && c.fresh(now))
         {
             return;
         }
-        let held = HeldCookie {
+        self.cookie = Some(HeldCookie {
             cookie: value,
             received: now,
-        };
-        self.cookie = Some(held);
+        });
+        // Replies anyone recorded, replayed in turn, each hold a different
+        // cookie: they never make the iPad send more than once per retry
+        // interval. The next scheduled retry carries the newest.
+        if cookie_resent.is_some_and(|t| now.saturating_sub(t) < interval) {
+            return;
+        }
+        *cookie_resent = Some(now);
         *last_sent = now;
         out.push(ClientOutput::Send(cookie::attach(initiator.msg1(), &value)));
     }
@@ -1462,5 +1472,47 @@ mod tests {
         let late = T0 + cookie::CLIENT_COOKIE_LIFETIME;
         let last = sent(&ipad.connect(late, key(), 3_000)).remove(0);
         assert_eq!(cookie::split(&last).1, None);
+    }
+
+    /// Two recorded replies to the iPad's message 1 (from two addresses that
+    /// replayed it), sent to it in turn by someone with no key: at most one
+    /// immediate send per retry interval, and the retries carry the newest
+    /// cookie.
+    #[test]
+    fn alternating_recorded_cookie_replies_never_make_the_ipad_send_more() {
+        let mut ipad = client();
+        let msg1 = sent(&ipad.connect(T0, key(), 1_000)).remove(0);
+        let mut rng = SeededRandom::new(123);
+        let mut jar = cookie::CookieJar::new(T0, &mut rng);
+        let k = cookie::session_key(&key().k_dev, &key().dev_id);
+        let mut reply_for = |addr: &[u8], rng: &mut SeededRandom| {
+            let binding = cookie::session_binding(&key().dev_id, addr);
+            jar.reply(T0, &binding, &k, super::super::EXT_SESSION, &msg1, rng)
+        };
+        let a = reply_for(b"addr-a", &mut rng);
+        let b = reply_for(b"addr-b", &mut rng);
+        let value = |reply: &[u8]| {
+            let parsed = CookieReply::parse(reply).unwrap();
+            cookie::open(&k, &parsed, &cookie::msg1_digest(&msg1)).unwrap()
+        };
+        let interval = ClientConfig::new(HOST).msg1_retry_interval;
+        let mut sends = 0;
+        for i in 0..100u64 {
+            let reply = if i % 2 == 0 { &a } else { &b };
+            sends += sent(&ipad.handle_datagram(T0 + Duration::from_millis(i), reply, 1_000)).len();
+        }
+        assert_eq!(sends, 1, "one immediate send");
+        // The scheduled retry carries the newest cookie (b came last).
+        let retry = sent(&ipad.poll(T0 + interval, 1_000));
+        assert_eq!(retry, vec![cookie::attach(&msg1, &value(&b))]);
+        // A new interval allows one more immediate send, for a new cookie,
+        // but never for a copy of the one held.
+        let later = T0 + interval + Duration::from_millis(1);
+        assert!(
+            sent(&ipad.handle_datagram(later, &b, 1_000)).is_empty(),
+            "b is held"
+        );
+        assert_eq!(sent(&ipad.handle_datagram(later, &a, 1_000)).len(), 1);
+        assert!(sent(&ipad.handle_datagram(later, &b, 1_000)).is_empty());
     }
 }

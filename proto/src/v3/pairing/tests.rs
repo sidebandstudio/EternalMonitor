@@ -934,3 +934,36 @@ fn a_pairing_cookie_binds_its_qr_window() {
     );
     assert!(!host.in_flight(T0 + ms(10)));
 }
+
+/// Two recorded replies to the iPad's pairing message 1 (from two addresses
+/// that replayed it), given to it in turn: one immediate send in all, and
+/// its retries carry the newest cookie.
+#[test]
+fn alternating_recorded_pairing_cookie_replies_never_make_the_ipad_send_more() {
+    let creds = Creds::default();
+    let mut host = host_with(CookieMode::Always);
+    let qr = host.open(T0, addr());
+    let mut ipad = client(&qr, 123);
+    let msg1 = ipad.msg1().to_vec();
+    let a = sends(&host.handle_datagram(T0, &10, &msg1, &creds)).remove(0);
+    let b = sends(&host.handle_datagram(T0, &11, &msg1, &creds)).remove(0);
+    let mut immediate = 0;
+    for i in 0..100 {
+        immediate += usize::from(
+            ipad.handle_cookie(if i % 2 == 0 { &a } else { &b })
+                .is_some(),
+        );
+    }
+    assert_eq!(immediate, 1);
+    let value = cookie::open(
+        &ipad.cookie_key,
+        &cookie::CookieReply::parse(&b).unwrap(),
+        &cookie::msg1_digest(&msg1),
+    )
+    .unwrap();
+    assert_eq!(
+        ipad.msg1(),
+        &cookie::attach(&msg1, &value)[..],
+        "the newest cookie"
+    );
+}
