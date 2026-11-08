@@ -42,6 +42,9 @@ pub struct PipelineStats {
     /// (CPU) encoding. Surfaced as a warning banner in the GUI so a tester is never silently
     /// stuck on slow software encoding.
     pub using_software_fallback: bool,
+    /// Pictures given to an encoder again to bring out a keyframe it held
+    /// (see `encoder::holds_last_frame`).
+    pub keyframe_resubmits: u64,
     /// NVENC refused to open because the NVIDIA driver is older than the
     /// linked FFmpeg's NVENC needs. The fallback notice then says to update
     /// it.
@@ -114,6 +117,7 @@ impl PipelineStats {
             bitrate_bps: 0,
             codec_name: String::new(),
             using_software_fallback: false,
+            keyframe_resubmits: 0,
             nvidia_driver_outdated: false,
             driver_update_vendors: Vec::new(),
             encode_timestamps: VecDeque::with_capacity(128),

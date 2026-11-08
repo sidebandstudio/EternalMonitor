@@ -109,6 +109,10 @@ struct StageRun {
     packets: Vec<NALUnit>,
     software_fallback: bool,
     codec_name: String,
+    /// Pictures the stage gave the encoder again (`keyframe_resubmits`).
+    resubmits: u64,
+    /// The longest time between two published frames.
+    longest_gap: Duration,
 }
 
 /// Feeds `FRAME_COUNT` frames through a fresh encode stage at
@@ -130,6 +134,7 @@ fn run_stage(
         ..GpuInfo::software_fallback()
     };
     let generation = eternal_host::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
+    let resubmits_before = PIPELINE_STATS.lock().keyframe_resubmits;
     let stage_shared = shared.clone();
     let stage = std::thread::spawn(move || {
         run_encode_stage(consumer, tx, stage_shared, gpu, generation).map_err(|e| e.to_string())
@@ -143,6 +148,8 @@ fn run_stage(
         packets
     });
 
+    let mut last_publish: Option<Instant> = None;
+    let mut longest_gap = Duration::ZERO;
     for number in 0..FRAME_COUNT {
         if keyframe_at == Some(number) {
             shared.force_next_idr.store(true, Ordering::SeqCst);
@@ -150,6 +157,9 @@ fn run_stage(
         let (width, height) = size_of(number);
         let mut data = frame_buffer((width * height * 4) as usize);
         render_synthetic_frame(&mut data, width, height, number);
+        if let Some(last) = last_publish.replace(Instant::now()) {
+            longest_gap = longest_gap.max(last.elapsed());
+        }
         producer.publish(RawFrame {
             frame_number: number,
             timestamp: Instant::now(),
@@ -173,6 +183,40 @@ fn run_stage(
         packets,
         software_fallback: stats.using_software_fallback,
         codec_name: stats.codec_name.clone(),
+        resubmits: stats.keyframe_resubmits - resubmits_before,
+        longest_gap,
+    }
+}
+
+/// A stream whose frames come every `FRAME_INTERVAL` is never still, so no
+/// picture may be given to the encoder again and none encoded twice. Only if
+/// the producer itself stalled for a frame and a half (the encode loop's wait,
+/// see `keyframe_flush_wait`) may a picture repeat, and then only one the
+/// stage reports giving again.
+fn assert_no_duplicate_encodes(run: &StageRun, pictures: &[(u32, u32, u64)]) {
+    let counters: Vec<u64> = pictures.iter().map(|picture| picture.2).collect();
+    assert!(
+        counters.windows(2).all(|pair| pair[0] <= pair[1]),
+        "frame counters go back: {counters:?}"
+    );
+    let repeats = counters
+        .windows(2)
+        .filter(|pair| pair[0] == pair[1])
+        .count() as u64;
+    if run.longest_gap < FRAME_INTERVAL * 3 / 2 {
+        assert_eq!(
+            (repeats, run.resubmits),
+            (0, 0),
+            "pictures encoded twice, and given again, while frames came every \
+             {FRAME_INTERVAL:?} at most {:?} apart: {counters:?}",
+            run.longest_gap
+        );
+    } else {
+        assert!(
+            repeats <= run.resubmits,
+            "{repeats} pictures encoded twice but {} given again: {counters:?}",
+            run.resubmits
+        );
     }
 }
 
@@ -242,7 +286,8 @@ fn assert_hevc_keyframe(packet: &NALUnit, what: &str) {
 /// picture is at most `KEYFRAME_WINDOW` frames past the request, and a decoder
 /// that joins there must decode everything after it.
 fn assert_keyframe_on_request(run: &StageRun, codec: Id) {
-    decode(codec, &run.packets.iter().collect::<Vec<_>>());
+    let all = decode(codec, &run.packets.iter().collect::<Vec<_>>());
+    assert_no_duplicate_encodes(run, &all);
     let keyframes: Vec<u64> = run
         .packets
         .iter()
@@ -274,10 +319,7 @@ fn assert_keyframe_on_request(run: &StageRun, codec: Id) {
          waited for the encoder's own IDR; keyframes at {keyframes:?}",
         counters[0]
     );
-    assert!(
-        counters.windows(2).all(|pair| pair[0] < pair[1]),
-        "frame counters do not advance: {counters:?}"
-    );
+    // Advancing counters across the whole stream: `assert_no_duplicate_encodes`.
 }
 
 /// Size schedule for the mode-change runs: small, then large, then small.
@@ -292,7 +334,8 @@ fn mode_changes(number: u64) -> (u32, u32) {
 /// After each mode change the stream must restart on a keyframe at the new
 /// size that a fresh decoder can join.
 fn assert_follows_mode_changes(run: &StageRun, codec: Id) {
-    decode(codec, &run.packets.iter().collect::<Vec<_>>());
+    let all = decode(codec, &run.packets.iter().collect::<Vec<_>>());
+    assert_no_duplicate_encodes(run, &all);
     for (from, size) in [(30u64, LARGE), (60, SMALL)] {
         let start = run
             .packets
@@ -506,9 +549,8 @@ const WARM_UP_QUIET: Duration = Duration::from_millis(300);
 
 /// Streams a few frames and waits for the encoder to encode them, goes still,
 /// then requests a keyframe with one resent picture and nothing after it, as
-/// for a reconnecting viewer. Returns how long that picture's keyframe took
-/// to leave the stage, or `None` if it did not within [`STILL_WINDOW`].
-fn keyframe_on_a_still_desktop(encoder: &str) -> (Option<Duration>, bool) {
+/// for a reconnecting viewer.
+fn keyframe_on_a_still_desktop(encoder: &str) -> StillRun {
     ffmpeg_next::init().unwrap();
     let (producer, consumer) = frame_slot();
     let (tx, mut rx) = tokio::sync::mpsc::channel(NAL_CHANNEL_CAPACITY);
@@ -520,6 +562,7 @@ fn keyframe_on_a_still_desktop(encoder: &str) -> (Option<Duration>, bool) {
         ..GpuInfo::software_fallback()
     };
     let generation = eternal_host::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
+    let resubmits_before = PIPELINE_STATS.lock().keyframe_resubmits;
     let stage_shared = shared.clone();
     let stage = std::thread::spawn(move || {
         run_encode_stage(consumer, tx, stage_shared, gpu, generation).map_err(|e| e.to_string())
@@ -571,7 +614,6 @@ fn keyframe_on_a_still_desktop(encoder: &str) -> (Option<Duration>, bool) {
     }
 
     // A viewer connects to the still desktop.
-    const RESENT: u64 = 100;
     let requested = Instant::now();
     shared.force_next_idr.store(true, Ordering::SeqCst);
     publish(RESENT);
@@ -596,7 +638,13 @@ fn keyframe_on_a_still_desktop(encoder: &str) -> (Option<Duration>, bool) {
         Err(_) => panic!("{encoder} encode stage panicked"),
     }
     collector.join().unwrap();
-    let software_fallback = PIPELINE_STATS.lock().using_software_fallback;
+    let (software_fallback, resubmits) = {
+        let stats = PIPELINE_STATS.lock();
+        (
+            stats.using_software_fallback,
+            stats.keyframe_resubmits - resubmits_before,
+        )
+    };
     eprintln!(
         "{encoder}: still-desktop keyframe after {keyframe:?}; packets {:?}",
         seen.iter()
@@ -608,19 +656,71 @@ fn keyframe_on_a_still_desktop(encoder: &str) -> (Option<Duration>, bool) {
             ))
             .collect::<Vec<_>>()
     );
-    (keyframe, software_fallback)
+    StillRun {
+        keyframe,
+        software_fallback,
+        resubmits,
+        sequences: seen.iter().map(|(_, nal)| nal.sequence).collect(),
+    }
+}
+
+/// The picture resent for the viewer, after the warm-up's frames 0 to 9.
+const RESENT: u64 = 100;
+
+struct StillRun {
+    /// How long the resent picture's keyframe took to leave the stage, or
+    /// `None` if it did not within [`STILL_WINDOW`].
+    keyframe: Option<Duration>,
+    software_fallback: bool,
+    resubmits: u64,
+    /// The capture number of each packet, in order.
+    sequences: Vec<u64>,
 }
 
 fn assert_still_keyframe(encoder: &str) {
-    let (keyframe, software_fallback) = keyframe_on_a_still_desktop(encoder);
+    let run = keyframe_on_a_still_desktop(encoder);
     assert!(
-        encoder == "libx264" || !software_fallback,
+        encoder == "libx264" || !run.software_fallback,
         "{encoder} fell back to libx264"
     );
     assert!(
-        keyframe.is_some(),
+        run.keyframe.is_some(),
         "{encoder} held the requested keyframe until the next captured frame"
     );
+    // Only the still picture may be encoded twice, and only by being given
+    // again: the warm-up's frames came every 20 ms.
+    let warm_up: Vec<u64> = run
+        .sequences
+        .iter()
+        .copied()
+        .filter(|&sequence| sequence != RESENT)
+        .collect();
+    assert!(
+        warm_up.windows(2).all(|pair| pair[0] < pair[1]),
+        "{encoder} encoded a moving picture twice: {:?}",
+        run.sequences
+    );
+    let still = run
+        .sequences
+        .iter()
+        .filter(|&&sequence| sequence == RESENT)
+        .count() as u64;
+    assert!(
+        still.saturating_sub(1) <= run.resubmits,
+        "{encoder}: the still picture came out {still} times, given again {}",
+        run.resubmits
+    );
+    if eternal_host::encoder::holds_last_frame(encoder) {
+        assert!(
+            run.resubmits >= 1,
+            "{encoder} brought out the keyframe without being given the picture again"
+        );
+    } else {
+        assert_eq!(
+            run.resubmits, 0,
+            "{encoder} returns each frame, so nothing is given again"
+        );
+    }
 }
 
 #[test]
