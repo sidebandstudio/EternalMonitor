@@ -29,6 +29,9 @@ fn wifi(up: bool, ip: Ipv4Addr) -> Adapter {
     }
 }
 
+/// The pipeline generation of the streams this test starts.
+const GENERATION: u64 = 7;
+
 /// Runs the transport until it stops, on its own thread.
 fn start(
     shared: &SharedControl,
@@ -55,6 +58,7 @@ fn start(
                 port,
                 shared,
                 supervisor_tx,
+                GENERATION,
             ))
             .unwrap();
     });
@@ -91,8 +95,12 @@ fn the_address_row_shows_a_chosen_network_that_came_back() {
     let command = supervisor_rx
         .recv_timeout(Duration::from_secs(30))
         .expect("the network check asks for a restart");
-    let generation = eternal_host::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
-    assert_eq!(command, SupervisorCommand::RestartStream { generation });
+    assert_eq!(
+        command,
+        SupervisorCommand::RestartStream {
+            generation: GENERATION
+        }
+    );
     transport.join().unwrap();
 
     // The supervisor starts the stream again, now on the network's address.

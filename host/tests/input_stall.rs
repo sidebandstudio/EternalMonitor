@@ -153,6 +153,7 @@ fn input_windows_holds_never_stops_the_transport_loop() {
                 port,
                 control,
                 supervisor_tx,
+                1,
             ))
             .unwrap();
     });

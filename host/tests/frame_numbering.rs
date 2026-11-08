@@ -47,6 +47,7 @@ fn skipped_capture_frames_leave_no_gap_on_the_wire() {
                 port,
                 sender_shared,
                 supervisor_tx,
+                1,
             ))
             .unwrap();
     });
