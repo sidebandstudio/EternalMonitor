@@ -159,10 +159,18 @@ final class OldPCPrompt: ObservableObject {
             guard target == key || memory.pcs[target]?.current == nil else { continue }
             named[service] = key
             guard target != key else { continue }
-            if let shown = memory.pcs[target]?.shownAt, var pc = memory.pcs[key] {
-                pc.shownAt = max(pc.shownAt ?? shown, shown)
-                memory.pcs[key] = pc
-                changed = true
+            // Both records keep the later showing, so a later launch, which
+            // has no link, holds the card back under either. Only the time
+            // is saved, never the link.
+            if let shown = [memory.pcs[target]?.shownAt, memory.pcs[key]?.shownAt].compactMap({ $0 }).max() {
+                if memory.pcs[key] != nil, memory.pcs[key]?.shownAt != shown {
+                    memory.pcs[key]?.shownAt = shown
+                    changed = true
+                }
+                if memory.pcs[target]?.shownAt != shown {
+                    memory.pcs[target, default: Memory.PC(seenAt: now())].shownAt = shown
+                    changed = true
+                }
             }
             if waiting?.key == target { waiting = nil }
             if let shown = card, shown.key == target { card = Card(key: key, pc: shown.pc, version: shown.version) }
@@ -279,6 +287,10 @@ final class OldPCPrompt: ObservableObject {
         pc.shownAt = now()
         pc.seenAt = now()
         memory.pcs[next.key] = pc
+        // The services this launch links to it by name get the showing too.
+        for (service, key) in named where key == next.key {
+            memory.pcs[Self.serviceKey(service), default: Memory.PC(seenAt: now())].shownAt = now()
+        }
         save(memory)
         card = next
         log("old_pc_prompt shown=true version=\(next.version ?? "unknown")")

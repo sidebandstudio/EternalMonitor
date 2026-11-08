@@ -379,6 +379,66 @@ final class OldPCTests: XCTestCase {
         }
     }
 
+    /// r4: one old PC used over USB and seen by the search gets one card
+    /// every three days, also in later launches, which have no name link.
+    /// The search's record may come before the card or after it.
+    func testAPCLinkedByNameGetsOneCardAcrossLaunches() {
+        let lab = service("Lab", at: "192.0.2.90", version: "0.3.3")
+        for listedFirst in [true, false] {
+            let store = defaults()
+            let start = Date(timeIntervalSince1970: 1_000_000)
+            var now = start
+            var lines: [String] = []
+            let make = { OldPCPrompt(defaults: store, now: { now }, log: { lines.append($0) }) }
+            var prompt = make()
+            if listedFirst { prompt.discovered([lab]) }
+            prompt.answered(hostName: "Lab", pairingToken: tokenA, hostCaps: oldCaps, address: nil)
+            prompt.show()
+            XCTAssertEqual(prompt.card?.key, OldPCPrompt.key(hostName: "Lab", pairingToken: tokenA, service: nil))
+            prompt.close()
+            if !listedFirst { prompt.discovered([lab]) }
+            prompt.show()
+            XCTAssertNil(prompt.card)
+
+            now = start + 86_400
+            prompt = make()
+            prompt.discovered([lab])
+            prompt.show()
+            XCTAssertNil(prompt.card, "listedFirst \(listedFirst): day 1, the search only")
+
+            now = start + OldPCPrompt.interval
+            prompt = make()
+            prompt.discovered([lab])
+            prompt.show()
+            XCTAssertEqual(prompt.card?.pc, "Lab", "listedFirst \(listedFirst): day 3")
+            XCTAssertEqual(lines.count, 2, "listedFirst \(listedFirst): \(lines)")
+            XCTAssertEqual(prompt.memory.services, [:])
+        }
+    }
+
+    /// Bonjour updates that change nothing write nothing.
+    func testUnchangedUpdatesWriteNothing() {
+        final class Counting: UserDefaults {
+            var writes = 0
+            override func set(_ value: Any?, forKey defaultName: String) {
+                writes += 1
+                super.set(value, forKey: defaultName)
+            }
+        }
+        let name = "OldPCTests-\(UUID().uuidString)"
+        let store = Counting(suiteName: name)!
+        addTeardownBlock { UserDefaults().removePersistentDomain(forName: name) }
+        let prompt = OldPCPrompt(defaults: store, now: { Date() }, log: { _ in })
+        let lab = service("Lab", at: "192.0.2.90", version: "0.3.3")
+        prompt.discovered([lab])
+        prompt.show()
+        prompt.close()
+        prompt.answered(hostName: "Lab", pairingToken: tokenA, hostCaps: oldCaps, address: nil)
+        let writes = store.writes
+        for _ in 0..<5 { prompt.discovered([lab]) }
+        XCTAssertEqual(store.writes, writes)
+    }
+
     /// r3: a name a PC gave up is free for another PC: after a rename in the
     /// same launch, and in any later launch.
     func testANameIsNotKeptForAnotherPC() {
