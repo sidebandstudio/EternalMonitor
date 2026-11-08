@@ -1,6 +1,6 @@
 use super::page_stream::{
-    audio_summary, capture_block_notice, firewall_notice, second_screen_notice,
-    software_fallback_body, usb_cable_notice, usb_summary,
+    audio_summary, capture_block_notice, firewall_fix_offered, firewall_notice,
+    second_screen_notice, software_fallback_body, usb_cable_notice, usb_summary,
 };
 use super::*;
 
@@ -26,6 +26,8 @@ fn the_firewall_notice_shows_only_for_a_block_it_is_sure_of() {
     );
     let (title, body) = firewall_notice(Some(&blocked), false).unwrap();
     assert_eq!(title, "Windows Firewall is blocking EternalMonitor");
+    // This exe's own Block rule: Setup's firewall lines remove it.
+    assert!(firewall_fix_offered(Some(&blocked)));
     assert!(
         body.contains("Run the EternalMonitor installer again"),
         "{body}"
@@ -39,6 +41,9 @@ fn the_firewall_notice_shows_only_for_a_block_it_is_sure_of() {
     let shields = report(&[profile(PUBLIC, true)], std::slice::from_ref(&allow), true);
     let (title, body) = firewall_notice(Some(&shields), false).unwrap();
     assert_eq!(title, "Windows Firewall blocks every incoming connection");
+    // Only the user's switch turns that off: no button.
+    assert!(!firewall_fix_offered(Some(&shields)));
+    assert!(!firewall_fix_offered(None));
     assert!(body.contains("choose the public network"), "{body}");
     let both = report(
         &[profile(PRIVATE, false), profile(PUBLIC, true)],
@@ -51,6 +56,8 @@ fn the_firewall_notice_shows_only_for_a_block_it_is_sure_of() {
         body.contains("installer again") && body.contains("choose the public network"),
         "{body}"
     );
+    // The rule part has the button; the switch keeps its instructions.
+    assert!(firewall_fix_offered(Some(&both)));
 
     // A rule for every program: Setup can't remove it, so it is only
     // logged, alone or beside this exe's own block.

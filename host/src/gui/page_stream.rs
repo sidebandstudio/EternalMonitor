@@ -56,10 +56,22 @@ impl AnalyzerApp {
     /// Update, restart and fault notices, most urgent first.
     fn notices(&mut self, ui: &mut Ui, snap: &StatsSnapshot, client: &ClientSnapshot) {
         self.port_notice(ui);
-        if let Some((title, body)) =
-            firewall_notice(crate::firewall::latest().as_ref(), client.peer.is_some())
-        {
-            widgets::banner(ui, WARNING, Icon::Warning, &title, &body, 0.0, |_| {});
+        let firewall = crate::firewall::latest();
+        if let Some((title, mut body)) = firewall_notice(firewall.as_ref(), client.peer.is_some()) {
+            let progress = crate::firewall_fix::progress();
+            if let crate::firewall_fix::Progress::Done(crate::firewall_fix::Outcome::Failed(
+                error,
+            )) = progress
+            {
+                body = format!("{body} {error}");
+            }
+            let fixable = firewall_fix_offered(firewall.as_ref());
+            let width = if fixable { 110.0 } else { 0.0 };
+            widgets::banner(ui, WARNING, Icon::Warning, &title, &body, width, |ui| {
+                if fixable {
+                    firewall_fix_action(ui, progress);
+                }
+            });
             ui.add_space(GAP - 10.0);
         }
         if let Some((title, body)) = usb_cable_notice(
@@ -1395,6 +1407,30 @@ pub(super) fn usb_cable_notice(
             "EternalMonitor needs Apple's free Apple Devices app to stream over the USB cable. Install it from the Microsoft Store, open it, and leave it running. Wi-Fi works without it.",
         )
     })
+}
+
+/// "Fix it" on the firewall notice: for this exe's own Block rule, which
+/// Setup's firewall lines remove, not for "Blocks all incoming
+/// connections", which only the user's switch in Windows Security turns off.
+pub(super) fn firewall_fix_offered(report: Option<&crate::firewall::Report>) -> bool {
+    matches!(
+        report.and_then(crate::firewall::Report::certain_block),
+        Some(crate::firewall::CertainBlock::Rule { .. })
+    )
+}
+
+/// Runs the fix; it asks Windows for administrator rights once.
+fn firewall_fix_action(ui: &mut Ui, progress: crate::firewall_fix::Progress) {
+    let running = progress == crate::firewall_fix::Progress::Running;
+    let clicked = ui
+        .add_enabled_ui(!running, |ui| {
+            widgets::button(ui, Tone::Primary, None, tr("Fix it"))
+        })
+        .inner
+        .clicked();
+    if clicked {
+        crate::firewall_fix::start(crate::firewall_fix::fix_now);
+    }
 }
 
 /// What the Stream page says while Windows Firewall keeps iPads out: only

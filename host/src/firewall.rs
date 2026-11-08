@@ -536,6 +536,32 @@ pub fn judge(
 
 static LATEST: Mutex<Option<Report>> = Mutex::new(None);
 
+/// Set to read the policy again now rather than at the next [`RECHECK`].
+static RECHECK_NOW: (Mutex<bool>, std::sync::Condvar) =
+    (Mutex::new(false), std::sync::Condvar::new());
+
+/// Reads the policy again at once (after "Fix it" ran), on the thread
+/// [`watch`] started.
+pub fn recheck_now() {
+    let (wanted, wake) = &RECHECK_NOW;
+    if let Ok(mut wanted) = wanted.lock() {
+        *wanted = true;
+        wake.notify_all();
+    }
+}
+
+/// Waits up to `timeout`, or until [`recheck_now`].
+#[cfg(any(windows, test))]
+fn wait_for_recheck(timeout: Duration) {
+    let (wanted, wake) = &RECHECK_NOW;
+    let Ok(guard) = wanted.lock() else {
+        return;
+    };
+    if let Ok((mut guard, _)) = wake.wait_timeout_while(guard, timeout, |wanted| !*wanted) {
+        *guard = false;
+    }
+}
+
 /// The last reading, if the last read worked. `None` off Windows.
 pub fn latest() -> Option<Report> {
     LATEST.lock().ok()?.clone()
@@ -592,7 +618,7 @@ pub fn watch(port: u16) {
                     });
                     let read = windows_policy::read(&exe, port, lan).map_err(|e| e.to_string());
                     observe(read, &mut failed);
-                    std::thread::sleep(RECHECK);
+                    wait_for_recheck(RECHECK);
                 }
             });
     }
@@ -1457,6 +1483,26 @@ mod tests {
             verdicts(&[on(DOMAIN)], &after_setup(Vec::new(), app)),
             [Verdict::Allowed]
         );
+    }
+
+    /// After "Fix it", the policy is read again at once, not at the next
+    /// minute's check.
+    #[test]
+    fn a_recheck_wakes_the_watch_at_once() {
+        let started = std::time::Instant::now();
+        let waiting = std::thread::spawn(|| wait_for_recheck(Duration::from_secs(30)));
+        std::thread::sleep(Duration::from_millis(50));
+        recheck_now();
+        waiting.join().unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            started.elapsed()
+        );
+        // Used up: the next wait waits its time.
+        let started = std::time::Instant::now();
+        wait_for_recheck(Duration::from_millis(100));
+        assert!(started.elapsed() >= Duration::from_millis(100));
     }
 
     #[test]

@@ -22,17 +22,25 @@ fn placeholders(text: &str) -> Vec<&str> {
     found
 }
 
+/// English keys whose translations come in a separate pass. Until then
+/// every language shows them in English. A language that has one already
+/// is checked like any other key.
+const AWAITING_TRANSLATION: &[&str] = &["Fix it"];
+
 #[test]
 fn every_language_has_exactly_the_english_keys_and_placeholders() {
     let english = strings(Lang::En);
     for (key, value) in &english {
         assert_eq!(key, value, "en.json maps each key to itself");
     }
+    for key in AWAITING_TRANSLATION {
+        assert!(english.contains_key(*key), "{key:?} is not an English key");
+    }
     for lang in Lang::ALL {
         let translated = strings(lang);
         let missing: Vec<_> = english
             .keys()
-            .filter(|k| !translated.contains_key(*k))
+            .filter(|k| !translated.contains_key(*k) && !AWAITING_TRANSLATION.contains(&k.as_str()))
             .collect();
         let extra: Vec<_> = translated
             .keys()
