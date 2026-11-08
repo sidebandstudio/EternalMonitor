@@ -257,6 +257,9 @@ final class ConnectionManager: ObservableObject {
         /// How long the cable goes unanswered after the given number of
         /// Busy refusals in a row (see `CableHold`).
         var cableBusyHoldSeconds: (Int) -> Double = CableHold.busySeconds
+        /// Waits out a cable hold. Tests replace it to end the wait when
+        /// they choose.
+        var cableHoldSleep: (Double) async -> Void = { try? await Task.sleep(for: .seconds($0)) }
     }
     var timing: Timing
     /// The Wi-Fi link to a host's port. Tests pass a fake one, or replace it
@@ -381,8 +384,9 @@ final class ConnectionManager: ObservableObject {
         usbListener = nil
         usbStatus = "USB: disconnected"
         guard let wait else { return }
+        let sleep = timing.cableHoldSleep
         cableHoldTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(for: .seconds(wait))
+            await sleep(wait)
             guard let self, !Task.isCancelled, self.cableHold == hold else { return }
             self.endCableHold()
             self.usbPaused = self.usbStoppedForNoPicture

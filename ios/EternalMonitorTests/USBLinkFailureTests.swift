@@ -653,17 +653,15 @@ final class USBLinkFailureTests: XCTestCase {
         manager.diagnostics.map(\.message).filter { $0.hasPrefix("session_summary ") }
     }
 
-    /// Offers the PC's dial every 100 ms until the iPad takes one; the
-    /// seconds from `since` until it did.
-    private func dialUntilTaken(_ manager: ConnectionManager, since: Date, cables: inout [FramedLink]) async throws -> Double {
+    /// Offers the PC's dial every 100 ms until the iPad takes one.
+    private func dialUntilTaken(_ manager: ConnectionManager, cables: inout [FramedLink]) async throws {
         let deadline = Date().addingTimeInterval(30)
         while Date() < deadline {
             cables.append(try await plugIn(manager))
-            if manager.state == .connecting { return Date().timeIntervalSince(since) }
+            if manager.state == .connecting { return }
             try await Task.sleep(nanoseconds: 100_000_000)
         }
         XCTFail("no dial was taken in 30 s")
-        return .infinity
     }
 
     /// The wait after each Busy in a row: 30 s, doubling, at most 5 minutes.
@@ -681,26 +679,27 @@ final class USBLinkFailureTests: XCTestCase {
     /// A PC streaming to another device turns the cable down as Busy, then
     /// dials it again a second later. The iPad shows why and doesn't take
     /// the cable again until the wait ends, a longer wait after each Busy in
-    /// a row, back to the first after a session. Each attempt's summary
-    /// names the refusal.
+    /// a row, back to the first after a session the PC accepted. Each
+    /// attempt's summary names the refusal. The waits run on a sleeper the
+    /// test ends, so the timing of this machine doesn't matter.
     func testABusyPCOnTheCableIsAnsweredOnlyAfterAGrowingWait() async throws {
         let previousUSB = UserDefaults.standard.object(forKey: "allowUSB")
         defer { UserDefaults.standard.set(previousUSB, forKey: "allowUSB") }
         // The end of a wait must not open the app's real USB listener port.
         UserDefaults.standard.set(false, forKey: "allowUSB")
-        var waits: [Int] = []
+        let sleeper = ManualSleeper()
         var timing = answering
-        timing.cableBusyHoldSeconds = { count in waits.append(count); return Double(count) * 0.8 }
+        timing.cableHoldSleep = { await sleeper.sleep($0) }
         let (manager, first) = try await connectOverCable(timing: timing)
         var cables = [first]
         defer { cables.forEach { $0.stop() }; manager.cancel() }
 
         await refuse(.busy)
         try await until("the refusal shows") { manager.state == .disconnected && manager.problem == .pcBusy }
-        let refusedAt = Date()
         XCTAssertEqual(manager.usbStatus, "USB: disconnected")
         XCTAssertTrue(summaries(manager).last?.contains(" stage=hello_sent outcome=error failure=pc_busy fallback=none end=error ") == true,
                       summaries(manager).joined(separator: "\n"))
+        try await until("the first wait starts") { sleeper.requested == [30] }
         // The PC dials again and again within the wait: none is taken.
         for _ in 1...5 {
             cables.append(try await plugIn(manager))
@@ -709,26 +708,31 @@ final class USBLinkFailureTests: XCTestCase {
         XCTAssertEqual(manager.problem, .pcBusy, "the reason stays up")
         XCTAssertEqual(summaries(manager).count, 1, "one attempt")
 
-        // The PC dials every 100 ms: the first taken comes once the wait
-        // ended, and the next Busy waits longer.
-        let firstWait = try await dialUntilTaken(manager, since: refusedAt, cables: &cables)
-        XCTAssertGreaterThanOrEqual(firstWait, 0.7, "the 0.8 s wait, less the time to see the refusal")
+        // Once the wait is over the next dial is taken; the next Busy in a
+        // row waits twice as long.
+        sleeper.advance()
+        try await dialUntilTaken(manager, cables: &cables)
         await refuse(.busy)
         try await until("the second refusal") { manager.state == .disconnected }
-        let secondWait = try await dialUntilTaken(manager, since: Date(), cables: &cables)
-        XCTAssertGreaterThanOrEqual(secondWait, 1.5, "the 1.6 s wait")
+        try await until("the second wait starts") { sleeper.requested == [30, 60] }
+        cables.append(try await plugIn(manager))
+        XCTAssertEqual(manager.state, .disconnected, "the cable isn't taken during the second wait")
+        sleeper.advance()
+        try await dialUntilTaken(manager, cables: &cables)
 
-        // A session resets the count: the next Busy waits the first wait.
+        // The PC accepts a session, then ends it by closing the cable. Its
+        // next dial is taken as usual, and the next Busy waits the first
+        // wait again.
         await answer()
         try await until("the session") { manager.hostInfo != nil }
-        manager.cancel()
-        manager.resumeUSBConnections()
+        shutdown(peer, SHUT_RDWR)
+        try await until("the closed cable ends it") { manager.state == .disconnected }
         cables.append(try await plugIn(manager))
+        XCTAssertEqual(manager.state, .connecting, "the next dial is taken")
         await refuse(.busy)
         try await until("the third refusal") { manager.state == .disconnected }
-        XCTAssertEqual(waits, [1, 2, 1])
-        XCTAssertEqual(summaries(manager).filter { $0.contains(" failure=pc_busy ") }.count, 1,
-                       "the list holds the latest attempt's lines")
+        try await until("the third wait starts") { sleeper.requested.count == 3 }
+        XCTAssertEqual(sleeper.requested, [30, 60, 30])
     }
 
     /// Try again during the wait takes the PC's next dial at once.
@@ -850,4 +854,23 @@ private final class UnresolvableLink: MediaLink {
 
     func send(_ data: Data) {}
     func stop() {}
+}
+
+/// Ends each wait when the test says so, and remembers how long each was.
+@MainActor
+private final class ManualSleeper {
+    private(set) var requested: [Double] = []
+    private var waiting: [CheckedContinuation<Void, Never>] = []
+
+    func sleep(_ seconds: Double) async {
+        requested.append(seconds)
+        await withCheckedContinuation { waiting.append($0) }
+    }
+
+    /// Ends every wait that has started.
+    func advance() {
+        let ended = waiting
+        waiting = []
+        ended.forEach { $0.resume() }
+    }
 }
