@@ -5,10 +5,10 @@
 //! panic, and never read past their input. Every count is bounded before
 //! anything is allocated for it.
 //!
-//! # Database file (`credentials.db`)
+//! # Database file (`credentials-<generation>.db`)
 //!
 //! ```text
-//! magic "EMV3CRED", version u8 = 1, generation u64
+//! magic "EMV3CRED", version u8 = 1, generation u64, head u64 (≥ generation)
 //! record count u16 (≤ MAX_RECORDS), then each record:
 //!   dev_id 16, slot_id 16, state u8 (0 pending, 1 active),
 //!   flags u8 (bit 0: replaces present), [replaces 16],
@@ -20,9 +20,11 @@
 //! mac 32: HMAC-SHA-256 over every byte before it
 //! ```
 //!
-//! Integers are little-endian. The wrap key and the MAC key are derived from
-//! the generation's wrapping key `W` with HKDF-SHA-256; each wrap binds
-//! `(dev_id, generation)` as associated data. `dev_id`s, slots and tombstones
+//! Integers are little-endian. `generation` is the generation whose key `W`
+//! the file is under; `head` is the newest committed generation its contents
+//! need (above `generation` while a rotation isn't confirmed durable yet).
+//! The wrap key and the MAC key are derived from `W` with HKDF-SHA-256; each
+//! wrap binds `(dev_id, generation)` as associated data. `dev_id`s, slots and tombstones
 //! are readable without `W`, so records that can't be opened can still be
 //! listed and tombstoned.
 //!
@@ -31,14 +33,17 @@
 //! ```text
 //! magic "EMV3KRNG", version u8 = 1
 //! committed generation u64, committed W 32
+//! base generation u64 (≤ committed), base W 32 (equal to committed W when
+//!   the generations are equal)
 //! staged flag u8 (0 or 1), [staged generation u64, staged W 32]
 //! intent flag u8 (0 or 1), [op_id 16,
 //!   invalidate count u8 (≤ MAX_RECORDS) + dev_id 16 × count,
 //!   promote count u8 (≤ MAX_RECORDS) + dev_id 16 × count]
 //! ```
 //!
-//! A staged key and an intent are present together or not at all, and the
-//! staged generation is the committed one plus one. The blob lives only in
+//! The base is the generation the database file is under: the newest one
+//! known to be durable. A staged key and an intent are present together or
+//! not at all, and the staged generation is above the committed one. The blob lives only in
 //! OS-protected storage, which protects it at rest.
 
 use eternal_wire::v3::wire::RecordState;
@@ -127,6 +132,8 @@ impl std::fmt::Debug for DiskRecord {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DbFile {
     pub generation: u64,
+    /// The newest committed generation the contents need.
+    pub head: u64,
     pub records: Vec<DiskRecord>,
     /// Per slot, oldest first.
     pub tombstones: Vec<(Id16, Vec<Id16>)>,
@@ -136,6 +143,8 @@ pub struct DbFile {
 #[derive(Clone, PartialEq, Eq)]
 pub struct KeyringState {
     pub committed: (u64, Zeroizing<Key32>),
+    /// The generation and key the database file is under.
+    pub base: (u64, Zeroizing<Key32>),
     /// A rotation in progress: the next generation's key and what it does.
     pub staged: Option<(u64, Zeroizing<Key32>, Intent)>,
 }
@@ -144,6 +153,7 @@ impl std::fmt::Debug for KeyringState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("KeyringState")
             .field("committed_generation", &self.committed.0)
+            .field("base_generation", &self.base.0)
             .field("staged", &self.staged.as_ref().map(|(g, _, i)| (g, i)))
             .finish()
     }
@@ -270,6 +280,8 @@ pub fn encode_db(db: &DbFile, keys: &GenerationKeys) -> Vec<u8> {
     out.extend_from_slice(DB_MAGIC);
     out.push(VERSION);
     out.extend_from_slice(&db.generation.to_le_bytes());
+    assert!(db.head >= db.generation && valid_generation(db.head));
+    out.extend_from_slice(&db.head.to_le_bytes());
     out.extend_from_slice(&(db.records.len() as u16).to_le_bytes());
     for r in &db.records {
         assert!(r.device_name.len() <= MAX_NAME_LEN);
@@ -322,6 +334,10 @@ pub fn parse_db(file: &[u8]) -> Result<DbFile, FormatError> {
     let generation = r.u64()?;
     if !valid_generation(generation) {
         return Err(FormatError::InvalidField("generation"));
+    }
+    let head = r.u64()?;
+    if !valid_generation(head) || head < generation {
+        return Err(FormatError::InvalidField("head"));
     }
     let count = usize::from(r.u16()?);
     if count > MAX_RECORDS {
@@ -386,6 +402,7 @@ pub fn parse_db(file: &[u8]) -> Result<DbFile, FormatError> {
     }
     let db = DbFile {
         generation,
+        head,
         records,
         tombstones,
     };
@@ -460,8 +477,7 @@ fn check_db(db: &DbFile) -> Result<(), FormatError> {
 /// The encoded size of `state`.
 fn keyring_len(state: &KeyringState) -> usize {
     8 + 1
-        + 8
-        + 32
+        + (8 + 32) * 2
         + match &state.staged {
             Some((_, _, i)) => {
                 1 + 8 + 32 + 1 + 16 + 1 + 16 * i.invalidate.len() + 1 + 16 * i.promote.len()
@@ -476,14 +492,18 @@ pub fn encode_keyring(state: &KeyringState) -> Zeroizing<Vec<u8>> {
     let len = keyring_len(state);
     let mut out = Zeroizing::new(Vec::with_capacity(len));
     let at = out.as_ptr();
-    assert!(valid_generation(state.committed.0));
+    assert!(valid_generation(state.committed.0) && valid_generation(state.base.0));
+    assert!(state.base.0 <= state.committed.0);
+    assert!(state.base.0 < state.committed.0 || state.base.1 == state.committed.1);
     out.extend_from_slice(KEYRING_MAGIC);
     out.push(VERSION);
     out.extend_from_slice(&state.committed.0.to_le_bytes());
     out.extend_from_slice(&state.committed.1[..]);
+    out.extend_from_slice(&state.base.0.to_le_bytes());
+    out.extend_from_slice(&state.base.1[..]);
     match &state.staged {
         Some((g, w, intent)) => {
-            assert_eq!(*g, state.committed.0 + 1);
+            assert!(*g > state.committed.0);
             assert!(valid_generation(*g));
             assert!(intent.invalidate.len() <= MAX_RECORDS && intent.promote.len() <= MAX_RECORDS);
             out.push(1);
@@ -524,6 +544,11 @@ pub fn parse_keyring(blob: &[u8]) -> Result<KeyringState, FormatError> {
         return Err(FormatError::InvalidField("generation"));
     }
     let w = r.key()?;
+    let base_g = r.u64()?;
+    let base_w = r.key()?;
+    if !valid_generation(base_g) || base_g > g || (base_g == g && base_w != w) {
+        return Err(FormatError::InvalidField("base"));
+    }
     let staged = match (r.u8()?, ()) {
         (0, ()) => {
             if r.u8()? != 0 {
@@ -533,7 +558,7 @@ pub fn parse_keyring(blob: &[u8]) -> Result<KeyringState, FormatError> {
         }
         (1, ()) => {
             let staged_g = r.u64()?;
-            if staged_g != g + 1 || !valid_generation(staged_g) {
+            if staged_g <= g || !valid_generation(staged_g) {
                 return Err(FormatError::InvalidField("staged_generation"));
             }
             let staged_w = r.key()?;
@@ -563,6 +588,7 @@ pub fn parse_keyring(blob: &[u8]) -> Result<KeyringState, FormatError> {
     }
     Ok(KeyringState {
         committed: (g, w),
+        base: (base_g, base_w),
         staged,
     })
 }
@@ -649,6 +675,7 @@ mod tests {
     fn sample(keys: &GenerationKeys) -> DbFile {
         DbFile {
             generation: 3,
+            head: 3,
             records: vec![
                 record(1, 9, RecordState::Active, keys),
                 record(2, 9, RecordState::Pending, keys),
@@ -772,6 +799,7 @@ mod tests {
             let keys = GenerationKeys::new(&[0x11; 32], g);
             let mut db = sample(&keys);
             db.generation = g;
+            db.head = g;
             db.records.clear();
             parse_db(&encode_db(&db, &keys)).is_ok()
         };
@@ -780,6 +808,7 @@ mod tests {
         let mut db = encode_db(
             &DbFile {
                 generation: 5,
+                head: 5,
                 records: Vec::new(),
                 tombstones: Vec::new(),
             },
@@ -792,12 +821,15 @@ mod tests {
         let at = |committed: u64, staged: bool| {
             let mut blob = encode_keyring(&KeyringState {
                 committed: (5, Zeroizing::new([1; 32])),
+                base: (5, Zeroizing::new([1; 32])),
                 staged: staged.then(|| (6, Zeroizing::new([2; 32]), Intent::default())),
             })
             .to_vec();
             blob[9..17].copy_from_slice(&committed.to_le_bytes());
+            // The base stays at 5 with its own key: below the committed one.
+            blob[57..89].copy_from_slice(&[7; 32]);
             if staged {
-                blob[50..58].copy_from_slice(&(committed.wrapping_add(1)).to_le_bytes());
+                blob[90..98].copy_from_slice(&(committed.wrapping_add(1)).to_le_bytes());
             }
             parse_keyring(&blob).is_ok()
         };
@@ -819,6 +851,7 @@ mod tests {
         let ids: Vec<Id16> = (0..MAX_RECORDS as u8).map(|i| [i; 16]).collect();
         let state = KeyringState {
             committed: (5, Zeroizing::new([1; 32])),
+            base: (5, Zeroizing::new([1; 32])),
             staged: Some((
                 6,
                 Zeroizing::new([2; 32]),
@@ -834,20 +867,57 @@ mod tests {
         assert_eq!(parse_keyring(&blob).unwrap(), state);
         let plain = encode_keyring(&KeyringState {
             committed: (5, Zeroizing::new([1; 32])),
+            base: (5, Zeroizing::new([1; 32])),
             staged: None,
         });
         assert_eq!(plain.len(), plain.capacity());
     }
 
     #[test]
+    fn the_base_and_head_follow_their_rules() {
+        // A base below the committed generation, with its own key.
+        let behind = KeyringState {
+            committed: (7, Zeroizing::new([1; 32])),
+            base: (5, Zeroizing::new([2; 32])),
+            staged: None,
+        };
+        let blob = encode_keyring(&behind);
+        assert_eq!(parse_keyring(&blob).unwrap(), behind);
+        // The base above the committed generation, or level with it under
+        // another key: rejected.
+        let mut above = blob.to_vec();
+        above[49..57].copy_from_slice(&8u64.to_le_bytes());
+        assert_eq!(
+            parse_keyring(&above),
+            Err(FormatError::InvalidField("base"))
+        );
+        let mut level = blob.to_vec();
+        level[49..57].copy_from_slice(&7u64.to_le_bytes());
+        assert_eq!(
+            parse_keyring(&level),
+            Err(FormatError::InvalidField("base"))
+        );
+        // A head below the file's generation: rejected.
+        let keys = GenerationKeys::new(&[0x11; 32], 3);
+        let mut db = encode_db(&sample(&keys), &keys);
+        assert_eq!(parse_db(&db).unwrap().head, 3);
+        db[17..25].copy_from_slice(&2u64.to_le_bytes());
+        assert_eq!(parse_db(&db), Err(FormatError::InvalidField("head")));
+        db[17..25].copy_from_slice(&9u64.to_le_bytes());
+        assert_eq!(parse_db(&db).unwrap().head, 9);
+    }
+
+    #[test]
     fn keyring_round_trip_and_rules() {
         let plain = KeyringState {
             committed: (4, Zeroizing::new([1; 32])),
+            base: (4, Zeroizing::new([1; 32])),
             staged: None,
         };
         assert_eq!(parse_keyring(&encode_keyring(&plain)).unwrap(), plain);
         let rotating = KeyringState {
             committed: (4, Zeroizing::new([1; 32])),
+            base: (4, Zeroizing::new([1; 32])),
             staged: Some((
                 5,
                 Zeroizing::new([2; 32]),
@@ -861,7 +931,7 @@ mod tests {
         let bytes = encode_keyring(&rotating);
         assert_eq!(parse_keyring(&bytes).unwrap(), rotating);
         let mut wrong_gen = bytes.to_vec();
-        wrong_gen[50] = 9; // staged generation
+        wrong_gen[90] = 4; // staged generation, level with the committed one
         assert!(parse_keyring(&wrong_gen).is_err());
         assert!(parse_keyring(&bytes[..bytes.len() - 1]).is_err());
     }

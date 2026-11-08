@@ -15,6 +15,7 @@ const W: [u8; 32] = [0x5A; 32];
 /// database it accepts.
 fn check_store_invariants(db: &DbFile) {
     assert!(valid_generation(db.generation));
+    assert!(valid_generation(db.head) && db.head >= db.generation);
     assert!(db.records.len() <= 64 && db.tombstones.len() <= 1024);
     for r in &db.records {
         let same = |state| {

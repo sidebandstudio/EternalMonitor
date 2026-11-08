@@ -165,6 +165,7 @@ name = "eternal-credstore"
 version = "0.1.0"
 dependencies = [
  "core-foundation",
+ "core-foundation-sys",
  "eternal-wire",
  "libc",
  "ring",

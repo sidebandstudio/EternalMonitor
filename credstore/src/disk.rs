@@ -177,6 +177,16 @@ impl MemDisk {
         }
     }
 
+    /// The disk after the process restarts in the same boot: everything a
+    /// reader saw is still there, and nothing more is durable.
+    pub fn restart(&self) -> Self {
+        Self {
+            calls: 0,
+            crash_at: None,
+            ..self.clone()
+        }
+    }
+
     /// Replaces a file directly, for restore tests.
     pub fn put(&mut self, name: &str, bytes: Vec<u8>) {
         self.visible.insert(name.to_string(), bytes.clone());
@@ -185,6 +195,12 @@ impl MemDisk {
 
     pub fn get(&self, name: &str) -> Option<&Vec<u8>> {
         self.visible.get(name)
+    }
+
+    /// Removes a file directly and durably, for restore tests.
+    pub fn remove_now(&mut self, name: &str) {
+        self.visible.remove(name);
+        self.durable.remove(name);
     }
 
     /// What a crash in the middle of writing `name` leaves: the first half

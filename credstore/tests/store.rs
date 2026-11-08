@@ -7,7 +7,7 @@ use eternal_credstore::format::{
     encode_db, encode_keyring, DbFile, GenerationKeys, KeyringState, MAX_GENERATION,
 };
 use eternal_credstore::format::{parse_db, parse_keyring};
-use eternal_credstore::store::{db_file, DB_TMP};
+use eternal_credstore::store::{db_file, BOOT_MARKER, DB_TMP};
 use eternal_credstore::{Finalize, NewRecord, Recovery, StoreCredentials, StoreError};
 use eternal_wire::v3::host::HostCredentials;
 use eternal_wire::v3::wire::{Accept, RecordState};
@@ -264,7 +264,7 @@ fn tombstones_forget_the_oldest_empty_slot_past_1024() {
                 NewRecord {
                     dev_id: dev,
                     slot_id: slot(n),
-                    key: Zeroizing::new([1; 32]),
+                    key: Box::new(Zeroizing::new([1; 32])),
                     replaces: None,
                     device_name: String::new(),
                 },
@@ -333,6 +333,10 @@ fn a_database_restored_from_before_an_invalidation_is_discarded() {
     let (mut store, _, live) = base.open();
     store.remove(&[id(0x11)]).unwrap();
     drop(store);
+    // The next boot confirms the rotation and moves the database to its key.
+    let (store, _, live) = live.at_rest().open();
+    assert_eq!(store.base_generation(), store.generation());
+    drop(store);
     let mut restored = live.at_rest();
     restored.disk = base.disk.clone();
     let (store, report, _) = restored.open();
@@ -378,40 +382,111 @@ fn a_keyring_rolled_back_past_an_observed_rotation_discards() {
     assert!(is_tombstoned(&store, 0x31));
 }
 
-/// Until an open has seen the new generation, a keyring back at the old
-/// one is a store that was lost: the operation never happened, and nothing
-/// else is touched.
+/// A rotation whose keyring stores are all lost keeps its data (the
+/// database is under the confirmed key), and the open rotates again so the
+/// invalidation still gets a new key.
 #[test]
-fn a_lost_rotation_keyring_comes_back_exactly_before() {
+fn a_lost_rotation_keyring_keeps_the_rotation_and_rotates_again() {
     let base = base_world();
-    let before = logical(&base.open().0);
     let (mut store, _, live) = base.open();
     store.expire(NOW).unwrap();
+    let after = logical(&store);
     drop(store);
     let mut lost = live.at_rest();
-    assert_eq!(db_generations(&lost).len(), 2, "both generations kept");
+    assert_eq!(db_generations(&lost).len(), 1, "one file");
     lost.keyring = base.keyring.clone();
-    let (store, report, live) = lost.open();
-    assert!(report.recovery.is_empty());
-    assert_eq!(logical(&store), before);
-    drop(store);
-    // The orphaned newer file is removed.
-    assert_eq!(db_generations(&live.at_rest()), db_generations(&base));
+    let (store, report, _) = lost.open();
+    assert_eq!(report.recovery, vec![Recovery::RotatedAgain]);
+    assert_eq!(logical(&store), after);
+    assert!(is_tombstoned(&store, 0x31));
 }
 
+/// macOS: the database moves to a rotation's key only at the first open in
+/// a later boot; a reopen in the same boot changes nothing. A keyring that
+/// flushes moves it at once.
 #[test]
-fn old_generation_files_stay_until_an_open_sees_the_new_one() {
+fn promotion_waits_for_a_later_boot_without_a_flush() {
     let base = base_world();
     let g = db_generations(&base);
     assert_eq!(g.len(), 1);
     let (mut store, _, live) = base.open();
     store.remove(&[id(0x21)]).unwrap();
+    assert_eq!(store.base_generation(), g[0]);
+    assert_eq!(store.generation(), g[0] + 1);
     drop(store);
-    let world = live.at_rest();
-    assert_eq!(db_generations(&world), vec![g[0], g[0] + 1]);
-    let (store, _, live) = world.open();
+    for _ in 0..3 {
+        let world = live.same_boot();
+        assert_eq!(db_generations(&world), g, "same boot: nothing moves");
+        let (store, _, _) = world.open();
+        assert_eq!(store.base_generation(), g[0]);
+    }
+    let (store, _, live) = live.at_rest().open();
+    assert_eq!(
+        store.base_generation(),
+        g[0] + 1,
+        "a later boot confirms it"
+    );
     drop(store);
     assert_eq!(db_generations(&live.at_rest()), vec![g[0] + 1]);
+
+    let base = base_world_with(MemKeyring::flushing());
+    let g = db_generations(&base);
+    let (mut store, _, live) = base.open();
+    store.remove(&[id(0x21)]).unwrap();
+    assert_eq!(
+        store.base_generation(),
+        store.generation(),
+        "flushed: at once"
+    );
+    drop(store);
+    assert_eq!(db_generations(&live.same_boot()), vec![g[0] + 1]);
+}
+
+/// The boot marker: an open with no marker, or the same boot's, confirms
+/// nothing; the next boot's open does.
+#[test]
+fn the_boot_marker_tells_a_later_boot_from_a_reopen() {
+    let base = base_world();
+    let (mut store, _, live) = base.open();
+    store.remove(&[id(0x21)]).unwrap();
+    let rotated = store.generation();
+    drop(store);
+    let marker = live.disk.borrow().get(BOOT_MARKER).cloned();
+    assert_eq!(
+        marker,
+        Some(live.keyring.borrow().boot().to_le_bytes().to_vec())
+    );
+    // A lost marker: not proof of a later boot, even in one.
+    let mut no_marker = live.at_rest();
+    no_marker.disk.remove_now(BOOT_MARKER);
+    let (store, _, live) = no_marker.open();
+    assert!(store.base_generation() < rotated);
+    drop(store);
+    let (store, _, _) = live.at_rest().open();
+    assert_eq!(store.base_generation(), rotated);
+}
+
+/// Unconfirmed rotations add no files, and an open reads at most two.
+#[test]
+fn files_stay_bounded_however_many_rotations_wait() {
+    let base = base_world();
+    let (mut store, _, live) = base.open();
+    for dev in 0..100u8 {
+        let dev = 0x60 + dev % 0x40;
+        store.add_pending(new_record(dev, 9, None), NOW).ok();
+        store.remove(&[id(dev)]).unwrap();
+    }
+    drop(store);
+    for world in [live.same_boot(), live.at_rest()] {
+        assert!(db_generations(&world).len() <= 2);
+        let (live, opened) = world.open_live(1, None, false);
+        opened.unwrap();
+        assert!(
+            live.steps.db_reads.get() <= 2,
+            "{}",
+            live.steps.db_reads.get()
+        );
+    }
 }
 
 #[test]
@@ -445,11 +520,6 @@ fn an_unreadable_keyring_is_never_replaced() {
         let (live, opened) = world.open_live(1, None, false);
         assert!(matches!(opened, Err(StoreError::KeyringUnreadable(_))));
         assert_eq!(live.keyring.borrow().get(), Some(&bad), "untouched");
-        assert_eq!(
-            live.steps.count.get(),
-            1,
-            "only the stray temporary file check"
-        );
         assert_eq!(db_generations(&live.at_rest()), db_generations(&base));
     }
     // A keyring that can't be read at all: the same.
@@ -494,18 +564,39 @@ fn an_unknown_step_1_outcome_fails_closed() {
     }
 }
 
+/// A failed step 1 that leaves a blob which doesn't parse: unknown, so the
+/// records are invalid in memory and writes are refused.
+#[test]
+fn an_unparseable_read_back_is_unknown() {
+    let base = base_world();
+    let (mut store, _, live) = base.open();
+    live.steps.crash_at.set(Some(live.steps.count.get()));
+    live.steps.garble.set(true);
+    assert!(store.remove(&[id(0x21)]).is_err());
+    assert!(
+        store.snapshot().key(&id(0x21)).is_none(),
+        "invalid in memory"
+    );
+    assert!(matches!(
+        store.persist_timestamp(&id(0x11), 6_000),
+        Err(StoreError::NeedsReopen)
+    ));
+}
+
 fn world_at(generation: u64) -> World {
     let w = [9u8; 32];
     let mut world = World::default();
     world.keyring.put(Some(
         encode_keyring(&KeyringState {
             committed: (generation, eternal_wire::v3::Zeroizing::new(w)),
+            base: (generation, eternal_wire::v3::Zeroizing::new(w)),
             staged: None,
         })
         .to_vec(),
     ));
     let db = DbFile {
         generation,
+        head: generation,
         records: Vec::new(),
         tombstones: Vec::new(),
     };

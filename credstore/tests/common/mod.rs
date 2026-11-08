@@ -15,7 +15,7 @@ pub fn new_record(dev: u8, slot: u8, replaces: Option<u8>) -> NewRecord {
     NewRecord {
         dev_id: id(dev),
         slot_id: id(slot),
-        key: Zeroizing::new([dev; 32]),
+        key: Box::new(Zeroizing::new([dev; 32])),
         replaces: replaces.map(id),
         device_name: format!("iPad {dev}"),
     }

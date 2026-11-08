@@ -1,22 +1,25 @@
-//! The credential store under a fuzzer-chosen sequence of operations, with
-//! crashes at fuzzer-chosen steps, a keyring that flushes or doesn't, and
-//! fuzzer-chosen damage to the files or keyring, at rest or in the middle of
-//! a rotation.
+//! The credential store under fuzzer-chosen sessions: one store open across
+//! several operations (rotations and plain writes mixed), crashes at
+//! fuzzer-chosen steps, restarts in the same boot or after a power loss
+//! that keeps a fuzzer-chosen keyring outcome, settling only when the input
+//! says so, a keyring that flushes or doesn't, and damage to the files or
+//! keyring.
 //!
-//! After a crash the restart may keep or lose unsynced renames and any
-//! keyring blob that was visible but not durable. What must hold:
+//! What must hold:
 //! - the invariants, always;
+//! - an operation that returned Ok left memory exactly as the same
+//!   operation does uncrashed;
 //! - a failed operation leaves memory exactly "before", or exactly "after"
 //!   once its intent is visible;
-//! - a restart finds exactly "before" or "after"; a rotation comes back
-//!   exactly "before" if its keyring blobs were lost, exactly "after"
-//!   otherwise;
+//! - after any restart, every acknowledged write is there (R1): the state
+//!   is exactly the acknowledged one, or, if an operation was killed, that
+//!   or the state after it;
 //! - damage never brings back a record.
 #![no_main]
 
 use eternal_credstore::keyring::MemKeyring;
-use eternal_credstore::testing::{check_invariants, logical, Store, World};
-use eternal_credstore::{Disk, NewRecord, StoreError};
+use eternal_credstore::testing::{check_invariants, logical, Live, Logical, Store, World};
+use eternal_credstore::{Disk, NewRecord, Recovery, StoreError};
 use eternal_wire::v3::{Id16, Zeroizing};
 use libfuzzer_sys::fuzz_target;
 
@@ -33,7 +36,7 @@ fn run(store: &mut Store, kind: u8, a: u8, b: u8, now: &mut u64) -> Result<(), S
             NewRecord {
                 dev_id: id(dev),
                 slot_id: id(100 + b % 4),
-                key: Zeroizing::new([dev; 32]),
+                key: Box::new(Zeroizing::new([dev; 32])),
                 replaces: (b & 0x80 != 0).then(|| id(1 + (b >> 2) % 12)),
                 device_name: "x".repeat(usize::from(b % 70)),
             },
@@ -53,8 +56,8 @@ fn run(store: &mut Store, kind: u8, a: u8, b: u8, now: &mut u64) -> Result<(), S
     }
 }
 
-/// Flips one byte of a database file (`which` picks it), or drops the
-/// keyring. True if anything held could be affected.
+/// Flips one byte of every database file, or drops the keyring. True if
+/// anything held could be affected.
 fn damage(world: &mut World, which: u8, a: u8, b: u8) -> bool {
     let mut names: Vec<String> = world
         .disk
@@ -68,7 +71,6 @@ fn damage(world: &mut World, which: u8, a: u8, b: u8) -> bool {
         world.keyring.put(None);
         return !names.is_empty();
     }
-    // Every generation's file: the one in use is among them.
     for name in &names {
         let mut bytes = world.disk.get(name).unwrap().clone();
         let at = usize::from(a) * bytes.len() / 256;
@@ -78,11 +80,36 @@ fn damage(world: &mut World, which: u8, a: u8, b: u8) -> bool {
     true
 }
 
+/// A restart of `live`: the same boot, a clean shutdown and the next boot,
+/// or a power loss keeping keyring outcome `d`.
+fn restart(live: &Live, c: u8, d: u8) -> World {
+    match c & 0x3 {
+        0 => live.same_boot(),
+        1 => live.at_rest(),
+        _ => live.after_crash(c & 0x4 != 0, usize::from(d)),
+    }
+}
+
+/// Opens `world`. A fresh keyring (first run, or after the keyring was
+/// dropped) is settled first: losing it to a power cut before it's durable
+/// is the documented first-run case, outside R1.
+fn open(world: &World) -> (Store, Live) {
+    let (store, report, live) = world.open();
+    check_invariants(&store);
+    if report.recovery.contains(&Recovery::FreshKeyring) {
+        drop(store);
+        let (store, _, live) = live.at_rest().open();
+        check_invariants(&store);
+        return (store, live);
+    }
+    (store, live)
+}
+
 fuzz_target!(|data: &[u8]| {
     let Some((&mode, data)) = data.split_first() else {
         return;
     };
-    let mut world = World {
+    let world = World {
         keyring: if mode & 1 == 0 {
             MemKeyring::new()
         } else {
@@ -90,91 +117,88 @@ fuzz_target!(|data: &[u8]| {
         },
         ..World::default()
     };
+    let (mut store, mut live) = open(&world);
+    // The state every acknowledged write adds up to.
+    let mut acked: Logical = logical(&store);
     let mut now = 400 * DAY;
     for chunk in data.chunks_exact(5).take(40) {
         let (kind, a, b, c, d) = (chunk[0], chunk[1], chunk[2], chunk[3], chunk[4]);
-        // Settle whatever the last restart's recovery wrote, so the keyring
-        // the operation starts from is durable. (Losing a recovery's own
-        // writes is covered by the crash tests.)
-        let (settle, _, live) = world.open();
-        drop(settle);
-        world = live.after_crash(false, usize::MAX);
-        let (mut store, _, live) = world.open();
-        check_invariants(&store);
-        let before = logical(&store);
         if kind >= 0xF0 {
             // Damage at rest, then a restart.
             drop(store);
-            let mut damaged = live.after_crash(false, usize::MAX);
-            let held = !before.records.is_empty();
+            let mut damaged = live.at_rest();
+            let held: Vec<Id16> = acked.records.iter().map(|r| r.0).collect();
             let touched = damage(&mut damaged, kind, a, b);
-            let (store, _, live) = damaged.open();
-            check_invariants(&store);
-            if touched && held {
-                assert!(
-                    logical(&store).records.is_empty(),
-                    "damage never brings a record back"
-                );
-            }
-            drop(store);
-            world = live.after_crash(false, usize::MAX);
-            continue;
-        }
-        let keyring_before = live.keyring.borrow().get().cloned();
-        let crash = c & 0x80 != 0;
-        if crash {
-            live.steps
-                .crash_at
-                .set(Some(live.steps.count.get() + usize::from(c & 0x0F)));
-            live.steps.ambiguous.set(c & 0x20 != 0);
-        }
-        // The same operation, uncrashed, from the same state.
-        let (after, rotates) = {
-            let (mut clean, _, clean_live) = world.open();
-            let mut clean_now = now;
-            let _ = run(&mut clean, kind, a, b, &mut clean_now);
-            let rotates = clean_live.keyring.borrow().get().cloned() != keyring_before;
-            (logical(&clean), rotates)
-        };
-        let result = run(&mut store, kind, a, b, &mut now);
-        check_invariants(&store);
-        let visible = live.keyring.borrow().get().cloned() != keyring_before;
-        match result {
-            Ok(()) => assert_eq!(logical(&store), after),
-            // Memory is exactly before, or exactly after once the intent
-            // is visible.
-            Err(_) if visible => assert_eq!(logical(&store), after),
-            Err(_) => assert_eq!(logical(&store), before),
-        }
-        drop(store);
-        let mut next = live.after_crash(c & 0x40 != 0, usize::from(d));
-        let kept_old_keyring = next.keyring.get().cloned() == keyring_before;
-        if crash && c & 0x10 != 0 && rotates {
-            // Damage in the middle of a rotation: nothing may come back.
-            let touched = damage(&mut next, d >> 1, a, b);
-            let (store, _, live) = next.open();
-            check_invariants(&store);
+            (store, live) = open(&damaged);
             if touched {
-                let held: Vec<Id16> = before.records.iter().map(|r| r.0).collect();
                 for r in logical(&store).records {
                     assert!(!held.contains(&r.0), "damage never brings a record back");
                 }
             }
-            drop(store);
-            world = live.after_crash(false, usize::MAX);
+            acked = logical(&store);
             continue;
         }
-        let (store, _, live) = next.open();
-        check_invariants(&store);
-        let reached = logical(&store);
-        if !rotates {
-            assert!(reached == before || reached == after);
-        } else if kept_old_keyring {
-            assert_eq!(reached, before, "the rotation's keyring blobs were lost");
-        } else {
-            assert_eq!(reached, after, "a keyring blob of the rotation survived");
+        if kind >= 0xE0 {
+            // A restart with every write acknowledged: exactly that state.
+            drop(store);
+            (store, live) = open(&restart(&live, c, d));
+            assert_eq!(logical(&store), acked, "every acknowledged write survives");
+            continue;
         }
+        // The same operation, uncrashed, from the same state.
+        let after = {
+            let (mut clean, _) = open(&live.same_boot());
+            let mut clean_now = now;
+            let _ = run(&mut clean, kind, a, b, &mut clean_now);
+            logical(&clean)
+        };
+        let keyring_before = live.keyring.borrow().get().cloned();
+        let crash_at = (c & 0x80 != 0).then(|| live.steps.count.get() + usize::from(c & 0x0F));
+        live.steps.crash_at.set(crash_at);
+        live.steps.ambiguous.set(c & 0x20 != 0);
+        let result = run(&mut store, kind, a, b, &mut now);
+        check_invariants(&store);
+        let crashed = crash_at.is_some_and(|at| live.steps.count.get() > at);
+        live.steps.crash_at.set(None);
+        if !crashed {
+            // Ok or a refusal: exactly what the uncrashed run did.
+            assert_eq!(logical(&store), after);
+            acked = after;
+            continue;
+        }
+        let visible = live.keyring.borrow().get().cloned() != keyring_before;
+        let before = acked.clone();
+        match result {
+            Ok(()) => assert_eq!(logical(&store), after),
+            Err(_) if visible => assert_eq!(logical(&store), after),
+            Err(_) => assert_eq!(logical(&store), before),
+        }
+        // The process died here: restart.
         drop(store);
-        world = live.after_crash(false, usize::MAX);
+        let mut next = restart(&live, c >> 4, d);
+        if c & 0x10 != 0 && d & 1 == 1 {
+            // Damage in the middle: nothing held may come back.
+            let held: Vec<Id16> = before.records.iter().map(|r| r.0).collect();
+            let touched = damage(&mut next, d >> 1, a, b);
+            (store, live) = open(&next);
+            if touched {
+                for r in logical(&store).records {
+                    assert!(!held.contains(&r.0), "damage never brings a record back");
+                }
+            }
+            acked = logical(&store);
+            continue;
+        }
+        (store, live) = open(&next);
+        let reached = logical(&store);
+        if result.is_ok() {
+            assert_eq!(reached, after, "it returned Ok");
+        } else {
+            assert!(
+                reached == before || reached == after,
+                "exactly before or after"
+            );
+        }
+        acked = reached;
     }
 });

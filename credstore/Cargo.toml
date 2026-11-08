@@ -17,6 +17,7 @@ zeroize = "1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 core-foundation = "0.10"
+core-foundation-sys = "0.8"
 security-framework-sys = { version = "2.17", features = ["OSX_10_15"] }
 libc = "0.2"
 

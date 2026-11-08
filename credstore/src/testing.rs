@@ -11,7 +11,7 @@ use eternal_wire::v3::wire::RecordState;
 use eternal_wire::v3::{Id16, Key32, SeededRandom, Zeroizing};
 
 use crate::disk::{Disk, MemDisk};
-use crate::keyring::{Keyring, MemKeyring};
+use crate::keyring::{Durability, Keyring, MemKeyring};
 use crate::store::{CredentialStore, OpenReport, StoreError};
 
 /// Counts every write to the disk and the keyring together; the one at
@@ -26,6 +26,10 @@ pub struct Steps {
     pub ambiguous: Rc<Cell<bool>>,
     /// Keyring loads fail.
     pub fail_load: Rc<Cell<bool>>,
+    /// A failing keyring store leaves a blob that can't be parsed visible.
+    pub garble: Rc<Cell<bool>>,
+    /// Database files read.
+    pub db_reads: Rc<Cell<usize>>,
 }
 
 impl Steps {
@@ -47,6 +51,9 @@ pub struct SharedDisk {
 
 impl Disk for SharedDisk {
     fn read(&self, name: &str) -> io::Result<Option<Vec<u8>>> {
+        if name.starts_with("credentials-") {
+            self.steps.db_reads.set(self.steps.db_reads.get() + 1);
+        }
         self.inner.borrow().read(name)
     }
     fn list(&self) -> io::Result<Vec<String>> {
@@ -88,12 +95,17 @@ impl Keyring for SharedKeyring {
     }
     fn store(&mut self, blob: &[u8]) -> io::Result<()> {
         if let Err(e) = self.steps.step() {
-            if self.steps.ambiguous.get() {
+            if self.steps.garble.get() {
+                self.inner.borrow_mut().store_visible(b"garbled", false);
+            } else if self.steps.ambiguous.get() {
                 self.inner.borrow_mut().store_visible(blob, false);
             }
             return Err(e);
         }
         self.inner.borrow_mut().store(blob)
+    }
+    fn flush(&mut self) -> io::Result<Durability> {
+        self.inner.borrow_mut().flush()
     }
 }
 
@@ -123,9 +135,19 @@ impl Live {
         }
     }
 
-    /// Everything synced and the last keyring blob kept: a clean shutdown.
+    /// Everything synced and the last keyring blob kept: a clean shutdown
+    /// and the next boot.
     pub fn at_rest(&self) -> World {
         self.after_crash(false, usize::MAX)
+    }
+
+    /// The process restarts in the same boot: nothing lost, nothing more
+    /// durable.
+    pub fn same_boot(&self) -> World {
+        World {
+            disk: self.disk.borrow().restart(),
+            keyring: self.keyring.borrow().restart(),
+        }
     }
 
     /// How many keyring blobs a crash now may leave.

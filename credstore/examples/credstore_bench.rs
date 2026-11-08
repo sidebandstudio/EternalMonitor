@@ -28,7 +28,7 @@ fn main() {
                 NewRecord {
                     dev_id: [i; 16],
                     slot_id: [i; 16],
-                    key: Zeroizing::new([i; 32]),
+                    key: Box::new(Zeroizing::new([i; 32])),
                     replaces: None,
                     device_name: "iPad Pro 13-inch (M5)".into(),
                 },
