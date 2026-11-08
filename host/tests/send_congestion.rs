@@ -225,6 +225,7 @@ fn refused_sends_back_off_step_down_once_and_log_one_episode() {
                 port,
                 sender_shared,
                 supervisor_tx,
+                1,
             ))
             .unwrap();
     });

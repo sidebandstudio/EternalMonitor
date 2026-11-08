@@ -103,13 +103,19 @@ pub async fn run_pipeline_supervised(
         return;
     }
 
-    let transport_outcome =
-        match transport::start_sender(nal_rx, audio_rx, listen_port, shared.clone(), supervisor_tx)
-            .await
-        {
-            Ok(()) => StageOutcome::Completed,
-            Err(e) => transport_failure(&*e),
-        };
+    let transport_outcome = match transport::start_sender(
+        nal_rx,
+        audio_rx,
+        listen_port,
+        shared.clone(),
+        supervisor_tx,
+        generation,
+    )
+    .await
+    {
+        Ok(()) => StageOutcome::Completed,
+        Err(e) => transport_failure(&*e),
+    };
     reporter.stage_exited(Stage::Transport, transport_outcome);
 
     stats::PIPELINE_STATS.lock().mark_pipeline_stopped();
