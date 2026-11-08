@@ -161,6 +161,9 @@ struct Proving {
     /// A time-limited driver call of this generation is outstanding (see
     /// [`driver_call`]): a failure now may be the driver's, not the PC's.
     call_pending: bool,
+    /// Windows lost the desktop during this proof while it was away (a
+    /// secure screen, the displays off), even if it is back by the failure.
+    away_seen: bool,
 }
 
 /// A second screen that loses the user's desktop more often than this in one
@@ -178,6 +181,11 @@ pub(crate) type ProofOutput = (crate::gpu_preference::AdapterId, String);
 /// How often [`State::retry_if_back`] asks Windows whether the desktop is
 /// back.
 const DESKTOP_CHECK: Duration = Duration::from_secs(1);
+
+/// How long after a second screen fails, having lost the desktop, Windows
+/// may still say a secure screen took it or the displays went off, and be
+/// taken as the cause. Windows can say so many seconds after the loss.
+const LATE_AWAY_WINDOW: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Default)]
 pub(crate) struct State {
@@ -220,6 +228,11 @@ pub(crate) struct State {
     /// [`desktop_away`]): once it is back, a connected viewer gets the
     /// second screen again. When to look at the desktop next.
     retry_when_back: Option<Instant>,
+    /// The last failure lost the desktop with the user's desktop there: until
+    /// then, Windows saying it was away after all (see [`LATE_AWAY_WINDOW`])
+    /// tries the second screen again once it is back. When to ask next.
+    late_away_until: Option<Instant>,
+    late_away_check: Option<Instant>,
     /// The graphics cards and the screens' wiring, as last read off the
     /// transport loop: see [`facts`].
     facts: facts::Cache,
@@ -232,6 +245,10 @@ pub(crate) struct State {
 impl State {
     /// `blocked`: [`mirror_blocked_now`], read for this decision when
     /// [`State::decides_on_mirror`] says it needs it.
+    /// `secure`: capture says a secure screen holds the desktop now
+    /// ([`CaptureBlock::SecureDesktop`]).
+    ///
+    /// [`CaptureBlock::SecureDesktop`]: crate::capture::recovery::CaptureBlock::SecureDesktop
     pub(crate) fn step(
         &mut self,
         selected: bool,
@@ -239,6 +256,7 @@ impl State {
         connected: bool,
         now: Instant,
         blocked: bool,
+        secure: bool,
     ) -> Step {
         self.memory.retry_clear(now);
         if !selected {
@@ -263,7 +281,8 @@ impl State {
         if let Some(reason) = self.fail_unproven(status, now, blocked) {
             return Step::Fallback(reason);
         }
-        self.retry_if_back(status, connected, now);
+        self.watch_late_away(*status, now, secure);
+        self.retry_if_back(status, connected, now, secure);
         match *status {
             VddStatus::WaitingForClient if connected => {
                 let held = self.memory.hold(now);
@@ -372,7 +391,74 @@ impl State {
         *status = VddStatus::Failed;
         let passing = proving.interrupted || proving.call_pending || proving.losses > LOSS_LIMIT;
         self.remember(reason, now, passing, blocked);
+        self.after_desktop_loss(reason, proving, now, blocked);
         Some(reason)
+    }
+
+    /// A second screen that showed no picture after Windows took its
+    /// desktop away: the lock screen, a UAC prompt or Ctrl+Alt+Del can take
+    /// the input before Windows says so, so the desktop may still read as
+    /// the user's at the failure. When the loss came while the desktop was
+    /// away, try again once it is back, as for a failure while it is away.
+    /// Otherwise watch for Windows to say so within [`LATE_AWAY_WINDOW`].
+    /// Neither for a driver call that didn't return, a display that keeps
+    /// dropping out, or a failure [`State::remember`] already set a retry
+    /// for.
+    fn after_desktop_loss(
+        &mut self,
+        reason: &'static str,
+        proving: Proving,
+        now: Instant,
+        blocked: bool,
+    ) {
+        let desktop_loss = reason == "no_frames"
+            && proving.interrupted
+            && !proving.call_pending
+            && proving.losses <= LOSS_LIMIT;
+        if !desktop_loss || blocked || self.retry_when_back.is_some() {
+            return;
+        }
+        if proving.away_seen {
+            tracing::info!(
+                reason,
+                "The second screen lost the desktop while Windows had it away — trying the \
+                 second screen again now that the desktop is back"
+            );
+            self.retry_when_back = Some(now);
+        } else {
+            self.late_away_until = Some(now + LATE_AWAY_WINDOW);
+            self.late_away_check = None;
+        }
+    }
+
+    /// While a failure that lost the desktop waits (see
+    /// [`State::after_desktop_loss`]): a secure screen or the displays off
+    /// now means that was the cause, and the second screen is tried again
+    /// once the desktop is back. Once per failure, and only while it is still
+    /// the failure: Try again, another mode or a retry ends the wait.
+    fn watch_late_away(&mut self, status: VddStatus, now: Instant, secure: bool) {
+        let Some(until) = self.late_away_until else {
+            return;
+        };
+        if status != VddStatus::Failed || now >= until {
+            self.late_away_until = None;
+            self.late_away_check = None;
+            return;
+        }
+        if !secure && self.late_away_check.is_some_and(|at| now < at) {
+            return;
+        }
+        self.late_away_check = Some(now + DESKTOP_CHECK);
+        if secure || self.desktop_away() {
+            self.late_away_until = None;
+            self.late_away_check = None;
+            tracing::info!(
+                reason = self.failure.unwrap_or("no_frames"),
+                "Windows took the desktop away just after the second screen failed — trying \
+                 the second screen again once the desktop is back"
+            );
+            self.retry_when_back = Some(now + DESKTOP_CHECK);
+        }
     }
 
     /// After a failure while the desktop was away, try the second screen
@@ -380,12 +466,18 @@ impl State {
     /// the app run stayed on the mirror after the PC was unlocked or its
     /// displays woke, until the user clicked Try again. Windows is asked at
     /// most once a second: this runs on the transport loop.
-    fn retry_if_back(&mut self, status: &mut VddStatus, connected: bool, now: Instant) {
+    fn retry_if_back(
+        &mut self,
+        status: &mut VddStatus,
+        connected: bool,
+        now: Instant,
+        secure: bool,
+    ) {
         let due = self.retry_when_back.is_some_and(|at| now >= at);
         if !due || !connected || *status != VddStatus::Failed {
             return;
         }
-        if self.desktop_away() {
+        if secure || self.desktop_away() {
             self.retry_when_back = Some(now + DESKTOP_CHECK);
             return;
         }
@@ -502,11 +594,13 @@ pub(crate) fn next_step(shared: &SharedControl, now: Instant) -> Step {
     let blocked = mirror_blocked_now(shared, |status, state| {
         state.decides_on_mirror(selected, status, connected, now)
     });
+    let secure =
+        *shared.capture_block.lock() == Some(crate::capture::recovery::CaptureBlock::SecureDesktop);
     let mut status = shared.vdd_status.lock();
     shared
         .second_screen
         .lock()
-        .step(selected, &mut status, connected, now, blocked)
+        .step(selected, &mut status, connected, now, blocked, secure)
 }
 
 /// A new capture generation ends a second screen that already failed to
@@ -927,6 +1021,7 @@ pub(crate) fn start_proving_on(
                 losses: 0,
                 persistent: false,
                 call_pending: false,
+                away_seen: false,
             })
         }
     }
@@ -1015,6 +1110,7 @@ fn note_interruption_while(shared: &SharedControl, generation: u64, away: bool) 
     if let Some(proving) = shared.second_screen.lock().proving.as_mut() {
         if proving.generation == generation {
             proving.interrupted = true;
+            proving.away_seen |= away;
             if !away {
                 proving.losses += 1;
                 proving.capture_failed |= proving.losses > LOSS_LIMIT;
@@ -2845,6 +2941,153 @@ mod tests {
         assert_eq!(remembered_failure(&shared), None);
         // Once only: the next failure decides afresh.
         assert!(shared.second_screen.lock().retry_when_back.is_none());
+    }
+
+    /// A second screen proving itself, with a viewer and a fake desktop,
+    /// whose capture then lost the desktop (`away` at that moment) and showed
+    /// no picture. Returns the shared state, the fake desktop and when it
+    /// fell back.
+    fn fell_back_after_a_desktop_loss(
+        away_at_loss: bool,
+        away_at_failure: bool,
+    ) -> (
+        SharedControl,
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+        Instant,
+    ) {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let shared = second_screen_selected();
+        let away = Arc::new(AtomicBool::new(false));
+        shared.second_screen.lock().fake_desktop_away = Some(away.clone());
+        connect_viewer(&shared);
+        note_attached(&shared, "virtual".into());
+        let start = Instant::now();
+        assert_eq!(next_step(&shared, start), Step::Switch);
+        start_proving(&shared, 7, start);
+        note_interruption_while(&shared, 7, away_at_loss);
+        away.store(away_at_failure, Ordering::Relaxed);
+        let failed = start + PROVE_TIMEOUT;
+        assert_eq!(next_step(&shared, failed), Step::Fallback("no_frames"));
+        (shared, away, failed)
+    }
+
+    /// Steps every quarter second from `from` for `span`, expecting nothing.
+    fn nothing_for(shared: &SharedControl, from: Instant, span: Duration) -> Instant {
+        let mut now = from;
+        while now < from + span {
+            now += secs(0.25);
+            assert_eq!(next_step(shared, now), Step::Nothing, "{:?}", now - from);
+        }
+        now
+    }
+
+    /// Windows said a secure screen had the desktop 13 s after the second
+    /// screen failed, having lost it: on 0.3.4 the app run stayed on the
+    /// mirror until Try again. It is tried again once the desktop is back.
+    #[test]
+    fn a_lock_windows_reports_after_the_fallback_brings_the_second_screen_back() {
+        let (shared, away, failed) = fell_back_after_a_desktop_loss(false, false);
+        let locked = nothing_for(&shared, failed, secs(13.0));
+        away.store(true, Ordering::Relaxed);
+        // Locked: the mirror stays, and the driver is left alone.
+        let unlocked = nothing_for(&shared, locked, secs(20.0));
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
+        away.store(false, Ordering::Relaxed);
+        assert_eq!(next_step(&shared, unlocked + DESKTOP_CHECK), Step::Attach);
+        assert_eq!(remembered_failure(&shared), None);
+        let state = shared.second_screen.lock();
+        assert!(state.retry_when_back.is_none() && state.late_away_until.is_none());
+    }
+
+    /// Capture saying a secure screen holds the desktop counts as well, and
+    /// the second screen waits until capture has the desktop again.
+    #[test]
+    fn a_secure_screen_capture_reports_after_the_fallback_brings_the_second_screen_back() {
+        use crate::capture::recovery::CaptureBlock;
+        let (shared, _away, failed) = fell_back_after_a_desktop_loss(false, false);
+        let blocked = nothing_for(&shared, failed, secs(13.0));
+        *shared.capture_block.lock() = Some(CaptureBlock::SecureDesktop);
+        let resumed = nothing_for(&shared, blocked, secs(10.0));
+        *shared.capture_block.lock() = None;
+        assert_eq!(next_step(&shared, resumed + DESKTOP_CHECK), Step::Attach);
+    }
+
+    /// A loss while the desktop was away, back by the failure (Windows said
+    /// so before the fallback): tried again at once.
+    #[test]
+    fn a_loss_while_the_desktop_was_away_is_tried_again_once_it_is_back() {
+        let (shared, _away, failed) = fell_back_after_a_desktop_loss(true, false);
+        assert_eq!(next_step(&shared, failed + secs(0.25)), Step::Attach);
+    }
+
+    /// Away at the failure itself: #207's retry, unchanged.
+    #[test]
+    fn a_failure_while_the_desktop_is_away_still_waits_for_it() {
+        let (shared, away, failed) = fell_back_after_a_desktop_loss(false, true);
+        let back = nothing_for(&shared, failed, secs(20.0));
+        away.store(false, Ordering::Relaxed);
+        assert_eq!(next_step(&shared, back + DESKTOP_CHECK), Step::Attach);
+    }
+
+    /// No secure screen, or one only after the window: the mirror stays
+    /// until Try again, as before.
+    #[test]
+    fn a_desktop_loss_with_no_lock_is_not_tried_again() {
+        let (shared, away, failed) = fell_back_after_a_desktop_loss(false, false);
+        let later = nothing_for(&shared, failed, LATE_AWAY_WINDOW + secs(1.0));
+        away.store(true, Ordering::Relaxed);
+        let back = nothing_for(&shared, later, secs(5.0));
+        away.store(false, Ordering::Relaxed);
+        nothing_for(&shared, back, secs(30.0));
+        assert_eq!(remembered_failure(&shared), Some("no_frames"));
+    }
+
+    /// One retry per lock: a retried second screen that fails the same way
+    /// with no new lock stays on the mirror.
+    #[test]
+    fn a_late_lock_brings_the_second_screen_back_once() {
+        let (shared, away, failed) = fell_back_after_a_desktop_loss(false, false);
+        away.store(true, Ordering::Relaxed);
+        let locked = nothing_for(&shared, failed, secs(2.0));
+        away.store(false, Ordering::Relaxed);
+        let retry = locked + DESKTOP_CHECK;
+        assert_eq!(next_step(&shared, retry), Step::Attach);
+        note_attached(&shared, "virtual".into());
+        assert_eq!(next_step(&shared, retry), Step::Switch);
+        start_proving(&shared, 8, retry);
+        note_interruption_while(&shared, 8, false);
+        let failed_again = retry + PROVE_TIMEOUT;
+        assert_eq!(
+            next_step(&shared, failed_again),
+            Step::Fallback("no_frames")
+        );
+        nothing_for(&shared, failed_again, LATE_AWAY_WINDOW + secs(5.0));
+    }
+
+    /// A driver call that didn't return, or a display that keeps dropping
+    /// out, is not a desktop transition: a lock afterwards changes nothing.
+    #[test]
+    fn a_driver_failure_is_not_tried_again_after_a_lock() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let shared = second_screen_selected();
+        let away = Arc::new(AtomicBool::new(false));
+        shared.second_screen.lock().fake_desktop_away = Some(away.clone());
+        connect_viewer(&shared);
+        note_attached(&shared, "virtual".into());
+        let start = Instant::now();
+        assert_eq!(next_step(&shared, start), Step::Switch);
+        start_proving(&shared, 7, start);
+        note_interruption_while(&shared, 7, false);
+        let _call = driver_call(&shared, 7);
+        let failed = start + PROVE_TIMEOUT;
+        assert_eq!(next_step(&shared, failed), Step::Fallback("no_frames"));
+        away.store(true, Ordering::Relaxed);
+        let back = nothing_for(&shared, failed, secs(5.0));
+        away.store(false, Ordering::Relaxed);
+        nothing_for(&shared, back, secs(10.0));
+        assert!(shared.second_screen.lock().late_away_until.is_none());
     }
 
     /// A proof that lost the desktop while the user was there is excused
