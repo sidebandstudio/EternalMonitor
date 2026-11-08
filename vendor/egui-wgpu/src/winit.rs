@@ -551,7 +551,19 @@ impl Painter {
             }
             Some(_) => {}
         }
-        let surface = match self.instance.create_surface(window) {
+        // The surface goes to the replacement thread, which a driver can hold forever. Made
+        // from the window's handles, it doesn't keep the window alive: eframe ends its loop
+        // only once the window is destroyed, so a surface holding it would keep the app from
+        // quitting.
+        // SAFETY: the surface is used while the window lives: here and by the replacement
+        // thread, and on this thread once installed. The window is the root viewport,
+        // destroyed only as the app quits, after which a stuck thread can only drop the
+        // surface, never configured.
+        let made = || -> Result<wgpu::Surface<'static>, crate::WgpuError> {
+            let target = unsafe { wgpu::SurfaceTargetUnsafe::from_window(&*window) }?;
+            Ok(unsafe { self.instance.create_surface_unsafe(target) }?)
+        };
+        let surface = match made() {
             Ok(surface) => surface,
             Err(err) => {
                 self.replacement_failed(now, &err);
