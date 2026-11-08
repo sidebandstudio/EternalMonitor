@@ -24,7 +24,7 @@ use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
 use tracing::{debug, info, warn};
 
-use super::link::PeerId;
+use super::link::{LinkId, PeerId};
 use super::usb::{LinkEvent, TransportLinks};
 use crate::control::SharedControl;
 
@@ -233,11 +233,12 @@ async fn answer(
         crate::diagnostics::log_session_end(end, shared);
     }
     for (destination, reply) in &actions.replies {
-        // An answer is never larger than the request it answers. iPads that
-        // understand these answers pad their HELLO2 so every answer fits
-        // (`STANDBY_HELLO2_LEN`); an older one may get today's silence. An
-        // IDENTIFY is as long as its answer.
-        if reply.len() > datagram.len() {
+        // Over Wi-Fi an answer is never larger than the request it answers.
+        // iPads that understand these answers pad their HELLO2 so every
+        // answer fits (`STANDBY_HELLO2_LEN`); an older one gets the short
+        // refusal, or today's silence. An IDENTIFY is as long as its answer.
+        // Answers over USB stay whole.
+        if destination.link == LinkId::Udp && reply.len() > datagram.len() {
             debug!(
                 peer = %destination,
                 reply = reply.len(),
