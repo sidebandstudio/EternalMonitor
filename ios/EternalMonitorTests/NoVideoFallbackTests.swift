@@ -128,9 +128,15 @@ final class NoVideoFallbackTests: XCTestCase {
         // Needed again later: the week starts over, at the newer size.
         NoVideoSizes.remember(1200, for: key, now: at.addingTimeInterval(86_400))
         XCTAssertEqual(NoVideoSizes.size(for: key, now: at.addingTimeInterval(NoVideoSizes.lifetime)), 1200)
+        // Each network keeps its own size; `forget` drops them all.
+        let other = sizeKey(pc, route: Self.otherRoute)
+        NoVideoSizes.remember(576, for: other, now: at.addingTimeInterval(86_400))
+        XCTAssertEqual(NoVideoSizes.size(for: key, now: at.addingTimeInterval(86_400)), 1200)
+        XCTAssertEqual(NoVideoSizes.size(for: other, now: at.addingTimeInterval(86_400)), 576)
         XCTAssertFalse(NoVideoSizes.forget(sizeKey(pc, pairing: Data(2...17))))
-        XCTAssertTrue(NoVideoSizes.forget(sizeKey(pc, route: Self.otherRoute)))
+        XCTAssertTrue(NoVideoSizes.forget(other))
         XCTAssertNil(NoVideoSizes.size(for: key, now: at.addingTimeInterval(86_400)))
+        XCTAssertNil(NoVideoSizes.size(for: other, now: at.addingTimeInterval(86_400)))
     }
 
     /// The size a path needed is kept: the next session at that address
@@ -167,6 +173,39 @@ final class NoVideoFallbackTests: XCTestCase {
         XCTAssertEqual(steps, ["no_video_fallback step=smaller_packets size=1200 result=no_video",
                                "no_video_fallback step=smaller_packets size=576 result=video",
                                "no_video_fallback step=remembered_size size=576 result=asked"])
+    }
+
+    /// Each network the iPad reaches the PC over keeps its own size: one
+    /// path needed 576 bytes, another 1,200. Back on the first, the session
+    /// asks for 576 at once.
+    func testEachNetworkKeepsItsOwnSize() async throws {
+        let pc = FakeUDPHost()
+        let (manager, _) = try manager(pairedAt: pc)
+        defer { manager.cancel() }
+        let at = Date(timeIntervalSince1970: 1_800_000_000)
+        manager.now = { at }
+        manager.timing.noVideoStepSeconds = 1.5
+        let frame = try FakeUDPHost.keyframe()
+        var runs: [FakeUDPHost.PathRun] = []
+        // Network A drops datagrams over 1,000 bytes, network B over 1,250.
+        for (route, limit) in [(Self.homeRoute, 1000), (Self.otherRoute, 1250), (Self.homeRoute, 1000)] {
+            manager.localRoute = { _, _ in route }
+            let streaming = OSAllocatedUnfairLock(initialState: false)
+            pc.forgetClient()
+            manager.connect(host: "127.0.0.1", port: pc.port)
+            let served = Task.detached {
+                pc.servePath(limit: limit, frame: frame, hostCaps: HelloAck.hostCapMediaSize) { streaming.withLock { $0 } }
+            }
+            try await until("streaming over \(route.address)") { manager.state == .connected }
+            streaming.withLock { $0 = true }
+            runs.append(await served.value)
+            manager.cancel()
+        }
+        XCTAssertEqual(runs[0].sizesAsked, [1200, 576])
+        XCTAssertEqual(runs[1].sizesAsked, [1200])
+        XCTAssertEqual(runs[2].sizesAsked, [576], "network A's size, at once")
+        XCTAssertEqual(NoVideoSizes.size(for: sizeKey(pc), now: at), 576)
+        XCTAssertEqual(NoVideoSizes.size(for: sizeKey(pc, route: Self.otherRoute), now: at), 1200)
     }
 
     /// A size kept for this address over another network isn't used, and

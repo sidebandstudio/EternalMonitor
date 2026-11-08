@@ -120,9 +120,10 @@ enum NoVideoPaths {
 /// The media datagram size a PC's video needed at an address, so the next
 /// session there starts with it instead of waiting through the steps again.
 /// Each entry is bound to the pairing by a digest of its token, and to the
-/// network this iPad reached the PC over. It lasts a week from when the
-/// size was last needed, and goes as soon as a session at the address shows
-/// a picture at the PC's own size. Kept in UserDefaults.
+/// network this iPad reached the PC over: one address may keep a size per
+/// network. It lasts a week from when the size was last needed, and every
+/// size kept for the address goes as soon as a session there shows a
+/// picture at the PC's own size. Kept in UserDefaults.
 enum NoVideoSizes {
     static let lifetime: TimeInterval = 7 * 24 * 60 * 60
     private static let key = "noVideoSizes"
@@ -153,23 +154,23 @@ enum NoVideoSizes {
     /// The size to start a session at `key` with: one kept for its address
     /// and pairing, on the same network, less than `lifetime` old.
     static func size(for key: Key, now: Date) -> UInt16? {
-        guard let entry = entry(key), entry.network == key.network, key.network != "-",
+        guard key.network != "-", let entry = load().last(where: { matches($0, key, network: true) }),
               now >= entry.at, now.timeIntervalSince(entry.at) < lifetime else { return nil }
         return entry.size
     }
 
     static func remember(_ size: UInt16, for key: Key, now: Date) {
-        var entries = load().filter { !matches($0, key) }
+        var entries = load().filter { !matches($0, key, network: true) }
         entries.append(Entry(address: key.address, pairing: NoVideoPaths.digest(key.pairing), network: key.network, size: size, at: now))
         save(Array(entries.suffix(kept)))
     }
 
-    /// Forgets the size kept for `key`'s address and pairing, on any
+    /// Forgets the sizes kept for `key`'s address and pairing, on every
     /// network; true if there was one.
     @discardableResult
     static func forget(_ key: Key) -> Bool {
         let entries = load()
-        let kept = entries.filter { !matches($0, key) }
+        let kept = entries.filter { !matches($0, key, network: false) }
         guard kept.count != entries.count else { return false }
         save(kept)
         return true
@@ -179,12 +180,11 @@ enum NoVideoSizes {
         UserDefaults.standard.removeObject(forKey: key)
     }
 
-    private static func entry(_ key: Key) -> Entry? {
-        load().last { matches($0, key) }
-    }
-
-    private static func matches(_ entry: Entry, _ key: Key) -> Bool {
+    /// Whether `entry` is kept for `key`'s address and pairing, and for its
+    /// network when `network` says so.
+    private static func matches(_ entry: Entry, _ key: Key, network: Bool) -> Bool {
         entry.address == key.address && entry.pairing == NoVideoPaths.digest(key.pairing)
+            && (!network || entry.network == key.network)
     }
 
     private static func load() -> [Entry] {
