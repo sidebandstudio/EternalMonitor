@@ -1,9 +1,10 @@
 name: Proto fuzz
 
 # Builds the cargo-fuzz targets in proto/fuzz (the v3 protocol and the
-# credential store) and runs each one briefly. Longer runs happen locally;
-# this keeps the targets compiling and catches shallow crashes on every
-# change to either crate.
+# credential store), runs each target's checked-in regression inputs
+# (proto/fuzz/regressions/<target>/), then runs each one briefly. Longer
+# runs happen locally; this keeps the targets compiling and catches shallow
+# crashes on every change to either crate.
 
 on:
   pull_request:
@@ -61,6 +62,15 @@ jobs:
             # Safe Rust only; it runs far faster without the sanitizer.
             case "$target" in v3_session_sim | credstore_ops) sanitizer=none ;; esac
             log="$RUNNER_TEMP/fuzz-$target.log"
+            # Checked-in regression inputs run first, each on its own.
+            if [ -d "regressions/$target" ]; then
+              for input in regressions/"$target"/*; do
+                if ! cargo "+$FUZZ_TOOLCHAIN" fuzz run -s "$sanitizer" "$target" "$input" > "$log" 2>&1; then
+                  echo "::error::regression $(basename "$input") fails in $target"
+                  failed=1
+                fi
+              done
+            fi
             if cargo "+$FUZZ_TOOLCHAIN" fuzz run -s "$sanitizer" "$target" -- -max_total_time=30 > "$log" 2>&1; then
               echo "$target: $(grep -E '^Done [0-9]+ runs' "$log" || echo 'finished')"
             else

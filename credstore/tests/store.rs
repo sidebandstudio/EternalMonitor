@@ -516,6 +516,35 @@ fn an_unreadable_boot_id_confirms_nothing() {
     }
 }
 
+/// A blob stored while the boot id couldn't be read is tagged with the boot
+/// at the next open that can read it, so promotion follows in the boot
+/// after that, as usual.
+#[test]
+fn an_untagged_blob_is_tagged_and_then_promoted() {
+    let mut world = base_world();
+    world.keyring.set_boot_unreadable(true);
+    let (mut store, _, live) = world.open();
+    store.remove(&[id(0x21)]).unwrap();
+    let rotated = store.generation();
+    drop(store);
+    let blob = live.keyring.borrow().get().cloned().unwrap();
+    assert!(parse_keyring(&blob).unwrap().boot.is_empty(), "untagged");
+    // The next boot, id readable: tagged, not yet promoted.
+    let mut world = live.at_rest();
+    world.keyring.set_boot_unreadable(false);
+    let (store, _, live) = world.open();
+    assert!(store.base_generation() < rotated);
+    let blob = live.keyring.borrow().get().cloned().unwrap();
+    assert_eq!(
+        parse_keyring(&blob).unwrap().boot,
+        live.keyring.borrow().boot().to_le_bytes().to_vec()
+    );
+    drop(store);
+    // The boot after: promoted.
+    let (store, _, _) = live.at_rest().open();
+    assert_eq!(store.base_generation(), rotated);
+}
+
 /// With this boot's id unreadable, every procedure still completes: a
 /// Remove returns Ok, an open that finishes a staged rotation succeeds, and
 /// an open that has to discard succeeds. Nothing is promoted.

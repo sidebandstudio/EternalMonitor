@@ -25,8 +25,9 @@
 //! the file is under; `head` is the newest committed generation its contents
 //! need (above `generation` while a rotation isn't confirmed durable yet),
 //! and the head fingerprint is [`key_fingerprint`] of that generation's key:
-//! it ties the file to one keyring history, so a file from another history
-//! with the same generation numbers is told apart.
+//! when the head is the keyring's committed or staged generation, a file
+//! written under another key for that generation (another history) is told
+//! apart.
 //! The wrap key and the MAC key are derived from `W` with HKDF-SHA-256; each
 //! wrap binds `(dev_id, generation)` as associated data. `dev_id`s, slots and tombstones
 //! are readable without `W`, so records that can't be opened can still be

@@ -15,13 +15,18 @@
 //!   is exactly the acknowledged one, or, if an operation was killed, that
 //!   or the state after it;
 //! - damage never brings back a record;
-//! - a retired record (removed, expired, conflicted, discarded) never comes
-//!   back, also when an earlier authentic copy of
-//!   the database files, or an older keyring blob, is restored on its own;
-//!   and what such a reopen serves survives a further power cut.
+//! - the store's tombstones are those an independent model of the
+//!   operations expects (the last 8 per slot), and an add of a tombstoned
+//!   `dev_id` is refused;
+//! - a retired record (removed, expired, conflicted, discarded) is never
+//!   served again, also when an earlier authentic copy of the database
+//!   files, or an older keyring blob, is restored on its own; the only
+//!   exception is the out-of-scope keyring rollback below its retirement,
+//!   and only from a file that rolled-back keyring's history vouches for;
+//! - what a reopen after a restore serves survives a further power cut.
 #![no_main]
 
-use eternal_credstore::format::parse_keyring;
+use eternal_credstore::format::{key_fingerprint, parse_db, parse_keyring, GenerationKeys};
 use eternal_credstore::keyring::MemKeyring;
 use eternal_credstore::testing::{check_invariants, logical, Live, Logical, Store, World};
 use eternal_credstore::{Disk, NewRecord, Recovery, StoreError};
@@ -112,74 +117,196 @@ fn db_files(live: &Live) -> Vec<(String, Vec<u8>)> {
     files
 }
 
-/// Moves `acked` to `new`. With `retiring`, the step was an operation (or
-/// a discard): every `dev_id` it retired is remembered with the committed
-/// generation it was retired under. The fuzzer reuses `dev_id`s, so a
-/// retired one is forgiven only when this step was an add of that id that
-/// landed (returned Ok, or was killed after it landed) and it wasn't
-/// tombstoned before the step.
-fn advance(
-    acked: &mut Logical,
-    new: Logical,
-    gone: &mut Vec<(Id16, u64)>,
-    generation: u64,
-    retiring: bool,
-    added: Option<Id16>,
-) {
-    let had = |id: &Id16| acked.tombstones.iter().any(|(_, ids)| ids.contains(id));
-    if retiring {
-        let left = acked
+/// What the oracle expects, kept from the operations alone (never from the
+/// store's own output, except after damage or an injected restore).
+struct Oracle {
+    /// The state every acknowledged write adds up to.
+    acked: Logical,
+    /// The tombstones the operations so far leave, per slot, each with the
+    /// step that added it (records retired in one step have no order the
+    /// model can know), the last 8 kept.
+    tombs: Vec<(Id16, Vec<(Id16, u64)>)>,
+    /// Every retired `dev_id`, with the committed generation it was retired
+    /// under.
+    gone: Vec<(Id16, u64)>,
+    /// Steps so far.
+    steps: u64,
+}
+
+/// Tombstones as comparable sets: per slot, sorted.
+fn tomb_sets<'a>(tombs: impl Iterator<Item = (Id16, Vec<Id16>)> + 'a) -> Vec<(Id16, Vec<Id16>)> {
+    let mut out: Vec<(Id16, Vec<Id16>)> = tombs
+        .filter(|(_, ids)| !ids.is_empty())
+        .map(|(s, mut ids)| {
+            ids.sort();
+            (s, ids)
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+impl Oracle {
+    fn tombstoned(&self, id: &Id16) -> bool {
+        self.tombs
+            .iter()
+            .any(|(_, ids)| ids.iter().any(|(t, _)| t == id))
+    }
+
+    /// An operation took the store from `acked` to `new`. Every record that
+    /// left is retired into its slot; an add of a tombstoned `dev_id` must
+    /// have been refused; each slot keeps its last 8 (older steps go first;
+    /// among records retired in one step, the store may keep any); and the
+    /// store's tombstones must be the model's.
+    fn step(&mut self, new: Logical, generation: u64, added: Option<Id16>) {
+        self.steps += 1;
+        let step = self.steps;
+        let batch: Vec<(Id16, Id16)> = self
+            .acked
             .records
             .iter()
-            .map(|r| r.0)
-            .filter(|id| !new.records.iter().any(|n| n.0 == *id));
-        // Tombstones this step added (not ones a restore brought back).
-        let tombstoned = new
-            .tombstones
-            .iter()
-            .flat_map(|(_, ids)| ids.iter().copied())
-            .filter(|id| !had(id));
-        for id in left.chain(tombstoned).collect::<Vec<_>>() {
-            if !gone.iter().any(|(g, _)| *g == id) {
-                gone.push((id, generation));
+            .filter(|r| !new.records.iter().any(|n| n.0 == r.0))
+            .map(|r| (r.1, r.0))
+            .collect();
+        for (slot, id) in &batch {
+            let i = match self.tombs.iter().position(|(s, _)| s == slot) {
+                Some(i) => i,
+                None => {
+                    self.tombs.push((*slot, Vec::new()));
+                    self.tombs.len() - 1
+                }
+            };
+            let list = &mut self.tombs[i].1;
+            if !list.iter().any(|(t, _)| t == id) {
+                list.push((*id, step));
+            }
+            if !self.gone.iter().any(|(g, _)| g == id) {
+                self.gone.push((*id, generation));
             }
         }
-    }
-    if let Some(id) = added {
-        let landed = new.records.iter().any(|n| n.0 == id);
-        let was_held = acked.records.iter().any(|r| r.0 == id);
-        if landed && !was_held && !had(&id) {
-            gone.retain(|(g, _)| *g != id);
+        if let Some(id) = added {
+            let landed = new.records.iter().any(|n| n.0 == id);
+            let was_held = self.acked.records.iter().any(|r| r.0 == id);
+            if landed && !was_held {
+                assert!(
+                    !self.tombstoned(&id),
+                    "an add of a tombstoned dev_id is refused"
+                );
+                self.gone.retain(|(g, _)| *g != id);
+            }
         }
-    }
-    *acked = new;
-}
-
-/// A step that rolled the keyring back (stores lost to a power cut, an
-/// injected restore of an older blob, or a dropped keyring) can undo the
-/// rotations that retired records: §4.3 puts a keyring rollback out of
-/// scope, so retirements under generations above the keyring's committed
-/// one are forgotten. Nothing else forgives a retirement.
-fn rolled_back(gone: &mut Vec<(Id16, u64)>, keyring: Option<&Vec<u8>>) {
-    let committed = keyring
-        .and_then(|b| parse_keyring(b).ok())
-        .map_or(0, |k| k.committed.0);
-    gone.retain(|(_, g)| *g <= committed);
-}
-
-/// The restart world `next` lost keyring stores that `live` had visible.
-fn lost_keyring_stores(live: &Live, next: &World) -> bool {
-    live.keyring.borrow().get() != next.keyring.get()
-}
-
-/// No retired record is served again.
-fn assert_none_back(store: &Store, gone: &[(Id16, u64)]) {
-    for r in store.records() {
-        assert!(
-            !gone.iter().any(|(g, _)| *g == r.dev_id),
-            "a retired record never comes back"
+        for (slot, list) in &mut self.tombs {
+            if list.len() <= 8 {
+                continue;
+            }
+            list.sort_by_key(|(_, st)| *st);
+            let cut = list.len() - 8;
+            let tie = list[cut].1;
+            if list[cut - 1].1 != tie {
+                list.drain(..cut);
+                continue;
+            }
+            // The boundary falls inside one step: the store's choice among
+            // those, if the counts fit.
+            let theirs: Vec<Id16> = new
+                .tombstones
+                .iter()
+                .find(|(s, _)| s == slot)
+                .map(|(_, ids)| ids.clone())
+                .unwrap_or_default();
+            let newer: Vec<(Id16, u64)> =
+                list.iter().filter(|(_, st)| *st > tie).copied().collect();
+            let chosen: Vec<(Id16, u64)> = list
+                .iter()
+                .filter(|(t, st)| *st == tie && theirs.contains(t))
+                .copied()
+                .collect();
+            assert_eq!(newer.len() + chosen.len(), 8, "the last 8 per slot");
+            *list = newer.into_iter().chain(chosen).collect();
+        }
+        assert_eq!(
+            tomb_sets(new.tombstones.iter().cloned()),
+            tomb_sets(
+                self.tombs
+                    .iter()
+                    .map(|(s, ids)| (*s, ids.iter().map(|(t, _)| *t).collect()))
+            ),
+            "the store's tombstones are the model's"
         );
+        self.acked = new;
     }
+
+    /// After damage or an injected restore the store may serve other
+    /// tombstones (a discard, an earlier copy): they become the model, in the
+    /// store's order. (What it may serve is checked at the open.)
+    fn resync(&mut self, new: Logical) {
+        self.tombs = new
+            .tombstones
+            .iter()
+            .map(|(s, ids)| {
+                let list = ids
+                    .iter()
+                    .map(|t| {
+                        self.steps += 1;
+                        (*t, self.steps)
+                    })
+                    .collect();
+                (*s, list)
+            })
+            .collect();
+        self.acked = new;
+    }
+}
+
+/// What the keyring and files of `world` let an open load, worked out
+/// independently: the keyring's committed generation, and whether the file
+/// it will load is one that keyring's history vouches for (its head is the
+/// committed or staged generation with that key's fingerprint, or above the
+/// committed one: the documented keyring-rollback limit).
+fn vouched(world: &World) -> Option<(u64, bool)> {
+    let k = parse_keyring(world.keyring.get()?).ok()?;
+    let mut candidates = vec![(k.committed.0, k.committed.1.clone())];
+    if k.base.0 != k.committed.0 {
+        candidates.push((k.base.0, k.base.1.clone()));
+    }
+    for (g, w) in candidates {
+        let Some(bytes) = world.disk.get(&format!("credentials-{g}.db")) else {
+            continue;
+        };
+        let Ok(db) = parse_db(bytes) else { continue };
+        if !GenerationKeys::new(&w, g).verify(bytes) {
+            continue;
+        }
+        let at = |g: u64, w: &[u8; 32]| db.head == g && db.head_fp == key_fingerprint(w, g);
+        let ok = db.head > k.committed.0
+            || at(k.committed.0, &k.committed.1)
+            || k.staged.as_ref().is_some_and(|(sg, sw, _)| at(*sg, sw));
+        return Some((k.committed.0, ok));
+    }
+    None
+}
+
+/// Opens `world` and checks it serves no retired record, except one the
+/// out-of-scope keyring rollback allows: the keyring is below the generation
+/// it was retired under, and the file loaded is one that keyring's history
+/// vouches for. Such a record is forgiven.
+/// `adding` is a `dev_id` the operation being recovered may have added,
+/// which the model allows: it may be served.
+fn open_checked(world: &World, oracle: &mut Oracle, adding: Option<Id16>) -> (Store, Live) {
+    let pre = vouched(world);
+    let (store, live) = open(world);
+    for r in store.records() {
+        if Some(r.dev_id) == adding {
+            continue;
+        }
+        let Some(&(_, g)) = oracle.gone.iter().find(|(id, _)| *id == r.dev_id) else {
+            continue;
+        };
+        let allowed = pre.is_some_and(|(committed, ok)| committed < g && ok);
+        assert!(allowed, "a retired record never comes back");
+        oracle.gone.retain(|(id, _)| *id != r.dev_id);
+    }
+    (store, live)
 }
 
 /// Opens `world`. A fresh keyring (first run, or after the keyring was
@@ -210,17 +337,18 @@ fuzz_target!(|data: &[u8]| {
         ..World::default()
     };
     let (mut store, mut live) = open(&world);
-    // The state every acknowledged write adds up to, and every record that
-    // ever left it.
-    let mut acked: Logical = logical(&store);
-    let mut gone: Vec<(Id16, u64)> = Vec::new();
+    let mut oracle = Oracle {
+        acked: logical(&store),
+        tombs: Vec::new(),
+        gone: Vec::new(),
+        steps: 0,
+    };
     // Earlier authentic copies, for restores.
     let mut snapshots: Vec<Vec<(String, Vec<u8>)>> = Vec::new();
     let mut blobs: Vec<Vec<u8>> = Vec::new();
     let mut now = 400 * DAY;
     for chunk in data.chunks_exact(5).take(40) {
         let (kind, a, b, c, d) = (chunk[0], chunk[1], chunk[2], chunk[3], chunk[4]);
-        assert_none_back(&store, &gone);
         if snapshots.len() < 8 {
             snapshots.push(db_files(&live));
             if let Some(blob) = live.keyring.borrow().get() {
@@ -245,29 +373,20 @@ fuzz_target!(|data: &[u8]| {
                     restored.disk.put(name, bytes.clone());
                 }
             } else if !blobs.is_empty() {
-                let blob = blobs[usize::from(a) % blobs.len()].clone();
-                rolled_back(&mut gone, Some(&blob));
-                restored.keyring.put(Some(blob));
+                restored
+                    .keyring
+                    .put(Some(blobs[usize::from(a) % blobs.len()].clone()));
             }
-            (store, live) = open(&restored);
-            assert_none_back(&store, &gone);
+            (store, live) = open_checked(&restored, &mut oracle, None);
             let served = logical(&store);
-            advance(
-                &mut acked,
-                served.clone(),
-                &mut gone,
-                store.generation(),
-                false,
-                None,
-            );
+            oracle.resync(served.clone());
             // What the reopen serves survives a further power cut.
             drop(store);
-            let next = live.after_crash(c & 2 != 0, usize::from(d));
-            if lost_keyring_stores(&live, &next) {
-                rolled_back(&mut gone, next.keyring.get());
-            }
-            (store, live) = open(&next);
-            assert_none_back(&store, &gone);
+            (store, live) = open_checked(
+                &live.after_crash(c & 2 != 0, usize::from(d)),
+                &mut oracle,
+                None,
+            );
             assert_eq!(logical(&store), served, "what a reopen serves survives");
             continue;
         }
@@ -275,42 +394,29 @@ fuzz_target!(|data: &[u8]| {
             // Damage at rest, then a restart.
             drop(store);
             let mut damaged = live.at_rest();
-            let held: Vec<Id16> = acked.records.iter().map(|r| r.0).collect();
+            let held: Vec<Id16> = oracle.acked.records.iter().map(|r| r.0).collect();
             let touched = damage(&mut damaged, kind, a, b);
-            if damaged.keyring.get().is_none() {
-                rolled_back(&mut gone, None);
-            }
-            (store, live) = open(&damaged);
+            (store, live) = open_checked(&damaged, &mut oracle, None);
             if touched {
                 for r in logical(&store).records {
                     assert!(!held.contains(&r.0), "damage never brings a record back");
                 }
             }
-            assert_none_back(&store, &gone);
-            let served = logical(&store);
-            advance(
-                &mut acked,
-                served,
-                &mut gone,
-                store.generation(),
-                true,
-                None,
-            );
+            oracle.resync(logical(&store));
             continue;
         }
         if kind >= 0xE0 {
             // A restart with every write acknowledged: exactly that state.
             drop(store);
-            let next = restart(&live, c, d);
-            if lost_keyring_stores(&live, &next) {
-                rolled_back(&mut gone, next.keyring.get());
-            }
-            (store, live) = open(&next);
-            assert_eq!(logical(&store), acked, "every acknowledged write survives");
-            assert_none_back(&store, &gone);
+            (store, live) = open_checked(&restart(&live, c, d), &mut oracle, None);
+            assert_eq!(
+                logical(&store),
+                oracle.acked,
+                "every acknowledged write survives"
+            );
             continue;
         }
-        // An add's `dev_id`, for forgiving a reused one.
+        // An add's `dev_id`, for the model's re-add rule.
         let added = (kind % 6 == 0).then(|| id(1 + a % 12));
         // The same operation, uncrashed, from the same state.
         let after = {
@@ -330,19 +436,11 @@ fuzz_target!(|data: &[u8]| {
         if !crashed {
             // Ok or a refusal: exactly what the uncrashed run did.
             assert_eq!(logical(&store), after);
-            advance(
-                &mut acked,
-                after,
-                &mut gone,
-                store.generation(),
-                true,
-                added.filter(|_| result.is_ok()),
-            );
-            assert_none_back(&store, &gone);
+            oracle.step(after, store.generation(), added);
             continue;
         }
         let visible = live.keyring.borrow().get().cloned() != keyring_before;
-        let before = acked.clone();
+        let before = oracle.acked.clone();
         match result {
             Ok(()) => assert_eq!(logical(&store), after),
             Err(_) if visible => assert_eq!(logical(&store), after),
@@ -351,35 +449,24 @@ fuzz_target!(|data: &[u8]| {
         // The process died here: restart.
         drop(store);
         let mut next = restart(&live, c >> 4, d);
-        if lost_keyring_stores(&live, &next) {
-            rolled_back(&mut gone, next.keyring.get());
-        }
         if c & 0x10 != 0 && d & 1 == 1 {
             // Damage in the middle: nothing held may come back.
             let held: Vec<Id16> = before.records.iter().map(|r| r.0).collect();
             let touched = damage(&mut next, d >> 1, a, b);
-            if next.keyring.get().is_none() {
-                rolled_back(&mut gone, None);
-            }
-            (store, live) = open(&next);
+            (store, live) = open_checked(&next, &mut oracle, None);
             if touched {
                 for r in logical(&store).records {
                     assert!(!held.contains(&r.0), "damage never brings a record back");
                 }
             }
-            assert_none_back(&store, &gone);
-            let served = logical(&store);
-            advance(
-                &mut acked,
-                served,
-                &mut gone,
-                store.generation(),
-                true,
-                None,
-            );
+            oracle.resync(logical(&store));
             continue;
         }
-        (store, live) = open(&next);
+        // A killed add the model allows may have landed.
+        let adding = added.filter(|id| {
+            !oracle.tombstoned(id) && !oracle.acked.records.iter().any(|r| r.0 == *id)
+        });
+        (store, live) = open_checked(&next, &mut oracle, adding);
         let reached = logical(&store);
         if result.is_ok() {
             assert_eq!(reached, after, "it returned Ok");
@@ -389,14 +476,6 @@ fuzz_target!(|data: &[u8]| {
                 "exactly before or after"
             );
         }
-        advance(
-            &mut acked,
-            reached,
-            &mut gone,
-            store.generation(),
-            true,
-            added,
-        );
-        assert_none_back(&store, &gone);
+        oracle.step(reached, store.generation(), added);
     }
 });

@@ -28,14 +28,16 @@
 //!
 //! The database header records the newest committed generation its contents
 //! need, with a fingerprint of that generation's key. Every write after a
-//! commit records at least that generation, so a file whose head is older
-//! than the keyring's committed generation, or names the committed (or
-//! staged) generation with another key's fingerprint, isn't from this
-//! keyring's history: a restored copy. It's never used, and with no other
-//! file the open discards. A rotation goes past every generation the
-//! keyring or the database names, so no generation number names two keys. If instead the keyring that survived is older
-//! (its rotation's stores were lost), the open rotates again, so the
-//! invalidation still gets a new key.
+//! commit records at least that generation. So a file whose head is older
+//! than the keyring's committed generation is a restored copy, and a file
+//! from another history whose head is the keyring's committed or staged
+//! generation (its fingerprint names another key) isn't this keyring's:
+//! neither is used, and with no other file the open discards. A rotation
+//! goes past every generation this keyring or its database names. A file
+//! whose head is above the keyring's committed generation is taken as the
+//! keyring's stores having been lost (the open rotates again, so the
+//! invalidation still gets a new key); after a keyring rollback that can
+//! also admit an older file, the documented keyring-rollback limit.
 //!
 //! At most two database files exist (the base's, and the committed one's
 //! during a promotion), and an open reads at most two.
@@ -325,6 +327,14 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
         self.base = (state.base.0, state.base.1.clone());
         self.committed = (state.committed.0, state.committed.1.clone());
         self.staged_floor = state.staged.as_ref().map_or(0, |(g, _, _)| *g);
+        if !flushed && state.boot.is_empty() && !self.boot.is_empty() {
+            // Stored while the boot id couldn't be read: tag the same blob
+            // with this boot (one atomic store), so a later boot confirms
+            // it as usual instead of never.
+            let mut tagged = state.clone();
+            tagged.boot = self.boot.clone();
+            self.keyring.store(&encode_keyring(&tagged))?;
+        }
 
         // The committed generation's file (a promotion got that far) is
         // newer than the base's, if both open. Nothing else is read.
@@ -347,10 +357,11 @@ impl<D: Disk, K: Keyring> CredentialStore<D, K> {
             };
             if let Some(h) = self.load_verified(&bytes, &GenerationKeys::new(&w, g)) {
                 // Every write after a commit records it (and its key's
-                // fingerprint), so a file whose head is older, or names the
-                // committed or staged generation with another key, isn't from
-                // this keyring's history: a restored copy. It isn't used; with
-                // nothing else, it's discarded below.
+                // fingerprint), so a file whose head is older is a restored
+                // copy, and one whose head is the committed or staged
+                // generation with another key's fingerprint is from another
+                // history. Neither is used; with nothing else, it's
+                // discarded below. (A higher head is the lost-stores case.)
                 let foreign = |g: u64, w: &Key32| h.0 == g && h.1 != key_fingerprint(w, g);
                 let stale = h.0 < self.committed.0
                     || foreign(self.committed.0, &self.committed.1)
