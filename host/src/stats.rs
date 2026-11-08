@@ -49,6 +49,9 @@ pub struct PipelineStats {
     /// The processor encodes because startup's GPU detection did not return
     /// in time. The fallback notice then says the driver did not answer.
     pub gpu_detection_stalled: bool,
+    /// AMD and Intel cards on the PC whose encoder failed to open: the
+    /// fallback notice says to update their driver.
+    pub driver_update_vendors: Vec<crate::gpu::GpuVendor>,
     encode_timestamps: VecDeque<Instant>,
 
     // Transport
@@ -113,6 +116,7 @@ impl PipelineStats {
             using_software_fallback: false,
             nvidia_driver_outdated: false,
             gpu_detection_stalled: false,
+            driver_update_vendors: Vec::new(),
             encode_timestamps: VecDeque::with_capacity(128),
 
             transport_fps: 0.0,
@@ -155,6 +159,7 @@ impl PipelineStats {
         self.using_software_fallback = previous.using_software_fallback;
         self.nvidia_driver_outdated = previous.nvidia_driver_outdated;
         self.gpu_detection_stalled = previous.gpu_detection_stalled;
+        self.driver_update_vendors = previous.driver_update_vendors;
         self.mdns_active = previous.mdns_active;
         previous.audio
     }

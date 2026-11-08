@@ -83,6 +83,7 @@ struct StatsSnapshot {
     using_software_fallback: bool,
     nvidia_driver_outdated: bool,
     gpu_detection_stalled: bool,
+    driver_update_vendors: Vec<crate::gpu::GpuVendor>,
     gpu_name: String,
     capture_display: String,
     transport_fps: f64,
@@ -122,6 +123,7 @@ impl StatsSnapshot {
             using_software_fallback: s.using_software_fallback,
             nvidia_driver_outdated: s.nvidia_driver_outdated,
             gpu_detection_stalled: s.gpu_detection_stalled,
+            driver_update_vendors: s.driver_update_vendors.clone(),
             gpu_name: s.gpu_name.clone(),
             capture_display: s.capture_display.clone(),
             transport_fps: s.transport_fps,
@@ -834,6 +836,8 @@ impl AnalyzerApp {
 
     fn restart_stream(&mut self) {
         self.restart_pending = false;
+        // The user may have updated a driver, as the fallback notice asks.
+        crate::encoder::forget_launch_failures();
         self.control.request_restart();
     }
 

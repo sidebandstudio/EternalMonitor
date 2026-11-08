@@ -92,6 +92,7 @@ impl AnalyzerApp {
                     customized,
                     snap.nvidia_driver_outdated,
                     snap.gpu_detection_stalled,
+                    &snap.driver_update_vendors,
                 ),
                 if customized { 230.0 } else { 110.0 },
                 |ui| {
@@ -838,13 +839,19 @@ pub(super) const SOFTWARE_FALLBACK_TITLE: &str =
     "Video is using the processor instead of the graphics card";
 
 /// What the CPU fallback notice says: that the graphics driver did not
-/// answer at startup, undo custom settings, say the NVIDIA driver is too old
-/// when that is what the graphics card refused, or suggest a driver update.
+/// answer at startup, undo custom settings first, say the NVIDIA driver is
+/// too old when that is what the graphics card refused, name the AMD or
+/// Intel driver whose card could not start encoding (`driver_vendors`), or
+/// suggest a driver update.
 pub(super) fn software_fallback_body(
     customized: bool,
     nvidia_driver_outdated: bool,
     detection_stalled: bool,
+    driver_vendors: &[crate::gpu::GpuVendor],
 ) -> String {
+    use crate::gpu::GpuVendor::{Amd, Intel};
+    let amd = driver_vendors.contains(&Amd);
+    let intel = driver_vendors.contains(&Intel);
     if detection_stalled {
         "The graphics driver did not respond when EternalMonitor started, so the processor encodes the video for now. The picture may lag and the PC may run hot. Click Restart to try the graphics card again.".to_string()
     } else if customized {
@@ -853,6 +860,13 @@ pub(super) fn software_fallback_body(
         format!(
             "The NVIDIA graphics driver on this PC is too old for the graphics card to encode video, so the picture may lag and the PC may run hot. Update the NVIDIA driver to version {} or newer, if your graphics card supports it, then click Restart. Older cards keep using the processor.",
             crate::encoder::NVENC_MIN_DRIVER
+        )
+    } else if amd && intel {
+        "The AMD and Intel graphics drivers on this PC could not start video encoding on the graphics cards, so the picture may lag and the PC may run hot. Update the AMD and Intel graphics drivers, then click Restart.".to_string()
+    } else if amd || intel {
+        let vendor = if amd { "AMD" } else { "Intel" };
+        format!(
+            "The {vendor} graphics driver on this PC could not start video encoding on the graphics card, so the picture may lag and the PC may run hot. Update the {vendor} graphics driver, then click Restart."
         )
     } else {
         "The picture may lag and the PC may run hot. Update your graphics driver from NVIDIA, AMD or Intel, then click Restart.".to_string()
