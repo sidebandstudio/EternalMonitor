@@ -94,6 +94,8 @@ final class NetworkScanner: NSObject, ObservableObject {
     /// Search once more when a search finds nothing. Off for a one-off
     /// lookup that stops the search itself.
     var retriesWhenEmpty = true
+    /// Keep searching until `stopScan`, for a watch rather than a lookup.
+    var searchesUntilStopped = false
 
     override init() {
         super.init()
@@ -122,6 +124,7 @@ final class NetworkScanner: NSObject, ObservableObject {
         }
         #endif
         browser.searchForServices(ofType: "_eternaldisplay._udp.", inDomain: "local.")
+        guard !searchesUntilStopped else { return }
 
         scanTask = Task { @MainActor in
             // 10s timeout — many routers are slow to forward the first mDNS

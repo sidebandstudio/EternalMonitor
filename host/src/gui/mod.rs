@@ -1787,6 +1787,15 @@ pub fn shown_address(ip: std::net::Ipv4Addr, listen_port: u16) -> String {
     }
 }
 
+/// The app quits from outside its window, as when Windows closes it for an
+/// installer, perhaps before the window is confirmed drawing. As for a quit
+/// from the graphics driver notice, this launch's renderer marker goes
+/// without counting, so the next launch avoids no backend, and nothing still
+/// in the driver saves it again.
+pub fn quitting_from_outside() {
+    renderer::abandon();
+}
+
 /// Launch the GUI window. Blocks the calling thread.
 /// Runs the window until it closes. `quit_while_stuck` is the app's quit
 /// path, for a Cancel in the graphics driver notice while the window's

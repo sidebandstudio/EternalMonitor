@@ -37,6 +37,10 @@ enum ConnectionProblem: Equatable {
     /// The PC ended the session on an error: it stopped hearing this iPad (a
     /// Wi-Fi stall) or hit a problem of its own. Nobody stopped the stream.
     case pcEndedSessionOnError
+    /// The PC said it is going to sleep.
+    case pcAsleep
+    /// The PC said it is shutting down, restarting or signing out.
+    case pcPoweringOff
     /// The PC is streaming to another device, or still to this iPad's cable.
     case pcBusy
     /// The PC stopped the stream to install an update and restarts on it.
@@ -129,6 +133,8 @@ enum ConnectionProblem: Equatable {
         case .pcEndedSession: return "Your PC ended the session"
         // Also what a PC that restarts by itself sends: true for both.
         case .pcEndedSessionOnError: return "The connection to your PC ended"
+        case .pcAsleep: return "Your PC went to sleep"
+        case .pcPoweringOff: return "Your PC is shutting down or signing out"
         case .pcBusy: return "Your PC is already streaming to another device"
         case .pcUpdating(.reconnecting), .pcUpdating(.manual): return "Your PC is updating EternalMonitor"
         case .pcUpdating(.notBack): return "Your PC hasn't come back from its update yet"
@@ -188,6 +194,10 @@ enum ConnectionProblem: Equatable {
             return "Someone clicked Stop on the PC, changed a setting that restarts the stream, or closed EternalMonitor. Try again when the PC says Ready for your iPad."
         case .pcEndedSessionOnError:
             return "The connection to your PC dropped, or the PC ran into a problem. Tap Try again to reconnect."
+        case .pcAsleep:
+            return "Wake the PC, then tap Try again."
+        case .pcPoweringOff:
+            return "Tap Try again once the PC is on, someone has signed in, and EternalMonitor is open."
         case .pcUpdating(.reconnecting):
             return "This iPad reconnects when it's back. If it doesn't, check that EternalMonitor opened again on the PC, then try again."
         case .pcUpdating(.manual):
@@ -228,7 +238,7 @@ enum ConnectionProblem: Equatable {
         switch self {
         case .reconnecting, .pcUpdating(.reconnecting), .pcUpdating(.manual),
              .lost(.cableUnplugged), .lost(.usbTurnedOff), .pcBusy, .pairingCodeAsAddress,
-             .pcNotStreaming(.stopped), .pcNotStreaming(.restarting):
+             .pcNotStreaming(.stopped), .pcNotStreaming(.restarting), .pcAsleep, .pcPoweringOff:
             return false
         default:
             return true
@@ -302,6 +312,8 @@ enum ConnectionProblem: Equatable {
         case .hostShuttingDown: return .pcUpdating(.reconnecting)
         case .error: return .pcEndedSessionOnError
         case .userDisconnect, .superseded, .appBackground: return .pcEndedSession
+        case .hostSleeping: return .pcAsleep
+        case .hostPoweringOff: return .pcPoweringOff
         }
     }
 

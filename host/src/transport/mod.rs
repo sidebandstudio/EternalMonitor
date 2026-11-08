@@ -551,6 +551,13 @@ pub async fn start_sender(
                 let actions = shared.session.lock().tick(&config, true, now());
                 act(actions, &mut state, &links, &shared, &config, &supervisor).await;
             }
+            // The PC is going down and left a goodbye: send it now, not at
+            // the next liveness tick, while Windows still waits.
+            _ = shared.power.woken() => {
+                beat.mark(Phase::Tick);
+                let actions = shared.session.lock().tick(&config, false, now());
+                act(actions, &mut state, &links, &shared, &config, &supervisor).await;
+            }
             _ = network_check.tick() => {
                 beat.mark(Phase::Tick);
                 look_at_network(&shared, &listen_on, bind_ip, &supervisor);
@@ -810,6 +817,7 @@ pub async fn start_sender(
     let goodbye = shared.session.lock().take_goodbye();
     if let Some(goodbye) = goodbye {
         say_goodbye(&links, goodbye).await;
+        shared.power.said();
     }
     park_stream_socket(&shared, links.into_udp_socket());
     info!("NAL channel closed, transport sender shutting down");
@@ -1301,6 +1309,7 @@ async fn execute_actions(
 
     if let Some(goodbye) = actions.goodbye {
         say_goodbye(links, goodbye).await;
+        shared.power.said();
     }
 
     if actions.force_idr {

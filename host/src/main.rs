@@ -243,7 +243,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         shared: shared.clone(),
         supervisor_tx: supervisor_tx.clone(),
     };
-
     /// Set by the termination-signal handler; the headless loop polls it.
     static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
@@ -339,6 +338,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             std::process::exit(0);
         },
     ))));
+
+    // Sleep, shutdown and sign-out end the iPad's session with a goodbye. An
+    // installer closing the app takes the quit path, as closing the window does.
+    #[cfg(windows)]
+    eternal_host::power::watch(gui_control.shared.clone(), {
+        let quit_once = std::sync::Arc::clone(&quit_once);
+        Box::new(move || {
+            gui::quitting_from_outside();
+            let quit = quit_once.lock().take();
+            if let Some(quit) = quit {
+                quit(None);
+            }
+        })
+    });
 
     // Headless mode for automation (the iOS E2E harness runs the host without
     // a window): stream until SIGTERM/SIGINT, then fall through to the same

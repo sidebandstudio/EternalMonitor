@@ -352,6 +352,14 @@ struct ConnectView: View {
                     .foregroundStyle(Theme.textMuted)
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("connect.problemDetail")
+                if connectionManager.watchingForPC {
+                    // Problem cards stay English.
+                    Text(verbatim: "Waiting for your PC: this iPad connects by itself when EternalMonitor opens there.")
+                        .font(.app(14, .medium, relativeTo: .callout))
+                        .foregroundStyle(Theme.text)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("connect.problemWaiting")
+                }
                 if !problem.actions.isEmpty {
                     HStack(spacing: 10) {
                         ForEach(problem.actions, id: \.self) { action in
