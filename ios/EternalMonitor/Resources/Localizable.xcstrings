@@ -9191,10 +9191,70 @@
       "comment" : "Over the held picture while no display is on at the PC: a closed laptop lid, or screens that are off or unplugged",
       "extractionState" : "manual",
       "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "لا توجد شاشة نشطة على PC. شغّل شاشة للمتابعة."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dein PC hat keinen aktiven Bildschirm. Schalte einen Bildschirm ein, um fortzufahren."
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
             "value" : "Your PC has no active display. Turn on a screen to continue."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tu PC no tiene una pantalla activa. Enciende una pantalla para continuar."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Votre PC n’a pas d’écran actif. Allumez un écran pour continuer."
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "आपके PC पर कोई स्क्रीन चालू नहीं है। जारी रखने के लिए एक स्क्रीन चालू करें।"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PC に有効な画面がありません。続行するには画面をオンにしてください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PC에 활성 화면이 없습니다. 계속하려면 화면을 켜세요."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Seu PC não tem uma tela ativa. Ligue uma tela para continuar."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "На PC нет активного экрана. Включите экран, чтобы продолжить."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PC 没有活动的显示器。打开显示器后即可继续。"
           }
         }
       }
