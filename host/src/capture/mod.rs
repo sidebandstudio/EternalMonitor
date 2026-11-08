@@ -261,7 +261,8 @@ pub struct RawFrame {
     /// A picture capture already had, sent again because the desktop gave
     /// no new one: the keepalive, a keyframe request's resend, the cached
     /// picture redrawn with or without the pointer, or a resend during
-    /// duplication recovery.
+    /// duplication recovery. Also a mirror's start picture read through GDI
+    /// (see `StartPicture`): no new picture is due after it either.
     pub cached: bool,
 }
 
@@ -1142,8 +1143,8 @@ pub(crate) const START_PICTURE_GRACE: Duration = Duration::from_millis(100);
 
 /// A mirror's start picture when its duplication gives none. Desktop
 /// Duplication delivers an image only once the desktop presents one. A
-/// display that went to sleep, or a desktop that changes nothing, presents
-/// none: the encoder then opened only at the 750 ms keepalive, which sent the
+/// display that went to sleep, and possibly a desktop that changes nothing,
+/// presents none: the encoder then opened only at the 750 ms keepalive, which sent the
 /// black start frame, and the viewer saw black until the desktop changed.
 /// GDI still reads what the desktop shows.
 #[cfg(any(windows, test))]

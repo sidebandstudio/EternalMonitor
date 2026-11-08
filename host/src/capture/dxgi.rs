@@ -34,7 +34,10 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
-use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
+use windows::Win32::Graphics::Dxgi::Common::{
+    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION, DXGI_MODE_ROTATION_IDENTITY,
+    DXGI_MODE_ROTATION_UNSPECIFIED, DXGI_SAMPLE_DESC,
+};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
     IDXGIOutputDuplication, IDXGIResource, DXGI_ADAPTER_DESC1, DXGI_ERROR_ACCESS_LOST,
@@ -440,7 +443,10 @@ pub fn run_capture_loop(
         }
 
         if start_picture.due(picture.real(), second_screen, Instant::now()) {
-            if let Some(pixels) = read_screen_gdi(&output1, (tex_width, tex_height)) {
+            let rotation = duplication
+                .as_ref()
+                .map(|duplication| unsafe { duplication.GetDesc() }.Rotation);
+            if let Some(pixels) = read_screen_gdi(&output1, (tex_width, tex_height), rotation) {
                 info!(
                     device = %chosen.device_name,
                     "Desktop duplication gave no image yet — starting from the screen's picture"
@@ -460,6 +466,7 @@ pub fn run_capture_loop(
                         data: Arc::clone(&last_frame),
                         width: tex_width,
                         height: tex_height,
+                        cached: true,
                     });
                     last_send = now;
                 }
@@ -1239,14 +1246,26 @@ fn publish_capture_geometry(output: &IDXGIOutput1, shared: &SharedControl) {
 
 /// The picture `output` shows, read through GDI, as `width`x`height` BGRA
 /// rows in a [`frame_buffer`]: for a duplication that gives no image (see
-/// [`StartPicture`]). The pointer is not in it. None if the output's desktop
-/// rect isn't that size (a rotated display) or GDI can't read it (no
-/// interactive desktop).
-fn read_screen_gdi(output: &IDXGIOutput1, (width, height): (u32, u32)) -> Option<Vec<u8>> {
+/// [`StartPicture`]). The pointer is not in it. None if the display is
+/// rotated (the duplication's `rotation`, or a desktop rect that isn't that
+/// size, as for 90 or 270 degrees), if GDI can't read it (no interactive
+/// desktop), or if it read only black, as on the secure desktop: the
+/// duplication's own image is waited for then.
+fn read_screen_gdi(
+    output: &IDXGIOutput1,
+    (width, height): (u32, u32),
+    rotation: Option<DXGI_MODE_ROTATION>,
+) -> Option<Vec<u8>> {
     use windows::Win32::Graphics::Gdi::{
         BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GdiFlush, GetDC,
         ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
     };
+    if !matches!(
+        rotation,
+        Some(DXGI_MODE_ROTATION_IDENTITY | DXGI_MODE_ROTATION_UNSPECIFIED)
+    ) {
+        return None;
+    }
     let rect = unsafe { output.GetDesc() }.ok()?.DesktopCoordinates;
     if (rect.right - rect.left, rect.bottom - rect.top) != (width as i32, height as i32) {
         return None;
@@ -1288,20 +1307,24 @@ fn read_screen_gdi(output: &IDXGIOutput1, (width, height): (u32, u32)) -> Option
                 )
                 .is_ok();
                 let _ = GdiFlush();
-                let pixels = copied.then(|| {
-                    let mut buf = frame_buffer(row_bytes * height as usize);
-                    std::ptr::copy_nonoverlapping(
-                        bits as *const u8,
-                        buf.as_mut_ptr(),
-                        row_bytes * height as usize,
-                    );
-                    // GDI leaves the alpha byte 0; Desktop Duplication's is opaque.
-                    let (pixels, _) = buf[..row_bytes * height as usize].as_chunks_mut::<4>();
-                    for pixel in pixels {
-                        pixel[3] = 255;
-                    }
-                    buf
-                });
+                let pixels = copied
+                    .then(|| {
+                        let mut buf = frame_buffer(row_bytes * height as usize);
+                        std::ptr::copy_nonoverlapping(
+                            bits as *const u8,
+                            buf.as_mut_ptr(),
+                            row_bytes * height as usize,
+                        );
+                        // GDI leaves the alpha byte 0; Desktop Duplication's is opaque.
+                        let (pixels, _) = buf[..row_bytes * height as usize].as_chunks_mut::<4>();
+                        let mut lit = false;
+                        for pixel in pixels {
+                            lit |= pixel[..3] != [0, 0, 0];
+                            pixel[3] = 255;
+                        }
+                        lit.then_some(buf)
+                    })
+                    .flatten();
                 SelectObject(memory, previous);
                 let _ = DeleteObject(bitmap);
                 pixels
@@ -1604,6 +1627,59 @@ fn draw_monochrome_cursor(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Native: GDI reads the primary display at its own size, as opaque BGRA
+    /// in a capture buffer, and nothing at another size or rotation. Needs an
+    /// interactive desktop that isn't all black; skips with no output listed
+    /// (a non-interactive SSH session).
+    /// `cargo test -p eternal-host --lib the_screen_is_read_through_gdi -- --ignored --nocapture`
+    #[test]
+    #[ignore = "native: needs an interactive Windows desktop"]
+    fn the_screen_is_read_through_gdi_only_at_its_own_size_and_rotation() {
+        use windows::Win32::Graphics::Dxgi::Common::{
+            DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE90,
+        };
+        let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.expect("DXGI factory");
+        let shared = SharedControl::new(0, 8_000_000);
+        let (listed, _) = super::super::listing::listed(&shared, &factory);
+        let Some(primary) = listed.into_iter().find(|listed| listed.info.is_primary) else {
+            eprintln!("skipping: no display output is listed in this session");
+            return;
+        };
+        let output: IDXGIOutput1 = primary.output.cast().expect("IDXGIOutput1");
+        let (width, height) = (primary.info.width, primary.info.height);
+        let pixels = read_screen_gdi(&output, (width, height), Some(DXGI_MODE_ROTATION_IDENTITY))
+            .expect("the desktop read through GDI");
+        let picture_bytes = (width * height * 4) as usize;
+        assert_eq!(pixels.len(), picture_bytes + FRAME_PADDING);
+        let (read, _) = pixels[..picture_bytes].as_chunks::<4>();
+        assert!(read.iter().all(|pixel| pixel[3] == 255), "not opaque");
+        assert!(read.iter().any(|pixel| pixel[..3] != [0, 0, 0]));
+        for (size, rotation, what) in [
+            (
+                (width + 1, height),
+                Some(DXGI_MODE_ROTATION_IDENTITY),
+                "another size",
+            ),
+            (
+                (width, height),
+                Some(DXGI_MODE_ROTATION_ROTATE180),
+                "upside down",
+            ),
+            (
+                (width, height),
+                Some(DXGI_MODE_ROTATION_ROTATE90),
+                "a quarter turn",
+            ),
+            ((width, height), None, "no duplication"),
+        ] {
+            assert!(
+                read_screen_gdi(&output, size, rotation).is_none(),
+                "{what} was read"
+            );
+        }
+        eprintln!("read {width}x{height} through GDI");
+    }
 
     /// Native: a real D3D11CreateDevice held past its limit. The caller gets
     /// the timeout on time, a second attempt is refused at once, the late
