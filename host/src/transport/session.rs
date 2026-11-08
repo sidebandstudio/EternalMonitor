@@ -1078,7 +1078,8 @@ impl Session {
 
     /// An iPad checking that this is the PC it paired with, at the address
     /// it asked, before it reconnects there. It starts no session and works
-    /// while another device streams. Only Wi-Fi asks, within
+    /// while another device streams, and through the standby responder while
+    /// nothing streams. Only Wi-Fi asks, within
     /// [`IdentifyLimiter`]'s bounds.
     fn answer_identify(
         &mut self,
@@ -2782,6 +2783,44 @@ mod tests {
             now
         ));
         assert!(answered(&mut session, asker, &identify_config(true), now));
+    }
+
+    /// While no stream runs, the standby responder hands an IDENTIFY to the
+    /// session: it is answered over Wi-Fi as while streaming, never over a
+    /// cable, with an answer no larger than the request, and it starts
+    /// nothing.
+    #[test]
+    fn identify_while_not_streaming_is_answered_as_while_streaming() {
+        let config = identify_config(true);
+        let request = eternal_wire::v2::control::encode_control(0, 1, &identify(1, [3; 16]));
+        for state in [
+            NotStreaming::Stopped,
+            NotStreaming::Restarting,
+            NotStreaming::Failed(FailedReason::Encoder),
+        ] {
+            let mut session = Session::new(100);
+            session.set_not_streaming(Some(state));
+            let mut ask = |peer: PeerId| {
+                let (header, message) = eternal_wire::v2::control::parse_control(&request).unwrap();
+                session.handle_datagram(
+                    peer,
+                    &header,
+                    message,
+                    request.len(),
+                    &config,
+                    Instant::now(),
+                )
+            };
+            assert!(ask(PeerId::usb(1)).replies.is_empty(), "{state:?}");
+            let actions = ask(addr([192, 0, 2, 9], 50100));
+            let identity = identity_reply(&actions);
+            assert_eq!(identity.nonce, [3; 16]);
+            assert_eq!(actions.replies[0].1.len(), request.len());
+            assert_eq!(request.len(), 84);
+            assert!(actions.new_target.is_none());
+            assert!(session.session_id().is_none());
+            assert_eq!(session.not_streaming(), Some(state));
+        }
     }
 
     /// A burst from one address gets 8 answers in 10 s, and the PC 32 in
