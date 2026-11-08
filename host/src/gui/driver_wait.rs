@@ -10,6 +10,9 @@
 //! - then the same wgpu calls the window's thread makes first are made once
 //!   on a thread of their own ([`Call::GpuProbe`]).
 //!
+//! Each is one call, waited for as long as it runs: past its limit the
+//! notice goes up, and a driver that answers late still opens the window.
+//!
 //! Past that, the window's thread can still stall in calls that cannot be
 //! moved off it (its own device and swap chain, a surface it recreates), so
 //! [`watch_first_paint`] watches from another thread until the window is
@@ -160,48 +163,90 @@ impl PromptState {
     }
 }
 
-/// Waits until none of `free` is stuck in `lanes` and `attempt` succeeds,
-/// with the notice up from the first time either fails. False when the
-/// user quit, also by a Cancel that came as the driver answered.
-fn wait_until(
-    lanes: &Lanes,
+/// A limit no startup call reaches: it is waited for as long as it runs.
+const NEVER: Duration = Duration::from_secs(365 * 24 * 60 * 60);
+
+/// Starts a call from `make` in `call`'s lane once none of `free` is stuck,
+/// and waits for it as long as it runs, with the notice up while a lane is
+/// stuck or once the call has run for `limits`' limit. Its result, also a
+/// late one; None when the user quit, also by a Cancel that came as the
+/// driver answered.
+fn await_call<T, F>(
+    lanes: &'static Lanes,
+    call: Call,
+    limits: Limits,
     free: &[Call],
-    mut attempt: impl FnMut() -> bool,
+    mut make: impl FnMut() -> F,
     prompt: &Prompt,
     poll: Duration,
-) -> bool {
+) -> Option<T>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
     let started = Instant::now();
-    loop {
-        if free.iter().all(|&call| lanes.abandoned(call) == 0) && attempt() {
-            if prompt.phase(Instant::now()) == Phase::Quit {
-                break;
+    let unlimited = Limits {
+        warn: limits.warn,
+        limit: NEVER,
+    };
+    let quit = |prompt: &Prompt| {
+        let quit = prompt.phase(Instant::now()) == Phase::Quit;
+        if quit {
+            info!(
+                waited_ms = started.elapsed().as_millis() as u64,
+                "Quit while the window waited for the graphics driver"
+            );
+        }
+        quit
+    };
+    let mut pending = loop {
+        if free.iter().all(|&stuck| lanes.abandoned(stuck) == 0) {
+            if let Ok(pending) = crate::stall::start_on(lanes, call, unlimited, make()) {
+                break pending;
             }
-            if prompt.raised() {
-                info!(
-                    waited_ms = started.elapsed().as_millis() as u64,
-                    "The graphics driver answered; opening the window"
-                );
-            }
-            return true;
         }
         prompt.raise(Instant::now());
-        if prompt.phase(Instant::now()) == Phase::Quit {
-            break;
+        if quit(prompt) {
+            return None;
         }
         std::thread::sleep(poll);
+    };
+    let mut up_to = limits.limit;
+    loop {
+        match pending.wait_up_to(up_to, &mut || {}) {
+            Some(Ok(value)) => {
+                if quit(prompt) {
+                    return None;
+                }
+                if prompt.raised() {
+                    info!(
+                        call = call.name(),
+                        waited_ms = started.elapsed().as_millis() as u64,
+                        "The graphics driver answered"
+                    );
+                }
+                return Some(value);
+            }
+            // Only past a limit no call reaches.
+            Some(Err(_)) => return None,
+            None => {
+                prompt.raise(Instant::now());
+                // Dropped, a call still in the driver keeps its lane taken
+                // until it returns.
+                if quit(prompt) {
+                    return None;
+                }
+                up_to += poll;
+            }
+        }
     }
-    info!(
-        waited_ms = started.elapsed().as_millis() as u64,
-        "Quit while the window waited for the graphics driver"
-    );
-    false
 }
 
 /// The steps before the window's thread makes its first graphics call:
-/// fresh lists from `list` run in [`Call::GpuDetect`] under `list_limits`
-/// until one returns in time, which `configure` gets; then fresh probes from
-/// `probe`, over what `configure` returned, run in [`Call::GpuProbe`] until
-/// one returns in time. False when the user quit from the notice.
+/// a list from `list`, in [`Call::GpuDetect`] under `list_limits`, which
+/// `configure` gets; then a probe from `probe`, over what `configure`
+/// returned, in [`Call::GpuProbe`] under `probe_limits`. Each is waited for
+/// as long as it runs. False when the user quit from the notice.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn before_window<T, L, S, F>(
     lanes: &'static Lanes,
@@ -209,7 +254,7 @@ pub(super) fn before_window<T, L, S, F>(
     probe_limits: Limits,
     prompt: &Prompt,
     poll: Duration,
-    mut list: impl FnMut() -> L,
+    list: impl FnMut() -> L,
     configure: impl FnOnce(T) -> S,
     probe: impl Fn(&S) -> F,
 ) -> bool
@@ -218,50 +263,50 @@ where
     L: FnOnce() -> T + Send + 'static,
     F: FnOnce() + Send + 'static,
 {
-    let mut listed = None;
-    let got_list = wait_until(
+    let Some(adapters) = await_call(
         lanes,
+        Call::GpuDetect,
+        list_limits,
         &[Call::GpuDetect],
-        || match crate::stall::run_on(lanes, Call::GpuDetect, list_limits, list(), || {}) {
-            Ok(adapters) => {
-                listed = Some(adapters);
-                true
-            }
-            Err(_) => false,
-        },
+        list,
         prompt,
         poll,
-    );
-    let Some(adapters) = listed.filter(|_| got_list) else {
+    ) else {
         return false;
     };
     let spec = configure(adapters);
-    wait_until(
+    await_call(
         lanes,
+        Call::GpuProbe,
+        probe_limits,
         &[Call::GpuDetect, Call::GpuProbe],
-        || crate::stall::run_on(lanes, Call::GpuProbe, probe_limits, probe(&spec), || {}).is_ok(),
+        || probe(&spec),
         prompt,
         poll,
     )
+    .is_some()
 }
 
 /// Watches the window from another thread until the wait ends
 /// ([`FirstPaintWatch::finisher`], called when the window is confirmed
-/// drawing, or [`FirstPaintWatch::stop`]). The notice goes up once the
-/// window's thread has begun no UI pass (`last_pass`, with whether the
-/// window was minimized then) for `limit`, counted from now before the
-/// first; a minimized window draws nothing and is left alone. Cancel runs
-/// `quit`, which ends the process: the window's thread may never return.
+/// drawing, or [`FirstPaintWatch::stop`]). The notice goes up once `limit`
+/// has passed since the latest of: the watch's start, the window thread's
+/// last UI pass (`last_pass`), and the last time the watcher saw the window
+/// held (`held`: minimized, or its title bar held, when a working window
+/// runs no UI pass either). Cancel runs `quit`, which ends the process: the
+/// window's thread may never return.
 pub(super) fn watch_first_paint(
     prompt: Prompt,
     limit: Duration,
     poll: Duration,
     now: impl Fn() -> Instant + Send + 'static,
-    last_pass: impl Fn() -> Option<(Instant, bool)> + Send + 'static,
+    last_pass: impl Fn() -> Option<Instant> + Send + 'static,
+    held: impl Fn() -> bool + Send + 'static,
     quit: impl FnOnce() + Send + 'static,
 ) -> FirstPaintWatch {
     let started = now();
     let watched = prompt.clone();
+    let mut last_held = None;
     let watch = move || loop {
         match watched.phase(now()) {
             Phase::Quit => {
@@ -273,8 +318,15 @@ pub(super) fn watch_first_paint(
             Phase::Waiting => {}
         }
         let at = now();
-        let (since, minimized) = last_pass().unwrap_or((started, false));
-        if !minimized && at.saturating_duration_since(since.max(started)) >= limit {
+        if held() {
+            last_held = Some(at);
+        }
+        let quiet_since = [Some(started), last_pass(), last_held]
+            .into_iter()
+            .flatten()
+            .max()
+            .unwrap_or(started);
+        if at.saturating_duration_since(quiet_since) >= limit {
             watched.raise(at);
         }
         std::thread::sleep(poll);
@@ -304,12 +356,10 @@ impl FirstPaintWatch {
     }
 
     /// The window ended: the wait is over, and the watcher is done. A
-    /// Cancel given by then still quits.
-    pub(super) fn stop(self) {
+    /// Cancel given by then still quits. Err if the watcher panicked.
+    pub(super) fn stop(self) -> std::thread::Result<()> {
         self.prompt.finish();
-        if let Some(thread) = self.thread {
-            let _ = thread.join();
-        }
+        self.thread.map_or(Ok(()), std::thread::JoinHandle::join)
     }
 }
 
@@ -384,17 +434,26 @@ impl Notice for MessageNotice {
         let Some(shown) = self.shown.take() else {
             return;
         };
-        // The box may not be up yet when the driver answers at once, so ask
-        // again until its thread ends. Bounded: the window opens regardless.
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !shown.answer.is_finished() && Instant::now() < deadline {
-            let thread = shown.thread.load(Ordering::SeqCst);
-            if thread != 0 {
-                unsafe {
-                    let _ = EnumThreadWindows(thread, Some(close_window), LPARAM(0));
+        // On a thread of its own: this may run on the window's thread, under
+        // the prompt's lock. The box may not be up yet when the driver
+        // answers at once, so ask again until its thread ends, for 2 s.
+        let closing = move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !shown.answer.is_finished() && Instant::now() < deadline {
+                let thread = shown.thread.load(Ordering::SeqCst);
+                if thread != 0 {
+                    unsafe {
+                        let _ = EnumThreadWindows(thread, Some(close_window), LPARAM(0));
+                    }
                 }
+                std::thread::sleep(Duration::from_millis(50));
             }
-            std::thread::sleep(Duration::from_millis(50));
+        };
+        if let Err(error) = std::thread::Builder::new()
+            .name("driver-wait-notice-close".into())
+            .spawn(closing)
+        {
+            warn!(%error, "Could not close the graphics driver notice");
         }
     }
 }
@@ -405,9 +464,16 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering::SeqCst};
     use std::sync::mpsc;
 
-    const LIMITS: Limits = Limits {
+    /// For a call that hangs until the test releases it.
+    const SHORT: Limits = Limits {
         warn: Duration::from_millis(100),
         limit: Duration::from_millis(300),
+    };
+    /// For a call that answers: a slow machine never reaches it, so the
+    /// events stay exactly what the test lists.
+    const LONG: Limits = Limits {
+        warn: Duration::from_secs(30),
+        limit: Duration::from_secs(60),
     };
     const SLICE: Duration = Duration::from_millis(1);
 
@@ -478,7 +544,7 @@ mod tests {
         let result = crate::stall::run_on(
             lanes,
             Call::GpuDetect,
-            LIMITS,
+            SHORT,
             move || {
                 let _ = held.recv();
             },
@@ -496,6 +562,7 @@ mod tests {
     fn start_before_window(
         lanes: &'static Lanes,
         fake: &Fake,
+        (list_limits, probe_limits): (Limits, Limits),
         list: impl FnMut() -> ListStep + Send + 'static,
         probe: impl Fn() -> ProbeStep + Send + 'static,
     ) -> std::thread::JoinHandle<bool> {
@@ -505,8 +572,8 @@ mod tests {
             let configured = events.clone();
             before_window(
                 lanes,
-                LIMITS,
-                LIMITS,
+                list_limits,
+                probe_limits,
                 &prompt,
                 SLICE,
                 list,
@@ -534,6 +601,28 @@ mod tests {
         Box::new(move || events.push("probe"))
     }
 
+    /// A step that blocks until the test sends on the returned sender, and
+    /// says when it started.
+    fn held_step(
+        events: &Events,
+        name: &'static str,
+    ) -> (
+        mpsc::Sender<()>,
+        mpsc::Receiver<()>,
+        Box<dyn FnOnce() + Send>,
+    ) {
+        let (release, held) = mpsc::channel::<()>();
+        let (started, running) = mpsc::channel::<()>();
+        let events = events.clone();
+        let step = Box::new(move || {
+            events.push(name);
+            let _ = started.send(());
+            let _ = held.recv();
+            events.push(format!("{name} returned"));
+        });
+        (release, running, step)
+    }
+
     #[test]
     fn a_driver_that_answers_opens_the_window_without_a_notice() {
         let fake = Fake::default();
@@ -541,6 +630,7 @@ mod tests {
         let opened = start_before_window(
             lanes(),
             &fake,
+            (LONG, LONG),
             move || listing(&list_events, "10de:2c02 32.0"),
             move || probing(&probe_events),
         );
@@ -560,6 +650,7 @@ mod tests {
         let opened = start_before_window(
             lanes,
             &fake,
+            (LONG, LONG),
             move || listing(&list_events, "gpus"),
             move || probing(&probe_events),
         );
@@ -576,102 +667,97 @@ mod tests {
     }
 
     #[test]
-    fn a_list_that_stalls_is_never_configured_and_the_next_one_is() {
+    fn a_list_that_answers_after_its_limit_is_waited_for_and_configures_once() {
         let lanes = lanes();
         let fake = Fake::default();
-        let (started, list_started) = mpsc::channel::<()>();
-        let (release, held) = mpsc::channel::<()>();
-        let held = Arc::new(Mutex::new(Some(held)));
-        let (list_events, probe_events) = (fake.events.clone(), fake.events.clone());
+        let (release, list_running, step) = held_step(&fake.events, "list");
+        let step = Arc::new(Mutex::new(Some(step)));
+        let probe_events = fake.events.clone();
         let opened = start_before_window(
             lanes,
             &fake,
+            (SHORT, LONG),
             move || {
-                let events = list_events.clone();
-                let started = started.clone();
-                // The first list blocks in the driver; the next answers.
-                let held = held.lock().take();
+                let step = step.lock().take().expect("listed once");
                 Box::new(move || {
-                    let _ = started.send(());
-                    match held {
-                        Some(held) => {
-                            let _ = held.recv();
-                            events.push("stalled list returned");
-                            "late".to_string()
-                        }
-                        None => {
-                            events.push("list");
-                            "gpus".to_string()
-                        }
-                    }
+                    step();
+                    "late".to_string()
                 })
             },
             move || probing(&probe_events),
         );
-        list_started.recv().unwrap();
+        list_running.recv().unwrap();
         fake.events.wait_for("shown", 1);
-        assert_eq!(fake.events.all(), ["shown"]);
         release.send(()).unwrap();
         assert!(opened.join().unwrap());
-        // The stalled list's result was dropped; the one that returned in
-        // time configured the renderer, once.
+        // One list, past its limit; its late result configured the renderer.
         assert_eq!(
             fake.events.all(),
-            [
-                "shown",
-                "stalled list returned",
-                "list",
-                "configure gpus",
-                "probe"
-            ]
+            ["list", "shown", "list returned", "configure late", "probe"]
         );
+        assert_eq!(lanes.abandoned(Call::GpuDetect), 0);
     }
 
     #[test]
-    fn a_probe_that_hangs_raises_the_notice_and_the_next_one_opens_the_window() {
+    fn a_probe_that_answers_after_its_limit_opens_the_window() {
         let lanes = lanes();
         let fake = Fake::default();
-        let (started, probe_started) = mpsc::channel::<()>();
-        let (release, held) = mpsc::channel::<()>();
-        let held = Arc::new(Mutex::new(Some(held)));
-        let (list_events, probe_events) = (fake.events.clone(), fake.events.clone());
+        let (release, probe_running, step) = held_step(&fake.events, "probe");
+        let step = Arc::new(Mutex::new(Some(step)));
+        let list_events = fake.events.clone();
         let opened = start_before_window(
             lanes,
             &fake,
+            (LONG, SHORT),
             move || listing(&list_events, "gpus"),
-            move || {
-                let events = probe_events.clone();
-                let started = started.clone();
-                let held = held.lock().take();
-                Box::new(move || {
-                    events.push("probe");
-                    let _ = started.send(());
-                    if let Some(held) = held {
-                        let _ = held.recv();
-                        events.push("probe returned");
-                    }
-                })
-            },
+            move || step.lock().take().expect("probed once"),
         );
-        probe_started.recv().unwrap();
+        probe_running.recv().unwrap();
         fake.events.wait_for("shown", 1);
         release.send(()).unwrap();
         assert!(opened.join().unwrap());
         assert_eq!(
             fake.events.all(),
-            [
-                "list",
-                "configure gpus",
-                "probe",
-                "shown",
-                "probe returned",
-                "probe"
-            ]
+            ["list", "configure gpus", "probe", "shown", "probe returned"]
         );
+        assert_eq!(lanes.abandoned(Call::GpuProbe), 0);
     }
 
     #[test]
-    fn cancel_opens_no_window() {
+    fn cancel_while_a_call_hangs_opens_no_window_and_leaves_its_lane_taken() {
+        let lanes = lanes();
+        let fake = Fake::default();
+        let (release, probe_running, step) = held_step(&fake.events, "probe");
+        let step = Arc::new(Mutex::new(Some(step)));
+        let list_events = fake.events.clone();
+        let opened = start_before_window(
+            lanes,
+            &fake,
+            (LONG, SHORT),
+            move || listing(&list_events, "gpus"),
+            move || step.lock().take().expect("probed once"),
+        );
+        probe_running.recv().unwrap();
+        fake.events.wait_for("shown", 1);
+        *fake.answer.lock() = Some(Answer::Quit);
+        assert!(!opened.join().unwrap());
+        assert_eq!(
+            fake.events.all(),
+            ["list", "configure gpus", "probe", "shown", "cancel"]
+        );
+        // The probe still runs in the driver; its lane says so until it
+        // returns.
+        assert_eq!(lanes.abandoned(Call::GpuProbe), 1);
+        release.send(()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while lanes.abandoned(Call::GpuProbe) != 0 {
+            assert!(Instant::now() < deadline, "the lane did not free");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn cancel_while_detection_is_stuck_opens_no_window() {
         let lanes = lanes();
         let _release = stuck_detection(lanes);
         let fake = Fake::default();
@@ -680,6 +766,7 @@ mod tests {
         let opened = start_before_window(
             lanes,
             &fake,
+            (LONG, LONG),
             move || listing(&list_events, "gpus"),
             move || probing(&probe_events),
         );
@@ -695,10 +782,11 @@ mod tests {
         let answer = Arc::clone(&fake.answer);
         let list_events = fake.events.clone();
         // The user clicks Cancel while the probe runs, the moment before it
-        // returns in time.
+        // returns.
         let opened = start_before_window(
             lanes,
             &fake,
+            (LONG, LONG),
             move || listing(&list_events, "gpus"),
             move || {
                 let answer = Arc::clone(&answer);
@@ -741,35 +829,48 @@ mod tests {
         assert_eq!(fake.events.all(), ["shown", "closed"]);
     }
 
-    /// A clock the test moves on by hand.
-    fn manual_clock() -> (Arc<AtomicU64>, impl Fn() -> Instant + Send + 'static) {
-        let start = Instant::now();
-        let ms = Arc::new(AtomicU64::new(0));
-        let read = Arc::clone(&ms);
-        (ms, move || start + Duration::from_millis(read.load(SeqCst)))
-    }
-
-    /// The renderer's view of the window: when its thread last began a UI
-    /// pass, in the manual clock's time.
-    #[derive(Clone)]
-    struct Passes {
+    /// A clock the test moves on by hand, and what the renderer and the live
+    /// window check report, in its time.
+    struct World {
         start: Instant,
-        last: Arc<Mutex<Option<(Instant, bool)>>>,
+        ms: Arc<AtomicU64>,
+        last_pass: Arc<Mutex<Option<Instant>>>,
+        held: Arc<AtomicBool>,
     }
 
-    impl Passes {
-        fn new(now: &impl Fn() -> Instant) -> Self {
+    impl World {
+        fn new() -> Self {
             Self {
-                start: now(),
-                last: Arc::default(),
+                start: Instant::now(),
+                ms: Arc::default(),
+                last_pass: Arc::default(),
+                held: Arc::default(),
             }
         }
-        fn pass_at(&self, ms: u64, minimized: bool) {
-            *self.last.lock() = Some((self.start + Duration::from_millis(ms), minimized));
+        fn at(&self, ms: u64) {
+            self.ms.store(ms, SeqCst);
         }
-        fn reader(&self) -> impl Fn() -> Option<(Instant, bool)> + Send + 'static {
-            let last = Arc::clone(&self.last);
-            move || *last.lock()
+        fn pass_at(&self, ms: u64) {
+            *self.last_pass.lock() = Some(self.start + Duration::from_millis(ms));
+            self.at(ms);
+        }
+        fn watch(&self, fake: &Fake, quit: impl FnOnce() + Send + 'static) -> FirstPaintWatch {
+            let (start, ms) = (self.start, Arc::clone(&self.ms));
+            let last_pass = Arc::clone(&self.last_pass);
+            let held = Arc::clone(&self.held);
+            watch_first_paint(
+                Prompt::new(fake.clone()),
+                SHORT.limit,
+                SLICE,
+                move || start + Duration::from_millis(ms.load(SeqCst)),
+                move || *last_pass.lock(),
+                move || held.load(SeqCst),
+                quit,
+            )
+        }
+        /// Lets the watcher look a few times.
+        fn settle(&self) {
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -777,102 +878,88 @@ mod tests {
         || panic!("quit")
     }
 
+    const LIMIT_MS: u64 = SHORT.limit.as_millis() as u64;
+
     #[test]
     fn a_window_that_draws_in_time_shows_no_notice() {
         let fake = Fake::default();
-        let (clock, now) = manual_clock();
-        let passes = Passes::new(&now);
-        let watch = watch_first_paint(
-            Prompt::new(fake.clone()),
-            LIMITS.limit,
-            SLICE,
-            now,
-            passes.reader(),
-            never_quit(),
-        );
+        let world = World::new();
+        let watch = world.watch(&fake, never_quit());
         // UI passes keep coming; then the window is confirmed drawing.
         for ms in [100, 300, 500, 700] {
-            passes.pass_at(ms, false);
-            clock.store(ms + 50, SeqCst);
-            std::thread::sleep(Duration::from_millis(5));
+            world.pass_at(ms);
+            world.settle();
         }
         (watch.finisher())();
-        watch.stop();
+        watch.stop().unwrap();
         assert!(fake.events.all().is_empty(), "{:?}", fake.events.all());
     }
 
     #[test]
     fn a_failed_first_acquire_then_a_stuck_recreation_gets_the_notice_until_the_window_draws() {
         let fake = Fake::default();
-        let (clock, now) = manual_clock();
-        let passes = Passes::new(&now);
-        let watch = watch_first_paint(
-            Prompt::new(fake.clone()),
-            LIMITS.limit,
-            SLICE,
-            now,
-            passes.reader(),
-            never_quit(),
-        );
+        let world = World::new();
+        let watch = world.watch(&fake, never_quit());
         // The first pass ran and its frame's surface acquire failed, so the
         // renderer did not confirm the window; recreating the surface at the
         // start of the next paint never returns: no more passes.
-        passes.pass_at(200, false);
-        let stuck_at = 200 + LIMITS.limit.as_millis() as u64;
-        clock.store(stuck_at - 1, SeqCst);
-        std::thread::sleep(Duration::from_millis(20));
+        world.pass_at(200);
+        world.at(200 + LIMIT_MS - 1);
+        world.settle();
         assert!(fake.events.all().is_empty(), "{:?}", fake.events.all());
-        clock.store(stuck_at, SeqCst);
+        world.at(200 + LIMIT_MS);
         fake.events.wait_for("shown", 1);
         // OK, then the reminder while it is still stuck.
         *fake.answer.lock() = Some(Answer::Wait);
         fake.events.wait_for("ok", 1);
-        clock.fetch_add(REMIND_AFTER.as_millis() as u64, SeqCst);
+        world.at(200 + LIMIT_MS + REMIND_AFTER.as_millis() as u64 + 1);
         fake.events.wait_for("shown", 2);
         // It comes back and is confirmed drawing: the notice goes.
         (watch.finisher())();
-        watch.thread.unwrap().join().unwrap();
+        watch.stop().unwrap();
         assert_eq!(fake.events.all(), ["shown", "ok", "shown", "closed"]);
     }
 
     #[test]
-    fn a_minimized_window_gets_no_notice() {
+    fn a_minimized_window_gets_no_notice_and_is_counted_from_when_it_is_restored() {
         let fake = Fake::default();
-        let (clock, now) = manual_clock();
-        let passes = Passes::new(&now);
-        let watch = watch_first_paint(
-            Prompt::new(fake.clone()),
-            LIMITS.limit,
-            SLICE,
-            now,
-            passes.reader(),
-            never_quit(),
-        );
-        passes.pass_at(100, true);
-        clock.store(100 + LIMITS.limit.as_millis() as u64 * 10, SeqCst);
-        std::thread::sleep(Duration::from_millis(20));
-        watch.stop();
+        let world = World::new();
+        let watch = world.watch(&fake, never_quit());
+        // One pass, then minimized: eframe runs no pass for a minimized
+        // window, so nothing reaches the renderer; only the live check sees
+        // it.
+        world.pass_at(100);
+        world.held.store(true, SeqCst);
+        for ms in (200..=100 * LIMIT_MS).step_by(LIMIT_MS as usize) {
+            world.at(ms);
+            world.settle();
+        }
         assert!(fake.events.all().is_empty(), "{:?}", fake.events.all());
+        // Restored at `back`, and its passes never come.
+        let back = 100 * LIMIT_MS + 1;
+        world.at(back);
+        world.settle();
+        world.held.store(false, SeqCst);
+        world.at(back + LIMIT_MS - 1);
+        world.settle();
+        assert!(fake.events.all().is_empty(), "{:?}", fake.events.all());
+        world.at(back + LIMIT_MS + 1);
+        fake.events.wait_for("shown", 1);
+        watch.stop().unwrap();
+        assert_eq!(fake.events.all(), ["shown", "closed"]);
     }
 
     #[test]
     fn cancel_while_the_window_is_stuck_quits_from_the_watcher() {
         let fake = Fake::default();
-        let (clock, now) = manual_clock();
-        clock.store(LIMITS.limit.as_millis() as u64, SeqCst);
+        let world = World::new();
         let quits = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&quits);
         *fake.answer.lock() = Some(Answer::Quit);
-        let watch = watch_first_paint(
-            Prompt::new(fake.clone()),
-            Duration::ZERO,
-            SLICE,
-            now,
-            || None,
-            move || {
-                count.fetch_add(1, SeqCst);
-            },
-        );
+        let watch = world.watch(&fake, move || {
+            count.fetch_add(1, SeqCst);
+        });
+        world.at(LIMIT_MS);
         watch.thread.unwrap().join().unwrap();
         assert_eq!(quits.load(SeqCst), 1);
         assert_eq!(fake.events.all(), ["shown", "cancel"]);
@@ -881,7 +968,6 @@ mod tests {
     #[test]
     fn a_cancel_that_comes_with_the_window_drawing_still_quits() {
         let fake = Fake::default();
-        let (_clock, now) = manual_clock();
         let quits = Arc::new(AtomicUsize::new(0));
         let count = Arc::clone(&quits);
         let prompt = Prompt::new(fake.clone());
@@ -894,8 +980,9 @@ mod tests {
             prompt,
             REMIND_AFTER,
             SLICE,
-            now,
+            Instant::now,
             || None,
+            || false,
             move || {
                 count.fetch_add(1, SeqCst);
             },
@@ -922,20 +1009,21 @@ mod tests {
                 let _ = reading.send(());
                 let _ = proceed.lock().unwrap().recv();
             }
-            start + LIMITS.limit * 2
+            start + SHORT.limit * 2
         };
         let watch = watch_first_paint(
             Prompt::new(fake.clone()),
-            LIMITS.limit,
+            SHORT.limit,
             SLICE,
             now,
             || None,
+            || false,
             never_quit(),
         );
         clock_read.recv().unwrap();
         (watch.finisher())();
         go.send(()).unwrap();
-        watch.thread.unwrap().join().unwrap();
+        watch.stop().unwrap();
         assert!(fake.events.all().is_empty(), "{:?}", fake.events.all());
     }
 }

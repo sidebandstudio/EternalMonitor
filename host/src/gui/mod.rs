@@ -381,6 +381,7 @@ pub struct AnalyzerApp {
 
 impl AnalyzerApp {
     pub fn new(cc: &eframe::CreationContext<'_>, control: GuiControl) -> Self {
+        renderer::remember_window(cc);
         // Load persisted settings first; values fall back to the live runtime state when the
         // file is missing or unreadable.
         let persisted = SettingsFile::load();
@@ -1829,6 +1830,7 @@ pub fn run_gui(
             driver_wait::POLL,
             std::time::Instant::now,
             renderer::last_pass,
+            renderer::window_held,
             move || {
                 renderer::abandon();
                 quit_while_stuck();
@@ -1849,7 +1851,7 @@ pub fn run_gui(
         Box::new(|cc| Ok(Box::new(AnalyzerApp::new(cc, control)))),
     );
     #[cfg(windows)]
-    watch.stop();
+    let _ = watch.stop();
     if result.is_ok() {
         renderer::window_closed();
     }

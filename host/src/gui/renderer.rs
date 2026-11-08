@@ -116,6 +116,9 @@ const HISTORY_LOCK: &str = "history.lock";
 /// at the first present, within milliseconds.
 const CONFIRM_AFTER: Duration = Duration::from_secs(3);
 const CONFIRM_FRAMES: u64 = 10;
+/// Frames after asking for the proof of a presented frame before asking
+/// again: the ask is dropped with a frame whose surface was not acquired.
+const PROOF_AGAIN_AFTER: u64 = 3 * CONFIRM_FRAMES;
 
 static STATE_DIR: OnceLock<PathBuf> = OnceLock::new();
 static LAUNCH: Mutex<Launch> = Mutex::new(Launch::new());
@@ -127,9 +130,12 @@ static STATUS: Mutex<Option<Status>> = Mutex::new(None);
 /// keys come from until it is confirmed drawing: no more DXGI calls on its
 /// thread before then.
 static ADAPTERS: Mutex<Option<Vec<(u32, u32, String)>>> = Mutex::new(None);
-/// When the window's thread last began a UI pass, and whether the window
-/// was minimized then.
-static LAST_PASS: Mutex<Option<(Instant, bool)>> = Mutex::new(None);
+/// When the window's thread last began a UI pass.
+static LAST_PASS: Mutex<Option<Instant>> = Mutex::new(None);
+/// The window, once it exists (an HWND on Windows), for checks made from
+/// other threads while its own may be stuck.
+#[cfg_attr(not(windows), allow(dead_code))]
+static WINDOW: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 /// Run once, when the window is confirmed drawing.
 type OnDrawing = Box<dyn FnOnce() + Send>;
 static ON_DRAWING: Mutex<Option<OnDrawing>> = Mutex::new(None);
@@ -632,26 +638,43 @@ fn save_marker(directory: &Path, owner: ProcessId, marker: &Marker) -> bool {
         .is_ok_and(|json| fs::write(marker_path(directory, owner), json).is_ok())
 }
 
+/// Marks the screenshot that proves a frame was presented.
+struct PresentProof;
+
 /// Called at the start of each UI pass; clears this launch's marker once the
 /// window has kept drawing without a surface error.
 pub(super) fn frame_started(ctx: &egui::Context) {
     crate::startup::simulate_surface_error(&FAILED_ACQUIRES);
     let visible = ctx.input(|input| input.viewport().minimized != Some(true));
     if let Ok(mut last) = LAST_PASS.lock() {
-        *last = Some((Instant::now(), !visible));
+        *last = Some(Instant::now());
     }
+    let proof = ctx.input(|input| {
+        input.events.iter().any(|event| {
+            matches!(event, egui::Event::Screenshot { user_data, .. }
+                if user_data.data.as_ref().is_some_and(|data| data.is::<PresentProof>()))
+        })
+    });
     let Ok(mut tracker) = PRESENT.lock() else {
         return;
     };
-    let now_drawing = tracker.observe(
+    let step = tracker.observe(
         ctx.cumulative_frame_nr(),
         FAILED_ACQUIRES.load(Ordering::SeqCst),
         visible,
         Instant::now(),
+        proof,
     );
     let drawing = tracker.confirmed;
     drop(tracker);
-    if now_drawing {
+    if step == Step::Prove {
+        // egui-wgpu answers only after it acquired the surface, drew the
+        // frame into it and submitted it, right before the present.
+        ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::new(
+            PresentProof,
+        )));
+    }
+    if step == Step::Confirmed {
         crate::startup::mark_window_shown();
         info!("Window renderer is drawing");
         let on_drawing = ON_DRAWING.lock().ok().and_then(|mut hook| hook.take());
@@ -664,11 +687,59 @@ pub(super) fn frame_started(ctx: &egui::Context) {
     }
 }
 
-/// When the window's thread last began a UI pass, and whether the window
-/// was minimized then. None before the first.
+/// When the window's thread last began a UI pass. None before the first.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub(super) fn last_pass() -> Option<(Instant, bool)> {
+pub(super) fn last_pass() -> Option<Instant> {
     LAST_PASS.lock().ok().and_then(|last| *last)
+}
+
+/// Remember the window, for [`window_held`].
+pub(super) fn remember_window(cc: &eframe::CreationContext<'_>) {
+    #[cfg(windows)]
+    {
+        use eframe::wgpu::rwh::{HasWindowHandle, RawWindowHandle};
+        if let Ok(handle) = cc.window_handle() {
+            if let RawWindowHandle::Win32(window) = handle.as_raw() {
+                WINDOW.store(window.hwnd.get(), Ordering::SeqCst);
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    let _ = cc;
+}
+
+/// Whether the window is minimized, or its thread is in the move/size or
+/// menu loop Windows runs while the title bar is held: no UI pass runs then
+/// in a working window either. Read from another thread, live.
+#[cfg(windows)]
+pub(super) fn window_held() -> bool {
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetGUIThreadInfo, GetWindowThreadProcessId, IsIconic, GUITHREADINFO, GUI_INMENUMODE,
+        GUI_INMOVESIZE,
+    };
+    let hwnd = WINDOW.load(Ordering::SeqCst);
+    if hwnd == 0 {
+        return false;
+    }
+    let hwnd = HWND(hwnd as _);
+    if unsafe { IsIconic(hwnd) }.as_bool() {
+        return true;
+    }
+    let thread = unsafe { GetWindowThreadProcessId(hwnd, None) };
+    let mut info = GUITHREADINFO {
+        cbSize: std::mem::size_of::<GUITHREADINFO>() as u32,
+        ..Default::default()
+    };
+    thread != 0
+        && unsafe { GetGUIThreadInfo(thread, &mut info) }.is_ok()
+        && (info.flags & (GUI_INMOVESIZE | GUI_INMENUMODE)).0 != 0
+}
+
+#[cfg(not(windows))]
+#[allow(dead_code)]
+pub(super) fn window_held() -> bool {
+    false
 }
 
 /// Run `hook` once, when the window is confirmed drawing: frames presented
@@ -713,12 +784,14 @@ fn finish_launch(directory: &Path, marker: &Marker, owner: ProcessId, drew: bool
     true
 }
 
-/// Confirms a working window from the frame counter, the time and surface
-/// errors. egui-wgpu presents inside its painter and reports nothing after a
-/// present; a surface it fails to recreate is not reported at all. So the
-/// window must keep drawing for a while after the last reported error, which
-/// takes it past device creation and the first presents, where the drivers of
-/// issue #59 fail.
+/// Confirms a working window from the frame counter, the time, surface
+/// errors and a proof of a presented frame. egui-wgpu presents inside its
+/// painter and reports nothing after a present; a surface it fails to
+/// recreate is not reported at all, and its later paints return before
+/// drawing. So the window must keep drawing for a while after the last
+/// reported error, which takes it past device creation and the first
+/// presents, where the drivers of issue #59 fail, and then answer a
+/// screenshot, which egui-wgpu takes only from a frame it acquired and drew.
 struct PresentTracker {
     span: Option<Span>,
     confirmed: bool,
@@ -730,6 +803,18 @@ struct Span {
     since: Instant,
     first_frame: u64,
     failures: u64,
+    /// The frame that asked for the proof in this span.
+    asked: Option<u64>,
+}
+
+/// What a UI pass does for the confirmation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Step {
+    Wait,
+    /// Ask for the proof: a screenshot of this frame.
+    Prove,
+    /// Confirmed, once.
+    Confirmed,
 }
 
 impl PresentTracker {
@@ -740,20 +825,38 @@ impl PresentTracker {
         }
     }
 
-    /// True once: after [`CONFIRM_AFTER`] and [`CONFIRM_FRAMES`] of visible
-    /// frames with no new surface error. A surface error or a minimized
-    /// window starts the span again.
-    fn observe(&mut self, frame: u64, failures: u64, visible: bool, now: Instant) -> bool {
+    /// After [`CONFIRM_AFTER`] and [`CONFIRM_FRAMES`] of visible frames with
+    /// no new surface error, asks for the proof (again after
+    /// [`PROOF_AGAIN_AFTER`] frames without it), and confirms once it came
+    /// (`proof`) in the same span. A surface error or a minimized window
+    /// starts the span again.
+    fn observe(
+        &mut self,
+        frame: u64,
+        failures: u64,
+        visible: bool,
+        now: Instant,
+        proof: bool,
+    ) -> Step {
         if self.confirmed {
-            return false;
+            return Step::Wait;
         }
-        match self.span {
+        match self.span.as_mut() {
             Some(span) if visible && span.failures == failures => {
-                if frame >= span.first_frame + CONFIRM_FRAMES
+                if let Some(asked) = span.asked {
+                    if proof {
+                        self.confirmed = true;
+                        return Step::Confirmed;
+                    }
+                    if frame >= asked + PROOF_AGAIN_AFTER {
+                        span.asked = Some(frame);
+                        return Step::Prove;
+                    }
+                } else if frame >= span.first_frame + CONFIRM_FRAMES
                     && now.duration_since(span.since) >= CONFIRM_AFTER
                 {
-                    self.confirmed = true;
-                    return true;
+                    span.asked = Some(frame);
+                    return Step::Prove;
                 }
             }
             _ => {
@@ -761,10 +864,11 @@ impl PresentTracker {
                     since: now,
                     first_frame: frame,
                     failures,
+                    asked: None,
                 });
             }
         }
-        false
+        Step::Wait
     }
 }
 
@@ -2277,49 +2381,117 @@ mod tests {
     }
 
     /// Visible frames every 200 ms, as the GUI repaints, counted from `start`.
+    /// Frames `frames` a 200 ms apart, the proof answering the frame after
+    /// each ask: whether the window was confirmed.
     fn run(
         tracker: &mut PresentTracker,
         start: Instant,
         frames: std::ops::Range<u64>,
         failures: u64,
     ) -> bool {
+        let mut asked = false;
         frames.into_iter().any(|frame| {
-            tracker.observe(
+            let step = tracker.observe(
                 frame,
                 failures,
                 true,
                 start + Duration::from_millis(200 * frame),
-            )
+                std::mem::take(&mut asked),
+            );
+            asked = step == Step::Prove;
+            step == Step::Confirmed
         })
     }
 
     #[test]
-    fn the_window_works_after_frames_and_time_without_surface_errors() {
+    fn the_window_works_after_frames_and_time_without_surface_errors_and_a_proof() {
         let start = Instant::now();
         let mut tracker = PresentTracker::new();
         // Frames alone are not enough: egui may lay out one frame many times.
         for frame in 0..100 {
-            assert!(!tracker.observe(frame, 0, true, start));
+            assert_eq!(tracker.observe(frame, 0, true, start, false), Step::Wait);
         }
-        assert!(tracker.observe(100, 0, true, start + CONFIRM_AFTER));
+        assert_eq!(
+            tracker.observe(100, 0, true, start + CONFIRM_AFTER, false),
+            Step::Prove
+        );
+        assert_eq!(
+            tracker.observe(101, 0, true, start + CONFIRM_AFTER, true),
+            Step::Confirmed
+        );
         let mut tracker = PresentTracker::new();
         // Nor is time alone, with one frame laid out repeatedly.
-        assert!(!tracker.observe(0, 0, true, start));
-        assert!(!tracker.observe(0, 0, true, start + 10 * CONFIRM_AFTER));
-        assert!(tracker.observe(CONFIRM_FRAMES, 0, true, start + CONFIRM_AFTER));
-        assert!(!tracker.observe(CONFIRM_FRAMES + 1, 0, true, start + CONFIRM_AFTER));
+        assert_eq!(tracker.observe(0, 0, true, start, false), Step::Wait);
+        assert_eq!(
+            tracker.observe(0, 0, true, start + 10 * CONFIRM_AFTER, false),
+            Step::Wait
+        );
+        assert_eq!(
+            tracker.observe(CONFIRM_FRAMES, 0, true, start + CONFIRM_AFTER, false),
+            Step::Prove
+        );
+        assert_eq!(
+            tracker.observe(CONFIRM_FRAMES + 1, 0, true, start + CONFIRM_AFTER, true),
+            Step::Confirmed
+        );
+        // Once.
+        assert_eq!(
+            tracker.observe(CONFIRM_FRAMES + 2, 0, true, start + CONFIRM_AFTER, true),
+            Step::Wait
+        );
+    }
+
+    #[test]
+    fn frames_that_present_nothing_are_never_confirmed() {
+        let start = Instant::now();
+        let later = start + CONFIRM_AFTER;
+        let mut tracker = PresentTracker::new();
+        assert_eq!(tracker.observe(0, 0, true, start, false), Step::Wait);
+        assert_eq!(
+            tracker.observe(CONFIRM_FRAMES, 0, true, later, false),
+            Step::Prove
+        );
+        // The surface was removed and its recreation failed: egui-wgpu's
+        // paints return before drawing, with no surface error, and the UI
+        // passes go on. No screenshot answers, so nothing is confirmed; the
+        // ask is repeated now and then.
+        for frame in CONFIRM_FRAMES + 1..CONFIRM_FRAMES + PROOF_AGAIN_AFTER {
+            assert_eq!(tracker.observe(frame, 0, true, later, false), Step::Wait);
+        }
+        assert_eq!(
+            tracker.observe(CONFIRM_FRAMES + PROOF_AGAIN_AFTER, 0, true, later, false),
+            Step::Prove
+        );
+        // A proof after a surface error is not this span's.
+        let mut tracker = PresentTracker::new();
+        tracker.observe(0, 0, true, start, false);
+        assert_eq!(
+            tracker.observe(CONFIRM_FRAMES, 0, true, later, false),
+            Step::Prove
+        );
+        assert_eq!(
+            tracker.observe(CONFIRM_FRAMES + 1, 1, true, later, true),
+            Step::Wait
+        );
+        assert_eq!(
+            tracker.observe(CONFIRM_FRAMES + 2, 1, true, later, true),
+            Step::Wait
+        );
     }
 
     #[test]
     fn a_lost_surface_that_is_recreated_late_is_not_a_working_window() {
         let start = Instant::now();
         let mut tracker = PresentTracker::new();
-        assert!(!tracker.observe(0, 0, true, start));
+        assert_eq!(tracker.observe(0, 0, true, start, false), Step::Wait);
         // Lost: egui reports it and recreates the surface on the next frame,
         // which can fail without a report and without a present.
-        assert!(!tracker.observe(1, 1, true, start + Duration::from_millis(16)));
-        assert!(!tracker.observe(2, 1, true, start + Duration::from_millis(32)));
-        assert!(!tracker.observe(3, 1, true, start + Duration::from_millis(48)));
+        for (frame, ms) in [(1, 16), (2, 32), (3, 48)] {
+            assert_eq!(
+                tracker.observe(frame, 1, true, start + Duration::from_millis(ms), false),
+                Step::Wait
+            );
+        }
         // Confirmed only once the window kept drawing after the error.
         assert!(!run(&mut tracker, start, 4..15, 1));
         let mut tracker = PresentTracker::new();
@@ -2330,10 +2502,35 @@ mod tests {
     fn a_minimized_window_is_not_confirmed() {
         let start = Instant::now();
         let mut tracker = PresentTracker::new();
-        assert!(!tracker.observe(0, 0, true, start));
-        assert!(!tracker.observe(CONFIRM_FRAMES, 0, false, start + CONFIRM_AFTER));
-        assert!(!tracker.observe(2 * CONFIRM_FRAMES, 0, true, start + CONFIRM_AFTER));
-        assert!(tracker.observe(3 * CONFIRM_FRAMES, 0, true, start + 2 * CONFIRM_AFTER));
+        assert_eq!(tracker.observe(0, 0, true, start, false), Step::Wait);
+        assert_eq!(
+            tracker.observe(CONFIRM_FRAMES, 0, false, start + CONFIRM_AFTER, false),
+            Step::Wait
+        );
+        assert_eq!(
+            tracker.observe(2 * CONFIRM_FRAMES, 0, true, start + CONFIRM_AFTER, false),
+            Step::Wait
+        );
+        assert_eq!(
+            tracker.observe(
+                3 * CONFIRM_FRAMES,
+                0,
+                true,
+                start + 2 * CONFIRM_AFTER,
+                false
+            ),
+            Step::Prove
+        );
+        assert_eq!(
+            tracker.observe(
+                3 * CONFIRM_FRAMES + 1,
+                0,
+                true,
+                start + 2 * CONFIRM_AFTER,
+                true
+            ),
+            Step::Confirmed
+        );
     }
 
     // ── Remote renderer rules ───────────────────────────────────────────────
