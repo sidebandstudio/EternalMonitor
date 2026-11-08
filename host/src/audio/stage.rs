@@ -31,6 +31,8 @@ enum Source {
     Wasapi(Box<super::wasapi::WasapiSource>),
     #[cfg(test)]
     Scripted(std::collections::VecDeque<PcmBlock>),
+    #[cfg(test)]
+    Fake(Box<dyn FnMut() -> AudioResult<Option<PcmBlock>>>),
 }
 
 impl Source {
@@ -65,6 +67,8 @@ impl Source {
             Self::Wasapi(source) => source.name(),
             #[cfg(test)]
             Self::Scripted(_) => "Scripted test source",
+            #[cfg(test)]
+            Self::Fake(_) => "Fake test source",
         }
     }
 
@@ -98,6 +102,8 @@ impl Source {
             Self::Wasapi(source) => source.read(),
             #[cfg(test)]
             Self::Scripted(blocks) => Ok(blocks.pop_front()),
+            #[cfg(test)]
+            Self::Fake(read) => read(),
         }
     }
 }
@@ -341,6 +347,32 @@ impl Retry {
     }
 }
 
+/// An output another app has to itself, for one audio session: when to try
+/// it again. Its "unavailable" line was logged when it began; its "back"
+/// line is logged only if that session's audio starts.
+struct OutputWait {
+    session_id: u32,
+    retry: Retry,
+}
+
+/// The stage loop's time, so tests can step through retry deadlines.
+trait Clock {
+    fn now(&self) -> Instant;
+    fn sleep(&self, wait: Duration);
+}
+
+struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn sleep(&self, wait: Duration) {
+        std::thread::sleep(wait);
+    }
+}
+
 /// An endpoint is opened only after both peers opt in. A failed capture
 /// attempt stays disabled for that session; reconnecting or toggling the
 /// host audio setting off and on retries without restarting video. An output
@@ -351,7 +383,7 @@ pub fn run_audio_stage(
     generation: u64,
     reporter: HealthReporter,
 ) {
-    run_stage(tx, shared, generation, reporter, Source::open);
+    run_stage(tx, shared, generation, reporter, Source::open, &SystemClock);
 }
 
 fn run_stage(
@@ -360,19 +392,26 @@ fn run_stage(
     generation: u64,
     reporter: HealthReporter,
     mut open: impl FnMut() -> AudioResult<Source>,
+    clock: &impl Clock,
 ) {
     let mut active: Option<CaptureSession> = None;
     let mut failed_session = None;
     let mut stalled = Retry::STALL;
-    let mut in_use = Retry::DEVICE_IN_USE;
-    // Logged once when an app takes the output, once when audio is back.
-    let mut waiting_for_output = false;
-    let mut next_log = Instant::now() + Duration::from_secs(1);
+    // Belongs to one session: it ends with it, when audio is turned off,
+    // or when another session wants audio.
+    let mut in_use: Option<OutputWait> = None;
+    let mut next_log = clock.now() + Duration::from_secs(1);
     while shared.running.load(Ordering::SeqCst)
         && generation_is_current(generation)
         && !tx.is_closed()
     {
         let wanted = wanted_session(&shared);
+        if in_use
+            .as_ref()
+            .is_some_and(|wait| Some(wait.session_id) != wanted)
+        {
+            in_use = None;
+        }
         if wanted.is_none() {
             log_final(active.take());
             if !shared.audio_enabled.load(Ordering::SeqCst) {
@@ -388,13 +427,16 @@ fn run_stage(
                     audio.error = None;
                 }
             });
-            std::thread::sleep(Duration::from_millis(20));
+            clock.sleep(Duration::from_millis(20));
             continue;
         }
         let session_id = wanted.unwrap();
-        let now = Instant::now();
-        if failed_session == Some(session_id) || !stalled.due(now) || !in_use.due(now) {
-            std::thread::sleep(Duration::from_millis(20));
+        let now = clock.now();
+        if failed_session == Some(session_id)
+            || !stalled.due(now)
+            || in_use.as_ref().is_some_and(|wait| !wait.retry.due(now))
+        {
+            clock.sleep(Duration::from_millis(20));
             continue;
         }
         let result = (|| -> AudioResult<bool> {
@@ -424,7 +466,7 @@ fn run_stage(
                     bitrate = super::BITRATE,
                     "PC audio session started (Opus, 48 kHz stereo, 20 ms)"
                 );
-                if std::mem::take(&mut waiting_for_output) {
+                if in_use.take().is_some() {
                     tracing::info!(
                         session_id,
                         "PC audio is back: the other app let go of the output"
@@ -438,17 +480,14 @@ fn run_stage(
             break;
         }
         match result {
-            Ok(true) => {
-                stalled = Retry::STALL;
-                in_use = Retry::DEVICE_IN_USE;
-            }
+            Ok(true) => stalled = Retry::STALL,
             Ok(false) => break,
             // Video's encoder holds FFmpeg's lock in a stuck driver call:
             // not this session's failure. Video goes on; the open is tried
             // again later, once the call has returned.
             Err(error) if super::encoder::is_stall(error.as_ref()) => {
                 log_final(active.take());
-                let wait = stalled.failed(Instant::now());
+                let wait = stalled.failed(clock.now());
                 tracing::warn!(
                     session_id,
                     retry_ms = wait.as_millis() as u64,
@@ -464,14 +503,18 @@ fn run_stage(
             // the app lets go, and the window says why meanwhile.
             Err(error) if super::is_device_in_use(error.as_ref()) => {
                 log_final(active.take());
-                in_use.failed(Instant::now());
-                if !std::mem::replace(&mut waiting_for_output, true) {
+                let wait = in_use.get_or_insert_with(|| {
                     tracing::warn!(
                         session_id,
                         reason = %error,
                         "PC audio unavailable while another app has the output to itself; video continues, and audio starts when it lets go"
                     );
-                }
+                    OutputWait {
+                        session_id,
+                        retry: Retry::DEVICE_IN_USE,
+                    }
+                });
+                wait.retry.failed(clock.now());
                 update_current(generation, |audio| {
                     audio.stopped(DEVICE_IN_USE_STATUS);
                     audio.error = None;
@@ -488,8 +531,8 @@ fn run_stage(
                 reporter.stage_exited(Stage::Audio, StageOutcome::Failed(reason));
             }
         }
-        if Instant::now() >= next_log {
-            next_log = Instant::now() + Duration::from_secs(1);
+        if clock.now() >= next_log {
+            next_log = clock.now() + Duration::from_secs(1);
             let stats = PIPELINE_STATS.lock().audio.clone();
             // Log only this stage's capture, never a successor's stats.
             if active
@@ -809,44 +852,133 @@ mod tests {
         assert_eq!(logged(|| restart_stats(&target, |_| {})), "");
     }
 
-    /// Runs the stage on this thread, opening its source with `open`, until
-    /// `control` returns on another. Gives the stage's log lines, its health
-    /// reports and what `control` returned.
-    fn run_with<T: Send + 'static>(
-        open: impl FnMut() -> AudioResult<Source>,
-        control: impl FnOnce(&mut tokio::sync::mpsc::Receiver<SessionPacket>) -> T + Send + 'static,
-    ) -> (String, Vec<crate::supervisor::SupMsg>, T) {
-        let (shared, _) =
+    /// Virtual time for the stage: a sleep moves it on at once, then runs
+    /// `on_sleep` with the time since the start, so a test changes the
+    /// session, the setting or `running` at exact points.
+    struct StepClock<'a> {
+        start: Instant,
+        elapsed: std::cell::Cell<Duration>,
+        on_sleep: std::cell::RefCell<Box<dyn FnMut(Duration) + 'a>>,
+    }
+
+    impl<'a> StepClock<'a> {
+        fn new(on_sleep: impl FnMut(Duration) + 'a) -> Self {
+            Self {
+                start: Instant::now(),
+                elapsed: Default::default(),
+                on_sleep: std::cell::RefCell::new(Box::new(on_sleep)),
+            }
+        }
+
+        fn ms(&self) -> u64 {
+            self.elapsed.get().as_millis() as u64
+        }
+    }
+
+    impl Clock for StepClock<'_> {
+        fn now(&self) -> Instant {
+            self.start + self.elapsed.get()
+        }
+
+        fn sleep(&self, wait: Duration) {
+            self.elapsed.set(self.elapsed.get() + wait);
+            (self.on_sleep.borrow_mut())(self.elapsed.get());
+        }
+    }
+
+    fn at(elapsed: Duration, ms: u64) -> bool {
+        elapsed == Duration::from_millis(ms)
+    }
+
+    /// A running stream with an iPad session that wants audio.
+    fn audio_session() -> (SharedControl, u32) {
+        let (shared, id) =
             crate::transport::test_session(eternal_wire::v2::control::FEATURE_WANTS_AUDIO);
         shared.running.store(true, Ordering::SeqCst);
+        (shared, id)
+    }
+
+    fn busy() -> AudioResult<Source> {
+        Err(crate::audio::DeviceInUse.into())
+    }
+
+    /// The audio status and error the window shows.
+    type Status = (String, Option<String>);
+
+    fn audio_status() -> Status {
+        let audio = PIPELINE_STATS.lock().audio.clone();
+        (audio.status, audio.error)
+    }
+
+    /// Ten 20 ms blocks of tone, then it notes the audio status in `seen`
+    /// and stops the stream.
+    fn tone_then_stop(
+        shared: &SharedControl,
+        seen: &std::rc::Rc<std::cell::RefCell<Option<Status>>>,
+    ) -> Source {
+        let (shared, seen) = (shared.clone(), seen.clone());
+        let start = crate::clock::host_now_us() + 50_000;
+        let mut index = 0;
+        Source::Fake(Box::new(move || {
+            if index == 10 {
+                *seen.borrow_mut() = Some(audio_status());
+                shared.running.store(false, Ordering::SeqCst);
+                return Ok(None);
+            }
+            index += 1;
+            Ok(Some(PcmBlock {
+                format: PcmFormat::STEREO_48K,
+                samples: vec![0.25; 2 * super::super::FRAME_SAMPLES],
+                capture_ts_us: start + (index - 1) * FRAME_US,
+                discontinuity: index == 1,
+            }))
+        }))
+    }
+
+    fn names_session(line: &str, id: u32) -> bool {
+        line.split_whitespace()
+            .any(|field| field == format!("session_id={id}"))
+    }
+
+    const UNAVAILABLE: &str = "PC audio unavailable while another app has the output to itself";
+    const BACK: &str = "PC audio is back";
+
+    /// Runs the stage on this thread until it stops, opening its source with
+    /// `open`, on `clock`. Gives its log lines and the packets it queued.
+    fn run_stepped(
+        shared: &SharedControl,
+        open: impl FnMut() -> AudioResult<Source>,
+        clock: &StepClock,
+    ) -> (String, Vec<SessionPacket>) {
         let generation = crate::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
         let (tx, mut rx) = tokio::sync::mpsc::channel(super::super::QUEUE_CAPACITY);
         let (health_tx, health_rx) = std::sync::mpsc::channel();
-        let controller = {
-            let shared = shared.clone();
-            std::thread::spawn(move || {
-                let out = control(&mut rx);
-                shared.running.store(false, Ordering::SeqCst);
-                out
-            })
-        };
         let reporter = HealthReporter::new(health_tx, generation);
-        let lines = logged(|| run_stage(tx, shared.clone(), generation, reporter, open));
-        let out = controller.join().unwrap();
-        // Video goes on: nothing the stage reported stops or restarts it.
+        let lines = logged(|| run_stage(tx, shared.clone(), generation, reporter, open, clock));
+        let mut packets = Vec::new();
+        while let Ok(packet) = rx.try_recv() {
+            packets.push(packet);
+        }
+        // Video goes on: the stage reported nothing but its own end, which
+        // neither stops nor restarts the pipeline.
         let health: Vec<_> = health_rx.try_iter().collect();
         let mut machine = crate::supervisor::Machine::new(generation);
         for message in &health {
             let crate::supervisor::SupMsg::Health {
                 generation,
-                stage,
-                outcome,
+                stage: Stage::Audio,
+                outcome: StageOutcome::Completed,
             } = message
             else {
-                unreachable!()
+                panic!("{message:?}")
             };
             assert_eq!(
-                machine.on_stage_exit(*generation, *stage, outcome, Instant::now()),
+                machine.on_stage_exit(
+                    *generation,
+                    Stage::Audio,
+                    &StageOutcome::Completed,
+                    clock.now()
+                ),
                 crate::supervisor::Effect::None
             );
         }
@@ -854,78 +986,54 @@ mod tests {
             machine.state,
             crate::supervisor::SupervisorState::Running { generation }
         );
-        assert!(shared.audio_enabled.load(Ordering::SeqCst));
-        (lines, health, out)
+        // The lines this change adds name no device.
+        for line in lines
+            .lines()
+            .filter(|line| line.contains(UNAVAILABLE) || line.contains(BACK))
+        {
+            assert!(
+                !line.contains("device=") && !line.contains("Fake test source"),
+                "{line}"
+            );
+        }
+        (lines, packets)
     }
-
-    fn only_completed(health: &[crate::supervisor::SupMsg]) -> bool {
-        health.iter().all(|message| {
-            matches!(
-                message,
-                crate::supervisor::SupMsg::Health {
-                    stage: Stage::Audio,
-                    outcome: StageOutcome::Completed,
-                    ..
-                }
-            )
-        })
-    }
-
-    const UNAVAILABLE: &str = "PC audio unavailable while another app has the output to itself";
-    const BACK: &str = "PC audio is back";
 
     #[test]
     fn audio_starts_once_another_app_lets_go_of_the_output() {
         let _stats = crate::audio::STATS_TEST_LOCK.lock();
         ffmpeg_next::init().unwrap();
-        const BUSY: usize = 3;
-        // The audio status each time the stage opens its source.
-        let seen = std::cell::RefCell::new(Vec::new());
+        let (shared, id) = audio_session();
+        let clock = StepClock::new(|_| {});
+        let seen = Default::default();
+        // When the stage opened its source, and the audio status then.
+        let opens = std::cell::RefCell::new(Vec::new());
         let open = || {
-            let mut seen = seen.borrow_mut();
-            seen.push(PIPELINE_STATS.lock().audio.status.clone());
-            if seen.len() <= BUSY {
-                return Err(crate::audio::DeviceInUse.into());
+            opens.borrow_mut().push((clock.ms(), audio_status().0));
+            if opens.borrow().len() <= 3 {
+                busy()
+            } else {
+                Ok(tone_then_stop(&shared, &seen))
             }
-            let start = crate::clock::host_now_us() + 50_000;
-            Ok(Source::Scripted(
-                (0..10u64)
-                    .map(|index| PcmBlock {
-                        format: PcmFormat::STEREO_48K,
-                        samples: vec![0.25; 2 * super::super::FRAME_SAMPLES],
-                        capture_ts_us: start + index * FRAME_US,
-                        discontinuity: index == 0,
-                    })
-                    .collect(),
-            ))
         };
-        let (lines, health, (packet, status)) = run_with(open, |rx| {
-            let until = Instant::now() + Duration::from_secs(10);
-            let mut packet = None;
-            while packet.is_none() && Instant::now() < until {
-                packet = rx.try_recv().ok();
-                std::thread::sleep(Duration::from_millis(5));
-            }
-            let audio = PIPELINE_STATS.lock().audio.clone();
-            (packet, (audio.status, audio.error))
-        });
-        let seen = seen.into_inner();
-        assert_eq!(seen.len(), BUSY + 1, "opens: {seen:?}");
+        let (lines, packets) = run_stepped(&shared, open, &clock);
+        let opens = opens.into_inner();
+        assert_eq!(
+            opens.iter().map(|(ms, _)| *ms).collect::<Vec<_>>(),
+            [0, 260, 760, 1760],
+            "retries after 250, 500 and 1000 ms, on the 20 ms poll"
+        );
         assert!(
-            seen[1..]
+            opens[1..]
                 .iter()
-                .all(|status| status == DEVICE_IN_USE_STATUS),
-            "the window said why while it waited: {seen:?}"
+                .all(|(_, status)| status == DEVICE_IN_USE_STATUS),
+            "the window said why while it waited: {opens:?}"
         );
-        assert!(
-            packet.is_some(),
-            "audio never started
-{lines}"
-        );
-        assert_eq!(status, ("Streaming".to_string(), None));
+        assert!(!packets.is_empty(), "audio never started\n{lines}");
+        assert!(packets.iter().all(|packet| packet.session_id == id));
+        assert_eq!(*seen.borrow(), Some(("Streaming".to_string(), None)));
         assert_eq!(lines.matches(UNAVAILABLE).count(), 1, "{lines}");
         assert_eq!(lines.matches(BACK).count(), 1, "{lines}");
-        assert!(only_completed(&health), "{health:?}");
     }
 
     #[test]
@@ -938,25 +1046,115 @@ mod tests {
             .collect();
         assert_eq!(waits, [250, 500, 1000, 2000, 2000, 2000]);
 
-        let opens = std::cell::Cell::new(0);
-        let open = || {
-            opens.set(opens.get() + 1);
-            Err(crate::audio::DeviceInUse.into())
-        };
-        // Tries at 0, 0.25, 0.75 and 1.75 s.
-        let (lines, health, status) = run_with(open, |_| {
-            std::thread::sleep(Duration::from_millis(2200));
-            PIPELINE_STATS.lock().audio.status.clone()
+        for (stop_ms, tries) in [
+            (4000, &[0, 260, 760, 1760, 3760][..]),
+            (1000, &[0, 260, 760][..]),
+        ] {
+            let (shared, _) = audio_session();
+            let clock = StepClock::new(|elapsed| {
+                if at(elapsed, stop_ms) {
+                    shared.running.store(false, Ordering::SeqCst);
+                }
+            });
+            let opens = std::cell::RefCell::new(Vec::new());
+            let open = || {
+                opens.borrow_mut().push((clock.ms(), audio_status().0));
+                busy()
+            };
+            let (lines, _) = run_stepped(&shared, open, &clock);
+            let opens = opens.into_inner();
+            assert_eq!(opens.iter().map(|(ms, _)| *ms).collect::<Vec<_>>(), tries);
+            assert!(opens[1..]
+                .iter()
+                .all(|(_, status)| status == DEVICE_IN_USE_STATUS));
+            // Stopped while a retry is pending: the stage ends at its next
+            // 20 ms poll and tries nothing more.
+            assert_eq!(clock.ms(), stop_ms);
+            assert_eq!(lines.matches(UNAVAILABLE).count(), 1, "{lines}");
+            assert_eq!(lines.matches(BACK).count(), 0, "{lines}");
+        }
+    }
+
+    #[test]
+    fn a_new_session_starts_with_no_wait_left_over_from_the_last() {
+        let _stats = crate::audio::STATS_TEST_LOCK.lock();
+        ffmpeg_next::init().unwrap();
+        let (shared, first) = audio_session();
+        let (next, second) = audio_session();
+        assert_ne!(first, second);
+        let clock = StepClock::new(|elapsed| {
+            // The iPad goes away while a retry waits until 1760 ms, and
+            // another session wants audio 100 ms later.
+            if at(elapsed, 800) {
+                *shared.session.lock() = crate::transport::session::Session::new(0);
+            }
+            if at(elapsed, 900) {
+                std::mem::swap(&mut *shared.session.lock(), &mut *next.session.lock());
+            }
+            if at(elapsed, 880) {
+                assert_eq!(audio_status().0, "Waiting for client");
+            }
         });
-        assert!(
-            (3..=5).contains(&opens.get()),
-            "{} opens in 2.2 s",
-            opens.get()
-        );
-        assert_eq!(status, DEVICE_IN_USE_STATUS);
-        assert_eq!(lines.matches(UNAVAILABLE).count(), 1, "{lines}");
-        assert_eq!(lines.matches(BACK).count(), 0, "{lines}");
-        assert!(only_completed(&health), "{health:?}");
+        let seen = Default::default();
+        let opens = std::cell::RefCell::new(Vec::new());
+        let open = || {
+            opens.borrow_mut().push(clock.ms());
+            // The new session finds the output still taken once.
+            if opens.borrow().len() <= 4 {
+                busy()
+            } else {
+                Ok(tone_then_stop(&shared, &seen))
+            }
+        };
+        let (lines, packets) = run_stepped(&shared, open, &clock);
+        assert_eq!(opens.into_inner(), [0, 260, 760, 900, 1160]);
+        assert!(packets.iter().all(|packet| packet.session_id == second));
+        assert!(!packets.is_empty());
+        let unavailable: Vec<_> = lines
+            .lines()
+            .filter(|line| line.contains(UNAVAILABLE))
+            .collect();
+        assert_eq!(unavailable.len(), 2, "{lines}");
+        assert!(names_session(unavailable[0], first), "{lines}");
+        assert!(names_session(unavailable[1], second), "{lines}");
+        let back: Vec<_> = lines.lines().filter(|line| line.contains(BACK)).collect();
+        assert_eq!(back.len(), 1, "{lines}");
+        assert!(names_session(back[0], second), "{lines}");
+    }
+
+    #[test]
+    fn turning_audio_off_and_on_starts_the_wait_over() {
+        let _stats = crate::audio::STATS_TEST_LOCK.lock();
+        ffmpeg_next::init().unwrap();
+        let (shared, _) = audio_session();
+        let clock = StepClock::new(|elapsed| {
+            if at(elapsed, 800) {
+                shared.audio_enabled.store(false, Ordering::SeqCst);
+            }
+            if at(elapsed, 880) {
+                assert_eq!(audio_status(), ("Off".to_string(), None));
+            }
+            if at(elapsed, 900) {
+                shared.audio_enabled.store(true, Ordering::SeqCst);
+            }
+        });
+        let seen = Default::default();
+        let opens = std::cell::RefCell::new(Vec::new());
+        let open = || {
+            opens.borrow_mut().push(clock.ms());
+            if opens.borrow().len() <= 4 {
+                busy()
+            } else {
+                Ok(tone_then_stop(&shared, &seen))
+            }
+        };
+        let (lines, packets) = run_stepped(&shared, open, &clock);
+        // Back on: tried at once, not when the old wait ran out (1760 ms).
+        assert_eq!(opens.into_inner(), [0, 260, 760, 900, 1160]);
+        assert!(!packets.is_empty());
+        assert_eq!(*seen.borrow(), Some(("Streaming".to_string(), None)));
+        assert_eq!(lines.matches(UNAVAILABLE).count(), 2, "{lines}");
+        assert_eq!(lines.matches(BACK).count(), 1, "{lines}");
     }
 
     /// Native check of the same startup path with the PC's real loopback.
