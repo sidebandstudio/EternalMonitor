@@ -72,6 +72,25 @@ pub enum Message {
     },
     /// WM_WTSSESSION_CHANGE WTS_SESSION_LOGOFF.
     SessionLogoff,
+    /// WM_CLOSE: someone asks the app to close, as Restart Manager does
+    /// after the end of session when the app still runs.
+    Close,
+}
+
+/// Whether the app quits once `message` is answered, the way it does when
+/// its window is closed: Restart Manager closing it for an installer, or a
+/// WM_CLOSE. The hidden window stays meanwhile, so sleep and shutdown are
+/// still heard should the quit not end the process.
+pub fn quits(message: Message) -> bool {
+    matches!(
+        message,
+        Message::Close
+            | Message::EndSession {
+                ending: true,
+                logoff: false,
+                close_app: true,
+            }
+    )
 }
 
 /// Longest the end-of-session message waits for the session summary to
@@ -122,6 +141,8 @@ pub fn handle(shared: &SharedControl, message: Message) -> isize {
             going_down(shared, PowerEvent::Logoff, END_SESSION_WAIT);
             0
         }
+        // The quit ends the stream ([`quits`]).
+        Message::Close => 0,
     }
 }
 
@@ -275,10 +296,12 @@ fn back_up(shared: &SharedControl, why: &'static str) {
 }
 
 /// Starts listening for Windows' sleep, shutdown and sign-out messages, on a
-/// hidden window of its own. Later calls do nothing.
+/// hidden window of its own. `quit` is the app's quit path, taken on a
+/// thread of its own after a message that [`quits`]; it runs once. Later
+/// calls do nothing.
 #[cfg(windows)]
-pub fn watch(shared: SharedControl) {
-    windows_impl::watch(shared);
+pub fn watch(shared: SharedControl, quit: Box<dyn FnOnce() + Send>) {
+    windows_impl::watch(shared, quit);
 }
 
 /// The hidden window's handle, once it exists, for tests that send it
@@ -291,7 +314,7 @@ pub fn window() -> Option<isize> {
 #[cfg(windows)]
 mod windows_impl {
     use std::sync::atomic::{AtomicIsize, Ordering};
-    use std::sync::OnceLock;
+    use std::sync::{Mutex, OnceLock};
 
     use windows::core::w;
     use windows::Win32::Foundation::{HANDLE, HINSTANCE, HWND, LPARAM, LRESULT, WPARAM};
@@ -304,8 +327,8 @@ mod windows_impl {
         CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, RegisterClassW,
         TranslateMessage, DEVICE_NOTIFY_WINDOW_HANDLE, ENDSESSION_CLOSEAPP, ENDSESSION_LOGOFF, MSG,
         PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, PBT_APMSUSPEND, WINDOW_EX_STYLE,
-        WINDOW_STYLE, WM_ENDSESSION, WM_POWERBROADCAST, WM_QUERYENDSESSION, WM_WTSSESSION_CHANGE,
-        WNDCLASSW, WTS_SESSION_LOGOFF,
+        WINDOW_STYLE, WM_CLOSE, WM_ENDSESSION, WM_POWERBROADCAST, WM_QUERYENDSESSION,
+        WM_WTSSESSION_CHANGE, WNDCLASSW, WTS_SESSION_LOGOFF,
     };
 
     use super::Message;
@@ -313,11 +336,15 @@ mod windows_impl {
 
     static SHARED: OnceLock<SharedControl> = OnceLock::new();
     static WINDOW: AtomicIsize = AtomicIsize::new(0);
+    /// The app's quit path, until a message takes it.
+    #[allow(clippy::type_complexity)]
+    static QUIT: Mutex<Option<Box<dyn FnOnce() + Send>>> = Mutex::new(None);
 
-    pub(super) fn watch(shared: SharedControl) {
+    pub(super) fn watch(shared: SharedControl, quit: Box<dyn FnOnce() + Send>) {
         if SHARED.set(shared).is_err() {
             return;
         }
+        *QUIT.lock().unwrap_or_else(|e| e.into_inner()) = Some(quit);
         let started = std::thread::Builder::new()
             .name("power-watch".into())
             .spawn(|| {
@@ -396,6 +423,7 @@ mod windows_impl {
                 close_app: lparam as u32 & ENDSESSION_CLOSEAPP != 0,
             },
             WM_WTSSESSION_CHANGE if wparam as u32 == WTS_SESSION_LOGOFF => Message::SessionLogoff,
+            WM_CLOSE => Message::Close,
             _ => return None,
         })
     }
@@ -407,14 +435,38 @@ mod windows_impl {
         lparam: LPARAM,
     ) -> LRESULT {
         match (message(kind, wparam.0, lparam.0), SHARED.get()) {
-            (Some(message), Some(shared)) => LRESULT(super::handle(shared, message)),
+            (Some(message), Some(shared)) => {
+                let answer = super::handle(shared, message);
+                if super::quits(message) {
+                    quit(message);
+                }
+                LRESULT(answer)
+            }
             _ => DefWindowProcW(hwnd, kind, wparam, lparam),
+        }
+    }
+
+    /// Takes the app's quit path on a thread of its own, so the window
+    /// answers Windows at once; the first time only. The window is never
+    /// destroyed here: until the process ends, it still hears Windows.
+    fn quit(message: Message) {
+        let Some(quit) = QUIT.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            tracing::debug!(?message, "Windows asked again for the app to close");
+            return;
+        };
+        tracing::info!(?message, "Windows asked the app to close — quitting");
+        if let Err(error) = std::thread::Builder::new()
+            .name("power-quit".into())
+            .spawn(quit)
+        {
+            tracing::warn!(%error, "Could not start quitting for Windows");
         }
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
+        use windows::Win32::UI::WindowsAndMessaging::ENDSESSION_CRITICAL;
 
         #[test]
         fn window_messages_map_to_what_windows_means() {
@@ -450,7 +502,8 @@ mod windows_impl {
                         close_app: false,
                     }),
                 ),
-                // Restart Manager closing the app for an installer.
+                // Restart Manager closing the app for an installer, also
+                // when it must.
                 (
                     WM_ENDSESSION,
                     1,
@@ -461,6 +514,17 @@ mod windows_impl {
                         close_app: true,
                     }),
                 ),
+                (
+                    WM_ENDSESSION,
+                    1,
+                    (ENDSESSION_CLOSEAPP | ENDSESSION_CRITICAL) as i32 as isize,
+                    Some(Message::EndSession {
+                        ending: true,
+                        logoff: false,
+                        close_app: true,
+                    }),
+                ),
+                (WM_CLOSE, 0, 0, Some(Message::Close)),
                 (
                     WM_ENDSESSION,
                     1,
@@ -497,6 +561,36 @@ mod windows_impl {
                     "{kind:#x} {wparam:#x}"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Only an installer closing the app, or a WM_CLOSE, quits it; the PC
+    /// going down, or a sign-out, leaves that to Windows.
+    #[test]
+    fn closing_the_app_quits_it_and_the_pc_going_down_does_not() {
+        let end = |ending, logoff, close_app| Message::EndSession {
+            ending,
+            logoff,
+            close_app,
+        };
+        assert!(quits(Message::Close));
+        assert!(quits(end(true, false, true)));
+        for message in [
+            end(true, false, false),
+            end(true, true, false),
+            end(true, true, true),
+            end(false, false, true),
+            Message::Suspend,
+            Message::Resume,
+            Message::QueryEndSession,
+            Message::SessionLogoff,
+        ] {
+            assert!(!quits(message), "{message:?}");
         }
     }
 }

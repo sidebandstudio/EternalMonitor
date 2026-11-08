@@ -347,19 +347,27 @@ fn an_installer_closing_the_app_ends_the_stream_as_a_quit() {
     }
 }
 
-/// The real window, given the message Windows sends before sleep. Windows
-/// only: it checks the window gets Windows' messages and answers them.
+/// The real window, given the message Windows sends before sleep, then
+/// those Restart Manager sends to close the app for an installer. Windows
+/// only: it checks the window gets Windows' messages and answers them, and
+/// that closing the app takes the app's quit path once while the window
+/// stays.
 #[cfg(windows)]
 #[test]
 fn the_hidden_window_turns_windows_messages_into_goodbyes() {
     use windows::Win32::Foundation::{HWND, LPARAM, WPARAM};
     use windows::Win32::UI::WindowsAndMessaging::{
-        SendMessageW, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND, WM_POWERBROADCAST,
+        IsWindow, SendMessageW, ENDSESSION_CLOSEAPP, PBT_APMRESUMEAUTOMATIC, PBT_APMSUSPEND,
+        WM_CLOSE, WM_ENDSESSION, WM_POWERBROADCAST,
     };
 
     let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let rig = Rig::start(FEATURE_POWER_BYE);
-    power::watch(rig.shared.clone());
+    let (quit_tx, quits) = std::sync::mpsc::channel();
+    power::watch(
+        rig.shared.clone(),
+        Box::new(move || quit_tx.send(()).unwrap()),
+    );
     let started = Instant::now();
     let hwnd = loop {
         if let Some(hwnd) = power::window() {
@@ -394,4 +402,47 @@ fn the_hidden_window_turns_windows_messages_into_goodbyes() {
     };
     assert_eq!(answer.0, 1);
     assert_eq!(rig.ask(2, Duration::from_secs(10)), Some(HelloStatus::Ok));
+
+    // Restart Manager closes the app: the quit goodbye, then the quit path.
+    let answer = unsafe {
+        SendMessageW(
+            hwnd,
+            WM_ENDSESSION,
+            WPARAM(1),
+            LPARAM(ENDSESSION_CLOSEAPP as isize),
+        )
+    };
+    assert_eq!(answer.0, 0);
+    assert_eq!(
+        rig.goodbyes(Duration::from_millis(500)),
+        [ByeReason::UserDisconnect; 3]
+    );
+    assert_eq!(
+        quits.recv_timeout(Duration::from_secs(5)),
+        Ok(()),
+        "the app quits"
+    );
+    // Its WM_CLOSE that follows neither quits again nor destroys the window,
+    // which still hears Windows.
+    let answer = unsafe { SendMessageW(hwnd, WM_CLOSE, WPARAM(0), LPARAM(0)) };
+    assert_eq!(answer.0, 0);
+    assert!(unsafe { IsWindow(hwnd) }.as_bool(), "the window stays");
+    assert!(quits.recv_timeout(Duration::from_millis(500)).is_err());
+    let answer = unsafe {
+        SendMessageW(
+            hwnd,
+            WM_POWERBROADCAST,
+            WPARAM(PBT_APMSUSPEND as usize),
+            LPARAM(0),
+        )
+    };
+    assert_eq!(answer.0, 1, "still answers Windows");
+    unsafe {
+        SendMessageW(
+            hwnd,
+            WM_POWERBROADCAST,
+            WPARAM(PBT_APMRESUMEAUTOMATIC as usize),
+            LPARAM(0),
+        )
+    };
 }
