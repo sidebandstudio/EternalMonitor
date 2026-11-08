@@ -50,27 +50,58 @@ impl WakeGate {
         if in_session {
             return false;
         }
+        // A session since the last wake restores the short wait first: after
+        // a long backoff, the next viewer's browse mustn't wait it out.
+        let paid = self.sessions_at_wake.is_none_or(|at| at != sessions);
+        if paid {
+            self.every = WAKE_EVERY;
+        }
         if let Some(last) = self.last {
             if now.saturating_duration_since(last) < self.every {
                 return false;
             }
         }
-        let paid = self.sessions_at_wake.is_none_or(|at| at != sessions);
-        self.every = if paid {
-            WAKE_EVERY
-        } else {
-            (self.every * 2).min(WAKE_EVERY_AT_MOST)
-        };
+        if !paid {
+            self.every = (self.every * 2).min(WAKE_EVERY_AT_MOST);
+        }
         self.sessions_at_wake = Some(sessions);
         self.last = Some(now);
         true
     }
 }
 
+/// Whether the encoder that will stream runs on the card detection chose
+/// (`detected`): the override in Settings (`encoder_override`) if any, and
+/// not a software fallback. Only that card is woken; a CPU encoder, or one
+/// on another card, needs none.
+pub fn wakes_card(encoder_override: Option<&str>, detected: &str, software_fallback: bool) -> bool {
+    let family = |name: &str| {
+        name.strip_prefix("h264_")
+            .or_else(|| name.strip_prefix("hevc_"))
+            .map(str::to_owned)
+    };
+    let effective = encoder_override.unwrap_or(detected);
+    !software_fallback && family(effective).is_some() && family(effective) == family(detected)
+}
+
+/// Runs `touch` unless `still_wanted`, checked just before, says a session
+/// has started since the wake was decided: the card is then the session's,
+/// and a device of the wake's during encoder or capture startup would only
+/// compete with it. Returns whether it ran.
+#[cfg(any(windows, test))]
+fn run_wake(still_wanted: impl FnOnce() -> bool, touch: impl FnOnce()) -> bool {
+    if !still_wanted() {
+        return false;
+    }
+    touch();
+    true
+}
+
 /// Starts waking the graphics card at DXGI adapter `adapter_index`, on a
-/// thread of its own, unless a wake is still running.
+/// thread of its own, unless a wake is still running. The thread drops it
+/// if `still_wanted` returns false when it starts (see [`run_wake`]).
 #[cfg(windows)]
-pub fn wake(adapter_index: u32) {
+pub fn wake(adapter_index: u32, still_wanted: impl FnOnce() -> bool + Send + 'static) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static RUNNING: AtomicBool = AtomicBool::new(false);
     if RUNNING.swap(true, Ordering::SeqCst) {
@@ -80,7 +111,7 @@ pub fn wake(adapter_index: u32) {
         .name("gpu-wake".into())
         .spawn(move || {
             let started = Instant::now();
-            match touch(adapter_index) {
+            let ran = run_wake(still_wanted, || match touch(adapter_index) {
                 Ok(()) => tracing::debug!(
                     adapter_index,
                     took_ms = started.elapsed().as_millis() as u64,
@@ -89,6 +120,12 @@ pub fn wake(adapter_index: u32) {
                 Err(error) => {
                     tracing::debug!(adapter_index, %error, "Could not wake the graphics card")
                 }
+            });
+            if !ran {
+                tracing::debug!(
+                    adapter_index,
+                    "A session started first: not waking the graphics card"
+                );
             }
             RUNNING.store(false, Ordering::SeqCst);
         });
@@ -98,7 +135,7 @@ pub fn wake(adapter_index: u32) {
 }
 
 #[cfg(not(windows))]
-pub fn wake(_adapter_index: u32) {}
+pub fn wake(_adapter_index: u32, _still_wanted: impl FnOnce() -> bool + Send + 'static) {}
 
 /// A D3D11 device on the adapter, dropped at once: enough to power it up.
 #[cfg(windows)]
@@ -149,6 +186,64 @@ mod tests {
         // The iPad connected and left: the wake paid off.
         assert!(gate.browse(at(start, 60), false, 8));
         assert!(gate.browse(at(start, 75), false, 9));
+    }
+
+    #[test]
+    fn only_the_encoder_that_will_stream_on_the_detected_card_wakes_it() {
+        assert!(wakes_card(None, "h264_amf", false));
+        assert!(
+            wakes_card(Some("hevc_amf"), "h264_amf", false),
+            "its HEVC sibling"
+        );
+        assert!(
+            !wakes_card(Some("libx264"), "h264_amf", false),
+            "a CPU override"
+        );
+        assert!(!wakes_card(None, "h264_amf", true), "a software fallback");
+        assert!(!wakes_card(None, "libx264", false));
+        assert!(
+            !wakes_card(Some("h264_qsv"), "h264_amf", false),
+            "another card"
+        );
+        assert!(
+            !wakes_card(Some("h264_nvenc"), "h264_amf", false),
+            "another card"
+        );
+    }
+
+    #[test]
+    fn a_wake_is_dropped_when_a_session_started_first() {
+        let touched = std::cell::Cell::new(false);
+        assert!(!run_wake(|| false, || touched.set(true)));
+        assert!(
+            !touched.get(),
+            "the card was touched during the session's startup"
+        );
+        assert!(run_wake(|| true, || touched.set(true)));
+        assert!(touched.get());
+    }
+
+    #[test]
+    fn a_session_after_a_long_backoff_restores_the_short_interval_at_once() {
+        let start = Instant::now();
+        let mut gate = WakeGate::default();
+        // Browses with nobody connecting, until the wait is at its longest.
+        let mut last = 0;
+        for s in (0..7200).step_by(20) {
+            if gate.browse(at(start, s), false, 7) {
+                last = s;
+            }
+        }
+        assert_eq!(gate.every, WAKE_EVERY_AT_MOST);
+        // An iPad connects, leaves, and browses again 20 s after that wake.
+        assert!(
+            gate.browse(at(start, last + 20), false, 8),
+            "the session's browse waited out the old ten-minute wait"
+        );
+        assert!(
+            !gate.browse(at(start, last + 30), false, 8),
+            "the 15 s minimum"
+        );
     }
 
     #[test]

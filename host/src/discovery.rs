@@ -147,13 +147,55 @@ fn watch_browsers(mut on_browse: impl FnMut() + Send + 'static) {
     let _ = thread::Builder::new()
         .name("mdns-browsers".into())
         .spawn(move || {
-            let mut packet = [0u8; 1500];
-            while let Ok((len, from)) = socket.recv_from(&mut packet) {
-                if asks_for_service(&packet[..len]) && !is_own(from.ip()) {
-                    on_browse();
+            let mut packet = vec![0u8; MDNS_PACKET_MAX];
+            let mut errors = 0u32;
+            loop {
+                match socket.recv_from(&mut packet) {
+                    Ok((len, from)) => {
+                        errors = 0;
+                        if asks_for_service(&packet[..len]) && !is_own(from.ip()) {
+                            on_browse();
+                        }
+                    }
+                    Err(error) => {
+                        let pause = after_receive_error(&error, errors);
+                        errors = errors.saturating_add(1);
+                        if errors.is_power_of_two() {
+                            tracing::debug!(%error, errors, "mDNS browse watch: receive failed");
+                        }
+                        thread::sleep(pause);
+                    }
                 }
             }
         });
+}
+
+/// The largest mDNS message (RFC 6762 section 17). A longer datagram fails
+/// the receive with WSAEMSGSIZE, and is dropped.
+#[cfg(windows)]
+const MDNS_PACKET_MAX: usize = 9000;
+
+/// How long the browse watch pauses after a receive error, the `in_a_row`th
+/// since the last packet. It never stops: one oversized or reset datagram
+/// had ended it until the app restarted. Errors that pass (an oversized
+/// datagram, a reset from an ICMP reply, an interruption) go on at once, a
+/// few in a row; anything else, or more, waits longer each time, up to a
+/// minute.
+#[cfg(any(windows, test))]
+fn after_receive_error(error: &std::io::Error, in_a_row: u32) -> Duration {
+    use std::io::ErrorKind;
+    const WSAEMSGSIZE: i32 = 10040;
+    let passing = matches!(
+        error.kind(),
+        ErrorKind::Interrupted
+            | ErrorKind::WouldBlock
+            | ErrorKind::TimedOut
+            | ErrorKind::ConnectionReset
+    ) || error.raw_os_error() == Some(WSAEMSGSIZE);
+    if passing && in_a_row < 8 {
+        return Duration::ZERO;
+    }
+    (Duration::from_millis(100) * 2u32.pow(in_a_row.min(10))).min(Duration::from_secs(60))
 }
 
 #[cfg(not(windows))]
@@ -332,6 +374,30 @@ mod tests {
         // "local" is at offset 12 + 1 + 8 + 1 + 4 = 26.
         packet.extend_from_slice(&[0xC0, 26, 0, 12, 0, 1]);
         assert!(asks_for_service(&packet));
+    }
+
+    #[test]
+    fn a_receive_error_never_ends_the_browse_watch() {
+        use std::io::{Error, ErrorKind};
+        let oversized = Error::from_raw_os_error(10040);
+        let reset = Error::from(ErrorKind::ConnectionReset);
+        let interrupted = Error::from(ErrorKind::Interrupted);
+        for error in [&oversized, &reset, &interrupted] {
+            assert_eq!(after_receive_error(error, 0), Duration::ZERO, "{error}");
+            assert_eq!(after_receive_error(error, 7), Duration::ZERO, "{error}");
+            assert!(
+                after_receive_error(error, 8) > Duration::ZERO,
+                "{error} keeps coming"
+            );
+        }
+        let other = Error::from(ErrorKind::PermissionDenied);
+        let pauses: Vec<Duration> = (0..20).map(|n| after_receive_error(&other, n)).collect();
+        assert!(pauses[0] > Duration::ZERO);
+        assert!(
+            pauses.windows(2).all(|pair| pair[0] <= pair[1]),
+            "{pauses:?}"
+        );
+        assert_eq!(*pauses.last().unwrap(), Duration::from_secs(60));
     }
 
     #[test]
