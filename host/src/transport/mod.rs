@@ -1,6 +1,8 @@
 pub mod abr;
 pub mod apple_usb;
 mod audio;
+#[cfg(test)]
+pub(crate) use audio::tests::session as test_session;
 pub mod beat;
 pub mod fault;
 pub mod link;

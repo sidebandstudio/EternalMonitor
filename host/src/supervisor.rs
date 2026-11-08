@@ -299,6 +299,11 @@ pub struct HealthReporter {
 }
 
 impl HealthReporter {
+    #[cfg(test)]
+    pub(crate) fn new(tx: mpsc::Sender<SupMsg>, generation: u64) -> Self {
+        Self { tx, generation }
+    }
+
     pub fn stage_exited(&self, stage: Stage, outcome: StageOutcome) {
         let _ = self.tx.send(SupMsg::Health {
             generation: self.generation,

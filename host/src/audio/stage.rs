@@ -6,7 +6,9 @@ use tokio::sync::mpsc::{error::TrySendError, Sender};
 use super::encoder::OpusEncoder;
 use super::resample::{PcmBlock, PcmFormat, Resampler};
 use super::synthetic::SyntheticSource;
-use super::{wanted_session, AudioResult, AudioStats, SessionPacket, SAMPLE_RATE};
+use super::{
+    wanted_session, AudioResult, AudioStats, SessionPacket, DEVICE_IN_USE_STATUS, SAMPLE_RATE,
+};
 use crate::capture::timing::FrameTimer;
 use crate::control::SharedControl;
 use crate::stats::PIPELINE_STATS;
@@ -121,10 +123,10 @@ struct CaptureSession {
 }
 
 impl CaptureSession {
-    fn new(id: u32) -> AudioResult<Self> {
+    fn new(id: u32, source: Source) -> AudioResult<Self> {
         Ok(Self {
             id,
-            source: Source::open()?,
+            source,
             resampler: None,
             encoder: OpusEncoder::new(MAX_OPUS_PAYLOAD)?,
             mark_discontinuity: true,
@@ -302,25 +304,38 @@ pub(crate) fn restart_stats(
     }
 }
 
-/// When to try again to open audio while FFmpeg's encoder lane is stuck:
-/// soon at first, then at most every 8 s, so a long stall neither spins nor
+/// When to try again to open audio that waits on something outside it:
+/// soon at first, then at most every `max`, so a long wait neither spins nor
 /// floods the log.
-#[derive(Default)]
-struct StallRetry {
+struct Retry {
     next: Option<Instant>,
     wait: Duration,
+    first: Duration,
+    max: Duration,
 }
 
-impl StallRetry {
-    const FIRST: Duration = Duration::from_millis(500);
-    const MAX: Duration = Duration::from_secs(8);
+impl Retry {
+    /// FFmpeg's encoder lane is stuck in a driver call.
+    const STALL: Self = Self::new(Duration::from_millis(500), Duration::from_secs(8));
+    /// Another app has the output to itself. A try is a few WASAPI calls and
+    /// opens no encoder, so audio is back within 2 s of the app letting go.
+    const DEVICE_IN_USE: Self = Self::new(Duration::from_millis(250), Duration::from_secs(2));
+
+    const fn new(first: Duration, max: Duration) -> Self {
+        Self {
+            next: None,
+            wait: Duration::ZERO,
+            first,
+            max,
+        }
+    }
 
     fn due(&self, now: Instant) -> bool {
         self.next.is_none_or(|next| now >= next)
     }
 
     fn failed(&mut self, now: Instant) -> Duration {
-        self.wait = (self.wait * 2).clamp(Self::FIRST, Self::MAX);
+        self.wait = (self.wait * 2).clamp(self.first, self.max);
         self.next = Some(now + self.wait);
         self.wait
     }
@@ -328,16 +343,30 @@ impl StallRetry {
 
 /// An endpoint is opened only after both peers opt in. A failed capture
 /// attempt stays disabled for that session; reconnecting or toggling the
-/// host audio setting off and on retries without restarting video.
+/// host audio setting off and on retries without restarting video. An output
+/// another app has to itself is tried again until it lets go.
 pub fn run_audio_stage(
     tx: Sender<SessionPacket>,
     shared: SharedControl,
     generation: u64,
     reporter: HealthReporter,
 ) {
+    run_stage(tx, shared, generation, reporter, Source::open);
+}
+
+fn run_stage(
+    tx: Sender<SessionPacket>,
+    shared: SharedControl,
+    generation: u64,
+    reporter: HealthReporter,
+    mut open: impl FnMut() -> AudioResult<Source>,
+) {
     let mut active: Option<CaptureSession> = None;
     let mut failed_session = None;
-    let mut stalled = StallRetry::default();
+    let mut stalled = Retry::STALL;
+    let mut in_use = Retry::DEVICE_IN_USE;
+    // Logged once when an app takes the output, once when audio is back.
+    let mut waiting_for_output = false;
     let mut next_log = Instant::now() + Duration::from_secs(1);
     while shared.running.load(Ordering::SeqCst)
         && generation_is_current(generation)
@@ -363,7 +392,8 @@ pub fn run_audio_stage(
             continue;
         }
         let session_id = wanted.unwrap();
-        if failed_session == Some(session_id) || !stalled.due(Instant::now()) {
+        let now = Instant::now();
+        if failed_session == Some(session_id) || !stalled.due(now) || !in_use.due(now) {
             std::thread::sleep(Duration::from_millis(20));
             continue;
         }
@@ -373,7 +403,7 @@ pub fn run_audio_stage(
                 .is_none_or(|session| session.id != session_id)
             {
                 active = None;
-                let mut session = CaptureSession::new(session_id)?;
+                let mut session = CaptureSession::new(session_id, open()?)?;
                 if !shared.running.load(Ordering::SeqCst) {
                     return Ok(false);
                 }
@@ -394,6 +424,12 @@ pub fn run_audio_stage(
                     bitrate = super::BITRATE,
                     "PC audio session started (Opus, 48 kHz stereo, 20 ms)"
                 );
+                if std::mem::take(&mut waiting_for_output) {
+                    tracing::info!(
+                        session_id,
+                        "PC audio is back: the other app let go of the output"
+                    );
+                }
                 active = Some(session);
             }
             active.as_mut().unwrap().tick(&tx, &shared, generation)
@@ -402,7 +438,10 @@ pub fn run_audio_stage(
             break;
         }
         match result {
-            Ok(true) => stalled = StallRetry::default(),
+            Ok(true) => {
+                stalled = Retry::STALL;
+                in_use = Retry::DEVICE_IN_USE;
+            }
             Ok(false) => break,
             // Video's encoder holds FFmpeg's lock in a stuck driver call:
             // not this session's failure. Video goes on; the open is tried
@@ -418,6 +457,24 @@ pub fn run_audio_stage(
                 update_current(generation, |audio| {
                     audio.stopped("Waiting for the graphics driver");
                     audio.error = Some(error.to_string());
+                });
+            }
+            // Another app has the output to itself: not this session's
+            // failure either. Video goes on; the open is tried again until
+            // the app lets go, and the window says why meanwhile.
+            Err(error) if super::is_device_in_use(error.as_ref()) => {
+                log_final(active.take());
+                in_use.failed(Instant::now());
+                if !std::mem::replace(&mut waiting_for_output, true) {
+                    tracing::warn!(
+                        session_id,
+                        reason = %error,
+                        "PC audio unavailable while another app has the output to itself; video continues, and audio starts when it lets go"
+                    );
+                }
+                update_current(generation, |audio| {
+                    audio.stopped(DEVICE_IN_USE_STATUS);
+                    audio.error = None;
                 });
             }
             Err(error) => {
@@ -453,7 +510,7 @@ mod tests {
 
     #[test]
     fn audio_retries_a_stalled_open_with_a_bounded_backoff() {
-        let mut retry = StallRetry::default();
+        let mut retry = Retry::STALL;
         let now = Instant::now();
         assert!(retry.due(now));
         let waits: Vec<u64> = (0..7)
@@ -533,6 +590,7 @@ mod tests {
 
     #[test]
     fn loopback_backlog_from_before_the_session_is_not_sent_stale() {
+        let _stats = crate::audio::STATS_TEST_LOCK.lock();
         ffmpeg_next::init().unwrap();
         // WASAPI buffers from Start() while the session opens its encoder. A
         // 0.3.1 host on an i7-5500U took 105 ms, and its first six packets
@@ -749,6 +807,156 @@ mod tests {
         assert_eq!(target.lock().bitrate_bps, 5_000_000);
         // An idle restart, with no capture, logs nothing.
         assert_eq!(logged(|| restart_stats(&target, |_| {})), "");
+    }
+
+    /// Runs the stage on this thread, opening its source with `open`, until
+    /// `control` returns on another. Gives the stage's log lines, its health
+    /// reports and what `control` returned.
+    fn run_with<T: Send + 'static>(
+        open: impl FnMut() -> AudioResult<Source>,
+        control: impl FnOnce(&mut tokio::sync::mpsc::Receiver<SessionPacket>) -> T + Send + 'static,
+    ) -> (String, Vec<crate::supervisor::SupMsg>, T) {
+        let (shared, _) =
+            crate::transport::test_session(eternal_wire::v2::control::FEATURE_WANTS_AUDIO);
+        shared.running.store(true, Ordering::SeqCst);
+        let generation = crate::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
+        let (tx, mut rx) = tokio::sync::mpsc::channel(super::super::QUEUE_CAPACITY);
+        let (health_tx, health_rx) = std::sync::mpsc::channel();
+        let controller = {
+            let shared = shared.clone();
+            std::thread::spawn(move || {
+                let out = control(&mut rx);
+                shared.running.store(false, Ordering::SeqCst);
+                out
+            })
+        };
+        let reporter = HealthReporter::new(health_tx, generation);
+        let lines = logged(|| run_stage(tx, shared.clone(), generation, reporter, open));
+        let out = controller.join().unwrap();
+        // Video goes on: nothing the stage reported stops or restarts it.
+        let health: Vec<_> = health_rx.try_iter().collect();
+        let mut machine = crate::supervisor::Machine::new(generation);
+        for message in &health {
+            let crate::supervisor::SupMsg::Health {
+                generation,
+                stage,
+                outcome,
+            } = message
+            else {
+                unreachable!()
+            };
+            assert_eq!(
+                machine.on_stage_exit(*generation, *stage, outcome, Instant::now()),
+                crate::supervisor::Effect::None
+            );
+        }
+        assert_eq!(
+            machine.state,
+            crate::supervisor::SupervisorState::Running { generation }
+        );
+        assert!(shared.audio_enabled.load(Ordering::SeqCst));
+        (lines, health, out)
+    }
+
+    fn only_completed(health: &[crate::supervisor::SupMsg]) -> bool {
+        health.iter().all(|message| {
+            matches!(
+                message,
+                crate::supervisor::SupMsg::Health {
+                    stage: Stage::Audio,
+                    outcome: StageOutcome::Completed,
+                    ..
+                }
+            )
+        })
+    }
+
+    const UNAVAILABLE: &str = "PC audio unavailable while another app has the output to itself";
+    const BACK: &str = "PC audio is back";
+
+    #[test]
+    fn audio_starts_once_another_app_lets_go_of_the_output() {
+        let _stats = crate::audio::STATS_TEST_LOCK.lock();
+        ffmpeg_next::init().unwrap();
+        const BUSY: usize = 3;
+        // The audio status each time the stage opens its source.
+        let seen = std::cell::RefCell::new(Vec::new());
+        let open = || {
+            let mut seen = seen.borrow_mut();
+            seen.push(PIPELINE_STATS.lock().audio.status.clone());
+            if seen.len() <= BUSY {
+                return Err(crate::audio::DeviceInUse.into());
+            }
+            let start = crate::clock::host_now_us() + 50_000;
+            Ok(Source::Scripted(
+                (0..10u64)
+                    .map(|index| PcmBlock {
+                        format: PcmFormat::STEREO_48K,
+                        samples: vec![0.25; 2 * super::super::FRAME_SAMPLES],
+                        capture_ts_us: start + index * FRAME_US,
+                        discontinuity: index == 0,
+                    })
+                    .collect(),
+            ))
+        };
+        let (lines, health, (packet, status)) = run_with(open, |rx| {
+            let until = Instant::now() + Duration::from_secs(10);
+            let mut packet = None;
+            while packet.is_none() && Instant::now() < until {
+                packet = rx.try_recv().ok();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let audio = PIPELINE_STATS.lock().audio.clone();
+            (packet, (audio.status, audio.error))
+        });
+        let seen = seen.into_inner();
+        assert_eq!(seen.len(), BUSY + 1, "opens: {seen:?}");
+        assert!(
+            seen[1..]
+                .iter()
+                .all(|status| status == DEVICE_IN_USE_STATUS),
+            "the window said why while it waited: {seen:?}"
+        );
+        assert!(
+            packet.is_some(),
+            "audio never started
+{lines}"
+        );
+        assert_eq!(status, ("Streaming".to_string(), None));
+        assert_eq!(lines.matches(UNAVAILABLE).count(), 1, "{lines}");
+        assert_eq!(lines.matches(BACK).count(), 1, "{lines}");
+        assert!(only_completed(&health), "{health:?}");
+    }
+
+    #[test]
+    fn an_output_that_stays_in_use_is_tried_on_a_bounded_backoff() {
+        let _stats = crate::audio::STATS_TEST_LOCK.lock();
+        let now = Instant::now();
+        let mut retry = Retry::DEVICE_IN_USE;
+        let waits: Vec<u64> = (0..6)
+            .map(|_| retry.failed(now).as_millis() as u64)
+            .collect();
+        assert_eq!(waits, [250, 500, 1000, 2000, 2000, 2000]);
+
+        let opens = std::cell::Cell::new(0);
+        let open = || {
+            opens.set(opens.get() + 1);
+            Err(crate::audio::DeviceInUse.into())
+        };
+        // Tries at 0, 0.25, 0.75 and 1.75 s.
+        let (lines, health, status) = run_with(open, |_| {
+            std::thread::sleep(Duration::from_millis(2200));
+            PIPELINE_STATS.lock().audio.status.clone()
+        });
+        assert!(
+            (3..=5).contains(&opens.get()),
+            "{} opens in 2.2 s",
+            opens.get()
+        );
+        assert_eq!(status, DEVICE_IN_USE_STATUS);
+        assert_eq!(lines.matches(UNAVAILABLE).count(), 1, "{lines}");
+        assert_eq!(lines.matches(BACK).count(), 0, "{lines}");
+        assert!(only_completed(&health), "{health:?}");
     }
 
     /// Native check of the same startup path with the PC's real loopback.
