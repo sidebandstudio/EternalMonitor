@@ -400,7 +400,16 @@ impl RenderState {
         let adapter = if let Some(selector) = &create_new.native_adapter_selector {
             selector(&candidates, None).map_err(WgpuError::CustomNativeAdapterSelectionError)?
         } else {
-            request_adapter(instance, create_new.power_preference, None, &candidates).await?
+            // wgpu chooses among all adapters, not these: keep its choice only if it is one.
+            let keys: Vec<AdapterKey> = candidates
+                .iter()
+                .map(|adapter| AdapterKey::of(&adapter.get_info()))
+                .collect();
+            request_adapter(instance, create_new.power_preference, None, &candidates)
+                .await
+                .ok()
+                .filter(|adapter| keys.contains(&AdapterKey::of(&adapter.get_info())))
+                .unwrap_or_else(|| candidates[0].clone())
         };
         let (device, queue) = adapter
             .request_device(&(*create_new.device_descriptor)(&adapter))
