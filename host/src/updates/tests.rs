@@ -1829,14 +1829,17 @@ fn the_failure_message_check_is_validated_and_bounded() {
 }
 
 fn pending_saved(from: &str, to: &str, result: Option<&str>) -> (Saved, PathBuf) {
+    // Each call its own folder: the clock alone repeats for calls in the same
+    // microsecond, and one test's update then reads or removes another's
+    // result.
+    static FOLDERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let dir = std::env::temp_dir().join(format!(
         "eternal-update-result-{}-{}",
         std::process::id(),
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
+        FOLDERS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
+    // A failed run of an earlier process with this id may have left one.
+    let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join(eternal_updater::RESULT_FILE);
     if let Some(text) = result {

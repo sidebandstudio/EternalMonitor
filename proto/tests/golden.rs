@@ -270,6 +270,18 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
             ControlMessage::Bye(ByeReason::AppBackground),
         ),
         (
+            "bye_host_sleeping",
+            0x1234_5678,
+            55,
+            ControlMessage::Bye(ByeReason::HostSleeping),
+        ),
+        (
+            "bye_host_powering_off",
+            0x1234_5678,
+            56,
+            ControlMessage::Bye(ByeReason::HostPoweringOff),
+        ),
+        (
             "keyframe_request",
             0x1234_5678,
             44,

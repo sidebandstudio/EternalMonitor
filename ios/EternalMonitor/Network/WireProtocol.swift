@@ -273,6 +273,9 @@ struct Hello2: Equatable {
     /// and wants heartbeats to count the frames the PC sent. Bit 5 is
     /// `featureDrawsPointer`.
     static let featureMediaSize: UInt16 = 1 << 6
+    /// This app understands the goodbyes a PC sends as it goes to sleep or
+    /// shuts down. Older apps drop a goodbye they can't read.
+    static let featurePowerBye: UInt16 = 1 << 7
     static let maxNameLength = 64
 
     var protoMin: UInt8 = 2
@@ -358,6 +361,16 @@ struct Heartbeat: Equatable {
     static let noticePCLocked: UInt8 = 1
     /// No display is on at the PC (a closed lid, screens off or unplugged).
     static let noticeNoDisplay: UInt8 = 2
+    /// Windows won't let EternalMonitor capture the PC's screen from the
+    /// graphics card it runs on. The PC's window says how to switch.
+    static let noticeUnsupportedGPU: UInt8 = 3
+    /// The same in Second screen mode, after the second screen failed to
+    /// start: the main screen it fell back to can't be captured either.
+    static let noticeSecondScreenUnsupportedGPU: UInt8 = 4
+    /// The PC is restarting its stream and keeps this session: the picture
+    /// comes back by itself. Sent only to an iPad that sets
+    /// `Hello2.featureStandbyStatus`. (3 and 4 are the graphics card notices.)
+    static let noticeRestarting: UInt8 = 5
     /// The video frames the PC sent this session, from a PC that offered
     /// `HelloAck.hostCapMediaSize`; nil from others. Appended after
     /// `notice`, which is then always written.
@@ -370,6 +383,11 @@ enum ByeReason: UInt8 {
     case hostShuttingDown = 2
     case error = 3
     case superseded = 4
+    /// The PC is going to sleep. Only to an iPad that sets `featurePowerBye`.
+    case hostSleeping = 5
+    /// The PC is shutting down, restarting or signing out. Only to an iPad
+    /// that sets `featurePowerBye`.
+    case hostPoweringOff = 6
 }
 
 enum KeyframeReason: UInt8 {

@@ -352,6 +352,14 @@ struct ConnectView: View {
                     .foregroundStyle(Theme.textMuted)
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("connect.problemDetail")
+                if connectionManager.watchingForPC {
+                    // Problem cards stay English.
+                    Text(verbatim: "Waiting for your PC: this iPad connects by itself when EternalMonitor opens there.")
+                        .font(.app(14, .medium, relativeTo: .callout))
+                        .foregroundStyle(Theme.text)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("connect.problemWaiting")
+                }
                 if !problem.actions.isEmpty {
                     HStack(spacing: 10) {
                         ForEach(problem.actions, id: \.self) { action in
@@ -571,10 +579,19 @@ struct ConnectView: View {
                     Text(L("Connecting…"))
                         .font(.app(18, .semibold, relativeTo: .headline))
                         .foregroundStyle(Theme.text)
-                    Text(normalizedHostIP.isEmpty ? L("Waiting for your PC") : L("Reaching \(normalizedHostIP)"))
-                        .font(.app(14, relativeTo: .callout))
-                        .foregroundStyle(Theme.textMuted)
-                        .lineLimit(1)
+                    // The PC answered and said why no picture comes yet.
+                    if let card = connectionManager.pcGraphicsCard {
+                        Text(card.short)
+                            .font(.app(14, relativeTo: .callout))
+                            .foregroundStyle(Theme.text)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("connect.pcGraphicsCard")
+                    } else {
+                        Text(normalizedHostIP.isEmpty ? L("Waiting for your PC") : L("Reaching \(normalizedHostIP)"))
+                            .font(.app(14, relativeTo: .callout))
+                            .foregroundStyle(Theme.textMuted)
+                            .lineLimit(1)
+                    }
                 }
                 Spacer(minLength: 0)
             }

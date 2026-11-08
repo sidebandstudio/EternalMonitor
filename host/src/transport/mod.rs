@@ -274,7 +274,20 @@ impl ConfigSource for SharedConfigSource<'_> {
     }
 
     fn notice(&self) -> u8 {
-        crate::capture::recovery::heartbeat_notice(*self.shared.capture_block.lock())
+        use crate::control::{CaptureTarget, VddStatus};
+        let block = *self.shared.capture_block.lock();
+        let second_screen_failed = *self.shared.capture_target.lock()
+            == CaptureTarget::VirtualExtended
+            && matches!(
+                *self.shared.vdd_status.lock(),
+                VddStatus::Failed | VddStatus::TaskFailed
+            );
+        crate::capture::recovery::heartbeat_notice(
+            block,
+            second_screen_failed,
+            &mut self.shared.gpu_refused_since.lock(),
+            std::time::Instant::now(),
+        )
     }
 
     fn host_caps(&self) -> u16 {
@@ -305,6 +318,35 @@ impl ConfigSource for SharedConfigSource<'_> {
         std::env::var("COMPUTERNAME")
             .or_else(|_| std::env::var("HOSTNAME"))
             .unwrap_or_else(|_| "EternalMonitor".to_string())
+    }
+}
+
+/// How often a stream looks at its chosen network while nobody streams.
+const NETWORK_CHECK: Duration = Duration::from_secs(10);
+
+/// With Listen on set to one network: while nobody streams, a stream bound
+/// to an address that network no longer gives restarts to listen on the
+/// one it gives now. The supervisor does that only while this stream still
+/// runs, never once the user stopped it.
+fn look_at_network(
+    shared: &SharedControl,
+    listen_on: &crate::network::ListenOn,
+    bind_ip: std::net::Ipv4Addr,
+    supervisor: &StreamSupervisor,
+) {
+    if *listen_on == crate::network::ListenOn::All
+        || shared.client_connected()
+        || crate::network::listen_ip_now(listen_on) == bind_ip
+    {
+        return;
+    }
+    info!(
+        listen_on = listen_on.label(),
+        "The chosen network changed: restarting the stream to listen on it"
+    );
+    shared.stop();
+    if let Err(error) = supervisor.restart() {
+        warn!(error = %error, "Failed to request a pipeline restart for the chosen network");
     }
 }
 
@@ -463,8 +505,13 @@ pub async fn start_sender(
     let mut liveness_tick = tokio::time::interval(Duration::from_millis(250));
     liveness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     // A chosen network can connect, or get a new address, after the stream
-    // starts. It is looked at again while nobody streams.
-    let mut network_check = tokio::time::interval(Duration::from_secs(10));
+    // bound. It is looked at now, before anything else, and again every
+    // 10 s while nobody streams. The first look used to be the interval's
+    // first tick, which could lose to the liveness tick: a stream stopped
+    // meanwhile then ended without looking.
+    look_at_network(&shared, &listen_on, bind_ip, &supervisor);
+    let mut network_check =
+        tokio::time::interval_at(tokio::time::Instant::now() + NETWORK_CHECK, NETWORK_CHECK);
     network_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut pointer_budget = Deadline::new("pointer-budget")?;
 
@@ -500,15 +547,16 @@ pub async fn start_sender(
                 let actions = shared.session.lock().tick(&config, true, now());
                 act(actions, &mut state, &links, &shared, &config, &supervisor).await;
             }
-            _ = network_check.tick(), if listen_on != crate::network::ListenOn::All => {
+            // The PC is going down and left a goodbye: send it now, not at
+            // the next liveness tick, while Windows still waits.
+            _ = shared.power.woken() => {
                 beat.mark(Phase::Tick);
-                if !shared.client_connected() && crate::network::listen_ip_now(&listen_on) != bind_ip {
-                    info!(listen_on = listen_on.label(), "The chosen network changed: restarting the stream to listen on it");
-                    shared.stop();
-                    if let Err(error) = supervisor.restart() {
-                        warn!(error = %error, "Failed to request a pipeline restart for the chosen network");
-                    }
-                }
+                let actions = shared.session.lock().tick(&config, false, now());
+                act(actions, &mut state, &links, &shared, &config, &supervisor).await;
+            }
+            _ = network_check.tick() => {
+                beat.mark(Phase::Tick);
+                look_at_network(&shared, &listen_on, bind_ip, &supervisor);
             }
             _ = liveness_tick.tick() => {
                 beat.mark(Phase::Tick);
@@ -765,6 +813,7 @@ pub async fn start_sender(
     let goodbye = shared.session.lock().take_goodbye();
     if let Some(goodbye) = goodbye {
         say_goodbye(&links, goodbye).await;
+        shared.power.said();
     }
     park_stream_socket(&shared, links.into_udp_socket());
     info!("NAL channel closed, transport sender shutting down");
@@ -1256,6 +1305,7 @@ async fn execute_actions(
 
     if let Some(goodbye) = actions.goodbye {
         say_goodbye(links, goodbye).await;
+        shared.power.said();
     }
 
     if actions.force_idr {
@@ -2104,6 +2154,59 @@ mod tests {
         assert_eq!(while_blocked, [NOTICE_PC_LOCKED, NOTICE_PC_LOCKED]);
         note_capture_resumed(&shared);
         assert_eq!(notices(), [NOTICE_NONE]);
+    }
+
+    /// A screen Windows won't share from this graphics card: the heartbeats
+    /// say so once it has lasted 2 s, and in Second screen mode, once the
+    /// second screen failed, that the main screen it fell back to can't be
+    /// shared either. While the second screen still starts, the mirror's
+    /// notice stays.
+    #[test]
+    fn heartbeats_say_which_screen_this_graphics_card_cannot_share() {
+        use crate::capture::recovery::CaptureBlock;
+        use crate::control::{CaptureTarget, VddStatus};
+        use eternal_wire::v2::control::{
+            NOTICE_NONE, NOTICE_SECOND_SCREEN_UNSUPPORTED_GPU, NOTICE_UNSUPPORTED_GPU,
+        };
+        let shared = SharedControl::new(9876, 15_000_000);
+        shared.pairing.lock().required = false;
+        let now = Instant::now();
+        repairable_session(&shared, "127.0.0.1:50000".parse().unwrap(), now);
+        let config = SharedConfigSource {
+            shared: &shared,
+            stream_epoch: 1,
+            pen_available: false,
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+        };
+        let notices = || {
+            let actions = shared.session.lock().tick(&config, true, now);
+            actions
+                .replies
+                .iter()
+                .filter_map(|(_, bytes)| match parse_control(bytes) {
+                    Ok((_, ControlMessage::Heartbeat(heartbeat))) => Some(heartbeat.notice),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        *shared.capture_block.lock() = Some(CaptureBlock::UnsupportedOnThisGpu);
+        assert_eq!(notices(), [NOTICE_NONE], "a refusal that just began");
+        *shared.gpu_refused_since.lock() = Some(Instant::now() - Duration::from_secs(3));
+        assert_eq!(notices(), [NOTICE_UNSUPPORTED_GPU]);
+        *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
+        *shared.vdd_status.lock() = VddStatus::Attaching;
+        assert_eq!(notices(), [NOTICE_UNSUPPORTED_GPU], "still starting");
+        for failed in [VddStatus::Failed, VddStatus::TaskFailed] {
+            *shared.vdd_status.lock() = failed;
+            assert_eq!(
+                notices(),
+                [NOTICE_SECOND_SCREEN_UNSUPPORTED_GPU],
+                "{failed:?}"
+            );
+        }
+        *shared.capture_block.lock() = None;
+        assert_eq!(notices(), [NOTICE_NONE]);
+        assert_eq!(*shared.gpu_refused_since.lock(), None);
     }
 
     /// A NACK of a session that ended for liveness, while another frame is

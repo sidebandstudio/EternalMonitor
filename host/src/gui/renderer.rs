@@ -782,7 +782,6 @@ pub(super) fn when_drawing(hook: OnDrawing) {
 /// The user quit before the window drew. A deliberate quit is no failed
 /// start: the marker goes without counting, and no worker still in the
 /// driver writes it again.
-#[cfg_attr(not(windows), allow(dead_code))]
 pub(super) fn abandon() {
     if let (Some(directory), Ok(mut launch)) = (STATE_DIR.get(), LAUNCH.lock()) {
         launch.abandon(directory, ProcessId::current());
@@ -2168,6 +2167,27 @@ mod tests {
         assert!(!marker_path(&directory, owner).exists());
         // The next launch counts no failed start.
         assert!(sweep(&directory, ProcessId::current()).is_empty());
+        let _ = fs::remove_dir_all(&directory);
+    }
+
+    /// The app quits from outside its window (Windows closing it for an
+    /// installer) before the window is confirmed drawing, through this
+    /// launch's own marker: none is left for the next launch to count, and a
+    /// probe still in the driver doesn't write it again. The only test of
+    /// the launch-wide marker; it puts it back as it found it.
+    #[test]
+    fn a_quit_from_outside_the_window_before_it_draws_leaves_no_marker() {
+        let directory = STATE_DIR.get_or_init(|| temp_dir("quit-outside")).clone();
+        let owner = ProcessId::current();
+        assert!(start(marker("10de:2c02 32.0", "dx12")));
+        assert!(marker_path(&directory, owner).exists());
+        crate::gui::quitting_from_outside();
+        assert!(!marker_path(&directory, owner).exists());
+        mark_thread(Some(WINDOW));
+        assert!(!start(marker("10de:2c02 32.0", "vulkan")));
+        assert!(!marker_path(&directory, owner).exists());
+        assert!(sweep(&directory, ProcessId::current()).is_empty());
+        *LAUNCH.lock().unwrap() = Launch::new();
         let _ = fs::remove_dir_all(&directory);
     }
 

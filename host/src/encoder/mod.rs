@@ -185,14 +185,19 @@ fn run_encode_loop(
     };
 
     let mut owed_keyframe: Option<OwedKeyframe> = None;
+    let mut cadence = CaptureCadence::default();
     loop {
-        let raw_frame = match owed_keyframe.as_mut() {
+        let (raw_frame, given_again) = match owed_keyframe.as_mut() {
             None => match frames.blocking_take() {
-                Some(frame) => frame,
+                Some(frame) => (frame, false),
                 None => break,
             },
             Some(owed) => match owed.next(&frames) {
-                Next::Frame(frame) => frame,
+                Next::Frame(frame) => (frame, false),
+                Next::Again(frame) => {
+                    PIPELINE_STATS.lock().keyframe_resubmits += 1;
+                    (frame, true)
+                }
                 Next::Closed => break,
                 Next::GaveUp => {
                     info!(
@@ -204,6 +209,9 @@ fn run_encode_loop(
                 }
             },
         };
+        if !given_again {
+            cadence.captured(raw_frame.timestamp, raw_frame.cached);
+        }
         if !shared.running.load(Ordering::SeqCst)
             || !crate::supervisor::generation_is_current(generation)
         {
@@ -849,8 +857,13 @@ fn run_encode_loop(
             continue;
         }
         encoder.bitrate_reset_unconfirmed = false;
-        owed_keyframe =
-            OwedKeyframe::after_encode(owed_keyframe.take(), picture, keyframe_out, encode_start);
+        owed_keyframe = OwedKeyframe::after_encode(
+            owed_keyframe.take(),
+            picture,
+            keyframe_out,
+            encode_start,
+            keyframe_flush_wait(target_fps, raw_frame.cached, cadence.pace()),
+        );
     }
 
     info!("Capture channel closed, encoder shutting down");
@@ -2403,11 +2416,71 @@ pub fn holds_last_frame(encoder_name: &str) -> bool {
     matches!(encoder_name, "h264_amf" | "hevc_amf")
 }
 
-/// How long the encode loop waits for capture's next picture before it gives
-/// an encoder that [holds its last frame](holds_last_frame) the last picture
-/// again, to bring out a session's first keyframe. It is about one frame at
-/// 60 fps, and longer than AMF takes to encode one.
+/// The shortest wait for capture's next picture before an encoder that
+/// [holds its last frame](holds_last_frame) is given the last picture again,
+/// to bring out a session's first keyframe: longer than AMF takes to encode
+/// one. See [`keyframe_flush_wait`].
 const KEYFRAME_FLUSH_WAIT: Duration = Duration::from_millis(20);
+
+/// A gap between capture's real pictures shorter than this is the desktop's
+/// pace while it moves; a longer one is an idle spell, which says nothing
+/// about the pace (capture resends a still picture after 100 ms for a
+/// keyframe request, else at its 750 ms keepalive).
+const MOVING_GAP: Duration = Duration::from_millis(100);
+/// After an idle spell this long, the pace seen before it is forgotten.
+const PACE_FORGOTTEN: Duration = Duration::from_secs(10);
+
+/// How long the encode loop waits for capture's next picture, after encoding
+/// `cached` (see [`RawFrame::cached`]), before it gives that picture again.
+/// After a cached picture of a still desktop no picture is due, so the
+/// shortest wait brings the keyframe out soonest. After a real one, a frame
+/// and a half: of the target rate, or of capture's pace while the desktop
+/// moves (`pace`) when that is slower, as for a 50 Hz display streamed at
+/// 60 fps or 30 fps content. A flat 20 ms gave those pictures to AMF twice.
+fn keyframe_flush_wait(target_fps: u32, cached: bool, pace: Option<Duration>) -> Duration {
+    if cached {
+        return KEYFRAME_FLUSH_WAIT;
+    }
+    let frame = crate::capture::frame_budget_for(target_fps).max(pace.unwrap_or_default());
+    (frame * 3 / 2).max(KEYFRAME_FLUSH_WAIT)
+}
+
+/// The pace of capture's real pictures, measured only between real pictures
+/// and kept across idle spells: motion that resumes keeps its pace.
+#[derive(Default)]
+struct CaptureCadence {
+    last: Option<Instant>,
+    gaps: std::collections::VecDeque<Duration>,
+}
+
+impl CaptureCadence {
+    const KEPT: usize = 8;
+
+    /// A picture from capture (not one given again).
+    fn captured(&mut self, at: Instant, cached: bool) {
+        if cached {
+            return;
+        }
+        if let Some(last) = self.last.replace(at) {
+            let gap = at.saturating_duration_since(last);
+            if gap < MOVING_GAP {
+                if self.gaps.len() == Self::KEPT {
+                    self.gaps.pop_front();
+                }
+                self.gaps.push_back(gap);
+            } else if gap >= PACE_FORGOTTEN {
+                self.gaps.clear();
+            }
+        }
+    }
+
+    /// The longest recent gap between real pictures while the desktop moved,
+    /// if any were seen.
+    fn pace(&self) -> Option<Duration> {
+        self.gaps.iter().copied().max()
+    }
+}
+
 /// How long after the keyframe went in the last picture is given again,
 /// before the keyframe is left to capture's next picture: an AMD driver can
 /// take a few hundred ms to encode a fresh session's first frame, and
@@ -2421,12 +2494,16 @@ struct OwedKeyframe {
     picture: Option<RawFrame>,
     /// When the picture stops being given again.
     until: Instant,
+    /// How long to wait for capture's next picture first.
+    wait: Duration,
     given: u32,
 }
 
 /// What the encode loop encodes next while a keyframe is owed.
 enum Next {
     Frame(RawFrame),
+    /// The last picture, given again.
+    Again(RawFrame),
     Closed,
     /// The deadline passed: capture's next picture brings the keyframe out.
     GaveUp,
@@ -2437,29 +2514,35 @@ impl OwedKeyframe {
         Self {
             picture: None,
             until,
+            wait: KEYFRAME_FLUSH_WAIT,
             given: 0,
         }
     }
 
     /// What is owed after a frame was submitted at `submitted`: nothing once
     /// the keyframe came out or the encoder holds no frame, else `picture`
-    /// to give again, until [`KEYFRAME_FLUSH_FOR`] after the first try.
+    /// to give again after `wait`, until [`KEYFRAME_FLUSH_FOR`] after the
+    /// first try.
     fn after_encode(
         owed: Option<Self>,
         picture: Option<RawFrame>,
         keyframe_out: bool,
         submitted: Instant,
+        wait: Duration,
     ) -> Option<Self> {
         let picture = picture.filter(|_| !keyframe_out)?;
         let mut owed = owed.unwrap_or_else(|| Self::until(submitted + KEYFRAME_FLUSH_FOR));
         owed.picture = Some(picture);
+        owed.wait = wait;
         Some(owed)
     }
 
-    /// Capture's next picture if one arrives within [`KEYFRAME_FLUSH_WAIT`],
-    /// else the last picture again, until the deadline.
+    /// Capture's next picture if one arrives within the wait, else the last
+    /// picture again, until the deadline.
     fn next(&mut self, frames: &FrameSlot) -> Next {
-        let wait = KEYFRAME_FLUSH_WAIT.min(self.until.saturating_duration_since(Instant::now()));
+        let wait = self
+            .wait
+            .min(self.until.saturating_duration_since(Instant::now()));
         match frames.take_within(wait, &mut self.picture) {
             Taken::Frame(frame) => Next::Frame(frame),
             Taken::Closed => Next::Closed,
@@ -2471,7 +2554,7 @@ impl OwedKeyframe {
                         given = self.given,
                         "Giving the encoder its last picture again to bring out the keyframe"
                     );
-                    Next::Frame(picture)
+                    Next::Again(picture)
                 }
                 _ => Next::GaveUp,
             },
@@ -6208,6 +6291,7 @@ mod tests {
             data: std::sync::Arc::clone(data),
             width: 2,
             height: 2,
+            cached: false,
         }
     }
 
@@ -6269,20 +6353,180 @@ mod tests {
             .checked_sub(Duration::from_millis(200))
             .unwrap();
         // The keyframe went in 200 ms ago; sending and receiving took that long.
-        let owed = OwedKeyframe::after_encode(None, Some(raw(1, &kept)), false, submitted)
-            .expect("the keyframe is owed");
+        let owed = OwedKeyframe::after_encode(
+            None,
+            Some(raw(1, &kept)),
+            false,
+            submitted,
+            KEYFRAME_FLUSH_WAIT,
+        )
+        .expect("the keyframe is owed");
         assert_eq!(owed.until, submitted + KEYFRAME_FLUSH_FOR);
         // A retry submitted later keeps the first deadline.
-        let owed =
-            OwedKeyframe::after_encode(Some(owed), Some(raw(1, &kept)), false, Instant::now())
-                .expect("still owed");
+        let owed = OwedKeyframe::after_encode(
+            Some(owed),
+            Some(raw(1, &kept)),
+            false,
+            Instant::now(),
+            KEYFRAME_FLUSH_WAIT,
+        )
+        .expect("still owed");
         assert_eq!(owed.until, submitted + KEYFRAME_FLUSH_FOR);
         assert!(
-            OwedKeyframe::after_encode(Some(owed), Some(raw(1, &kept)), true, Instant::now())
-                .is_none(),
+            OwedKeyframe::after_encode(
+                Some(owed),
+                Some(raw(1, &kept)),
+                true,
+                Instant::now(),
+                KEYFRAME_FLUSH_WAIT
+            )
+            .is_none(),
             "the keyframe came out"
         );
-        assert!(OwedKeyframe::after_encode(None, None, false, submitted).is_none());
+        assert!(
+            OwedKeyframe::after_encode(None, None, false, submitted, KEYFRAME_FLUSH_WAIT).is_none()
+        );
+    }
+
+    const ENCODE: Duration = Duration::from_millis(2);
+
+    /// Replays capture on a fake clock through the rule the encode loop
+    /// uses, as if a keyframe were owed after every picture: encoding ends
+    /// [`ENCODE`] after a picture is captured, and the picture is given
+    /// again if capture's next one has not come by then plus the wait.
+    /// `pictures` are capture times, each marked cached or real. Returns the
+    /// indices of the pictures that would have been given again.
+    fn given_again(target_fps: u32, pictures: &[(Instant, bool)]) -> Vec<usize> {
+        let mut cadence = CaptureCadence::default();
+        let mut again = Vec::new();
+        for (n, pair) in pictures.windows(2).enumerate() {
+            let (at, cached) = pair[0];
+            cadence.captured(at, cached);
+            let wait = keyframe_flush_wait(target_fps, cached, cadence.pace());
+            if pair[1].0 > at + ENCODE + wait {
+                again.push(n);
+            }
+        }
+        again
+    }
+
+    /// Real pictures every `frame`, off by up to a quarter frame (offsets in
+    /// eighths of a frame). Gaps run from 0.75 to 1.5 frames. The 1.25- and
+    /// 1.5-frame gaps come once per 12 pictures, rarer than the 8 gaps the
+    /// pace remembers, so the 1.5-frame gap is longer than the pace when it
+    /// comes: the wait needs its half frame of margin (1.0x fails here).
+    fn moving(start: Instant, frame: Duration, count: u32) -> Vec<(Instant, bool)> {
+        let eighth = frame / 8;
+        let offsets = [0i32, 0, 2, 0, 0, -1, 0, 0, 0, 0, -2, 2];
+        (0..count)
+            .map(|n| {
+                let at = start + frame * n;
+                let at = match offsets[n as usize % offsets.len()] {
+                    k if k >= 0 => at + eighth * k as u32,
+                    k => at - eighth * (-k) as u32,
+                };
+                (at, false)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_moving_desktop_never_has_its_picture_given_again_at_60_50_or_30_fps() {
+        let start = Instant::now() + Duration::from_secs(1);
+        let us = Duration::from_micros;
+        for (target_fps, frame, what) in [
+            (60, us(16_667), "60 fps"),
+            (60, us(20_000), "a 50 Hz display streamed at 60 fps"),
+            (50, us(20_000), "50 fps"),
+            (30, us(33_333), "30 fps"),
+            (60, us(33_333), "30 fps content streamed at 60 fps"),
+        ] {
+            let pictures = moving(start, frame, 240);
+            // The pipeline's first picture has no pace to go by. It is
+            // encoded before any viewer arrives (see capture's IdleGate).
+            let again: Vec<usize> = given_again(target_fps, &pictures)
+                .into_iter()
+                .filter(|&n| n > 0)
+                .collect();
+            assert!(again.is_empty(), "{what}: pictures {again:?} given again");
+        }
+    }
+
+    #[test]
+    fn motion_that_resumes_after_an_idle_spell_keeps_its_pace() {
+        let start = Instant::now() + Duration::from_secs(1);
+        for (target_fps, frame) in [
+            (60, Duration::from_micros(16_667)),
+            (60, Duration::from_micros(20_000)),
+            (60, Duration::from_micros(33_333)),
+            (30, Duration::from_micros(33_333)),
+        ] {
+            let mut pictures = moving(start, frame, 20);
+            let last = pictures.last().unwrap().0;
+            // Still for 750 ms, with the keepalive's cached resend, then
+            // moving again at the same pace.
+            pictures.push((last + Duration::from_millis(750), true));
+            let resumed = last + Duration::from_millis(1500);
+            pictures.extend(moving(resumed, frame, 20));
+            // Judged from the first picture after the resend: the last one
+            // before the idle spell is given again, as the desktop went
+            // still after it.
+            let resent = 20;
+            let again: Vec<usize> = given_again(target_fps, &pictures)
+                .into_iter()
+                .filter(|&n| n > resent)
+                .collect();
+            assert!(
+                again.is_empty(),
+                "{target_fps} fps, {frame:?} frames: real pictures {again:?} given again"
+            );
+        }
+        // Past a long idle spell the pace is forgotten: the target's again.
+        let mut cadence = CaptureCadence::default();
+        for (at, cached) in moving(start, Duration::from_micros(33_333), 10) {
+            cadence.captured(at, cached);
+        }
+        cadence.captured(start + PACE_FORGOTTEN * 2, false);
+        assert_eq!(cadence.pace(), None);
+        assert_eq!(
+            keyframe_flush_wait(60, false, cadence.pace()),
+            crate::capture::frame_budget_for(60) * 3 / 2
+        );
+    }
+
+    #[test]
+    fn a_cached_picture_is_given_again_after_the_shortest_wait() {
+        let start = Instant::now() + Duration::from_secs(1);
+        for target_fps in [60, 50, 30] {
+            let frame = crate::capture::frame_budget_for(target_fps);
+            let mut pictures = moving(start, frame, 10);
+            let last = pictures.last().unwrap().0;
+            // A pointer redraw resends the cached picture after only 50 ms,
+            // then the desktop stays still.
+            pictures.push((last + Duration::from_millis(50), true));
+            pictures.push((last + Duration::from_millis(800), true));
+            let mut cadence = CaptureCadence::default();
+            for &(at, cached) in &pictures[..pictures.len() - 1] {
+                cadence.captured(at, cached);
+            }
+            assert_eq!(
+                keyframe_flush_wait(target_fps, true, cadence.pace()),
+                KEYFRAME_FLUSH_WAIT,
+                "{target_fps} fps: a cached picture"
+            );
+            assert!(
+                given_again(target_fps, &pictures).contains(&10),
+                "{target_fps} fps: the redrawn picture was not given again"
+            );
+            // A real picture waits a frame and a half of the pace.
+            assert_eq!(
+                keyframe_flush_wait(target_fps, false, cadence.pace()),
+                frame.max(cadence.pace().unwrap()) * 3 / 2,
+                "{target_fps} fps: a real picture"
+            );
+        }
+        // Past 75 fps a frame and a half is shorter than AMF's encode.
+        assert_eq!(keyframe_flush_wait(120, false, None), KEYFRAME_FLUSH_WAIT);
     }
 
     #[test]
@@ -6292,7 +6536,7 @@ mod tests {
         let mut owed = OwedKeyframe::until(Instant::now() + Duration::from_secs(60));
         owed.picture = Some(raw(1, &kept));
         let started = Instant::now();
-        let Next::Frame(frame) = owed.next(&consumer) else {
+        let Next::Again(frame) = owed.next(&consumer) else {
             panic!("the picture was not given again");
         };
         assert_eq!(frame.frame_number, 1);
@@ -6446,6 +6690,7 @@ mod tests {
                 data: std::sync::Arc::new(data),
                 width: 1280,
                 height: 720,
+                cached: false,
             });
             self.number += 1;
             std::thread::sleep(std::time::Duration::from_millis(33));

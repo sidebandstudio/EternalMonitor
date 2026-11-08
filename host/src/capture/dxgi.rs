@@ -675,6 +675,7 @@ pub fn run_capture_loop(
                             data: Arc::clone(&data),
                             width: tex_width,
                             height: tex_height,
+                            cached: false,
                         });
                         last_send = now;
                     } else {
@@ -865,7 +866,7 @@ pub fn run_capture_loop(
                             }
                             // Tell the GUI why while the retries continue.
                             if let Some(block) = CaptureBlock::from_hresult(last_code.0) {
-                                *shared.capture_block.lock() = Some(block);
+                                super::recovery::note_capture_blocked(&shared, block);
                             }
                             // The output may be gone: look at the whole layout.
                             let allowed = keepalive_allowed(picture.real(), second_screen);
@@ -1012,6 +1013,7 @@ fn resend_last_frame(
         data: Arc::clone(last_frame),
         width,
         height,
+        cached: true,
     });
     *last_send = now;
 }

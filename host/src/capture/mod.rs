@@ -258,6 +258,11 @@ pub struct RawFrame {
     pub data: Arc<Vec<u8>>,
     pub width: u32,
     pub height: u32,
+    /// A picture capture already had, sent again because the desktop gave
+    /// no new one: the keepalive, a keyframe request's resend, the cached
+    /// picture redrawn with or without the pointer, or a resend during
+    /// duplication recovery.
+    pub cached: bool,
 }
 
 /// Readable bytes after a frame's last row: FFmpeg's
@@ -490,6 +495,8 @@ const VDD_POLL_INTERVAL: Duration = Duration::from_millis(120);
 enum AttachResult {
     Attached(OutputInfo),
     TimedOut,
+    /// The driver runs, but Windows added no monitor for it, and won't.
+    NoMonitor,
     Cancelled,
 }
 
@@ -502,6 +509,7 @@ fn wait_for_virtual_output(
     mut poll: impl FnMut() -> Option<Vec<OutputInfo>>,
     mut now: impl FnMut() -> Instant,
     mut wait: impl FnMut(Duration),
+    mut no_monitor: impl FnMut() -> bool,
 ) -> AttachResult {
     let deadline = now() + timeout;
     loop {
@@ -513,6 +521,9 @@ fn wait_for_virtual_output(
         }
         if now() >= deadline {
             return AttachResult::TimedOut;
+        }
+        if no_monitor() {
+            return AttachResult::NoMonitor;
         }
         wait(VDD_POLL_INTERVAL);
     }
@@ -1442,6 +1453,7 @@ mod tests {
             data: Arc::new(Vec::new()),
             width: 2,
             height: 2,
+            cached: false,
         };
         let short = Duration::from_millis(5);
         assert!(matches!(
@@ -1482,6 +1494,7 @@ mod tests {
             data: Arc::clone(&pool[n]),
             width: 2,
             height: 2,
+            cached: false,
         };
         let mut kept = Some(frame(0));
         producer.publish(frame(1));
@@ -2047,6 +2060,7 @@ mod tests {
                     "driver startup must not trip the 3s/5s watchdogs"
                 );
             },
+            || false,
         );
         let AttachResult::Attached(output) = result else {
             panic!("virtual display did not attach")
@@ -2079,6 +2093,7 @@ mod tests {
             || Some(Vec::new()),
             || start + elapsed.get(),
             |duration| elapsed.set(elapsed.get() + duration),
+            || false,
         );
         assert!(matches!(result, AttachResult::TimedOut));
         assert!(elapsed.get() >= timeout && elapsed.get() < timeout + VDD_POLL_INTERVAL);
@@ -2099,6 +2114,7 @@ mod tests {
                 elapsed.set(elapsed.get() + duration);
                 cancelled_at.set(true);
             },
+            || false,
         );
         assert!(matches!(result, AttachResult::Cancelled));
     }
