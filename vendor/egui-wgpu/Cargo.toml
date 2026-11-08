@@ -338,3 +338,9 @@ priority = -1
 
 [lints.rustdoc]
 all = "warn"
+
+# EternalMonitor patch: an adapter's Vulkan LUID (`AdapterKey`), at wgpu-hal's version.
+[target.'cfg(windows)'.dependencies.ash]
+version = "0.38"
+default-features = false
+

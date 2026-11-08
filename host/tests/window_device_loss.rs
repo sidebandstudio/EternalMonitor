@@ -4,10 +4,12 @@
 //! patched copy in `vendor/egui-wgpu` skips the frame and replaces the device
 //! on a schedule (`Replacement`), giving up after repeated failures.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
-use eframe::egui_wgpu::winit::{Answer, Asked, Replacement, REPLACEMENT_TIMEOUT};
+use eframe::egui_wgpu::winit::{watch, Answer, Asked, Replacement, REPLACEMENT_TIMEOUT};
 use eframe::egui_wgpu::{
     replacement_candidates, AdapterKey, RenderState, Renderer, RendererOptions, ScreenDescriptor,
     WgpuConfiguration,
@@ -241,19 +243,27 @@ fn a_replacement_device_is_made_without_any_window_or_surface() {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let drew_on = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
         .expect("a graphics adapter");
-    let preferred = AdapterKey::of(&drew_on.get_info());
-    let mut watched = false;
+    let preferred = AdapterKey::of(&drew_on);
+    let lost = Arc::new(AtomicBool::new(false));
     let new = block_on(RenderState::new_device(
         &config,
         &instance,
         Some(&preferred),
         &[],
-        |_| watched = true,
+        |device| watch(device, &lost),
     ))
     .expect("a device");
-    // The loss handlers went on before anything was made on the device.
-    assert!(watched);
     assert_eq!(new.adapter_key(), preferred);
+    // The loss handlers are on the device: a wgpu error marks it lost, where
+    // wgpu's default handler would panic.
+    assert!(!lost.load(Ordering::SeqCst));
+    let _misaligned = new.device().create_buffer(&wgpu::BufferDescriptor {
+        label: None,
+        size: 3,
+        usage: wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: true,
+    });
+    assert!(lost.load(Ordering::SeqCst));
     let buffer = new.device().create_buffer(&wgpu::BufferDescriptor {
         label: None,
         size: 256,
@@ -265,6 +275,7 @@ fn a_replacement_device_is_made_without_any_window_or_surface() {
 
 fn adapter(name: &str, backend: wgpu::Backend, vendor: u32) -> AdapterKey {
     AdapterKey {
+        luid: None,
         backend,
         vendor,
         device: 1,
@@ -310,4 +321,46 @@ fn a_replacement_prefers_the_adapter_that_drew_and_moves_past_ones_that_cannot()
     };
     assert_eq!(chosen, dgpu_vulkan);
     assert_eq!(tried, [dgpu, igpu, dgpu_vulkan]);
+}
+
+#[test]
+fn two_identical_cards_are_told_apart_by_their_luid() {
+    use wgpu::Backend::Dx12;
+    // Two of the same card on different buses: wgpu's DX12 bus comes from the
+    // PCI ids, so everything but the LUID matches.
+    let card = |luid| AdapterKey {
+        luid: Some(luid),
+        pci_bus: "0000:01:00.0".into(),
+        ..adapter("RTX 5080", Dx12, 0x10de)
+    };
+    let (first, second) = (card(0x0000_0000_0001_a2b3), card(0x0000_0000_0001_c4d5));
+    let listed = [first.clone(), second.clone()];
+
+    // The one that drew is chosen, not its twin listed first.
+    assert_eq!(replacement_candidates(&listed, Some(&second), &[]), [1]);
+    // Leaving one out leaves the other.
+    assert_eq!(
+        replacement_candidates(&listed, Some(&first), std::slice::from_ref(&first)),
+        [1]
+    );
+    assert_eq!(replacement_candidates(&listed, None, &[second]), [0]);
+}
+
+#[cfg(windows)]
+#[test]
+fn every_dx12_adapter_has_its_own_luid() {
+    let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: wgpu::Backends::DX12,
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    });
+    let adapters = block_on(instance.enumerate_adapters(wgpu::Backends::DX12));
+    assert!(!adapters.is_empty());
+    let luids: Vec<u64> = adapters
+        .iter()
+        .map(|adapter| AdapterKey::of(adapter).luid.expect("a DX12 LUID"))
+        .collect();
+    let mut unique = luids.clone();
+    unique.sort_unstable();
+    unique.dedup();
+    assert_eq!(unique.len(), luids.len(), "{luids:x?}");
 }

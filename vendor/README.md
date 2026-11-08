@@ -51,8 +51,11 @@ The patch:
   `replacement_candidates` gives the host's adapter choice only the adapter
   that last drew on the window, starting with the one from start, while it is
   listed. An adapter that can't draw on the window is left out of later tries
-  until a replacement works. Adapters are told apart by `AdapterKey` (backend,
-  PCI ids, type, name, PCI bus), because wgpu reports no LUID.
+  until a replacement works. Adapters are told apart by `AdapterKey`: the
+  LUID (from DXGI on DX12, and `VkPhysicalDeviceIDProperties` on Vulkan 1.1+
+  on Windows, through the `ash` dependency at wgpu-hal's version), else the
+  backend, PCI ids, type, name and PCI bus. wgpu's DX12 bus comes from the
+  PCI ids alone, so identical cards differ only by LUID.
   The thread is named `winit::REPLACEMENT_THREAD`, so the host's panic hook
   treats a panic there as one failed try: it doesn't turn the virtual display
   off as it does for other background threads.

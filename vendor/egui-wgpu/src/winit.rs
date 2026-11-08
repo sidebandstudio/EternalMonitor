@@ -131,7 +131,7 @@ enum Replacing {
 /// EternalMonitor patch: flag the loss of `device` in `lost`. An error wgpu reports outside
 /// an error scope flags it too, instead of panicking as wgpu's default handler does: a
 /// window whose device or surface fails is drawn again on a new one.
-fn watch(device: &wgpu::Device, lost: &Arc<AtomicBool>) {
+pub fn watch(device: &wgpu::Device, lost: &Arc<AtomicBool>) {
     let flag = Arc::clone(lost);
     device.set_device_lost_callback(move |reason, message| {
         log::warn!("The wgpu device was lost ({reason:?}): {message}");
@@ -493,7 +493,7 @@ impl Painter {
             let lost = Arc::new(AtomicBool::new(false));
             watch(&render_state.device, &lost);
             self.device_lost = lost;
-            self.preferred = Some(crate::AdapterKey::of(&render_state.adapter.get_info()));
+            self.preferred = Some(crate::AdapterKey::of(&render_state.adapter));
             self.render_state = Some(render_state);
         }
         self.install_surface(surface, viewport_id, size.width, size.height, false);

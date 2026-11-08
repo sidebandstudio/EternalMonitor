@@ -296,11 +296,13 @@ impl RenderState {
     }
 }
 
-/// EternalMonitor patch: which adapter one is, across listings: wgpu's `AdapterInfo`
-/// carries no LUID, so the backend, the PCI ids, the type, the name and the PCI bus (when
-/// the backend reports one).
+/// EternalMonitor patch: which adapter one is, across listings. Its LUID where the
+/// backend gives one (DX12 always, Vulkan 1.1+ on Windows), which tells identical cards
+/// apart. Without one, the backend, the PCI ids, the type, the name and the PCI bus: wgpu's
+/// DX12 bus comes from the PCI ids alone, so identical cards there would share it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AdapterKey {
+    pub luid: Option<u64>,
     pub backend: wgpu::Backend,
     pub vendor: u32,
     pub device: u32,
@@ -310,16 +312,52 @@ pub struct AdapterKey {
 }
 
 impl AdapterKey {
-    pub fn of(info: &wgpu::AdapterInfo) -> Self {
+    pub fn of(adapter: &wgpu::Adapter) -> Self {
+        let info = adapter.get_info();
         Self {
+            luid: luid(adapter),
             backend: info.backend,
             vendor: info.vendor,
             device: info.device,
             device_type: info.device_type,
-            name: info.name.clone(),
-            pci_bus: info.device_pci_bus_id.clone(),
+            name: info.name,
+            pci_bus: info.device_pci_bus_id,
         }
     }
+}
+
+/// EternalMonitor patch: the adapter's LUID, from DXGI on DX12, or from
+/// `VkPhysicalDeviceIDProperties` on Vulkan 1.1+.
+#[cfg(windows)]
+fn luid(adapter: &wgpu::Adapter) -> Option<u64> {
+    // SAFETY: the backend objects are only read, while `adapter` holds them.
+    if let Some(hal) = unsafe { adapter.as_hal::<wgpu::hal::api::Dx12>() } {
+        let desc = unsafe { hal.raw_adapter().GetDesc1() }.ok()?;
+        let luid = desc.AdapterLuid;
+        return Some((u64::from(luid.HighPart as u32) << 32) | u64::from(luid.LowPart));
+    }
+    if let Some(hal) = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() } {
+        let shared = hal.shared_instance();
+        if shared.instance_api_version() < ash::vk::API_VERSION_1_1 {
+            return None;
+        }
+        let mut id = ash::vk::PhysicalDeviceIDProperties::default();
+        {
+            let mut properties = ash::vk::PhysicalDeviceProperties2::default().push_next(&mut id);
+            unsafe {
+                shared
+                    .raw_instance()
+                    .get_physical_device_properties2(hal.raw_physical_device(), &mut properties);
+            }
+        }
+        return (id.device_luid_valid == ash::vk::TRUE).then(|| u64::from_le_bytes(id.device_luid));
+    }
+    None
+}
+
+#[cfg(not(windows))]
+fn luid(_adapter: &wgpu::Adapter) -> Option<u64> {
+    None
 }
 
 /// EternalMonitor patch: the adapters, by index into `keys`, that a replacement may choose
@@ -359,7 +397,7 @@ impl NewDevice {
     }
 
     pub fn adapter_key(&self) -> AdapterKey {
-        AdapterKey::of(&self.adapter.get_info())
+        AdapterKey::of(&self.adapter)
     }
 }
 
@@ -384,10 +422,7 @@ impl RenderState {
         let available_adapters = instance
             .enumerate_adapters(create_new.instance_descriptor.backends)
             .await;
-        let keys: Vec<AdapterKey> = available_adapters
-            .iter()
-            .map(|adapter| AdapterKey::of(&adapter.get_info()))
-            .collect();
+        let keys: Vec<AdapterKey> = available_adapters.iter().map(AdapterKey::of).collect();
         let candidates: Vec<wgpu::Adapter> = replacement_candidates(&keys, preferred, excluded)
             .into_iter()
             .map(|index| available_adapters[index].clone())
@@ -401,14 +436,11 @@ impl RenderState {
             selector(&candidates, None).map_err(WgpuError::CustomNativeAdapterSelectionError)?
         } else {
             // wgpu chooses among all adapters, not these: keep its choice only if it is one.
-            let keys: Vec<AdapterKey> = candidates
-                .iter()
-                .map(|adapter| AdapterKey::of(&adapter.get_info()))
-                .collect();
+            let keys: Vec<AdapterKey> = candidates.iter().map(AdapterKey::of).collect();
             request_adapter(instance, create_new.power_preference, None, &candidates)
                 .await
                 .ok()
-                .filter(|adapter| keys.contains(&AdapterKey::of(&adapter.get_info())))
+                .filter(|adapter| keys.contains(&AdapterKey::of(adapter)))
                 .unwrap_or_else(|| candidates[0].clone())
         };
         let (device, queue) = adapter
