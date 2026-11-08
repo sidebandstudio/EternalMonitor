@@ -24,7 +24,8 @@ pub enum Phase {
     Tick,
     /// Handling a control datagram from an iPad, or a USB tunnel event.
     Control,
-    /// Injecting the iPad's touch, pen, mouse or keyboard input into Windows.
+    /// Queueing the iPad's touch, pen, mouse or keyboard input for the input
+    /// thread, which hands it to Windows.
     Input,
     /// Sending what the session decided: replies, goodbyes, summaries.
     Actions,

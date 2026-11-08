@@ -33,7 +33,7 @@ use abr::AbrController;
 use beat::Phase;
 use fault::FaultInjector;
 use link::{LinkId, PeerId};
-use pacer::{Deadline, FramePacer, PacingClock};
+use pacer::{FramePacer, PacingClock};
 use retransmit::RetransmitRing;
 use session::{Actions, ConfigSource, HEARTBEAT_INTERVAL};
 use usb::{LinkEvent, TransportLinks};
@@ -229,11 +229,13 @@ pub async fn start_sender(
         .lock()
         .set_target_addr(shared.target_addr.lock().to_string());
 
-    let input_relay = crate::input::InputRelay::default();
+    let input = shared
+        .input
+        .begin(std::sync::Arc::clone(&shared.capture_geometry));
     let config = SharedConfigSource {
         shared: &shared,
         stream_epoch,
-        pen_available: input_relay.pen_available(),
+        pen_available: input.pen_available(),
         listen: local_addr,
     };
 
@@ -282,7 +284,7 @@ pub async fn start_sender(
     let mut state = LoopState {
         retransmit_ring: RetransmitRing::default(),
         fault,
-        input_relay,
+        input,
         abr,
     };
     let mut audio_sender = audio::AudioSender::default();
@@ -313,37 +315,14 @@ pub async fn start_sender(
     // starts. It is looked at again while nobody streams.
     let mut network_check = tokio::time::interval(Duration::from_secs(10));
     network_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let mut pen_tick = tokio::time::interval(Duration::from_millis(50));
-    pen_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut pen_spacing = Deadline::new("pen-spacing")?;
 
     loop {
-        // A pen backlog sends one bounded chunk at the top of every pass,
-        // whatever the select below keeps ready, so the loop serves one
-        // branch between chunks and the backlog never waits behind them.
-        if state
-            .input_relay
-            .pen_spaced_until()
-            .is_some_and(|at| at <= Instant::now())
-        {
-            beat.mark(Phase::Input);
-            state
-                .input_relay
-                .keep_pen_alive(*shared.capture_geometry.lock());
-        }
-        pen_spacing.arm(state.input_relay.pen_spaced_until());
         beat.mark(Phase::Waiting);
         tokio::select! {
             // Service timers and queued control before another paced frame.
             // Random branch selection can delay a NACK by multiple frame
             // bursts on platforms with coarse sleep granularity.
             biased;
-            // Not while a backlog is held: its chunk went at the top of
-            // this pass, and a second one would leave nothing between them.
-            _ = pen_tick.tick(), if state.input_relay.pen_tick_needed() && state.input_relay.pen_spaced_until().is_none() => {
-                beat.mark(Phase::Input);
-                state.input_relay.keep_pen_alive(*shared.capture_geometry.lock());
-            }
             _ = tokio::time::sleep_until(state.fault.next_deadline().unwrap_or_else(|| Instant::now() + Duration::from_secs(3600)).into()), if state.fault.enabled() => {
                 beat.mark(Phase::Video);
                 let destination = *shared.target_addr.lock();
@@ -568,10 +547,6 @@ pub async fn start_sender(
                     "Frame sent"
                 );
             }
-            // Only wakes an otherwise idle loop for the next chunk, which
-            // goes at the top of the pass. Last, because any branch ready
-            // before it starts that pass anyway.
-            _ = pen_spacing.wait(), if pen_spacing.armed() => {}
         }
     }
 
@@ -815,7 +790,9 @@ async fn repair_while_pacing(
 struct LoopState {
     retransmit_ring: RetransmitRing,
     fault: FaultInjector,
-    input_relay: crate::input::InputRelay,
+    /// Hands input to Windows on its own thread: Windows' input calls can
+    /// wait seconds while it reconfigures displays.
+    input: crate::input::Injector,
     abr: AbrController,
 }
 
@@ -836,7 +813,7 @@ async fn act(
         state.fault.clear();
     }
     if actions.new_target.is_some() || actions.client_lost || actions.release_input {
-        state.input_relay.reset();
+        state.input.reset();
     }
     if let Some(nack) = actions.retransmit.take() {
         send_repairs(&links.udp.socket, &mut state.retransmit_ring, shared, &nack).await;
@@ -844,11 +821,9 @@ async fn act(
     if let Some((session_id, event)) = actions.input.take() {
         shared.transport_beat.mark(Phase::Input);
         if let Some(geometry) = *shared.capture_geometry.lock() {
-            if actions.input_late {
-                state.input_relay.relay_late(session_id, &event, geometry);
-            } else {
-                state.input_relay.relay(session_id, &event, geometry);
-            }
+            state
+                .input
+                .relay(session_id, event, geometry, actions.input_late);
         }
     }
     if let Some(report) = actions.report.take() {
@@ -1286,7 +1261,7 @@ mod tests {
         LoopState {
             retransmit_ring: RetransmitRing::default(),
             fault: FaultInjector::new(0.0, 0.0, Duration::ZERO),
-            input_relay: crate::input::InputRelay::default(),
+            input: crate::input::InputThread::default().begin(Default::default()),
             abr: AbrController::new(15_000_000, true),
         }
     }
@@ -1391,8 +1366,16 @@ mod tests {
             )
             .await;
         }
+        // Windows takes input on the input thread.
+        let injected = |count: usize| {
+            let started = Instant::now();
+            while recorder::peek().len() < count && started.elapsed() < Duration::from_secs(5) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            recorder::take()
+        };
         assert!(matches!(
-            recorder::take().as_slice(),
+            injected(3).as_slice(),
             [
                 Injection::KeyDown { .. },
                 Injection::MoveAbs { .. },
@@ -1413,7 +1396,7 @@ mod tests {
         .await;
         assert!(shared.session.lock().session_id().is_none());
         assert!(matches!(
-            recorder::take().as_slice(),
+            injected(2).as_slice(),
             [Injection::KeyUp { .. }, Injection::LeftUp { .. }]
         ));
     }
@@ -1686,102 +1669,190 @@ mod tests {
         );
     }
 
-    /// `start_sender` itself, with a native pen device that takes every
-    /// frame (Windows' own off Windows). A stall delivers 64 samples at
-    /// once while the encoder always has a frame ready, which the loop takes
-    /// in a branch ahead of the pen's wake-up. The spacing holds back all
-    /// but the first burst, and the loop sends the rest within a few times
-    /// the spacing, one chunk at the top of each pass.
-    #[cfg(not(windows))]
+    /// Windows holds the input thread inside a still Pencil's refresh. The
+    /// loop takes the capture rect for every input datagram, so a refresh
+    /// that kept it while Windows held the call stopped the loop at the
+    /// iPad's next touch: no heartbeats, no HELLO answers, no goodbye.
     #[test]
-    fn the_loop_sends_a_held_pen_backlog_while_video_is_always_ready() {
-        use crate::input::{native_pen, CaptureGeometry, PenPhase, PenSample};
-        const SAMPLES: usize = 64;
-        const VIDEO_QUEUE: usize = 1 << 16;
-        let output = CaptureGeometry {
+    fn a_pen_refresh_windows_holds_never_stops_the_loop() {
+        use crate::input::{CaptureGeometry, InputThread, Sink, KIND_KEY, PHASE_BEGAN};
+        use eternal_wire::v2::control::{HelloStatus, InputEvent, FEATURE_WANTS_INPUT};
+
+        /// Holds the first refresh until told to go on.
+        struct StuckRefresh {
+            entered: Option<std_mpsc::Sender<()>>,
+            hold: Option<std_mpsc::Receiver<()>>,
+        }
+        impl Sink for StuckRefresh {
+            fn relay(&mut self, _: u32, _: &InputEvent, _: CaptureGeometry, _: bool) {}
+            fn reset(&mut self) {}
+            fn keep_alive(&mut self, _: Option<CaptureGeometry>) {
+                if let Some(entered) = self.entered.take() {
+                    let _ = entered.send(());
+                }
+                if let Some(hold) = self.hold.take() {
+                    let _ = hold.recv();
+                }
+            }
+            fn pen_available(&self) -> bool {
+                true
+            }
+            fn spaced_until(&self) -> Option<Instant> {
+                None
+            }
+            fn tick_needed(&self) -> bool {
+                true
+            }
+        }
+
+        let ipad = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        ipad.set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        let port = std::net::UdpSocket::bind("127.0.0.1:0")
+            .and_then(|s| s.local_addr())
+            .unwrap()
+            .port();
+        let host = SocketAddr::from(([127, 0, 0, 1], port));
+        let (entered_tx, entered) = std_mpsc::channel();
+        let (go, hold) = std_mpsc::channel();
+        let mut shared = SharedControl::new(port, 15_000_000);
+        shared.input = std::sync::Arc::new(InputThread::with_fake(move || StuckRefresh {
+            entered: Some(entered_tx),
+            hold: Some(hold),
+        }));
+        shared.pairing.lock().required = false;
+        shared.running.store(true, Ordering::SeqCst);
+        *shared.capture_geometry.lock() = Some(CaptureGeometry {
             left: 0,
             top: 0,
-            width: 1920,
-            height: 1080,
-        };
-        let taken = native_pen::install();
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let (delivered, queued) = runtime.block_on(async {
-            let shared = SharedControl::new(0, 15_000_000);
-            shared.running.store(true, Ordering::SeqCst);
-            *shared.capture_geometry.lock() = Some(output);
-            let (nal_tx, nal_rx) = mpsc::channel(VIDEO_QUEUE);
-            let (_audio_tx, audio_rx) = mpsc::channel(1);
-            let (supervisor_tx, _supervisor_rx) = std_mpsc::channel();
-            let frame = |sequence| NALUnit {
-                data: vec![0, 0, 0, 1, 0x41],
-                sequence,
-                timestamp: Instant::now(),
-                encode_duration_us: 0,
-                is_keyframe: false,
-            };
-            // A full queue, kept full until the loop stops and drops it.
-            let mut sequence = 0;
-            while nal_tx.try_send(frame(sequence)).is_ok() {
-                sequence += 1;
-            }
-            let video = std::thread::spawn(move || {
-                while nal_tx.blocking_send(frame(sequence)).is_ok() {
-                    sequence += 1;
-                }
-                sequence
-            });
-            let delivered = Instant::now();
-            native_pen::with(|device| {
-                for x in 0..SAMPLES as u16 {
-                    let sample = PenSample {
-                        phase: if x == 0 {
-                            PenPhase::Down
-                        } else {
-                            PenPhase::Move
-                        },
-                        x: i32::from(x),
-                        y: 10,
-                        x_norm: x,
-                        y_norm: 10,
-                        pressure: 512,
-                        tilt_x: 0,
-                        tilt_y: 0,
-                    };
-                    device.deliver(sample, native_pen::SCREEN, Some(output), Instant::now());
-                }
-            });
-            assert!(
-                taken.borrow().len() < SAMPLES / 2,
-                "the spacing must hold the backlog back"
-            );
-            let stop = shared.clone();
-            let watch = async {
-                while taken.borrow().len() < SAMPLES && delivered.elapsed() < Duration::from_secs(2)
-                {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                }
-                stop.stop();
-            };
-            let (sent, ()) = tokio::join!(
-                start_sender(nal_rx, audio_rx, 0, shared, supervisor_tx),
-                watch
-            );
-            sent.unwrap();
-            (delivered, video.join().unwrap())
+            width: 1280,
+            height: 720,
         });
-        let taken = taken.borrow();
-        let order: Vec<_> = taken.iter().map(|(frame, _)| frame.x_norm).collect();
-        assert_eq!(order, (0..SAMPLES as u16).collect::<Vec<_>>());
-        let drained = taken.last().unwrap().1 - delivered;
-        // 58 held frames 250 µs apart take 15 ms; the 50 ms tick alone
-        // would take 500 ms.
-        assert!(drained < Duration::from_millis(250), "{drained:?}");
-        // The loop kept taking video.
-        assert!(queued > (VIDEO_QUEUE + SAMPLES) as u64, "{queued}");
+        let (nal_tx, nal_rx) = mpsc::channel(4);
+        let control = shared.clone();
+        let transport = std::thread::spawn(move || {
+            let (_audio_tx, audio_rx) = mpsc::channel(4);
+            let (supervisor_tx, _supervisor_rx) = std_mpsc::channel();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(start_sender(nal_rx, audio_rx, port, control, supervisor_tx))
+                .unwrap();
+        });
+        // The refresh ticks from the stream's start; Windows holds it.
+        entered
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the input thread refreshes the pen");
+
+        let mut msg_seq = 0;
+        let mut send = |session_id, message: &ControlMessage| {
+            msg_seq += 1;
+            ipad.send_to(&encode_control(session_id, msg_seq, message), host)
+                .unwrap();
+        };
+        let heard = |until: Instant| {
+            let mut messages = Vec::new();
+            let mut bytes = [0u8; 2048];
+            while Instant::now() < until {
+                if let Ok((len, _)) = ipad.recv_from(&mut bytes) {
+                    if let Ok((_, message)) = parse_control(&bytes[..len]) {
+                        messages.push(message);
+                    }
+                }
+            }
+            messages
+        };
+        let hello = ControlMessage::Hello2(Hello2 {
+            proto_min: 2,
+            proto_max: 2,
+            client_nonce: 1,
+            listen_port: 0,
+            decoder_caps: CAP_DECODE_H264,
+            feature_caps: FEATURE_WANTS_INPUT,
+            screen_px_w: 1280,
+            screen_px_h: 720,
+            screen_pt_w: 1280,
+            screen_pt_h: 720,
+            refresh_hz: 60,
+            device_name: "Pen refresh test".into(),
+            device_id: 1,
+            preferred_fps: 0,
+            auth_token: [0; 16],
+            pairing_code: 0,
+        });
+        let started = Instant::now();
+        let session_id = loop {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "no HELLO answer"
+            );
+            send(0, &hello);
+            let accepted = heard(Instant::now() + Duration::from_millis(200))
+                .into_iter()
+                .find_map(|message| match message {
+                    ControlMessage::HelloAck(ack) if ack.status == HelloStatus::Ok => {
+                        Some(ack.session_id)
+                    }
+                    _ => None,
+                });
+            if let Some(id) = accepted {
+                break id;
+            }
+        };
+
+        // The iPad keeps typing while Windows holds the refresh; the loop
+        // keeps its heartbeats going.
+        let mut watch = beat::Watch::default();
+        let mut verdicts = Vec::new();
+        let mut heartbeats = 0;
+        let until = Instant::now() + Duration::from_secs(3);
+        let mut event_id = 0;
+        while Instant::now() < until {
+            event_id += 1;
+            send(
+                session_id,
+                &ControlMessage::InputEvent(InputEvent {
+                    input_ver: 1,
+                    kind: KIND_KEY,
+                    phase: PHASE_BEGAN,
+                    buttons: 0,
+                    event_id,
+                    x_norm: 0,
+                    y_norm: 0,
+                    pressure_x1000: 0,
+                    scroll_dx: 0,
+                    scroll_dy: 0,
+                    keycode: 0x01,
+                    modifiers: 0,
+                    client_time_us: 0,
+                    tilt_x: 0,
+                    tilt_y: 0,
+                }),
+            );
+            heartbeats += heard(Instant::now() + Duration::from_millis(100))
+                .iter()
+                .filter(|message| matches!(message, ControlMessage::Heartbeat(_)))
+                .count();
+            verdicts.extend(watch.check(
+                shared.transport_beat.read(),
+                crate::clock::host_now_us() / 1000,
+            ));
+        }
+        let stuck = heartbeats < 2 || !verdicts.is_empty();
+        if stuck {
+            // Let a stuck loop go, so the test ends.
+            let _ = go.send(());
+        }
+        assert!(
+            heartbeats >= 2,
+            "heartbeats while Windows held the refresh: {heartbeats}"
+        );
+        assert_eq!(verdicts, []);
+        shared.stop();
+        drop(nal_tx);
+        transport.join().unwrap();
+        let _ = go.send(());
     }
 
     #[test]
