@@ -140,6 +140,14 @@ class NotesTest(unittest.TestCase):
         self.assertIn("TestFlight", text)
         self.assertIn(f"```\n{HASH}\n```", text)
 
+    def test_the_beta_body_is_the_one_the_windows_app_reads(self):
+        # host/src/updates.rs reads the version and SHA-256 from this fixture too.
+        fixture = (ROOT / "scripts/fixtures/beta-release-body.md").read_text(encoding="utf-8")
+        text = nightly.beta_body(
+            nightly.notes("0.3.5-beta.20261107.26", "release/0.3.5-candidate", SHA, "0.3.4", HASH), SHA)
+        self.assertEqual(text, fixture.replace("\r\n", "\n"))
+        self.assertEqual(nightly.published_commit(text), SHA)
+
     def test_notes_need_the_full_commit_and_hash(self):
         with self.assertRaises(ValueError):
             nightly.notes("v", "b", SHA[:7], "0.3.3", HASH)

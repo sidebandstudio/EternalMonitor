@@ -24,6 +24,10 @@ pub struct SettingsFile {
     pub encoder_input: crate::encoder::input::EncoderInput,
     #[serde(default = "default_true")]
     pub check_for_updates: bool,
+    /// On a Beta build: newer Betas are offered too. Off: only stable
+    /// releases.
+    #[serde(default = "default_true")]
+    pub beta_updates: bool,
     /// DXGI `DeviceName` of the capture display (e.g. `\\.\DISPLAY3`).
     /// `None` means auto (primary monitor).
     #[serde(default)]
@@ -147,6 +151,7 @@ impl Default for SettingsFile {
             encoder_override: None,
             encoder_input: Default::default(),
             check_for_updates: true,
+            beta_updates: true,
             capture_display: None,
             hevc_enabled: false,
             stream_audio: true,

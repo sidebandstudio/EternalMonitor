@@ -58,8 +58,10 @@ fn versions_compare_as_semver_and_ignore_previews_build_metadata_and_garbage() {
     assert_eq!(newer_stable("0.4.0", "not a version"), None);
 }
 
+/// The stable comparison never names a Beta; a Beta build reads the Beta
+/// channel separately (see the Beta channel tests at the end).
 #[test]
-fn beta_channel_builds_are_never_offered_and_get_the_next_stable_release() {
+fn newer_stable_never_names_a_beta_and_a_beta_gets_the_next_stable_release() {
     // scripts/nightly.py versions the nightly Beta channel <next>-beta.<YYYYMMDD>.<run>.
     let beta = "0.3.4-beta.20261030.12";
     assert_eq!(newer_stable(beta, "0.3.3"), None);
@@ -2125,4 +2127,991 @@ fn the_update_funnel_is_logged_without_identifiers() {
         log.contains("Update check found no newer version manual=true"),
         "{log}"
     );
+}
+
+// ── The Beta channel ────────────────────────────────────────────────────────
+
+/// The newest Beta in these tests, and the Beta build they run as.
+const BETA: &str = "0.3.5-beta.20261107.26";
+const OLD_BETA: &str = "0.3.5-beta.20261105.20";
+
+fn beta_installer() -> String {
+    "https://github.com/sidebandstudio/EternalMonitor/releases/download/beta/EternalMonitor-Setup-beta.exe".into()
+}
+
+fn beta(version: &str) -> Release {
+    Release {
+        version: version.into(),
+        installer: beta_installer(),
+        sha256: SHA.into(),
+        recommended: false,
+        note: Some(BETA_NOTE.into()),
+        rollout: None,
+    }
+}
+
+/// The beta release's body exactly as scripts/nightly.py publishes it, for
+/// `version` and `sha` (test_nightly.py checks the fixture is nightly.py's).
+fn beta_body(version: &str, sha: &str) -> String {
+    let fixture =
+        include_str!("../../../scripts/fixtures/beta-release-body.md").replace("\r\n", "\n");
+    assert_eq!(fixture.matches("0.3.5-beta.20261107.26").count(), 1);
+    assert_eq!(fixture.matches(&"ab".repeat(32)).count(), 1);
+    fixture
+        .replace("0.3.5-beta.20261107.26", version)
+        .replace(&"ab".repeat(32), sha)
+}
+
+/// The fixed `beta` release as the GitHub API returns it, with one installer
+/// at `url` whose GitHub digest is `digest`, and the manifest and signature
+/// beside it. `extra` overrides release fields; its `asset` entry overrides
+/// the installer's, and `drop` lists assets to leave out.
+fn beta_github(
+    body: &str,
+    url: &str,
+    size: u64,
+    digest: &str,
+    extra: serde_json::Value,
+) -> Vec<u8> {
+    let mut asset = serde_json::json!({
+        "name": "EternalMonitor-Setup-beta.exe",
+        "size": size,
+        "browser_download_url": url,
+        "digest": format!("sha256:{digest}"),
+    });
+    let mut release = serde_json::json!({
+        "tag_name": "beta", "draft": false, "prerelease": true, "body": body,
+    });
+    let mut drop = Vec::new();
+    for (key, value) in extra.as_object().unwrap() {
+        if key == "asset" {
+            for (key, value) in value.as_object().unwrap() {
+                asset[key] = value.clone();
+            }
+        } else if key == "drop" {
+            drop = value.as_array().unwrap().clone();
+        } else {
+            release[key] = value.clone();
+        }
+    }
+    let folder = url.rsplit_once('/').unwrap().0;
+    let mut assets = vec![asset];
+    for name in [BETA_MANIFEST_NAME, BETA_SIGNATURE_NAME] {
+        if !drop.contains(&name.into()) {
+            assets.push(serde_json::json!({
+                "name": name, "size": 64, "browser_download_url": format!("{folder}/{name}"),
+            }));
+        }
+    }
+    release["assets"] = serde_json::json!(assets);
+    release.to_string().into_bytes()
+}
+
+fn beta_state(saved: Saved) -> State {
+    State::new(OLD_BETA, true, saved)
+}
+
+#[test]
+fn beta_versions_order_by_semver_across_beta_stable_and_dated_forms() {
+    for version in [
+        BETA,
+        "0.3.4-beta.1",
+        "1.0.0-beta.2",
+        "0.3.5-beta.20261107.26+ci.1",
+    ] {
+        assert!(is_beta(version), "{version}");
+    }
+    for version in [
+        "0.3.5",
+        "0.3.5-rc.1",
+        "0.3.5-betas.1",
+        "0.3.5-beta",
+        "v0.3.5-beta.1",
+        "0.3-beta.1",
+        "",
+        "garbage",
+    ] {
+        assert!(!is_beta(version), "{version}");
+    }
+    let newer_than = [
+        // A later night, or a later run the same night.
+        ("0.3.5-beta.20261108.27", BETA),
+        (BETA, "0.3.5-beta.20261107.25"),
+        // Numbers compare as numbers, not text.
+        ("0.3.5-beta.20261107.100", BETA),
+        // Dated builds sort above the hand-made -beta.1, below the release.
+        (BETA, "0.3.5-beta.1"),
+        ("0.3.5", BETA),
+        (BETA, "0.3.4"),
+        ("0.3.6-beta.20261201.40", "0.3.5"),
+    ];
+    for (candidate, current) in newer_than {
+        assert!(newer(candidate, current), "{candidate} > {current}");
+        assert!(!newer(current, candidate), "{current} < {candidate}");
+    }
+    for (candidate, current) in [
+        (BETA, BETA),
+        // A higher run on an earlier night is older.
+        ("0.3.5-beta.20261106.30", BETA),
+        // Build metadata does not make a version newer.
+        ("0.3.5-beta.20261107.26+ci.2", BETA),
+        ("garbage", BETA),
+        (BETA, "garbage"),
+    ] {
+        assert!(!newer(candidate, current), "{candidate} vs {current}");
+    }
+}
+
+#[test]
+fn the_beta_release_names_its_version_and_hash_in_the_body_nightly_writes() {
+    let endpoints = Endpoints::production();
+    let body = beta_body(BETA, &SHA.to_uppercase());
+    // A body edited on Windows may have CRLF line endings.
+    for body in [body.clone(), body.replace('\n', "\r\n")] {
+        let data = beta_github(&body, &beta_installer(), 9, SHA, serde_json::json!({}));
+        let listing = parse_beta(&data, &endpoints).unwrap();
+        assert_eq!((listing.release, listing.size), (beta(BETA), 9));
+    }
+    let shown = Popup {
+        version: BETA.into(),
+        recommended: false,
+        note: Some(BETA_NOTE.into()),
+    };
+    assert_eq!(shown.message(), "An update is available.");
+}
+
+#[test]
+fn a_beta_with_a_missing_or_malformed_version_or_hash_is_refused() {
+    let endpoints = Endpoints::production();
+    let url = beta_installer();
+    let none = || serde_json::json!({});
+    let body = beta_body(BETA, SHA);
+    let no_version = body.replace(
+        "Version 0.3.5-beta.20261107.26, from the Beta channel",
+        "From the Beta channel",
+    );
+    let two_versions = format!("Version 0.3.5-beta.20261108.27, from the Beta channel\n{body}");
+    let no_hash = body.replace(SHA, "");
+    let two_hashes = format!(
+        "{body}\nSHA-256 of EternalMonitor-Setup-beta.exe:\n\n```\n{}\n```\n",
+        "0".repeat(64)
+    );
+    let malformed = [
+        beta_github(&beta_body("0.3.5", SHA), &url, 9, SHA, none()),
+        beta_github(&beta_body("0.3.5-rc.1", SHA), &url, 9, SHA, none()),
+        beta_github(&beta_body("0.3.5-beta.1+ci.2", SHA), &url, 9, SHA, none()),
+        beta_github(&beta_body("0.3.5-beta.01", SHA), &url, 9, SHA, none()),
+        beta_github(
+            &beta_body("v0.3.5-beta.20261107.26", SHA),
+            &url,
+            9,
+            SHA,
+            none(),
+        ),
+        beta_github(&no_version, &url, 9, SHA, none()),
+        beta_github(&two_versions, &url, 9, SHA, none()),
+        beta_github(&no_hash, &url, 9, SHA, none()),
+        beta_github(&beta_body(BETA, &SHA[..63]), &url, 9, SHA, none()),
+        beta_github(
+            &beta_body(BETA, &SHA.replace('b', "g")),
+            &url,
+            9,
+            SHA,
+            none(),
+        ),
+        beta_github(&two_hashes, &url, 9, SHA, none()),
+        beta_github(&body, &url, 9, SHA, serde_json::json!({ "body": null })),
+        // The installer and the signed manifest's files must be there.
+        beta_github(
+            &body,
+            &url,
+            9,
+            SHA,
+            serde_json::json!({ "asset": { "name": "EternalMonitor-Setup.exe" } }),
+        ),
+        beta_github(
+            &body,
+            &url,
+            9,
+            SHA,
+            serde_json::json!({ "drop": ["beta-manifest.txt"] }),
+        ),
+        beta_github(
+            &body,
+            &url,
+            9,
+            SHA,
+            serde_json::json!({ "drop": ["beta-manifest.sig"] }),
+        ),
+        b"<html>rate limited</html>".to_vec(),
+    ];
+    for data in malformed {
+        assert!(
+            matches!(
+                parse_beta(&data, &endpoints),
+                Err(UpdateError::BadManifest(_))
+            ),
+            "{}",
+            String::from_utf8_lossy(&data)
+        );
+    }
+    let other = "0".repeat(64);
+    let unsafe_releases = [
+        beta_github(
+            &body,
+            &url,
+            9,
+            SHA,
+            serde_json::json!({ "tag_name": "v0.3.5" }),
+        ),
+        beta_github(&body, &url, 9, SHA, serde_json::json!({ "draft": true })),
+        beta_github(
+            &body,
+            &url,
+            9,
+            SHA,
+            serde_json::json!({ "prerelease": false }),
+        ),
+        // GitHub's digest of the installer must be there and agree.
+        beta_github(
+            &body,
+            &url,
+            9,
+            SHA,
+            serde_json::json!({ "asset": { "digest": null } }),
+        ),
+        beta_github(&body, &url, 9, &other, none()),
+        // Mid-publish: the new installer is up, the body still names the old one.
+        beta_github(&beta_body(BETA, &other), &url, 9, SHA, none()),
+        beta_github(&body, &url.replace("https:", "http:"), 9, SHA, none()),
+        beta_github(&body, &production_installer("0.3.5"), 9, SHA, none()),
+        beta_github(&body, &url, 0, SHA, none()),
+        beta_github(&body, &url, MAX_INSTALLER_BYTES + 1, SHA, none()),
+    ];
+    for data in unsafe_releases {
+        assert!(
+            matches!(
+                parse_beta(&data, &endpoints),
+                Err(UpdateError::UnsafeDownload(_))
+            ),
+            "{}",
+            String::from_utf8_lossy(&data)
+        );
+    }
+}
+
+#[test]
+fn a_stable_install_is_never_offered_a_beta() {
+    for current in ["0.3.4", "0.3.4-rc.1"] {
+        let mut s = State::new(current, true, Saved::default());
+        assert!(!s.beta_channel(), "{current}");
+        // Even with a Beta saved (an install that was a Beta before).
+        s.finish_beta(Ok(beta(BETA)));
+        assert_eq!(s.finish_check(1000, false, Ok(release("0.3.3"))), None);
+        assert_eq!(s.notice(1000), None);
+        assert_eq!(s.popup(1000), None);
+        assert!(s.update_now(false).is_none());
+        // The next stable release is offered as before.
+        assert_eq!(
+            s.finish_check(1000 + DAY, false, Ok(release("0.3.5"))),
+            Some("0.3.5".into())
+        );
+        assert_eq!(
+            s.notice(1000 + DAY),
+            Some(Notice::Available("0.3.5".into()))
+        );
+    }
+}
+
+#[test]
+fn a_beta_install_is_offered_the_newer_beta_and_never_an_older_one() {
+    let mut s = beta_state(Saved::default());
+    assert!(s.beta_channel());
+    s.finish_beta(Ok(beta(BETA)));
+    assert_eq!(
+        s.finish_check(1000, false, Ok(release("0.3.4"))),
+        Some(BETA.into())
+    );
+    assert_eq!(s.check, CheckStatus::Available);
+    assert_eq!(s.notice(1000), Some(Notice::Available(BETA.into())));
+    let popup = s.popup(1000).unwrap();
+    assert_eq!(popup.title(), format!("EternalMonitor {BETA} is ready"));
+    assert_eq!(popup.note.as_deref(), Some(BETA_NOTE));
+    match s.update_now(false) {
+        Some(Command::Download(release)) => assert_eq!(release, beta(BETA)),
+        _ => panic!("Update now downloads the Beta"),
+    }
+
+    for version in [
+        OLD_BETA,
+        "0.3.5-beta.20261104.30",
+        "0.3.4-beta.20261020.3",
+        "0.3.5-beta.1",
+    ] {
+        let mut s = beta_state(Saved::default());
+        s.finish_beta(Ok(beta(version)));
+        assert_eq!(
+            s.finish_check(1000, false, Ok(release("0.3.4"))),
+            None,
+            "{version}"
+        );
+        assert_eq!(s.check, CheckStatus::UpToDate, "{version}");
+        assert_eq!(s.notice(1000), None, "{version}");
+        assert!(s.update_now(false).is_none(), "{version}");
+    }
+}
+
+#[test]
+fn a_newer_stable_release_wins_over_the_beta() {
+    let mut s = beta_state(Saved::default());
+    s.finish_beta(Ok(beta(BETA)));
+    assert_eq!(
+        s.finish_check(1000, false, Ok(release("0.3.5"))),
+        Some("0.3.5".into())
+    );
+    assert_eq!(s.notice(1000), Some(Notice::Available("0.3.5".into())));
+    assert_eq!(
+        s.available().map(|release| release.installer.clone()),
+        Some(production_installer("0.3.5"))
+    );
+    // A Beta of the release after it is newer still.
+    s.finish_beta(Ok(beta("0.3.6-beta.20261201.40")));
+    s.finish_check(1000 + DAY, false, Ok(release("0.3.5")));
+    assert_eq!(
+        s.notice(1000 + DAY),
+        Some(Notice::Available("0.3.6-beta.20261201.40".into()))
+    );
+}
+
+#[test]
+fn a_refused_beta_is_not_offered_and_offline_keeps_the_last_one() {
+    let endpoints = Endpoints::production();
+    let mut s = beta_state(Saved::default());
+    s.finish_beta(Ok(beta(BETA)));
+    s.finish_check(1000, false, Ok(release("0.3.4")));
+    // Offline: the saved Beta is still offered.
+    s.finish_beta(Err(UpdateError::Network("offline".into())));
+    s.finish_check(
+        1000 + DAY,
+        false,
+        Err(UpdateError::Network("offline".into())),
+    );
+    assert_eq!(s.notice(1000 + DAY), Some(Notice::Available(BETA.into())));
+    // A release with no hash replaces it: neither is offered.
+    let no_hash = beta_github(
+        &beta_body(BETA, ""),
+        &beta_installer(),
+        9,
+        SHA,
+        serde_json::json!({}),
+    );
+    s.finish_beta(parse_beta(&no_hash, &endpoints).map(|listing| listing.release));
+    s.finish_check(1000 + 2 * DAY, false, Ok(release("0.3.4")));
+    assert_eq!(s.saved.beta, None);
+    assert_eq!(s.check, CheckStatus::UpToDate);
+    assert_eq!(s.notice(1000 + 2 * DAY), None);
+    // So does one whose installer GitHub hashes differently.
+    s.finish_beta(Ok(beta(BETA)));
+    let swapped = beta_github(
+        &beta_body(BETA, SHA),
+        &beta_installer(),
+        9,
+        &"0".repeat(64),
+        serde_json::json!({}),
+    );
+    s.finish_beta(parse_beta(&swapped, &endpoints).map(|listing| listing.release));
+    assert_eq!(s.saved.beta, None);
+}
+
+#[test]
+fn turning_beta_updates_off_offers_only_stable_releases() {
+    let mut s = beta_state(Saved::default());
+    s.finish_beta(Ok(beta(BETA)));
+    s.finish_check(1000, false, Ok(release("0.3.4")));
+    assert_eq!(s.notice(1000), Some(Notice::Available(BETA.into())));
+    s.beta_updates = false;
+    assert!(!s.beta_channel());
+    assert_eq!(s.notice(1000), None);
+    assert_eq!(
+        s.finish_check(1000 + DAY, false, Ok(release("0.3.5"))),
+        Some("0.3.5".into())
+    );
+    assert_eq!(
+        s.notice(1000 + DAY),
+        Some(Notice::Available("0.3.5".into()))
+    );
+}
+
+#[test]
+fn betas_are_announced_at_most_once_a_day_and_never_during_a_stream() {
+    const HOUR: u64 = 60 * 60;
+    let mut s = beta_state(Saved::default());
+    s.finish_beta(Ok(beta(BETA)));
+    assert_eq!(
+        s.finish_check(1000, false, Ok(release("0.3.4"))),
+        Some(BETA.into())
+    );
+    s.popup_closed(1000);
+    // A newer Beta the same day is on the banner, without a notification or
+    // the popup.
+    let next = "0.3.5-beta.20261107.27";
+    s.finish_beta(Ok(beta(next)));
+    assert_eq!(
+        s.finish_check(1000 + HOUR, false, Ok(release("0.3.4"))),
+        None
+    );
+    assert_eq!(s.notice(1000 + HOUR), Some(Notice::Available(next.into())));
+    assert_eq!(s.popup(1000 + DAY - 1), None);
+    // A day on, both come back, also after a restart.
+    let mut s = beta_state(s.saved.clone());
+    assert!(s.popup(1000 + DAY).is_some());
+    assert_eq!(
+        s.finish_check(1000 + DAY, false, Ok(release("0.3.4"))),
+        Some(next.into())
+    );
+    // Not while a stream runs; a check after it announces it.
+    let third = "0.3.5-beta.20261109.28";
+    s.finish_beta(Ok(beta(third)));
+    s.streaming = true;
+    assert_eq!(
+        s.finish_check(1000 + 2 * DAY, false, Ok(release("0.3.4"))),
+        None
+    );
+    s.streaming = false;
+    assert_eq!(
+        s.finish_check(1000 + 2 * DAY + HOUR, false, Ok(release("0.3.4"))),
+        Some(third.into())
+    );
+    // Announced "in the future" (the clock went back) counts as now.
+    s.saved.beta_notified = Some(u64::MAX / 2);
+    s.finish_beta(Ok(beta("0.3.5-beta.20261120.40")));
+    assert_eq!(s.finish_check(20 * DAY, false, Ok(release("0.3.4"))), None);
+    assert_eq!(s.saved.beta_notified, Some(20 * DAY));
+    assert_eq!(
+        s.finish_check(21 * DAY, false, Ok(release("0.3.4"))),
+        Some("0.3.5-beta.20261120.40".into())
+    );
+    // A stable release keeps its own rules, streaming or not.
+    s.streaming = true;
+    assert_eq!(
+        s.finish_check(21 * DAY + HOUR, false, Ok(release("0.3.5"))),
+        Some("0.3.5".into())
+    );
+}
+
+#[test]
+fn later_on_a_beta_covers_newer_betas_for_a_day_but_not_a_stable_release() {
+    let mut s = beta_state(Saved::default());
+    s.finish_beta(Ok(beta(BETA)));
+    s.finish_check(1000, false, Ok(release("0.3.4")));
+    s.later(1000);
+    assert_eq!(s.notice(1000), None);
+    let next = "0.3.5-beta.20261108.27";
+    s.finish_beta(Ok(beta(next)));
+    assert_eq!(s.finish_check(2000, false, Ok(release("0.3.4"))), None);
+    assert_eq!(s.notice(1000 + DAY - 1), None);
+    assert_eq!(s.notice(1000 + DAY), Some(Notice::Available(next.into())));
+    s.later(1000 + DAY);
+    s.finish_check(2000 + DAY, false, Ok(release("0.3.5")));
+    assert_eq!(
+        s.notice(2000 + DAY),
+        Some(Notice::Available("0.3.5".into()))
+    );
+}
+
+#[test]
+fn relaunch_after_a_beta_update_reports_whether_it_finished() {
+    let saved = Saved {
+        pending: Some((OLD_BETA.into(), BETA.into())),
+        beta: Some(beta(BETA)),
+        ..Saved::default()
+    };
+    let updated = State::new(BETA, true, saved.clone());
+    assert_eq!(updated.notice(0), Some(Notice::Updated(BETA.into())));
+    let failed = State::new(OLD_BETA, true, saved);
+    assert!(
+        matches!(failed.notice(0), Some(Notice::Failed(_))),
+        "{:?}",
+        failed.notice(0)
+    );
+}
+
+/// A published, test-only seed (scripts/test_sign_beta_manifest.py signs
+/// with it too).
+const TEST_SEED: [u8; 32] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+    26, 27, 28, 29, 30, 31,
+];
+
+fn test_key() -> ring::signature::Ed25519KeyPair {
+    ring::signature::Ed25519KeyPair::from_seed_unchecked(&TEST_SEED).unwrap()
+}
+
+fn test_public_key() -> [u8; 32] {
+    use ring::signature::KeyPair;
+    test_key().public_key().as_ref().try_into().unwrap()
+}
+
+/// What the fake GitHub publishes for the Beta: `version` with `published`
+/// as its installer, which downloads as `served`; the manifest and
+/// signature, or `None` for no such asset. With `status`, the listed
+/// manifest's download answers that HTTP status instead.
+#[derive(Clone)]
+struct BetaSite {
+    version: String,
+    published: Vec<u8>,
+    served: Vec<u8>,
+    manifest: Option<Vec<u8>>,
+    signature: Option<Vec<u8>>,
+    status: Option<u16>,
+}
+
+impl BetaSite {
+    /// Signed with the test key.
+    fn signed(version: &str, published: &[u8]) -> Self {
+        let mut site = Self {
+            version: version.into(),
+            published: published.to_vec(),
+            served: published.to_vec(),
+            manifest: None,
+            signature: None,
+            status: None,
+        };
+        site.sign(BetaManifest {
+            version: version.into(),
+            sha256: sha_of(published),
+            size: published.len() as u64,
+        });
+        site
+    }
+
+    fn sign(&mut self, manifest: BetaManifest) {
+        let text = manifest.text().into_bytes();
+        self.signature = Some(test_key().sign(&text).as_ref().to_vec());
+        self.manifest = Some(text);
+    }
+}
+
+/// Serves `site` like GitHub, and a latest.json naming 0.3.4, until the
+/// test ends. The endpoints trust the test key. Counts reads of the Beta.
+fn serve_beta(site: Arc<Mutex<BetaSite>>) -> (Endpoints, Arc<std::sync::atomic::AtomicUsize>) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let reads = Arc::new(AtomicUsize::new(0));
+    let counted = reads.clone();
+    let base = serve(Box::new(move |base, path| {
+        let site = site.lock().clone();
+        let folder = format!("{base}/releases/download/beta");
+        let found = |data: Option<Vec<u8>>| match data {
+            Some(data) => (200, vec![], data),
+            None => (404, vec![], Vec::new()),
+        };
+        match path {
+            "/latest.json" => (
+                200,
+                vec![],
+                manifest(
+                    "0.3.4",
+                    &format!("{base}/releases/download/v0.3.4/EternalMonitor-Setup.exe"),
+                    SHA,
+                ),
+            ),
+            "/repos/sidebandstudio/EternalMonitor/releases/tags/beta" => {
+                counted.fetch_add(1, Ordering::SeqCst);
+                let sha = sha_of(&site.published);
+                let mut drop = Vec::new();
+                if site.manifest.is_none() {
+                    drop.push(BETA_MANIFEST_NAME);
+                }
+                if site.signature.is_none() {
+                    drop.push(BETA_SIGNATURE_NAME);
+                }
+                let listing = beta_github(
+                    &beta_body(&site.version, &sha),
+                    &format!("{folder}/EternalMonitor-Setup-beta.exe"),
+                    site.published.len() as u64,
+                    &sha,
+                    serde_json::json!({ "drop": drop }),
+                );
+                (200, vec![], listing)
+            }
+            // Downloads redirect to an asset host, as on GitHub.
+            "/releases/download/beta/EternalMonitor-Setup-beta.exe" => (
+                302,
+                vec![("Location".into(), "/assets/installer".into())],
+                Vec::new(),
+            ),
+            "/releases/download/beta/beta-manifest.txt" => (
+                302,
+                vec![("Location".into(), "/assets/manifest".into())],
+                Vec::new(),
+            ),
+            "/assets/installer" => (200, vec![], site.served),
+            "/assets/manifest" => match site.status {
+                Some(status) => (status, vec![], Vec::new()),
+                None => found(site.manifest),
+            },
+            "/releases/download/beta/beta-manifest.sig" => found(site.signature),
+            _ => (404, vec![], Vec::new()),
+        }
+    }));
+    let endpoints = Endpoints {
+        beta_key: test_public_key(),
+        ..Endpoints::local(&base).unwrap()
+    };
+    (endpoints, reads)
+}
+
+fn fetch_site(site: BetaSite) -> (Endpoints, Result<Release, UpdateError>) {
+    let (endpoints, _) = serve_beta(Arc::new(Mutex::new(site)));
+    let result = fetch_beta(&endpoints);
+    (endpoints, result)
+}
+
+#[test]
+fn the_beta_manifest_parses_only_in_its_canonical_form() {
+    let fixture = include_str!("../../../scripts/fixtures/beta-manifest.txt").replace("\r\n", "\n");
+    let parsed = BetaManifest::parse(fixture.as_bytes()).unwrap();
+    assert_eq!(
+        parsed,
+        BetaManifest {
+            version: BETA.into(),
+            sha256: "ab".repeat(32),
+            size: 63_301_683,
+        }
+    );
+    assert_eq!(parsed.text(), fixture);
+    let variants = [
+        fixture.replace('\n', "\r\n"),
+        fixture.trim_end().to_string(),
+        format!("{fixture}\n"),
+        format!("{fixture}note=x\n"),
+        fixture.replace("manifest 1", "manifest 2"),
+        fixture.replace(&"ab".repeat(32), &"AB".repeat(32)),
+        fixture.replace(&"ab".repeat(32), &"ab".repeat(31)),
+        fixture.replace("size=63301683", "size=063301683"),
+        fixture.replace("size=63301683", "size= 63301683"),
+        fixture.replace("size=63301683", "size=-1"),
+        fixture.replace("Setup-beta.exe", "Setup.exe"),
+        fixture.replace(BETA, "0.3.5"),
+        fixture.replace(BETA, "0.3.5-beta.01"),
+        fixture.replace(BETA, &format!("{BETA}+ci.1")),
+        fixture.replace("version=", "version = "),
+        fixture.replace("sha256=", "sha256:"),
+    ];
+    for text in variants {
+        assert_eq!(BetaManifest::parse(text.as_bytes()), None, "{text:?}");
+    }
+    assert_eq!(BetaManifest::parse(b"\xff\xfe"), None);
+}
+
+/// Ed25519 is deterministic: ring signs the fixture to the bytes OpenSSL
+/// made with the same test seed, the way scripts/sign_beta_manifest.py signs.
+#[test]
+fn a_manifest_signed_by_the_release_script_verifies_here() {
+    let manifest =
+        include_str!("../../../scripts/fixtures/beta-manifest.txt").replace("\r\n", "\n");
+    let signature = include_bytes!("../../../scripts/fixtures/beta-manifest.test.sig");
+    assert_eq!(test_key().sign(manifest.as_bytes()).as_ref(), signature);
+    let listing = BetaListing {
+        release: Release {
+            sha256: "ab".repeat(32),
+            ..beta(BETA)
+        },
+        size: 63_301_683,
+        manifest: String::new(),
+        signature: String::new(),
+    };
+    assert_eq!(
+        check_beta_manifest(&listing, manifest.as_bytes(), signature, &test_public_key()),
+        Ok(())
+    );
+    // Not by the production key.
+    assert!(matches!(
+        check_beta_manifest(&listing, manifest.as_bytes(), signature, &BETA_PUBLIC_KEY),
+        Err(UpdateError::UnsafeDownload(_))
+    ));
+}
+
+#[test]
+fn the_pinned_key_is_the_published_public_key() {
+    assert_eq!(
+        hex(&BETA_PUBLIC_KEY),
+        "82c2af21c685d2c042c51f72a34c78bdb5d004bad89e75a8306a43224d16ec5a"
+    );
+    assert_eq!(Endpoints::production().beta_key, BETA_PUBLIC_KEY);
+    assert_eq!(
+        Endpoints::local("http://127.0.0.1:1").unwrap().beta_key,
+        BETA_PUBLIC_KEY
+    );
+}
+
+#[test]
+fn a_beta_is_offered_only_with_a_valid_signed_manifest() {
+    let payload = b"MZ fake beta installer";
+    let (_, fetched) = fetch_site(BetaSite::signed(BETA, payload));
+    let fetched = fetched.unwrap();
+    assert_eq!(
+        (fetched.version.as_str(), fetched.sha256.as_str()),
+        (BETA, sha_of(payload).as_str())
+    );
+    let mut s = beta_state(Saved::default());
+    s.finish_beta(Ok(fetched));
+    s.finish_check(1000, false, Ok(release("0.3.4")));
+    assert_eq!(s.notice(1000), Some(Notice::Available(BETA.into())));
+
+    let good = BetaSite::signed(BETA, payload);
+    let manifest = |version: &str, sha256: String, size: usize| BetaManifest {
+        version: version.into(),
+        sha256,
+        size: size as u64,
+    };
+    let mut flipped = good.clone();
+    flipped.manifest.as_mut().unwrap()[40] ^= 1;
+    let mut other_sha = good.clone();
+    other_sha.sign(manifest(BETA, "0".repeat(64), payload.len()));
+    let mut other_size = good.clone();
+    other_size.sign(manifest(BETA, sha_of(payload), payload.len() + 1));
+    let mut other_version = good.clone();
+    other_version.sign(manifest(
+        "0.3.5-beta.20261108.27",
+        sha_of(payload),
+        payload.len(),
+    ));
+    let mut crlf = good.clone();
+    let text = String::from_utf8(good.manifest.clone().unwrap())
+        .unwrap()
+        .replace('\n', "\r\n");
+    crlf.signature = Some(test_key().sign(text.as_bytes()).as_ref().to_vec());
+    crlf.manifest = Some(text.into_bytes());
+    let mut short = good.clone();
+    short.signature.as_mut().unwrap().pop();
+    let mut no_signature = good.clone();
+    no_signature.signature = None;
+    let mut no_manifest = good.clone();
+    no_manifest.manifest = None;
+    // The nightly published a new build that nobody has signed yet.
+    let mut unsigned_build = good.clone();
+    unsigned_build.version = "0.3.5-beta.20261108.27".into();
+    unsigned_build.published = b"MZ next beta installer".to_vec();
+    let cases = [
+        ("flipped byte", flipped),
+        ("manifest sha differs from the body", other_sha),
+        ("manifest size differs from the asset", other_size),
+        ("manifest version differs from the body", other_version),
+        ("signed, but not canonical", crlf),
+        ("63-byte signature", short),
+        ("missing signature", no_signature),
+        ("missing manifest", no_manifest),
+        ("unsigned new build", unsigned_build),
+    ];
+    for (name, site) in cases {
+        let (_, fetched) = fetch_site(site);
+        assert!(
+            matches!(
+                fetched,
+                Err(UpdateError::UnsafeDownload(_) | UpdateError::BadManifest(_))
+            ),
+            "{name}: {fetched:?}"
+        );
+        // No offer, and the Beta saved before is not offered either.
+        let mut s = beta_state(Saved {
+            beta: Some(beta(BETA)),
+            ..Saved::default()
+        });
+        s.finish_beta(fetched);
+        s.finish_check(1000, false, Ok(release("0.3.4")));
+        assert_eq!(s.notice(1000), None, "{name}");
+    }
+
+    // Signed with another key: the production key does not trust the test key.
+    let (endpoints, _) = serve_beta(Arc::new(Mutex::new(good)));
+    let production = Endpoints {
+        beta_key: BETA_PUBLIC_KEY,
+        ..endpoints
+    };
+    assert!(
+        matches!(fetch_beta(&production), Err(UpdateError::UnsafeDownload(why)) if why.contains("signature")),
+    );
+}
+
+#[test]
+fn a_signed_beta_that_is_not_newer_is_not_offered() {
+    for version in [OLD_BETA, "0.3.5-beta.20261104.30", "0.3.4-beta.1"] {
+        let (_, fetched) = fetch_site(BetaSite::signed(version, b"MZ old beta installer"));
+        let mut s = beta_state(Saved::default());
+        s.finish_beta(fetched);
+        assert_eq!(
+            s.saved.beta.as_ref().map(|r| r.version.as_str()),
+            Some(version)
+        );
+        assert_eq!(
+            s.finish_check(1000, false, Ok(release("0.3.4"))),
+            None,
+            "{version}"
+        );
+        assert_eq!(s.notice(1000), None, "{version}");
+    }
+}
+
+#[test]
+fn a_beta_downloads_and_is_verified_like_a_stable_release() {
+    let payload = b"MZ fake beta installer".to_vec();
+    let (endpoints, release) = fetch_site(BetaSite::signed(BETA, &payload));
+    let release = release.unwrap();
+    let path = download_case(&endpoints, &release).unwrap();
+    assert_eq!(std::fs::read(&path).unwrap(), payload);
+    assert!(eternal_updater::open_verified(&path, &release.sha256).is_ok());
+    std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap()).unwrap();
+
+    // The downloaded file must be the one the signed manifest names.
+    let mut swapped = BetaSite::signed(BETA, &payload);
+    swapped.served = b"MZ evil beta installer".to_vec();
+    let (endpoints, release) = fetch_site(swapped);
+    let error = download_case(&endpoints, &release.unwrap()).unwrap_err();
+    assert!(
+        matches!(&error, UpdateError::UnsafeDownload(why) if why.contains("SHA-256")),
+        "{error}"
+    );
+
+    // The release now names another Beta than the one chosen.
+    let (endpoints, release) = fetch_site(BetaSite::signed(BETA, &payload));
+    let chosen = Release {
+        version: OLD_BETA.into(),
+        ..release.unwrap()
+    };
+    let error = download_case(&endpoints, &chosen).unwrap_err();
+    assert!(
+        matches!(&error, UpdateError::UnsafeDownload(why) if why.contains("changed")),
+        "{error}"
+    );
+}
+
+/// Through the worker against a fake website and GitHub: a stable install
+/// never asks for the Beta, a Beta install offers it, and a Beta published
+/// after the check replaces the offer before anything downloads.
+#[test]
+fn the_worker_reads_the_beta_only_for_a_beta_build_and_again_before_downloading() {
+    use std::sync::atomic::Ordering;
+    let site = Arc::new(Mutex::new(BetaSite::signed(
+        BETA,
+        b"MZ fake beta installer",
+    )));
+    let (endpoints, beta_reads) = serve_beta(site.clone());
+    let run = |state: &Arc<Mutex<State>>, command: Command| {
+        let (tx, rx) = mpsc::channel();
+        tx.send(command).unwrap();
+        drop(tx);
+        Worker {
+            state: state.clone(),
+            path: None,
+            endpoints: endpoints.clone(),
+            session: Arc::new(Mutex::new(crate::transport::session::Session::new(1))),
+            wake: Arc::new(|_| {}),
+        }
+        .run(rx);
+    };
+
+    let stable = Arc::new(Mutex::new(State::new("0.3.4", true, Saved::default())));
+    run(&stable, Command::Check { manual: false });
+    assert_eq!(stable.lock().check, CheckStatus::UpToDate);
+    assert_eq!(
+        beta_reads.load(Ordering::SeqCst),
+        0,
+        "a stable install never asks"
+    );
+
+    let state = Arc::new(Mutex::new(beta_state(Saved::default())));
+    run(&state, Command::Check { manual: false });
+    assert_eq!(beta_reads.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        state.lock().notice(now_secs()),
+        Some(Notice::Available(BETA.into()))
+    );
+    let Some(Command::Download(chosen)) = state.lock().update_now(false) else {
+        panic!("Update now downloads the Beta");
+    };
+    let next = "0.3.5-beta.20261108.27";
+    *site.lock() = BetaSite::signed(next, b"MZ next beta installer");
+    run(&state, Command::Download(chosen));
+    assert_eq!(beta_reads.load(Ordering::SeqCst), 2);
+    let state = state.lock();
+    assert_eq!(state.phase, Phase::Idle, "nothing downloaded");
+    assert_eq!(
+        state.notice(now_secs()),
+        Some(Notice::Available(next.into()))
+    );
+}
+
+#[test]
+fn a_manifest_file_that_is_not_served_or_too_large_drops_the_beta() {
+    let good = BetaSite::signed(BETA, b"MZ fake beta installer");
+    let mut large = good.clone();
+    large.manifest = Some(vec![b'a'; MAX_MANIFEST_BYTES as usize + 1]);
+    let mut missing = good.clone();
+    missing.status = Some(404);
+    let mut failing = good.clone();
+    failing.status = Some(500);
+    for (name, site) in [("too large", large), ("404", missing), ("500", failing)] {
+        let (_, fetched) = fetch_site(site);
+        assert!(
+            matches!(fetched, Err(UpdateError::BadManifest(_))),
+            "{name}: {fetched:?}"
+        );
+        let mut s = beta_state(Saved {
+            beta: Some(beta(BETA)),
+            ..Saved::default()
+        });
+        s.finish_beta(fetched);
+        assert_eq!(s.saved.beta, None, "{name}");
+    }
+}
+
+#[test]
+fn the_download_checks_the_signed_manifest_again() {
+    let payload = b"MZ fake beta installer";
+    let site = Arc::new(Mutex::new(BetaSite::signed(BETA, payload)));
+    let (endpoints, _) = serve_beta(site.clone());
+    let release = fetch_beta(&endpoints).unwrap();
+    // Between the check and the download, the manifest stops verifying.
+    site.lock().manifest.as_mut().unwrap()[40] ^= 1;
+    let error = download_case(&endpoints, &release).unwrap_err();
+    assert!(
+        matches!(&error, UpdateError::UnsafeDownload(why) if why.contains("signature")),
+        "{error}"
+    );
+    let mut unsigned = BetaSite::signed(BETA, payload);
+    unsigned.signature = None;
+    *site.lock() = unsigned;
+    assert!(matches!(
+        download_case(&endpoints, &release),
+        Err(UpdateError::BadManifest(_))
+    ));
+}
+
+#[test]
+fn an_older_signed_beta_than_one_verified_before_is_refused() {
+    let older = "0.3.5-beta.20261106.22";
+    let next = "0.3.5-beta.20261108.27";
+    let mut s = beta_state(Saved::default());
+    s.finish_beta(Ok(beta(BETA)));
+    s.finish_check(1000, false, Ok(release("0.3.4")));
+    assert_eq!(s.notice(1000), Some(Notice::Available(BETA.into())));
+    // A replayed older signed Beta, still newer than this build: no offer,
+    // also after a restart.
+    s.finish_beta(Ok(beta(older)));
+    s.finish_check(2000, false, Ok(release("0.3.4")));
+    assert_eq!(s.notice(2000), None);
+    assert_eq!(s.saved.beta_highest.as_deref(), Some(BETA));
+    let mut s = beta_state(s.saved.clone());
+    s.finish_beta(Ok(beta(older)));
+    s.finish_check(3000, false, Ok(release("0.3.4")));
+    assert_eq!(s.notice(3000), None);
+    // The same Beta again, or a newer one, is offered.
+    s.finish_beta(Ok(beta(BETA)));
+    s.finish_check(4000, false, Ok(release("0.3.4")));
+    assert_eq!(s.notice(4000), Some(Notice::Available(BETA.into())));
+    s.finish_beta(Ok(beta(next)));
+    s.finish_check(5000, false, Ok(release("0.3.4")));
+    assert_eq!(s.notice(5000), Some(Notice::Available(next.into())));
+    assert_eq!(s.saved.beta_highest.as_deref(), Some(next));
 }

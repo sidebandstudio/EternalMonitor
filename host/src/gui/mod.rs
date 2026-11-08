@@ -306,6 +306,7 @@ pub struct AnalyzerApp {
     settings_fps_target: u32,
     settings_encoder_input: crate::encoder::input::EncoderInput,
     settings_check_updates: bool,
+    settings_beta_updates: bool,
     updates: crate::updates::Updater,
     /// The update popup is on screen; it stays until a button is chosen.
     update_popup_open: bool,
@@ -477,6 +478,7 @@ impl AnalyzerApp {
             let ctx = cc.egui_ctx.clone();
             crate::updates::Updater::start(
                 persisted.check_for_updates,
+                persisted.beta_updates,
                 control.shared.session.clone(),
                 control.shared.handoff.clone(),
                 std::sync::Arc::new(move |version: Option<&str>| {
@@ -493,6 +495,7 @@ impl AnalyzerApp {
         Self {
             settings_encoder_input: persisted.encoder_input,
             settings_check_updates: persisted.check_for_updates,
+            settings_beta_updates: persisted.beta_updates,
             updates,
             update_popup_open: false,
             ipad_last_seen: Some(popup_now()),
@@ -569,6 +572,7 @@ impl AnalyzerApp {
             encoder_override,
             encoder_input: self.settings_encoder_input,
             check_for_updates: self.settings_check_updates,
+            beta_updates: self.settings_beta_updates,
             capture_display: if self.settings_capture_display.is_empty() {
                 None
             } else {
@@ -788,6 +792,12 @@ impl AnalyzerApp {
     fn set_check_updates(&mut self, enabled: bool) {
         self.settings_check_updates = enabled;
         self.updates.set_auto(enabled);
+        self.persist_settings();
+    }
+
+    fn set_beta_updates(&mut self, enabled: bool) {
+        self.settings_beta_updates = enabled;
+        self.updates.set_beta(enabled);
         self.persist_settings();
     }
 

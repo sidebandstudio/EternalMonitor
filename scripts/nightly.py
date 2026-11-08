@@ -20,8 +20,10 @@
 
 Users see these builds as the Beta channel. Each is a semver pre-release,
 <next>-beta.<YYYYMMDD>.<run>, which semver orders below <next> and above a
-hand-made <next>-beta.1. The apps never offer a pre-release, and a Beta user
-is offered the next stable release as usual (host/src/updates.rs).
+hand-made <next>-beta.1. A stable install is never offered one. A Beta
+install reads the beta release's body (beta_body()) and is offered the newer
+of that Beta and the next stable release (host/src/updates.rs), once
+scripts/sign_beta_manifest.py has signed the build; this script never signs.
 """
 import argparse
 import datetime
@@ -121,6 +123,8 @@ def stamp(cargo_toml, cargo_lock, version):
 
 
 def notes(version, branch, sha, stable, sha256, repo=REPO):
+    """A Beta install reads the first line's "Version <version>, from the Beta
+    channel" and the hash after "SHA-256 of <ASSET>:" (scripts/fixtures/beta-release-body.md)."""
     if not re.fullmatch(r"[0-9a-f]{40}", sha) or not re.fullmatch(r"[0-9A-Fa-f]{64}", sha256):
         raise ValueError("notes need the full commit and the installer's SHA-256")
     return (
@@ -157,6 +161,11 @@ def download_url(tag, name=ASSET, repo=REPO):
 def marker(sha):
     """The beta release body's last line once a build has finished publishing."""
     return f"<!-- beta-commit: {sha} -->"
+
+
+def beta_body(notes, sha):
+    """The beta release's body once sha's build has finished publishing."""
+    return f"{notes.rstrip()}\n\n{marker(sha)}\n"
 
 
 def published_commit(body):
@@ -344,7 +353,7 @@ def publish(github, tag, sha, title, notes, path, sleep=time.sleep):
 
     # 3. The tag, then the marker that says this commit is done.
     github.move_tag(MOVING_TAG, sha)
-    github.edit(MOVING_TAG, title, f"{notes.rstrip()}\n\n{marker(sha)}\n")
+    github.edit(MOVING_TAG, title, beta_body(notes, sha))
 
 
 def git(*args):
