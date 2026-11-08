@@ -3662,6 +3662,7 @@ mod tests {
             .with_ansi(false)
             .with_writer(move || Sink(Arc::clone(&writer)))
             .finish();
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(subscriber, || attach(&shared, &driver, ATTACH_TIMEOUT));
         let lines = String::from_utf8(out.lock().clone()).unwrap();
         assert!(

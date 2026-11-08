@@ -2082,6 +2082,7 @@ mod tests {
         let primary = out(r"\\.\DISPLAY1", 0, 0);
         let chosen = CaptureTarget::Output(r"\\.\DISPLAY2".to_string());
         let unplugged = vec![primary.clone()];
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(subscriber, || {
             for _ in 0..20 {
                 assert!(!target_moved(&unplugged, &chosen, &primary));
