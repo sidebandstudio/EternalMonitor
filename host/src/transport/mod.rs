@@ -57,14 +57,14 @@ fn now() -> Instant {
 /// is in flight before moving the clock on.
 #[cfg(feature = "test-hooks")]
 pub mod probe {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, VecDeque};
     use std::net::SocketAddr;
+    use std::time::Instant;
 
     use parking_lot::Mutex;
 
     static SENT: Mutex<BTreeMap<SocketAddr, u64>> = Mutex::new(BTreeMap::new());
     static TAKEN: Mutex<BTreeMap<SocketAddr, u64>> = Mutex::new(BTreeMap::new());
-    static REFUSE: Mutex<BTreeMap<SocketAddr, (Kind, u64, u64)>> = Mutex::new(BTreeMap::new());
 
     pub(crate) fn sent(addr: SocketAddr) {
         *SENT.lock().entry(addr).or_default() += 1;
@@ -89,37 +89,116 @@ pub mod probe {
         Control,
     }
 
+    /// How a failed send fails.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum Fail {
+        /// As if the system had no buffer space (WSAENOBUFS, ENOBUFS).
+        NoBufferSpace,
+        /// Any other error: connection reset.
+        Other,
+    }
+
+    struct Failing {
+        kind: Kind,
+        after: u64,
+        fails: VecDeque<Fail>,
+    }
+
+    static FAIL: Mutex<BTreeMap<SocketAddr, Failing>> = Mutex::new(BTreeMap::new());
+
     /// Of the UDP sends of `kind` to `addr`, the next `after` go out and
-    /// the `count` after them fail as if the system had no buffer space for
-    /// them (WSAENOBUFS, ENOBUFS).
-    pub fn refuse_sends(addr: SocketAddr, kind: Kind, after: u64, count: u64) {
-        REFUSE.lock().insert(addr, (kind, after, count));
+    /// the ones after them fail as `fails` says, in order.
+    pub fn fail_sends(addr: SocketAddr, kind: Kind, after: u64, fails: &[Fail]) {
+        let fails = fails.iter().copied().collect();
+        FAIL.lock().insert(addr, Failing { kind, after, fails });
     }
 
-    /// Sends of the kind given to [`refuse_sends`] still to be refused.
-    pub fn refusals_left(addr: SocketAddr) -> u64 {
-        REFUSE.lock().get(&addr).map_or(0, |&(_, _, count)| count)
+    /// As [`fail_sends`], with `count` sends refused for lack of buffer space.
+    pub fn refuse_sends(addr: SocketAddr, kind: Kind, after: u64, count: usize) {
+        fail_sends(addr, kind, after, &vec![Fail::NoBufferSpace; count]);
     }
 
-    /// Whether this send of `datagram` to `addr` is refused, counting it.
-    pub(crate) fn refuse(addr: SocketAddr, datagram: &[u8]) -> bool {
+    /// Failures [`fail_sends`] still has to give.
+    pub fn refusals_left(addr: SocketAddr) -> usize {
+        FAIL.lock()
+            .get(&addr)
+            .map_or(0, |failing| failing.fails.len())
+    }
+
+    /// How this send of `datagram` to `addr` fails, if it does.
+    pub(crate) fn fail(addr: SocketAddr, datagram: &[u8]) -> Option<std::io::Error> {
         use eternal_wire::v2::{classify, Classified};
         let kind = match classify(datagram) {
             Classified::Media { .. } => Kind::Media,
             Classified::Control(_) => Kind::Control,
-            _ => return false,
+            _ => return None,
         };
-        let mut refuse = REFUSE.lock();
-        match refuse.get_mut(&addr) {
-            Some((refused, after, _)) if *refused == kind && *after > 0 => {
-                *after -= 1;
-                false
+        let fail = match FAIL.lock().get_mut(&addr).filter(|f| f.kind == kind) {
+            Some(failing) if failing.after > 0 => {
+                failing.after -= 1;
+                None
             }
-            Some((refused, _, count)) if *refused == kind && *count > 0 => {
-                *count -= 1;
-                true
-            }
-            _ => false,
+            Some(failing) => failing.fails.pop_front(),
+            None => None,
+        };
+        attempted(addr, datagram, fail);
+        fail.map(|fail| match fail {
+            Fail::NoBufferSpace => super::congestion::no_buffer_space(),
+            Fail::Other => std::io::Error::from(std::io::ErrorKind::ConnectionReset),
+        })
+    }
+
+    /// One video datagram the transport tried to send, as the send saw it.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Attempt {
+        pub at: Instant,
+        pub frame_seq: u32,
+        pub frag_index: u16,
+        pub retransmit: bool,
+        pub failed: Option<Fail>,
+    }
+
+    static RECORDED: Mutex<Option<SocketAddr>> = Mutex::new(None);
+    static ATTEMPTS: Mutex<Vec<Attempt>> = Mutex::new(Vec::new());
+    /// When each pacing wait was asked for, and its deadline.
+    static WAITS: Mutex<Vec<(Instant, Instant)>> = Mutex::new(Vec::new());
+
+    /// Records every video send to `addr` from now on, and every pacing
+    /// wait, clearing what was recorded.
+    pub fn record(addr: SocketAddr) {
+        *RECORDED.lock() = Some(addr);
+        ATTEMPTS.lock().clear();
+        WAITS.lock().clear();
+    }
+
+    /// The video sends recorded so far, in order.
+    pub fn attempts() -> Vec<Attempt> {
+        ATTEMPTS.lock().clone()
+    }
+
+    /// The pacing waits recorded so far: when each was asked for, and until when.
+    pub fn waits() -> Vec<(Instant, Instant)> {
+        WAITS.lock().clone()
+    }
+
+    fn attempted(addr: SocketAddr, datagram: &[u8], failed: Option<Fail>) {
+        if *RECORDED.lock() != Some(addr) {
+            return;
+        }
+        if let Ok((header, _)) = eternal_wire::v2::media::MediaHeader::decode(datagram) {
+            ATTEMPTS.lock().push(Attempt {
+                at: Instant::now(),
+                frame_seq: header.frame_seq,
+                frag_index: header.frag_index,
+                retransmit: header.is_retransmit,
+                failed,
+            });
+        }
+    }
+
+    pub(crate) fn waited(deadline: Instant) {
+        if RECORDED.lock().is_some() {
+            WAITS.lock().push((Instant::now(), deadline));
         }
     }
 }
@@ -583,8 +662,15 @@ pub async fn start_sender(
                             }
                         }
                     }
-                    if refused && links.send_to(datagram, target_addr).await.is_err() {
-                        break;
+                    if refused {
+                        match links.send_to(datagram, target_addr).await {
+                            Err(e) if congestion::is_no_buffer_space(&e) => break,
+                            Err(e) if !send_failed => {
+                                log_send_failed(target_addr.link, &e);
+                                send_failed = true;
+                            }
+                            _ => {}
+                        }
                     }
                 }
 
@@ -777,15 +863,15 @@ async fn receive_control(
 }
 
 async fn send_repairs(
-    socket: &UdpSocket,
+    links: &TransportLinks,
     ring: &mut RetransmitRing,
     shared: &SharedControl,
     nack: &eternal_wire::v2::control::Nack,
 ) {
     let target = *shared.target_addr.lock();
-    let Some(destination) = target.addr.filter(|_| target.link == LinkId::Udp) else {
+    if target.link != LinkId::Udp || target.addr.is_none() {
         return;
-    };
+    }
     let mut sent = 0;
     for datagram in ring.resend(
         nack.stream_epoch,
@@ -794,9 +880,8 @@ async fn send_repairs(
         &nack.missing,
         Instant::now(),
     ) {
-        if socket.send_to(&datagram, destination).await.is_ok() {
-            #[cfg(feature = "test-hooks")]
-            probe::sent(destination);
+        // Through the links, so a refused repair counts in the episode.
+        if links.send_to(&datagram, target).await.is_ok() {
             sent += 1;
         }
     }
@@ -877,7 +962,7 @@ async fn act(
         state.input.reset();
     }
     if let Some(nack) = actions.retransmit.take() {
-        send_repairs(&links.udp.socket, &mut state.retransmit_ring, shared, &nack).await;
+        send_repairs(links, &mut state.retransmit_ring, shared, &nack).await;
     }
     if let Some((session_id, event)) = actions.input.take() {
         shared.transport_beat.mark(Phase::Input);

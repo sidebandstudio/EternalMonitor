@@ -248,8 +248,10 @@ impl AbrController {
     }
 
     /// The system had no buffer space for a datagram: one rung down at
-    /// once, without waiting for the iPad to report the loss. It counts as a
-    /// downgrade, so the loss reports that follow wait out the cooldown.
+    /// once, without waiting for the iPad to report the loss. Like any
+    /// downgrade it waits out the cooldown after the last one, and starts
+    /// it, so refusals and loss reports together step at most once per
+    /// [`DOWN_COOLDOWN`].
     pub fn on_send_refused(&mut self, now: Instant) -> AbrDecision {
         let unchanged = AbrDecision {
             target_bps: self.current_bps,
@@ -259,6 +261,12 @@ impl AbrController {
             return unchanged;
         }
         self.clean_since = None;
+        if matches!(
+            self.last_change,
+            Some((when, true)) if now.duration_since(when) < DOWN_COOLDOWN
+        ) {
+            return unchanged;
+        }
         let target = step(self.current_bps, -1, self.ceiling_bps);
         if target == self.current_bps {
             return unchanged;
@@ -623,10 +631,48 @@ mod tests {
         assert!(!d.changed, "the same loss, inside the cooldown");
         assert_eq!(abr.current_bps(), 12_000_000);
 
+        let d = abr.on_send_refused(t0 + Duration::from_secs(2));
+        assert!(!d.changed, "a refusal waits out the cooldown too");
+        assert_eq!(abr.current_bps(), 12_000_000);
+
         let mut floor = AbrController::new(4_000_000, true);
         assert!(!floor.on_send_refused(t0).changed);
         let mut disabled = AbrController::new(20_000_000, false);
         assert!(!disabled.on_send_refused(t0).changed);
         assert_eq!(disabled.current_bps(), 20_000_000);
+    }
+
+    /// Episodes of refused sends a little over a second apart each ask for
+    /// a step, but steps come at most once per cooldown: not 15 Mbps down to
+    /// the floor in five seconds.
+    #[test]
+    fn refusal_episodes_step_at_most_once_per_cooldown() {
+        let mut abr = AbrController::new(20_000_000, true);
+        let t0 = Instant::now();
+        let mut steps = Vec::new();
+        for n in 0..5u64 {
+            let at = Duration::from_millis(1_100 * n);
+            if abr.on_send_refused(t0 + at).changed {
+                steps.push((at.as_millis(), abr.current_bps()));
+            }
+        }
+        assert_eq!(steps, [(0, 12_000_000), (3_300, 10_000_000)]);
+    }
+
+    /// A receiver report that just stepped down starts the cooldown: a
+    /// refusal right after it doesn't step again for the same congestion.
+    #[test]
+    fn a_refusal_right_after_a_report_downgrade_waits_the_cooldown() {
+        let mut abr = AbrController::new(20_000_000, true);
+        let t0 = Instant::now();
+        let d = abr.on_report(&report(950, 50, 0), None, t0);
+        assert_eq!((d.target_bps, d.changed), (12_000_000, true));
+        assert!(!abr.on_send_refused(t0 + Duration::from_millis(500)).changed);
+        assert!(
+            !abr.on_send_refused(t0 + Duration::from_millis(2_900))
+                .changed
+        );
+        let d = abr.on_send_refused(t0 + Duration::from_millis(3_100));
+        assert_eq!((d.target_bps, d.changed), (10_000_000, true));
     }
 }

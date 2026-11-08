@@ -104,8 +104,8 @@ impl Link for UdpLink {
         };
         check_length(datagram.len())?;
         #[cfg(feature = "test-hooks")]
-        if super::probe::refuse(addr, datagram) {
-            return Err(super::congestion::no_buffer_space());
+        if let Some(error) = super::probe::fail(addr, datagram) {
+            return Err(error);
         }
         self.socket.send_to(datagram, addr).await?;
         #[cfg(feature = "test-hooks")]

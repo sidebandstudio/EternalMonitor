@@ -1,8 +1,11 @@
 //! When the system has no buffer space for a datagram (WSAENOBUFS 10055 on
 //! Windows, ENOBUFS elsewhere), the real transport loop backs off, steps the
-//! bitrate down once per episode, gives up a frame it can't send rather than
-//! wait on it, retries a control reply once, and logs one line per episode
-//! plus its end. The sends are refused through the test-hooks seam.
+//! bitrate down at most once per episode, gives up a frame it can't send
+//! rather than wait on it, retries a control reply once, and logs one line
+//! per episode plus its end. The sends are refused through the test-hooks
+//! seam, which also records each video send and pacing wait, so the order
+//! and deadlines are checked where the transport sent, not where the fake
+//! iPad happened to read.
 
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::Ordering;
@@ -12,7 +15,7 @@ use std::time::{Duration, Instant};
 use eternal_host::control::SharedControl;
 use eternal_host::encoder::NALUnit;
 use eternal_host::transport::congestion::{BACKOFF, EPISODE_QUIET};
-use eternal_host::transport::probe::{self, Kind};
+use eternal_host::transport::probe::{self, Attempt, Fail, Kind};
 use eternal_wire::v2::control::{
     encode_control, parse_control, ControlMessage, Hello2, Nack, Ping, CAP_DECODE_H264,
     FEATURE_SUPPORTS_NACK,
@@ -94,16 +97,44 @@ impl Ipad {
         received
     }
 
-    /// Frame `frame_seq`'s fragments among `received`, with when each came.
-    fn fragments(received: &[(Instant, Vec<u8>)], frame_seq: u32) -> Vec<(Instant, u16)> {
+    /// Frame `frame_seq`'s original fragments among `received`, in order.
+    fn fragments(received: &[(Instant, Vec<u8>)], frame_seq: u32) -> Vec<u16> {
         received
             .iter()
-            .filter_map(|(at, bytes)| {
+            .filter_map(|(_, bytes)| {
                 let (header, _) = MediaHeader::decode(bytes).ok()?;
                 (header.frame_seq == frame_seq && !header.is_retransmit)
-                    .then_some((*at, header.frag_index))
+                    .then_some(header.frag_index)
             })
             .collect()
+    }
+
+    /// Waits until the transport has tried at least `count` sends of frame
+    /// `frame_seq`'s originals, and returns them.
+    fn attempts(&mut self, frame_seq: u32, count: usize) -> Vec<Attempt> {
+        self.attempted(frame_seq, false, count)
+    }
+
+    /// As [`Self::attempts`], for the frame's repairs.
+    fn retransmits(&mut self, frame_seq: u32, count: usize) -> Vec<Attempt> {
+        self.attempted(frame_seq, true, count)
+    }
+
+    fn attempted(&mut self, frame_seq: u32, retransmit: bool, count: usize) -> Vec<Attempt> {
+        let until = Instant::now() + Duration::from_secs(10);
+        loop {
+            let attempts = attempts_of(frame_seq, retransmit);
+            if attempts.len() >= count {
+                return attempts;
+            }
+            assert!(
+                Instant::now() < until,
+                "only {} sends: {attempts:?}",
+                attempts.len()
+            );
+            self.keep_alive();
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     /// Waits for a heartbeat, so the next second has none.
@@ -120,6 +151,34 @@ impl Ipad {
         }
         panic!("no heartbeat");
     }
+}
+
+fn attempts_of(frame_seq: u32, retransmit: bool) -> Vec<Attempt> {
+    probe::attempts()
+        .into_iter()
+        .filter(|a| a.frame_seq == frame_seq && a.retransmit == retransmit)
+        .collect()
+}
+
+fn indexes(attempts: &[Attempt]) -> Vec<u16> {
+    attempts.iter().map(|a| a.frag_index).collect()
+}
+
+/// Which attempts failed, by position, and how.
+fn failures(attempts: &[Attempt]) -> Vec<(usize, Fail)> {
+    attempts
+        .iter()
+        .enumerate()
+        .filter_map(|(n, a)| a.failed.map(|fail| (n, fail)))
+        .collect()
+}
+
+/// The pacing waits asked for after `from` and before `to`.
+fn waits_between(from: Instant, to: Instant) -> Vec<(Instant, Instant)> {
+    probe::waits()
+        .into_iter()
+        .filter(|&(asked, _)| asked > from && asked < to)
+        .collect()
 }
 
 /// A keyframe of exactly `fragments` datagrams.
@@ -212,28 +271,41 @@ fn refused_sends_back_off_step_down_once_and_log_one_episode() {
     };
     let addr = ipad.addr();
     assert_eq!(shared.abr_current_bps.load(Ordering::SeqCst), 15_000_000);
+    probe::record(addr);
 
-    // Frame 1: fragment 10 is refused once. The frame backs off and sends it
-    // again, and the bitrate steps down without waiting for a loss report.
+    // Frame 1: fragment 10 is refused once. The frame asks the pacing clock
+    // for one back-off, sends it again once that deadline has passed, and
+    // the bitrate steps down without waiting for a loss report.
     probe::refuse_sends(addr, Kind::Media, 10, 1);
     nal_tx.blocking_send(keyframe(&shared, 40)).unwrap();
-    let received = ipad.receive(Duration::from_millis(300));
-    let frame = Ipad::fragments(&received, 1);
-    let indexes: Vec<u16> = frame.iter().map(|&(_, index)| index).collect();
+    let frame = ipad.attempts(1, 41);
+    let expected: Vec<u16> = (0..=10).chain(10..40).collect();
     assert_eq!(
-        indexes,
-        (0..40).collect::<Vec<u16>>(),
-        "the refused fragment is sent again, not lost"
+        indexes(&frame),
+        expected,
+        "fragment 10 is tried twice, in order"
     );
-    let paused = frame[10].0.duration_since(frame[9].0);
+    assert_eq!(failures(&frame), [(10, Fail::NoBufferSpace)]);
+    let (refused, retried) = (frame[10].at, frame[11].at);
+    let backoffs = waits_between(refused, retried);
+    assert_eq!(backoffs.len(), 1, "one back-off: {backoffs:?}");
+    let (_, deadline) = backoffs[0];
     assert!(
-        paused >= BACKOFF - Duration::from_millis(1),
-        "it waited {paused:?} before sending again"
+        deadline >= refused + BACKOFF,
+        "the back-off lasts {BACKOFF:?}"
     );
+    assert!(retried >= deadline, "the retry waits for the deadline");
+    let stepped = Instant::now();
     assert_eq!(
         shared.abr_current_bps.load(Ordering::SeqCst),
         12_000_000,
         "one rung down at once"
+    );
+    let received = ipad.receive(Duration::from_millis(100));
+    assert_eq!(
+        Ipad::fragments(&received, 1),
+        (0..40).collect::<Vec<u16>>(),
+        "the refused fragment is sent again, not lost"
     );
 
     // Frame 2, in the same episode: fragment 5 is refused, and so is its
@@ -241,18 +313,30 @@ fn refused_sends_back_off_step_down_once_and_log_one_episode() {
     // bitrate stays: one step per episode.
     probe::refuse_sends(addr, Kind::Media, 5, 2);
     nal_tx.blocking_send(keyframe(&shared, 40)).unwrap();
-    let received = ipad.receive(Duration::from_millis(300));
-    let indexes: Vec<u16> = Ipad::fragments(&received, 2)
-        .iter()
-        .map(|&(_, index)| index)
-        .collect();
+    let frame = ipad.attempts(2, 7);
+    let received = ipad.receive(Duration::from_millis(100));
+    let frame_after = attempts_of(2, false);
     assert_eq!(
-        indexes,
+        frame_after.len(),
+        frame.len(),
+        "nothing after the second refusal"
+    );
+    assert_eq!(indexes(&frame), [0, 1, 2, 3, 4, 5, 5]);
+    assert_eq!(
+        failures(&frame),
+        [(5, Fail::NoBufferSpace), (6, Fail::NoBufferSpace)]
+    );
+    assert_eq!(waits_between(frame[5].at, frame[6].at).len(), 1);
+    assert_eq!(
+        Ipad::fragments(&received, 2),
         (0..5).collect::<Vec<u16>>(),
         "the rest is given up"
     );
-    assert_eq!(probe::refusals_left(addr), 0);
     assert_eq!(shared.abr_current_bps.load(Ordering::SeqCst), 12_000_000);
+
+    // Repairs go through the same sends: five of them are refused, count in
+    // the episode, and don't arrive.
+    probe::refuse_sends(addr, Kind::Media, 10, 5);
     let epoch = received
         .iter()
         .find_map(|(_, bytes)| MediaHeader::decode(bytes).ok())
@@ -265,43 +349,71 @@ fn refused_sends_back_off_step_down_once_and_log_one_episode() {
         frag_count: 40,
         missing: (5..40).collect(),
     }));
+    let repairs = ipad.retransmits(2, 35);
+    assert_eq!(
+        failures(&repairs),
+        (10..15)
+            .map(|n| (n, Fail::NoBufferSpace))
+            .collect::<Vec<_>>()
+    );
     let repaired = ipad
-        .receive(Duration::from_millis(300))
+        .receive(Duration::from_millis(100))
         .iter()
         .filter(|(_, bytes)| {
             MediaHeader::decode(bytes)
                 .is_ok_and(|(header, _)| header.frame_seq == 2 && header.is_retransmit)
         })
         .count();
-    assert_eq!(repaired, 35, "repair recovers what was given up");
+    assert_eq!(
+        repaired, 30,
+        "repair recovers what was given up, less what was refused"
+    );
+
+    // Frame 3: fragment 3 is refused, and its retry fails another way. That
+    // is logged as any failed send is, and the frame goes on.
+    probe::fail_sends(addr, Kind::Media, 3, &[Fail::NoBufferSpace, Fail::Other]);
+    nal_tx.blocking_send(keyframe(&shared, 40)).unwrap();
+    let frame = ipad.attempts(3, 41);
+    let expected: Vec<u16> = (0..=3).chain(3..40).collect();
+    assert_eq!(indexes(&frame), expected);
+    assert_eq!(
+        failures(&frame),
+        [(3, Fail::NoBufferSpace), (4, Fail::Other)]
+    );
+    let failed = log_lines("UDP send failed link=");
+    assert_eq!(
+        failed,
+        ["WARN UDP send failed link=wifi error=connection reset"]
+    );
 
     // Five frames of 100 fragments while every send is refused: each frame
-    // backs off once and gives up, so none holds the loop for more than one
-    // back-off.
-    probe::refuse_sends(addr, Kind::Media, 0, 1_000_000);
-    let pushed = Instant::now();
+    // asks for one back-off, no longer, and gives up after its retry, so no
+    // frame holds the loop for more than one back-off.
+    probe::refuse_sends(addr, Kind::Media, 0, 1000);
     for _ in 0..5 {
         nal_tx.blocking_send(keyframe(&shared, 100)).unwrap();
     }
-    while 1_000_000 - probe::refusals_left(addr) < 10 {
-        assert!(
-            pushed.elapsed() < Duration::from_secs(2),
-            "refused {} sends",
-            1_000_000 - probe::refusals_left(addr)
-        );
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    let took = pushed.elapsed();
+    let last = ipad.attempts(8, 2);
     ipad.receive(Duration::from_millis(100));
-    assert_eq!(
-        1_000_000 - probe::refusals_left(addr),
-        10,
-        "two refusals per frame, the first and its retry"
-    );
-    assert!(
-        took < 5 * (BACKOFF + Duration::from_millis(30)),
-        "five frames took {took:?}"
-    );
+    assert_eq!(probe::refusals_left(addr), 990, "two refusals per frame");
+    let first = attempts_of(4, false)[0].at;
+    let backoffs = waits_between(first, last[1].at);
+    assert_eq!(backoffs.len(), 5, "{backoffs:?}");
+    for (asked, until) in &backoffs {
+        assert!(
+            *until <= *asked + BACKOFF,
+            "a pause of {:?}",
+            *until - *asked
+        );
+    }
+    for frame_seq in 4..=8 {
+        let frame = attempts_of(frame_seq, false);
+        assert_eq!(indexes(&frame), [0, 0], "frame {frame_seq}");
+        assert_eq!(
+            failures(&frame),
+            [(0, Fail::NoBufferSpace), (1, Fail::NoBufferSpace)]
+        );
+    }
     probe::refuse_sends(addr, Kind::Media, 0, 0);
     assert_eq!(shared.abr_current_bps.load(Ordering::SeqCst), 12_000_000);
 
@@ -320,7 +432,7 @@ fn refused_sends_back_off_step_down_once_and_log_one_episode() {
     assert_eq!(ended.len(), 1, "{ended:#?}");
     assert!(
         ended[0]
-            .starts_with("INFO UDP sends have buffer space again link=wifi refused=13 took_ms="),
+            .starts_with("INFO UDP sends have buffer space again link=wifi refused=19 took_ms="),
         "{ended:#?}"
     );
     let steps = log_lines("ABR stepping bitrate down");
@@ -331,7 +443,11 @@ fn refused_sends_back_off_step_down_once_and_log_one_episode() {
     );
 
     // A refused control reply is sent again once. This is a new episode,
-    // with its own step down.
+    // and the downgrade cooldown (3 s) since the first step is over, so it
+    // steps down again.
+    while stepped.elapsed() < Duration::from_millis(3_200) {
+        ipad.receive(Duration::from_millis(50));
+    }
     ipad.after_heartbeat();
     // No keep-alive Pong still on its way to take the refusal.
     ipad.pinged = Instant::now();
@@ -357,8 +473,9 @@ fn refused_sends_back_off_step_down_once_and_log_one_episode() {
     assert_eq!(shared.abr_current_bps.load(Ordering::SeqCst), 10_000_000);
     assert_eq!(log_lines("no buffer space").len(), 2);
     assert!(log_lines("Failed to send control reply").is_empty());
-    assert!(
-        log_lines("UDP send failed link=").is_empty(),
+    assert_eq!(
+        log_lines("UDP send failed link=").len(),
+        1,
         "no line per send"
     );
 

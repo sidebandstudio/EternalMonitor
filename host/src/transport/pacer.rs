@@ -39,6 +39,8 @@ impl PacingClock {
 
     /// Waits until `deadline`, or not at all if a wait is already queued.
     pub async fn until(&self, deadline: Instant) {
+        #[cfg(feature = "test-hooks")]
+        super::probe::waited(deadline);
         let (done, ready) = tokio::sync::oneshot::channel();
         if self.tx.try_send((deadline, done)).is_ok() {
             let _ = ready.await;
