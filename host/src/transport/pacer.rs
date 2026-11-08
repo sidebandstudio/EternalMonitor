@@ -34,12 +34,13 @@ impl PacingClock {
     }
 
     pub async fn wait(&self, duration: Duration) {
+        self.until(Instant::now() + duration.min(MAX_SPREAD)).await;
+    }
+
+    /// Waits until `deadline`, or not at all if a wait is already queued.
+    pub async fn until(&self, deadline: Instant) {
         let (done, ready) = tokio::sync::oneshot::channel();
-        if self
-            .tx
-            .try_send((Instant::now() + duration.min(MAX_SPREAD), done))
-            .is_ok()
-        {
+        if self.tx.try_send((deadline, done)).is_ok() {
             let _ = ready.await;
         }
     }

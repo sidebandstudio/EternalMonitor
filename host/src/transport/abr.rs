@@ -246,6 +246,36 @@ impl AbrController {
 
         unchanged
     }
+
+    /// The system had no buffer space for a datagram: one rung down at
+    /// once, without waiting for the iPad to report the loss. It counts as a
+    /// downgrade, so the loss reports that follow wait out the cooldown.
+    pub fn on_send_refused(&mut self, now: Instant) -> AbrDecision {
+        let unchanged = AbrDecision {
+            target_bps: self.current_bps,
+            changed: false,
+        };
+        if !self.enabled {
+            return unchanged;
+        }
+        self.clean_since = None;
+        let target = step(self.current_bps, -1, self.ceiling_bps);
+        if target == self.current_bps {
+            return unchanged;
+        }
+        info!(
+            from = self.current_bps,
+            to = target,
+            reason = "no_buffer_space",
+            "ABR stepping bitrate down"
+        );
+        self.current_bps = target;
+        self.last_change = Some((now, true));
+        AbrDecision {
+            target_bps: target,
+            changed: true,
+        }
+    }
 }
 
 /// Nearest ladder rung at or below `bps`, capped by `ceiling`.
@@ -579,5 +609,24 @@ mod tests {
         }
         assert!(stepped_up);
         assert_eq!(abr.current_bps(), 15_000_000);
+    }
+
+    /// A refused send steps one rung down at once, and the loss reports of
+    /// the datagrams it lost wait out the cooldown instead of stepping again.
+    #[test]
+    fn a_refused_send_steps_down_at_once_and_reports_wait_the_cooldown() {
+        let mut abr = AbrController::new(20_000_000, true);
+        let t0 = Instant::now();
+        let d = abr.on_send_refused(t0);
+        assert_eq!((d.target_bps, d.changed), (12_000_000, true));
+        let d = abr.on_report(&report(950, 50, 0), None, t0 + Duration::from_secs(1));
+        assert!(!d.changed, "the same loss, inside the cooldown");
+        assert_eq!(abr.current_bps(), 12_000_000);
+
+        let mut floor = AbrController::new(4_000_000, true);
+        assert!(!floor.on_send_refused(t0).changed);
+        let mut disabled = AbrController::new(20_000_000, false);
+        assert!(!disabled.on_send_refused(t0).changed);
+        assert_eq!(disabled.current_bps(), 20_000_000);
     }
 }

@@ -195,6 +195,11 @@ fn note(waiting: &mut Waiting, held: Option<Held>) {
                 port,
                 code, "Windows is blocking the stream port; checking again every 2 s"
             ),
+            // Its socket is still closing after a restart: no fault.
+            HeldBy::ThisCopy => info!(
+                port,
+                "This copy's previous stream still has the stream port; the stream starts once it lets go"
+            ),
             by => warn!(
                 port,
                 holder = category(by),
@@ -824,6 +829,29 @@ mod tests {
             assert!(log.contains(&field), "{field}: {log}");
         }
         assert!(log.contains("Windows is blocking"), "{log}");
+    }
+
+    /// This copy's own previous stream, whose socket is still closing, is
+    /// no fault: said at info. Any other holder is still a warning.
+    #[test]
+    fn this_copys_previous_stream_is_said_at_info() {
+        let _serial = HELD_TESTS.lock().unwrap_or_else(|e| e.into_inner());
+        let log = logged(|| {
+            check_with(9876, Bind::InUse, || Some(HeldBy::ThisCopy), || None);
+            check_with(9876, Bind::Free, || None, || None);
+            check_with(9876, Bind::InUse, || Some(HeldBy::OtherCopy), || None);
+            forget();
+        });
+        let lines: Vec<&str> = log.lines().collect();
+        assert_eq!(lines.len(), 3, "{log}");
+        assert!(
+            lines[0].contains(" INFO ") && lines[0].contains("previous stream still has"),
+            "{log}"
+        );
+        assert!(
+            lines[2].contains(" WARN ") && lines[2].contains("Another program"),
+            "{log}"
+        );
     }
 
     fn image(path: &'static str) -> impl FnOnce(u32) -> Option<(String, Option<u64>)> {

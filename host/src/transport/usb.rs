@@ -14,6 +14,7 @@ use tokio::task::{AbortHandle, JoinSet};
 use tracing::{debug, info, warn};
 
 use super::apple_usb::{self, AppleUsbState};
+use super::congestion::{is_no_buffer_space, SendCongestion};
 use super::link::{FramedLink, Link, LinkId, PeerId, UdpLink};
 use super::usbmuxd::{self, BoxedTunnel, Client};
 use crate::stats::PIPELINE_STATS;
@@ -233,6 +234,8 @@ impl Drop for ActiveLink {
 
 pub struct TransportLinks {
     pub udp: UdpLink,
+    /// UDP sends the system had no buffer space for.
+    pub congestion: Mutex<SendCongestion>,
     usb: HashMap<LinkId, ActiveLink>,
     events: mpsc::Receiver<HubEvent>,
     _subscription: HubToken,
@@ -252,6 +255,7 @@ impl TransportLinks {
         let subscription = UsbHub::get().subscribe(&force_idr);
         let mut links = Self {
             udp: UdpLink::new(socket),
+            congestion: Mutex::default(),
             usb: HashMap::new(),
             events: subscription.events,
             _subscription: HubToken(subscription.token),
@@ -279,7 +283,15 @@ impl TransportLinks {
 
     pub async fn send_to(&self, bytes: &[u8], peer: PeerId) -> io::Result<()> {
         match peer.link {
-            LinkId::Udp => self.udp.send(peer, bytes).await,
+            LinkId::Udp => {
+                let sent = self.udp.send(peer, bytes).await;
+                if let Err(error) = &sent {
+                    if is_no_buffer_space(error) {
+                        self.congestion.lock().refused(error, super::now());
+                    }
+                }
+                sent
+            }
             id => match self.usb.get(&id) {
                 Some(active) => active.link.send(peer, bytes).await,
                 None => Err(io::Error::new(
