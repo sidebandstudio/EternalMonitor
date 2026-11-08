@@ -664,17 +664,29 @@ fn one_sender_flooding_junk_never_blocks_a_pairing_from_another() {
         }
     }
     assert!(answered >= 1, "the genuine iPad got its message 2");
+}
 
-    // The host-wide cap still bounds what many real senders cause.
-    let mut host = self::host();
-    let _qr = host.open(T0, addr());
-    for source in 0..200u32 {
-        for _ in 0..20 {
-            host.handle_datagram(T0, &(100 + source), &junk, &creds);
+/// Many senders, each inside its own limit, burst junk right before each of
+/// the genuine iPad's retries: it still gets its message 2. (No host-wide
+/// limit before authentication can be used up.)
+#[test]
+fn a_genuine_pairing_gets_message_2_behind_many_senders() {
+    let creds = Creds::default();
+    let mut host = host();
+    let qr = host.open(T0, addr());
+    let mut forged = qr.clone();
+    forged.secret = Zeroizing::new([0x04; 32]);
+    let junk = client(&forged, 42).msg1().to_vec();
+    let ipad = client(&qr, 43);
+    let mut answered = 0;
+    for retry in 0..8u64 {
+        let at = T0 + Duration::from_millis(250 * retry);
+        for source in 0..200u32 {
+            for _ in 0..20 {
+                host.handle_datagram(at, &(100 + source), &junk, &creds);
+            }
         }
+        answered += sends(&host.handle_datagram(at, &ADDR, ipad.msg1(), &creds)).len();
     }
-    assert_eq!(
-        host.reads.1, host.config.msg1_per_second,
-        "capped host-wide"
-    );
+    assert!(answered >= 1, "message 2 on {answered} of 8 retries");
 }

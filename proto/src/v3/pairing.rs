@@ -133,8 +133,8 @@ impl QrPayload {
         push_hex(&mut out, &*self.secret);
         out.push_str("&hv=");
         out.push_str(&self.host_version);
-        debug_assert_eq!(out.len(), len);
-        debug_assert_eq!(out.as_ptr(), start, "never reallocated");
+        assert_eq!(out.len(), len);
+        assert_eq!(out.as_ptr(), start, "never reallocated");
         out
     }
 
@@ -328,12 +328,13 @@ pub struct PairingConfig {
     pub reanswer_interval: Duration,
     /// Message 1s read per second from one source (its
     /// [`PeerAddr::rate_bucket`]), before the QR's PSK authenticates them.
-    /// Sources beyond the table share one budget of the same size.
+    /// Sources beyond the table share one budget of the same size. There's
+    /// no host-wide limit before authentication, as on the session path: one
+    /// would let many senders inside their own limits starve a genuine iPad.
+    /// A read that fails is one AEAD attempt and no Diffie-Hellman (about
+    /// 10 µs), so the most the table admits, (1,024 + 1) × 20 a second, is
+    /// about a fifth of one core.
     pub msg1_per_source_per_second: u32,
-    /// Message 1s read per second, host-wide. A read that fails is one AEAD
-    /// attempt and no Diffie-Hellman, so this is large; it bounds the work
-    /// many real senders can cause.
-    pub msg1_per_second: u32,
 }
 
 impl Default for PairingConfig {
@@ -343,7 +344,6 @@ impl Default for PairingConfig {
             answered_lifetime: Duration::from_secs(30),
             reanswer_interval: Duration::from_millis(50),
             msg1_per_source_per_second: 20,
-            msg1_per_second: 2000,
         }
     }
 }
@@ -420,8 +420,6 @@ pub struct PairingHost<A: PeerAddr> {
     /// The generation the next window gets.
     next_generation: u64,
     attempt: Option<Attempt<A>>,
-    /// Message 1 reads in the current second, host-wide: (start, count).
-    reads: (Duration, u32),
     /// Message 1 reads per source.
     per_source: SourceLimiter<A::Bucket>,
 }
@@ -445,7 +443,6 @@ impl<A: PeerAddr> PairingHost<A> {
             window: None,
             next_generation: 1,
             attempt: None,
-            reads: (Duration::ZERO, 0),
         }
     }
 
@@ -586,18 +583,10 @@ impl<A: PeerAddr> PairingHost<A> {
         if window.handled.contains(&digest) || window.handled.len() >= MAX_HANDLED_MSG1 {
             return;
         }
-        // One source can't use up everyone's reads: its own limit first,
-        // then the host-wide cap.
+        // One source can't use up everyone's reads.
         if !self.per_source.allow(now, &from.rate_bucket()) {
             return;
         }
-        if now.saturating_sub(self.reads.0) >= Duration::from_secs(1) {
-            self.reads = (now, 0);
-        }
-        if self.reads.1 >= self.config.msg1_per_second {
-            return;
-        }
-        self.reads.1 += 1;
         let ctx = pairing_ctx(
             pair1.ipad_version,
             &self.host_version,
