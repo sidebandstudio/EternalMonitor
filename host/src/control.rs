@@ -382,6 +382,15 @@ mod tests {
                 std::time::Instant::now(),
             );
             assert!(shared.client_connected());
+            assert!(!shared.client_draws_pointer(), "not before it answers");
+            let session_id = shared.session.lock().session_id().unwrap();
+            shared.session.lock().handle_control(
+                PeerId::udp("10.0.0.5:50000".parse().unwrap()),
+                session_id,
+                ControlMessage::ReceiverReport(Default::default()),
+                &Config,
+                std::time::Instant::now(),
+            );
             assert_eq!(shared.client_draws_pointer(), draws, "caps {caps:#x}");
         }
     }

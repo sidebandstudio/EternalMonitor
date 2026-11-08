@@ -721,14 +721,19 @@ impl Session {
             .map(|session| session.session_id)
     }
 
-    /// The session's id while its client draws the pointer itself. A
-    /// client keeps its HELLO2's answer for the whole session, so capture
-    /// never switches mid-session.
+    /// The session's id while its client draws the pointer itself, from
+    /// when it has answered: until then nothing confirms it received its
+    /// HELLO_ACK, so it gets no pointer messages (an image can be hundreds
+    /// of kilobytes), and capture keeps the pointer in the video for it, as
+    /// for any other client. Pointer messages start once the iPad answers;
+    /// capture switches then, once, and never again in the session.
     pub fn pointer_session_id(&self) -> Option<u32> {
         self.active
             .as_ref()
             .filter(|session| {
-                session.info.feature_caps & eternal_wire::v2::control::FEATURE_DRAWS_POINTER != 0
+                session.answered
+                    && session.info.feature_caps & eternal_wire::v2::control::FEATURE_DRAWS_POINTER
+                        != 0
             })
             .map(|session| session.session_id)
     }
@@ -2237,18 +2242,30 @@ mod tests {
             unreachable!()
         };
         draws.feature_caps = FEATURE_DRAWS_POINTER;
-        let actions =
-            session.handle_control_authed(peer, ControlMessage::Hello2(draws), &TestConfig, now);
-        let (ack, _) = parse_control(&actions.replies[0].1).unwrap();
-        let id = session.pointer_session_id().expect("this iPad draws it");
-        assert_eq!(Some(id), session.session_id());
+        session.handle_control_authed(peer, ControlMessage::Hello2(draws), &TestConfig, now);
+        // Review r2: nothing has confirmed it got its HELLO_ACK, so no
+        // pointer messages yet, and capture keeps drawing the pointer.
+        assert_eq!(
+            session.pointer_session_id(),
+            None,
+            "a HELLO that only claims the bit gets no pointer messages"
+        );
+        let id = session.session_id().unwrap();
+        let answer = session.handle_control(
+            peer,
+            id,
+            ControlMessage::ReceiverReport(ReceiverReport::default()),
+            &TestConfig,
+            now,
+        );
+        assert!(answer.replies.is_empty());
+        assert_eq!(session.pointer_session_id(), Some(id), "it answered");
         let state = ControlMessage::PointerState(PointerState::default());
         let (to, datagram) = session.encode_for_client(&state).unwrap();
         assert_eq!(to, peer);
         let (header, parsed) = parse_control(&datagram).unwrap();
         assert_eq!(parsed, state);
         assert_eq!(header.session_id, id);
-        assert_eq!(header.msg_seq, ack.msg_seq + 1);
 
         session.handle_control_authed(
             peer,

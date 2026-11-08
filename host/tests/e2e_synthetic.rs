@@ -3880,3 +3880,99 @@ fn the_pointer_moves_without_video_frames_for_an_ipad_that_draws_it() {
         .recv_timeout(Duration::from_secs(5))
         .expect("supervisor must shut down within 5s");
 }
+
+/// Review r2: a HELLO2 that only claims `FEATURE_DRAWS_POINTER` must not get
+/// pointer messages (an image can be hundreds of kilobytes) before it has
+/// answered, as audio waits for it; the pointer stays in its video until
+/// then. Once it answers, pointer messages start.
+#[test]
+fn pointer_messages_start_once_the_ipad_has_answered() {
+    use eternal_wire::v2::control::FEATURE_DRAWS_POINTER;
+    let _env = test_env();
+    init_test_tracing();
+    let _ = ffmpeg_next::init();
+    std::env::set_var("ETERNAL_SYNTH_SIZE", format!("{SYNTH_W}x{SYNTH_H}"));
+    std::env::set_var("ETERNAL_CAPTURE", "synthetic");
+    std::env::set_var("ETERNAL_SYNTH_POINTER", "1");
+    for name in ["ETERNAL_DROP", "ETERNAL_REORDER", "ETERNAL_JITTER_MS"] {
+        std::env::remove_var(name);
+    }
+    let listen_port = free_udp_port();
+    let shared = SharedControl::new(listen_port, pipeline::DEFAULT_BITRATE_BPS);
+    shared.pairing.lock().required = false;
+    *shared.encoder_override.lock() = Some("libx264".to_string());
+    let (supervisor_tx, supervisor_rx) = mpsc::channel();
+    let supervisor = {
+        let shared = shared.clone();
+        let tx = supervisor_tx.clone();
+        std::thread::spawn(move || {
+            eternal_host::supervisor::run(
+                listen_port,
+                shared,
+                GpuInfo::software_fallback(),
+                tx,
+                supervisor_rx,
+            );
+        })
+    };
+
+    // The handshake alone, no ping: nothing confirms it got its HELLO_ACK.
+    let mut receiver = FakeReceiver::handshake(
+        listen_port,
+        CAP_DECODE_H264,
+        FEATURE_DRAWS_POINTER,
+        60,
+        0xE2E0_0185,
+    );
+    let mut datagram = [0u8; 2048];
+    let count = |receiver: &mut FakeReceiver, datagram: &mut [u8; 2048], for_: Duration| {
+        let (mut pointer, mut media) = (0, 0);
+        let until = Instant::now() + for_;
+        while Instant::now() < until {
+            let Ok((len, _)) = receiver.socket.recv_from(datagram) else {
+                continue;
+            };
+            match classify(&datagram[..len]) {
+                Classified::Media { .. } => media += 1,
+                Classified::Control(_) => {
+                    if matches!(
+                        parse_control(&datagram[..len]).map(|(_, m)| m),
+                        Ok(ControlMessage::PointerShape(_) | ControlMessage::PointerState(_))
+                    ) {
+                        pointer += 1;
+                    }
+                }
+                _ => {}
+            }
+        }
+        (pointer, media)
+    };
+    // Silent after its HELLO2: the pointer moves every frame meanwhile.
+    let (pointer, media) = count(&mut receiver, &mut datagram, Duration::from_millis(1500));
+    assert_eq!(pointer, 0, "pointer messages before the iPad answered");
+    assert!(media > 0, "its first picture still came");
+    assert!(
+        !shared.client_draws_pointer(),
+        "capture keeps the pointer in its video"
+    );
+
+    receiver.send(&ControlMessage::ReceiverReport(ReceiverReport::default()));
+    let (pointer, _) = count(&mut receiver, &mut datagram, Duration::from_millis(1500));
+    assert!(
+        pointer > 10,
+        "only {pointer} pointer messages after it answered"
+    );
+    assert!(shared.client_draws_pointer());
+
+    receiver.send(&ControlMessage::Bye(ByeReason::UserDisconnect));
+    shared.stop();
+    supervisor_tx.send(SupervisorCommand::Shutdown).unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = supervisor.join();
+        let _ = done_tx.send(());
+    });
+    done_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("supervisor must shut down within 5s");
+}

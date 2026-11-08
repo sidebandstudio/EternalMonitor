@@ -12,6 +12,9 @@
 //! - An image goes when it changes, when a session starts, with every IDR
 //!   the session asks for, and again when a report the iPad sent
 //!   [`SHAPE_RESEND_AFTER`] or more after it went still names another one.
+//! - An image's chunks resume where the link last refused one (the USB
+//!   tunnel's control queue holds 64), [`SHAPE_RETRY`] later. It counts as
+//!   sent once every chunk was accepted.
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -24,10 +27,14 @@ pub const REPEAT_AFTER: Duration = Duration::from_millis(100);
 /// Long enough for the image to reach the iPad before a report it sends,
 /// so a report already on its way doesn't send the image twice.
 pub const SHAPE_RESEND_AFTER: Duration = Duration::from_millis(250);
+/// How long a refused image chunk waits before it is offered again.
+pub const SHAPE_RETRY: Duration = Duration::from_millis(5);
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Send {
-    Shape(Arc<Shape>),
+    /// The image, from this chunk on: report what went with
+    /// [`PointerSender::shape_progress`].
+    Shape(Arc<Shape>, usize),
     State(PointerState),
 }
 
@@ -39,8 +46,12 @@ pub struct PointerSender {
     /// Where the grid of frame budgets starts.
     epoch: Option<Instant>,
     repeat_at: Option<Instant>,
-    /// The image sent last, and when.
+    /// The image sent last, whole, and when.
     shape_sent: Option<(u32, Instant)>,
+    /// The image being sent, and its next chunk.
+    pending: Option<(Arc<Shape>, usize)>,
+    /// A chunk was refused: offer the image again from then.
+    retry_at: Option<Instant>,
     shape_due: bool,
     /// The image the iPad's last report said it holds, and when it came.
     client_shape: Option<(u32, Instant)>,
@@ -99,8 +110,20 @@ impl PointerSender {
             };
             if changed || lagging || self.shape_due {
                 self.shape_due = false;
-                self.shape_sent = Some((shape.id, now));
-                out.push(Send::Shape(Arc::clone(shape)));
+                // Sending it already: carry on from where it got to.
+                if self
+                    .pending
+                    .as_ref()
+                    .is_none_or(|(sending, _)| sending.id != shape.id)
+                {
+                    self.pending = Some((Arc::clone(shape), 0));
+                    self.retry_at = None;
+                }
+            }
+        }
+        if let Some((sending, next)) = self.pending.as_ref() {
+            if self.retry_at.is_none_or(|at| now >= at) {
+                out.push(Send::Shape(Arc::clone(sending), *next));
             }
         }
         let Some(position) = position else {
@@ -132,6 +155,33 @@ impl PointerSender {
             }));
         }
         out
+    }
+
+    /// The transport sent the pending image's chunks up to `next` of
+    /// `total`; `refused` when the link refused chunk `next`. The image is
+    /// sent once every chunk was.
+    pub fn shape_progress(
+        &mut self,
+        id: u32,
+        next: usize,
+        total: usize,
+        refused: bool,
+        now: Instant,
+    ) {
+        let Some((sending, at)) = self.pending.as_mut() else {
+            return;
+        };
+        if sending.id != id {
+            return;
+        }
+        if next >= total {
+            self.pending = None;
+            self.retry_at = None;
+            self.shape_sent = Some((id, now));
+            return;
+        }
+        *at = next;
+        self.retry_at = refused.then_some(now + SHAPE_RETRY);
     }
 
     /// When [`Self::poll`] next has something to send without new input:
@@ -178,9 +228,14 @@ impl PointerSender {
         waiting.then(|| self.next_slot(budget)).flatten()
     }
 
-    /// When the last position goes again, no earlier than the next budget.
+    /// When the last position goes again, no earlier than the next budget,
+    /// or a refused image chunk is offered again.
     pub fn repeat_due(&self, budget: Duration) -> Option<Instant> {
-        Some(self.repeat_at?.max(self.next_slot(budget)?))
+        let repeat = self
+            .repeat_at
+            .and_then(|due| Some(due.max(self.next_slot(budget)?)));
+        let retry = self.pending.as_ref().and(self.retry_at);
+        [repeat, retry].into_iter().flatten().min()
     }
 
     fn next_slot(&self, budget: Duration) -> Option<Instant> {
@@ -223,11 +278,27 @@ mod tests {
         }
     }
 
+    /// Polls with a link that takes every chunk.
+    fn poll_all(
+        sender: &mut PointerSender,
+        now: Instant,
+        budget: Duration,
+        latest: (Option<Arc<Shape>>, Option<Position>),
+    ) -> Vec<Send> {
+        let sent = sender.poll(now, budget, latest);
+        for send in &sent {
+            if let Send::Shape(shape, _) = send {
+                sender.shape_progress(shape.id, 1, 1, false, now);
+            }
+        }
+        sent
+    }
+
     fn states(sent: &[Send]) -> Vec<i32> {
         sent.iter()
             .filter_map(|send| match send {
                 Send::State(state) => Some(state.x),
-                Send::Shape(_) => None,
+                Send::Shape(..) => None,
             })
             .collect()
     }
@@ -261,7 +332,12 @@ mod tests {
                 latest = Some(at(next.next().unwrap().1));
             }
             let now = start + Duration::from_millis(ms);
-            for x in states(&sender.poll(now, BUDGET, (Some(shape(1)), latest))) {
+            for x in states(&poll_all(
+                &mut sender,
+                now,
+                BUDGET,
+                (Some(shape(1)), latest),
+            )) {
                 sent.push((ms, x));
             }
             // What the loop's high-resolution timer waits for: within one
@@ -323,7 +399,13 @@ mod tests {
             let mut t = arrived;
             loop {
                 let now = start + Duration::from_micros(t);
-                if states(&sender.poll(now, BUDGET, (Some(shape(1)), latest))).contains(&(k as i32))
+                if states(&poll_all(
+                    &mut sender,
+                    now,
+                    BUDGET,
+                    (Some(shape(1)), latest),
+                ))
+                .contains(&(k as i32))
                 {
                     delays.push(t - arrived);
                     break;
@@ -344,15 +426,23 @@ mod tests {
         let mut sender = PointerSender::default();
         sender.serve(Some(1));
         let latest = (Some(shape(1)), Some(at(5)));
-        assert_eq!(sender.poll(start, BUDGET, latest.clone()).len(), 2);
         assert_eq!(
-            states(&sender.poll(start + REPEAT_AFTER, BUDGET, latest.clone())),
+            poll_all(&mut sender, start, BUDGET, latest.clone()).len(),
+            2
+        );
+        assert_eq!(
+            states(&poll_all(
+                &mut sender,
+                start + REPEAT_AFTER,
+                BUDGET,
+                latest.clone()
+            )),
             [5]
         );
         for ms in 101..2000 {
             let now = start + Duration::from_millis(ms);
             assert!(
-                sender.poll(now, BUDGET, latest.clone()).is_empty(),
+                poll_all(&mut sender, now, BUDGET, latest.clone()).is_empty(),
                 "{ms} ms"
             );
             assert_eq!(sender.next_poll(BUDGET, latest.1, Some(1)), None);
@@ -360,7 +450,7 @@ mod tests {
         let now = start + Duration::from_secs(2);
         sender.refresh(now);
         assert_eq!(sender.next_poll(BUDGET, latest.1, Some(1)), Some(now));
-        assert_eq!(states(&sender.poll(now, BUDGET, latest)), [5]);
+        assert_eq!(states(&poll_all(&mut sender, now, BUDGET, latest)), [5]);
     }
 
     #[test]
@@ -368,7 +458,7 @@ mod tests {
         let start = Instant::now();
         let mut sender = PointerSender::default();
         sender.serve(Some(1));
-        sender.poll(start, BUDGET, (None, Some(at(5))));
+        poll_all(&mut sender, start, BUDGET, (None, Some(at(5))));
         let hidden = Position {
             visible: false,
             ..at(5)
@@ -377,7 +467,7 @@ mod tests {
             sender.next_poll(BUDGET, Some(hidden), None),
             Some(start + BUDGET)
         );
-        let sent = sender.poll(start + BUDGET, BUDGET, (None, Some(hidden)));
+        let sent = poll_all(&mut sender, start + BUDGET, BUDGET, (None, Some(hidden)));
         assert!(matches!(sent[..], [Send::State(state)] if state.flags & POINTER_VISIBLE == 0));
     }
 
@@ -388,7 +478,7 @@ mod tests {
         let shapes = |sent: &[Send]| {
             sent.iter()
                 .filter_map(|send| match send {
-                    Send::Shape(shape) => Some(shape.id),
+                    Send::Shape(shape, _) => Some(shape.id),
                     Send::State(_) => None,
                 })
                 .collect::<Vec<_>>()
@@ -401,25 +491,40 @@ mod tests {
         );
         sender.serve(Some(7));
         assert_eq!(
-            shapes(&sender.poll(start, BUDGET, (Some(shape(1)), None))),
+            shapes(&poll_all(
+                &mut sender,
+                start,
+                BUDGET,
+                (Some(shape(1)), None)
+            )),
             [1]
         );
         assert!(sender
             .poll(start, BUDGET, (Some(shape(1)), None))
             .is_empty());
         assert_eq!(
-            shapes(&sender.poll(start, BUDGET, (Some(shape(2)), None))),
+            shapes(&poll_all(
+                &mut sender,
+                start,
+                BUDGET,
+                (Some(shape(2)), None)
+            )),
             [2]
         );
         // A report sent before image 2 could arrive names image 1: no resend.
         let soon = start + SHAPE_RESEND_AFTER - Duration::from_millis(1);
         sender.report(1, soon);
-        assert!(sender.poll(soon, BUDGET, (Some(shape(2)), None)).is_empty());
+        assert!(poll_all(&mut sender, soon, BUDGET, (Some(shape(2)), None)).is_empty());
         // A later one still names it: image 2 was lost on the way.
         let later = start + SHAPE_RESEND_AFTER;
         sender.report(1, later);
         assert_eq!(
-            shapes(&sender.poll(later, BUDGET, (Some(shape(2)), None))),
+            shapes(&poll_all(
+                &mut sender,
+                later,
+                BUDGET,
+                (Some(shape(2)), None)
+            )),
             [2]
         );
         assert!(
@@ -430,24 +535,99 @@ mod tests {
         );
         let next = later + Duration::from_millis(500);
         sender.report(2, next);
-        assert!(sender.poll(next, BUDGET, (Some(shape(2)), None)).is_empty());
+        assert!(poll_all(&mut sender, next, BUDGET, (Some(shape(2)), None)).is_empty());
         let much_later = later + Duration::from_secs(5);
         assert!(sender
             .poll(much_later, BUDGET, (Some(shape(2)), None))
             .is_empty());
         sender.keyframe(much_later);
         assert_eq!(
-            shapes(&sender.poll(much_later, BUDGET, (Some(shape(2)), None))),
+            shapes(&poll_all(
+                &mut sender,
+                much_later,
+                BUDGET,
+                (Some(shape(2)), None)
+            )),
             [2]
         );
         // A new session gets the image and position again.
         sender.serve(Some(8));
-        let sent = sender.poll(much_later, BUDGET, (Some(shape(2)), Some(at(1))));
+        let sent = poll_all(
+            &mut sender,
+            much_later,
+            BUDGET,
+            (Some(shape(2)), Some(at(1))),
+        );
         assert_eq!(shapes(&sent), [2]);
         assert_eq!(states(&sent), [1]);
         sender.serve(None);
         assert!(sender
             .poll(much_later, BUDGET, (Some(shape(3)), Some(at(2))))
             .is_empty());
+    }
+
+    /// Review r2: over USB the tunnel's control queue takes 64 datagrams and
+    /// refuses the rest. An image of more chunks than that resumes where the
+    /// link refused it, also when it is due again meanwhile, and counts as
+    /// sent only once every chunk went.
+    #[test]
+    fn a_refused_image_resumes_where_it_stopped_and_is_sent_only_when_whole() {
+        let start = Instant::now();
+        let mut sender = PointerSender::default();
+        sender.serve(Some(1));
+        let total = 194;
+        let big = shape(1);
+        let offered = |sent: &[Send]| {
+            sent.iter().find_map(|send| match send {
+                Send::Shape(shape, next) => Some((shape.id, *next)),
+                Send::State(_) => None,
+            })
+        };
+        assert_eq!(
+            offered(&sender.poll(start, BUDGET, (Some(Arc::clone(&big)), None))),
+            Some((1, 0))
+        );
+        // The queue takes 64, then refuses.
+        sender.shape_progress(1, 64, total, true, start);
+        assert_eq!(sender.repeat_due(BUDGET), Some(start + SHAPE_RETRY));
+        let soon = start + SHAPE_RETRY / 2;
+        assert_eq!(
+            offered(&sender.poll(soon, BUDGET, (Some(Arc::clone(&big)), None))),
+            None,
+            "waits"
+        );
+        // A keyframe asks for it again: it carries on, it doesn't restart.
+        sender.keyframe(soon);
+        let retry = start + SHAPE_RETRY;
+        assert_eq!(
+            offered(&sender.poll(retry, BUDGET, (Some(Arc::clone(&big)), None))),
+            Some((1, 64))
+        );
+        sender.shape_progress(1, 128, total, true, retry);
+        // Not sent yet: a report naming nothing doesn't resend from 0.
+        sender.report(0, retry + SHAPE_RESEND_AFTER);
+        let later = retry + SHAPE_RETRY;
+        assert_eq!(
+            offered(&sender.poll(later, BUDGET, (Some(Arc::clone(&big)), None))),
+            Some((1, 128))
+        );
+        sender.shape_progress(1, total, total, false, later);
+        assert_eq!(
+            offered(&sender.poll(later, BUDGET, (Some(Arc::clone(&big)), None))),
+            None,
+            "whole"
+        );
+        assert_eq!(sender.repeat_due(BUDGET), None);
+        // A newer image replaces one still going.
+        let next = later + SHAPE_RETRY;
+        assert_eq!(
+            offered(&sender.poll(next, BUDGET, (Some(shape(2)), None))),
+            Some((2, 0))
+        );
+        sender.shape_progress(2, 10, total, true, next);
+        assert_eq!(
+            offered(&sender.poll(next + SHAPE_RETRY, BUDGET, (Some(shape(3)), None))),
+            Some((3, 0))
+        );
     }
 }
