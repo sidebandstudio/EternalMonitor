@@ -389,13 +389,13 @@ pub fn with_gpu(xml: &str, gpu: &str) -> Option<String> {
 /// would leave it none. A file that does not parse as expected is left
 /// alone, and the error says why.
 pub fn pin_gpu_in(path: &Path, gpu: &str) -> io::Result<bool> {
-    let current = read_settings(path)?;
+    let (current, legacy) = read_settings(path)?;
     let updated = gpu_edit(&current, gpu)
         .map_err(|reason| io::Error::new(io::ErrorKind::InvalidData, reason))?;
     if updated == current {
         return Ok(false);
     }
-    replace(path, &updated)?;
+    replace_settings(path, legacy, &updated)?;
     Ok(true)
 }
 
@@ -551,7 +551,7 @@ pub fn apply_pin(
     wanted: Option<&str>,
 ) -> io::Result<PinOutcome> {
     let invalid = |reason| io::Error::new(io::ErrorKind::InvalidData, reason);
-    let current = read_settings(path)?;
+    let (current, legacy) = read_settings(path)?;
     let named = named_gpu(&current).map_err(invalid)?;
     let ours = recorded_pins(record);
     let ours: Vec<&str> = ours.iter().map(String::as_str).collect();
@@ -563,7 +563,9 @@ pub fn apply_pin(
     };
     let updated = gpu_edit(&current, &name).map_err(invalid)?;
     let new_record = (outcome == PinOutcome::Named).then_some(name.as_str());
-    record_around(record, new_record, &ours, || replace(path, &updated))?;
+    record_around(record, new_record, &ours, || {
+        replace_settings(path, legacy, &updated)
+    })?;
     Ok(outcome)
 }
 
@@ -622,13 +624,13 @@ pub fn write_with_pin(
     modes: &[VddMode],
     wanted: Option<&str>,
 ) -> io::Result<PinOutcome> {
-    let named = match read_settings(path) {
-        Ok(current) => match named_gpu(&current) {
-            Ok(named) => named,
-            Err(_) if owned && wanted.is_some() => None,
+    let (named, legacy) = match read_settings(path) {
+        Ok((current, legacy)) => match named_gpu(&current) {
+            Ok(named) => (named, legacy),
+            Err(_) if owned && wanted.is_some() => (None, legacy),
             Err(reason) => return Err(io::Error::new(io::ErrorKind::InvalidData, reason)),
         },
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (None, false),
         Err(error) => return Err(error),
     };
     let ours = recorded_pins(record);
@@ -639,7 +641,12 @@ pub fn write_with_pin(
         PinChange::Write(card) => (Some(card), PinOutcome::Named),
         PinChange::Reset => (None, PinOutcome::Reset),
     };
-    let write = || write_to(path, modes, name.as_deref());
+    let write = || {
+        if legacy {
+            back_up(path)?;
+        }
+        write_to(path, modes, name.as_deref())
+    };
     match outcome {
         PinOutcome::Named => record_around(record, name.as_deref(), &ours, write)?,
         PinOutcome::Reset => record_around(record, None, &ours, write)?,
@@ -662,31 +669,42 @@ pub fn pin_result(
     }
 }
 
-/// The settings file as text. Another tool may have saved it as UTF-16
-/// (Windows PowerShell's `Out-File` does), with a byte order mark or, as XML
-/// allows, without one; it is read and, when this host writes it, written
-/// back as UTF-8, the encoding the driver's own file has and every file this
-/// host writes. A UTF-16 document's `encoding="utf-16"` declaration becomes
-/// `utf-8` with it, so the declaration always names what is on disk. UTF-8
-/// keeps any byte order mark. Any other encoding, UTF-32 included, is left
-/// alone, and the error says so.
-fn read_settings(path: &Path) -> io::Result<String> {
-    decode_settings(&std::fs::read(path)?).ok_or_else(|| {
+/// The settings file as text, and whether it was in a legacy code page.
+/// Another tool may have saved it as UTF-16 (Windows PowerShell's
+/// `Out-File` does), with a byte order mark or, as XML allows, without one;
+/// or in a Windows code page, as Notepad's ANSI does, keeping the driver's
+/// `encoding='utf-8'` declaration or naming the code page. It is read and,
+/// when this host writes it, written back as UTF-8, the encoding the
+/// driver's own file has and every file this host writes. The driver's XML
+/// reader takes UTF-8 and UTF-16 but not double-byte code pages: declared,
+/// it reads nothing; otherwise it stops at the first byte it cannot read,
+/// keeping only the settings before it. A UTF-16 or code page
+/// document's declaration names UTF-8 with it, so the declaration always
+/// names what is on disk. UTF-8 keeps any byte order mark. Any other
+/// encoding, UTF-32 included, is left alone, and the error says so.
+fn read_settings(path: &Path) -> io::Result<(String, bool)> {
+    decode_settings(&std::fs::read(path)?, ANSI).ok_or_else(|| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            "the settings file is neither UTF-8 nor UTF-16",
+            "the settings file is in no encoding this host reads",
         )
     })
 }
 
-fn decode_settings(bytes: &[u8]) -> Option<String> {
-    let text = decode_text(bytes)?;
+/// `CP_ACP`: the system's ANSI code page, which Notepad and other older
+/// tools save text in.
+const ANSI: u32 = 0;
+
+/// `bytes` as text, and whether they were in a code page; text that is not
+/// UTF and declares no other encoding is in code page `ansi`.
+fn decode_settings(bytes: &[u8], ansi: u32) -> Option<(String, bool)> {
+    let (text, legacy) = decode_text(bytes, ansi)?;
     // XML never holds NUL: text with one was read in the wrong encoding,
     // such as UTF-32 without a byte order mark, which reads as UTF-8.
-    (!text.contains('\0')).then_some(text)
+    (!text.contains('\0')).then_some((text, legacy))
 }
 
-fn decode_text(bytes: &[u8]) -> Option<String> {
+fn decode_text(bytes: &[u8], ansi: u32) -> Option<(String, bool)> {
     // UTF-32's byte order marks; the little-endian one starts like UTF-16's.
     if bytes.starts_with(&[0xFF, 0xFE, 0, 0]) || bytes.starts_with(&[0, 0, 0xFE, 0xFF]) {
         return None;
@@ -697,7 +715,7 @@ fn decode_text(bytes: &[u8]) -> Option<String> {
         // "<?" without a byte order mark (XML 1.0, appendix F).
         [b'<', 0, b'?', 0, ..] => (bytes, false),
         [0, b'<', 0, b'?', ..] => (bytes, true),
-        _ => return String::from_utf8(bytes.to_vec()).ok(),
+        _ => return decode_bytes(bytes, ansi),
     };
     let (pairs, odd) = units.as_chunks::<2>();
     if !odd.is_empty() {
@@ -713,26 +731,135 @@ fn decode_text(bytes: &[u8]) -> Option<String> {
     let text = char::decode_utf16(units)
         .collect::<Result<String, _>>()
         .ok()?;
-    Some(declared_utf8(text))
+    let label = encoding_label(text.as_bytes()).map(|label| text[label].to_ascii_lowercase());
+    match label.as_deref() {
+        Some("utf-16" | "utf-16le" | "utf-16be") => Some((declared_utf8(text), false)),
+        _ => Some((text, false)),
+    }
 }
 
-/// `xml` with its declaration's UTF-16 encoding named as UTF-8, quote and
-/// all else unchanged.
-fn declared_utf8(xml: String) -> String {
-    let Some(end) = xml.starts_with("<?xml").then(|| xml.find("?>")).flatten() else {
-        return xml;
-    };
-    let declaration = &xml[..end];
-    for quote in ['"', '\''] {
-        for label in ["utf-16", "utf-16le", "utf-16be"] {
-            let pattern = format!("encoding={quote}{label}{quote}");
-            if let Some(at) = declaration.to_ascii_lowercase().find(&pattern) {
-                let utf8 = format!("encoding={quote}utf-8{quote}");
-                return format!("{}{utf8}{}", &xml[..at], &xml[at + pattern.len()..]);
+/// Bytes in an 8-bit encoding: UTF-8, or the code page the declaration
+/// names. Without one, bytes that are not UTF-8 are in code page `ansi`;
+/// so are bytes declared UTF-8 that are not, as Notepad leaves the driver's
+/// file when it saves it as ANSI.
+fn decode_bytes(bytes: &[u8], ansi: u32) -> Option<(String, bool)> {
+    let label = encoding_label(bytes).map(|label| bytes[label].to_ascii_lowercase());
+    let code_page = match label.as_deref() {
+        None | Some(b"utf-8") => match String::from_utf8(bytes.to_vec()) {
+            Ok(text) => return Some((text, false)),
+            Err(_) => ansi,
+        },
+        Some(label) => match std::str::from_utf8(label).ok().and_then(code_page) {
+            Some(code_page) => code_page,
+            // The declaration is not one this host edits.
+            None => {
+                return String::from_utf8(bytes.to_vec())
+                    .ok()
+                    .map(|text| (text, false))
             }
-        }
+        },
+    };
+    let text = decode_code_page(bytes, code_page)?;
+    Some((declared_utf8(text), true))
+}
+
+/// The Windows multi-byte code page an XML encoding name stands for. The
+/// driver's reader takes none of these, declared or not; it does take the
+/// single-byte ones, so a file declaring one stays as it is.
+fn code_page(label: &str) -> Option<u32> {
+    let numbered = ["windows-", "x-windows-", "cp", "x-cp"]
+        .iter()
+        .find_map(|prefix| label.strip_prefix(prefix)?.parse().ok());
+    let code_page = numbered.or(match label {
+        "shift_jis" | "shift-jis" | "sjis" | "ms_kanji" | "windows-31j" => Some(932),
+        "gb2312" | "gbk" | "x-gbk" => Some(936),
+        "euc-kr" | "ks_c_5601-1987" | "ks_c_5601-1989" | "ksc5601" | "uhc" => Some(949),
+        "big5" => Some(950),
+        "gb18030" => Some(54936),
+        _ => None,
+    })?;
+    [932, 936, 949, 950, 54936]
+        .contains(&code_page)
+        .then_some(code_page)
+}
+
+/// `bytes` in Windows code page `code_page`; `None` when any byte is not
+/// a character there, or off Windows.
+#[cfg(windows)]
+fn decode_code_page(bytes: &[u8], code_page: u32) -> Option<String> {
+    use windows::Win32::Globalization::{MultiByteToWideChar, MB_ERR_INVALID_CHARS};
+    if bytes.is_empty() {
+        return Some(String::new());
     }
-    xml
+    let length = unsafe { MultiByteToWideChar(code_page, MB_ERR_INVALID_CHARS, bytes, None) };
+    let mut wide = vec![0u16; usize::try_from(length).ok().filter(|&n| n > 0)?];
+    let length =
+        unsafe { MultiByteToWideChar(code_page, MB_ERR_INVALID_CHARS, bytes, Some(&mut wide)) };
+    String::from_utf16(wide.get(..usize::try_from(length).ok().filter(|&n| n > 0)?)?).ok()
+}
+
+#[cfg(not(windows))]
+fn decode_code_page(_bytes: &[u8], _code_page: u32) -> Option<String> {
+    None
+}
+
+/// Where the XML declaration at the start of `xml` names its encoding.
+fn encoding_label(xml: &[u8]) -> Option<std::ops::Range<usize>> {
+    let end = xml
+        .starts_with(b"<?xml")
+        .then(|| xml.windows(2).position(|w| w == b"?>"))??;
+    let declaration = &xml[..end];
+    let at = declaration.windows(9).position(|w| w == b"encoding=")? + 9;
+    let quote = *declaration.get(at).filter(|&&c| c == b'"' || c == b'\'')?;
+    let length = declaration[at + 1..].iter().position(|&c| c == quote)?;
+    Some(at + 1..at + 1 + length)
+}
+
+/// `xml` with its declaration's encoding named as UTF-8, quote and all else
+/// unchanged.
+fn declared_utf8(xml: String) -> String {
+    match encoding_label(xml.as_bytes()) {
+        Some(label) => format!("{}utf-8{}", &xml[..label.start], &xml[label.end..]),
+        None => xml,
+    }
+}
+
+/// Keep a file read from a code page as it was, beside it, before its
+/// first replacement on a day: `vdd_settings.xml.bak-<YYYYMMDD>`.
+fn back_up(path: &Path) -> io::Result<()> {
+    let mut backup = path.as_os_str().to_owned();
+    backup.push(format!(".bak-{}", utc_date(std::time::SystemTime::now())));
+    let backup = std::path::PathBuf::from(backup);
+    if backup.exists() {
+        return Ok(());
+    }
+    std::fs::copy(path, backup).map(drop)
+}
+
+/// `time`'s UTC date as `YYYYMMDD` (Howard Hinnant's civil_from_days).
+fn utc_date(time: std::time::SystemTime) -> String {
+    let seconds = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let days = (seconds / 86_400) as i64 + 719_468;
+    let era = days / 146_097;
+    let doe = days - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}{month:02}{day:02}")
+}
+
+/// Replace the settings file with `contents`, backing it up first when it
+/// was read from a code page (`legacy`).
+fn replace_settings(path: &Path, legacy: bool, contents: &str) -> io::Result<()> {
+    if legacy {
+        back_up(path)?;
+    }
+    replace(path, contents)
 }
 
 /// Write atomically (tmp + rename) so the driver never reads a torn file.
@@ -1763,18 +1890,25 @@ mod tests {
             dir.join("vdd_settings.xml"),
             dir.join("app").join("vdd-pin.txt"),
         );
-        let ansi = VENDOR
+        // Not UTF-8, in an encoding this host does not know.
+        let unknown = VENDOR
+            .replace("encoding='utf-8'", "encoding='x-unknown'")
             .replace(">default<", ">Radeon\u{AE}<")
             .replace('\u{AE}', "");
-        let mut ansi = ansi.into_bytes();
-        let at = ansi.windows(7).position(|w| w == b"Radeon<").unwrap() + 6;
-        ansi.insert(at, 0xAE);
+        let mut unknown = unknown.into_bytes();
+        let at = unknown.windows(7).position(|w| w == b"Radeon<").unwrap() + 6;
+        unknown.insert(at, 0xAE);
+        // A double-byte character cut short.
+        let mut broken = declared(CP949, "euc-kr");
+        let at = broken.iter().position(|&b| b >= 0x80).unwrap();
+        broken[at + 1] = b' ';
         let mut odd = utf16(VENDOR, false, true);
         odd.push(b' ');
         let mut lone = utf16(VENDOR, false, true);
         lone.extend_from_slice(&0xD800u16.to_le_bytes());
         for (name, bytes) in [
-            ("ansi", ansi),
+            ("unknown encoding", unknown),
+            ("broken code page", broken),
             ("odd utf-16", odd),
             ("lone surrogate", lone),
         ] {
@@ -1784,12 +1918,197 @@ mod tests {
             assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{name}");
             assert_eq!(
                 error.to_string(),
-                "the settings file is neither UTF-8 nor UTF-16"
+                "the settings file is in no encoding this host reads"
             );
-            let written = write_with_pin(&path, &record, false, &default_modes(), Some("x"));
-            assert!(written.is_err(), "{name}");
+            for owned in [false, true] {
+                let written = write_with_pin(&path, &record, owned, &default_modes(), Some("x"));
+                assert!(written.is_err(), "{name}");
+            }
             assert_eq!(std::fs::read(&path).unwrap(), bytes, "{name}");
+            assert_eq!(backups(&dir), Vec::<Vec<u8>>::new(), "{name}");
         }
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The driver's file saved in code page 949 as Notepad's ANSI does: its
+    /// `encoding='utf-8'` declaration stays. A comment holds a folder path in
+    /// non-ASCII text, and so does the card's name.
+    const CP949: &[u8] = include_bytes!("../tests/fixtures/vdd_settings-25.5.2-cp949.xml");
+    const VENDOR_DECLARATION: &str = "<?xml version='1.0' encoding='utf-8'?>\r\n";
+
+    /// The code page 949 fixture and its code page 936 twin, each with its
+    /// code page, the text it holds, and the card it names.
+    #[cfg(windows)]
+    fn code_page_fixtures() -> [(&'static [u8], u32, String, &'static str); 2] {
+        let text = |comment: &str, card: &str| {
+            VENDOR_FILE
+                .replacen(
+                    "<vdd_settings>\r\n",
+                    &format!("<vdd_settings>\r\n    <!-- {comment} -->\r\n"),
+                    1,
+                )
+                .replace(">default<", &format!(">{card}<"))
+        };
+        const CP949_CARD: &str = "Microsoft 기본 렌더링 드라이버";
+        const CP936_CARD: &str = "Microsoft 基本呈现驱动程序";
+        [
+            (
+                CP949,
+                949,
+                text("가상 디스플레이 설정: D:\\도구\\디스플레이", CP949_CARD),
+                CP949_CARD,
+            ),
+            (
+                include_bytes!("../tests/fixtures/vdd_settings-25.5.2-cp936.xml"),
+                936,
+                text("虚拟显示器设置: D:\\工具\\显示器", CP936_CARD),
+                CP936_CARD,
+            ),
+        ]
+    }
+
+    /// A code page fixture declaring `label` as its encoding instead.
+    fn declared(fixture: &[u8], label: &str) -> Vec<u8> {
+        let body = fixture.strip_prefix(VENDOR_DECLARATION.as_bytes()).unwrap();
+        let declaration = format!("<?xml version=\"1.0\" encoding=\"{label}\"?>\r\n");
+        [declaration.as_bytes(), body].concat()
+    }
+
+    /// The backups beside the settings file in `dir`.
+    fn backups(dir: &Path) -> Vec<Vec<u8>> {
+        let mut found: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                name.starts_with("vdd_settings.xml.bak-")
+            })
+            .collect();
+        found.sort();
+        found
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect()
+    }
+
+    /// Field triage round 3: a settings file saved in a Windows code page
+    /// was "not valid UTF-8", so the second screen kept the driver's old
+    /// modes and the card was never named. Declared UTF-8 as Notepad leaves
+    /// it, or not declared, it is in the system's code page, given here.
+    #[cfg(windows)]
+    #[test]
+    fn a_code_page_settings_file_is_read_in_the_systems_code_page() {
+        const INTEL: &str = "Intel(R) HD Graphics 630";
+        for (bytes, code_page, text, card) in code_page_fixtures() {
+            let undeclared = bytes.strip_prefix(VENDOR_DECLARATION.as_bytes()).unwrap();
+            let body = text.strip_prefix(VENDOR_DECLARATION).unwrap();
+            for (bytes, text) in [(bytes, text.as_str()), (undeclared, body)] {
+                assert_eq!(
+                    decode_settings(bytes, code_page),
+                    Some((text.to_string(), true)),
+                    "{code_page}"
+                );
+                assert_eq!(named_gpu(text), Ok(Some(card.to_string())));
+                assert_eq!(with_gpu(text, INTEL), Some(text.replace(card, INTEL)));
+            }
+            // UTF-8 stays UTF-8 whatever the system's code page.
+            assert_eq!(
+                decode_settings(text.as_bytes(), code_page),
+                Some((text.clone(), false))
+            );
+        }
+    }
+
+    /// A declaration may name the code page instead. Either way the file is
+    /// written back as UTF-8, declared so, which the driver's reader takes to
+    /// the end, and the file as it was is kept beside it.
+    #[cfg(windows)]
+    #[test]
+    fn a_code_page_settings_file_is_written_back_as_utf8_with_a_backup() {
+        let dir = std::env::temp_dir().join(format!("vdd-encoding-cp-{}", std::process::id()));
+        let (path, record) = (
+            dir.join("vdd_settings.xml"),
+            dir.join("app").join("vdd-pin.txt"),
+        );
+        const INTEL: &str = "Intel(R) HD Graphics 630";
+        const AMD: &str = "AMD Radeon(TM) Graphics";
+        let modes = modes_for_client(1640, 2360, 60);
+        let labels = [
+            (
+                949,
+                &["euc-kr", "ks_c_5601-1987", "windows-949", "CP949"][..],
+            ),
+            (936, &["gb2312", "GBK", "windows-936", "cp936"][..]),
+        ];
+        for (bytes, code_page, text, card) in code_page_fixtures() {
+            let utf8 = text.replacen(
+                VENDOR_DECLARATION,
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n",
+                1,
+            );
+            let (_, labels) = labels.iter().find(|(page, _)| *page == code_page).unwrap();
+            for label in *labels {
+                let declared = declared(bytes, label);
+                let fresh = || {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    std::fs::create_dir_all(&dir).unwrap();
+                    std::fs::write(&path, &declared).unwrap();
+                };
+
+                // Only the card changes, as the driver will read it.
+                fresh();
+                let pinned = apply_pin(&path, &record, true, Some(INTEL));
+                assert_eq!(pinned.ok(), Some(PinOutcome::Named), "{label}");
+                let written = std::fs::read_to_string(&path).expect(label);
+                assert_eq!(written, utf8.replace(card, INTEL), "{label}");
+                assert_eq!(backups(&dir), vec![declared.clone()], "{label}");
+                // The file is UTF-8 now: the next write keeps the backup.
+                let pinned = apply_pin(&path, &record, true, Some(AMD));
+                assert_eq!(pinned.ok(), Some(PinOutcome::Named), "{label}");
+                assert_eq!(
+                    std::fs::read_to_string(&path).unwrap(),
+                    utf8.replace(card, AMD)
+                );
+                assert_eq!(backups(&dir), vec![declared.clone()], "{label}");
+
+                // Match the iPad's resolution writes the whole file, keeping
+                // the card another app named.
+                fresh();
+                let written = write_with_pin(&path, &record, false, &modes, Some(INTEL));
+                assert_eq!(
+                    written.ok(),
+                    Some(PinOutcome::Kept(NAMED_ELSEWHERE)),
+                    "{label}"
+                );
+                let text = std::fs::read_to_string(&path).expect(label);
+                assert_eq!(text, render(&modes, Some(card)), "{label}");
+                assert_eq!(backups(&dir), vec![declared.clone()], "{label}");
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn encoding_names_are_windows_code_pages() {
+        for (label, expected) in [
+            ("euc-kr", Some(949)),
+            ("ks_c_5601-1987", Some(949)),
+            ("windows-949", Some(949)),
+            ("cp949", Some(949)),
+            ("gb2312", Some(936)),
+            ("gbk", Some(936)),
+            ("x-windows-936", Some(936)),
+            ("windows-1252", None),
+            ("iso-8859-1", None),
+            ("utf-16", None),
+            ("x-unknown", None),
+        ] {
+            assert_eq!(code_page(label), expected, "{label}");
+        }
+        let at = |seconds| std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds);
+        assert_eq!(utc_date(at(0)), "19700101");
+        assert_eq!(utc_date(at(951_868_800)), "20000301");
+        assert_eq!(utc_date(at(1_709_251_199)), "20240229");
+        assert_eq!(utc_date(at(1_794_096_000)), "20261108");
     }
 }
