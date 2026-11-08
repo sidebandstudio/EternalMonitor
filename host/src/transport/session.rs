@@ -15,8 +15,8 @@ use std::time::{Duration, Instant};
 use eternal_wire::v2::control::{
     ByeReason, ControlHeader, ControlMessage, FailedReason, HelloAck, HelloStatus, InputEvent,
     KeyframeRequest, Nack, ReceiverReport, StreamConfig, FEATURE_MEDIA_SIZE, FEATURE_POWER_BYE,
-    FEATURE_STANDBY_STATUS, FEATURE_SUPPORTS_NACK, FEATURE_WANTS_INPUT, HOSTCAP_MEDIA_SIZE,
-    HOSTCAP_NACK, MIN_MEDIA_DGRAM,
+    FEATURE_STANDBY_STATUS, FEATURE_SUPPORTS_NACK, FEATURE_WANTS_INPUT, HOSTCAP_KEYFRAME_PER_LOSS,
+    HOSTCAP_MEDIA_SIZE, HOSTCAP_NACK, MIN_MEDIA_DGRAM,
 };
 use tracing::{info, warn};
 
@@ -114,7 +114,8 @@ struct RefusalMinute {
     summarized: u32,
     left_out: u32,
 }
-/// Honor at most one keyframe request per this window (PLI storm guard).
+/// Honor at most one keyframe request per this window (PLI storm guard),
+/// besides one for each loss after a recovery ([`ActiveSession::recovered`]).
 pub const KEYFRAME_REQUEST_MIN_INTERVAL: Duration = Duration::from_millis(500);
 /// Smaller media sizes per session whose keyframe skips that window: the
 /// iPad asks for two (1,200 then 576 bytes). Any later one is an ordinary,
@@ -358,7 +359,12 @@ struct ActiveSession {
     client_clock: Option<(i64, Instant)>,
     late_input: LateInput,
     awaiting_takeover: bool,
+    /// The last IDR granted on [`KEYFRAME_REQUEST_MIN_INTERVAL`]'s schedule.
     last_keyframe_grant: Option<Instant>,
+    /// The stream epoch and frame number of the first keyframe sent since
+    /// the last IDR was granted, on that schedule or not (see
+    /// [`ActiveSession::recovered`]).
+    keyframe_since_grant: Option<(u32, u32)>,
     last_report: Option<ReceiverReport>,
     msg_seq_out: u32,
     /// When the first video went to this session.
@@ -867,6 +873,18 @@ impl Session {
         }
     }
 
+    /// A keyframe went to `session_id`'s client as frame `frame_seq` of
+    /// `stream_epoch`.
+    pub fn note_keyframe_sent(&mut self, session_id: u32, stream_epoch: u32, frame_seq: u32) {
+        if let Some(session) = self.active.as_mut() {
+            if session.session_id == session_id {
+                session
+                    .keyframe_since_grant
+                    .get_or_insert((stream_epoch, frame_seq));
+            }
+        }
+    }
+
     pub fn session_id(&self) -> Option<u32> {
         self.active.as_ref().map(|s| s.session_id)
     }
@@ -1325,6 +1343,7 @@ impl Session {
             late_input: LateInput::default(),
             awaiting_takeover: false,
             last_keyframe_grant: None,
+            keyframe_since_grant: None,
             last_report: None,
             msg_seq_out: 0,
             first_video_at: None,
@@ -1421,6 +1440,7 @@ impl Session {
                 );
                 if session.media_size_lowered <= MEDIA_SIZE_IDRS {
                     session.last_keyframe_grant = Some(now);
+                    session.keyframe_since_grant = None;
                     actions.force_idr = true;
                     return actions;
                 }
@@ -1429,6 +1449,14 @@ impl Session {
 
         if session.grant_keyframe(now) {
             info!(reason = ?request.reason, "Keyframe requested by client — forcing IDR");
+            actions.force_idr = true;
+        } else if session.recovered(&request) {
+            // A new loss: the client already had the last recovery.
+            session.keyframe_since_grant = None;
+            info!(
+                reason = ?request.reason,
+                "Keyframe requested by client after a recovery — forcing IDR"
+            );
             actions.force_idr = true;
         }
         actions
@@ -2001,6 +2029,7 @@ impl Session {
             host_name: config.host_name(),
             auth_token,
             host_caps: HOSTCAP_NACK
+                | HOSTCAP_KEYFRAME_PER_LOSS
                 | config.host_caps()
                 | if media_size { HOSTCAP_MEDIA_SIZE } else { 0 },
             reason: reason.to_string(),
@@ -2127,8 +2156,24 @@ impl ActiveSession {
         );
         if granted {
             self.last_keyframe_grant = Some(now);
+            self.keyframe_since_grant = None;
         }
         granted
+    }
+
+    /// Whether the client completed the first keyframe sent since the last
+    /// IDR was granted, or a later frame, before it lost the frame it asks
+    /// for now. Such a loss is new, so its IDR needn't wait out
+    /// [`KEYFRAME_REQUEST_MIN_INTERVAL`], and doesn't move it. A request
+    /// from before that recovery landed names an older frame and waits as
+    /// before. Only a request that names a frame can show it: the iPad's
+    /// `GapLoss` does; `DecodeError` and `Resume` name none.
+    fn recovered(&self, request: &KeyframeRequest) -> bool {
+        self.keyframe_since_grant.is_some_and(|(epoch, seq)| {
+            request.stream_epoch == epoch
+                && request.last_complete_seq != 0
+                && request.last_complete_seq.wrapping_sub(seq) < u32::MAX / 2
+        })
     }
 
     /// `device=` stays last: uploads cut the iPad's name at the line's end.
@@ -2900,6 +2945,148 @@ mod tests {
         assert!(resume.force_idr, "granted once the window has passed");
     }
 
+    /// A keyframe request from `peer` at `now` + `millis`: whether it forces an IDR.
+    fn keyframe_asked(
+        session: &mut Session,
+        peer: PeerId,
+        now: Instant,
+        millis: u64,
+        (stream_epoch, last_complete_seq): (u32, u32),
+        reason: KeyframeReason,
+    ) -> bool {
+        session
+            .handle_control_authed(
+                peer,
+                ControlMessage::KeyframeRequest(KeyframeRequest {
+                    stream_epoch,
+                    last_complete_seq,
+                    reason,
+                    max_media_dgram: 0,
+                }),
+                &TestConfig,
+                now + Duration::from_millis(millis),
+            )
+            .force_idr
+    }
+
+    #[test]
+    fn a_loss_after_a_recovery_gets_its_keyframe_at_once() {
+        // Under Wi-Fi loss the next frame is often lost soon after a
+        // recovery IDR lands. A request naming a frame at or past that
+        // keyframe is a new loss: it gets its own IDR without waiting out
+        // the 500 ms window, and doesn't move it. A request from before the
+        // recovery waits, as does a second one for the same loss.
+        let mut session = Session::new(1234);
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
+        let id = session.session_id().unwrap();
+        let gap = KeyframeReason::GapLoss;
+        let ask = |session: &mut Session, millis, last_complete_seq| {
+            keyframe_asked(session, peer, now, millis, (7, last_complete_seq), gap)
+        };
+
+        // The session's opening keyframe, then the first loss.
+        session.note_keyframe_sent(id, 7, 1);
+        assert!(ask(&mut session, 0, 10));
+        assert!(
+            !ask(&mut session, 40, 11),
+            "no keyframe has gone out since the grant"
+        );
+        session.note_keyframe_sent(id, 7, 12);
+        session.note_keyframe_sent(id, 7, 20);
+        assert!(
+            !ask(&mut session, 60, 11),
+            "a request from before the recovery waits"
+        );
+        assert!(ask(&mut session, 150, 12), "the client had the recovery");
+        assert!(
+            !ask(&mut session, 170, 14),
+            "the same loss asks again before its keyframe went out"
+        );
+        session.note_keyframe_sent(id, 7, 15);
+        assert!(
+            !ask(&mut session, 200, 14),
+            "a request from before the second recovery waits"
+        );
+        assert!(ask(&mut session, 260, 18), "a third loss");
+        // The schedule still runs from the first grant.
+        assert!(!ask(&mut session, 450, 18));
+        assert!(
+            keyframe_asked(
+                &mut session,
+                peer,
+                now,
+                520,
+                (0, 0),
+                KeyframeReason::DecodeError
+            ),
+            "the window is 500 ms from the last grant on schedule"
+        );
+    }
+
+    #[test]
+    fn only_a_request_naming_a_frame_of_this_epoch_shows_a_recovery() {
+        let mut session = Session::new(1234);
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
+        let id = session.session_id().unwrap();
+        assert!(keyframe_asked(
+            &mut session,
+            peer,
+            now,
+            0,
+            (7, 10),
+            KeyframeReason::GapLoss
+        ));
+        session.note_keyframe_sent(id, 7, u32::MAX);
+        // The decoder's requests name no frame.
+        for reason in [KeyframeReason::DecodeError, KeyframeReason::Resume] {
+            assert!(!keyframe_asked(
+                &mut session,
+                peer,
+                now,
+                100,
+                (0, 0),
+                reason
+            ));
+        }
+        assert!(
+            !keyframe_asked(
+                &mut session,
+                peer,
+                now,
+                100,
+                (6, 5),
+                KeyframeReason::GapLoss
+            ),
+            "another epoch's frame"
+        );
+        assert!(
+            !keyframe_asked(
+                &mut session,
+                peer,
+                now,
+                100,
+                (7, u32::MAX - 1),
+                KeyframeReason::GapLoss
+            ),
+            "older, just below the wrap"
+        );
+        assert!(
+            keyframe_asked(
+                &mut session,
+                peer,
+                now,
+                100,
+                (7, 3),
+                KeyframeReason::GapLoss
+            ),
+            "newer, past the wrap"
+        );
+    }
+
     fn input_event(event_id: u32) -> ControlMessage {
         ControlMessage::InputEvent(InputEvent {
             input_ver: 1,
@@ -3212,7 +3399,10 @@ mod tests {
             );
             let ack = parse_ack(&accepted.replies[0].1);
             assert_eq!(ack.host_caps & HOSTCAP_MEDIA_SIZE != 0, offered);
-            assert_eq!(ack.host_caps & !HOSTCAP_MEDIA_SIZE, HOSTCAP_NACK);
+            assert_eq!(
+                ack.host_caps & !HOSTCAP_MEDIA_SIZE,
+                HOSTCAP_NACK | HOSTCAP_KEYFRAME_PER_LOSS
+            );
             let id = session.session_id().unwrap();
             for _ in 0..3 {
                 assert!(session.may_send_media(id, 1000, now));

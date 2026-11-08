@@ -78,6 +78,12 @@ pub const HOSTCAP_POINTER: u16 = 1 << 6;
 /// for an iPad whose HELLO2 has [`FEATURE_MEDIA_SIZE`], so an older iPad
 /// gets the same bytes as before. Bit 6 is [`HOSTCAP_POINTER`].
 pub const HOSTCAP_MEDIA_SIZE: u16 = 1 << 7;
+/// The host answers a keyframe request inside its 500 ms window when the
+/// request names a frame from the first keyframe it sent since its last
+/// grant on: a loss after that recovery. Older iPads ignore the bit; an iPad
+/// asks early only a host that sets it, since an older one moves its window
+/// for any grant.
+pub const HOSTCAP_KEYFRAME_PER_LOSS: u16 = 1 << 8;
 /// The smallest media datagram an iPad may ask for: the IPv4 minimum
 /// reassembly size, also the smallest packet size the PC's own setting takes.
 pub const MIN_MEDIA_DGRAM: u16 = 576;

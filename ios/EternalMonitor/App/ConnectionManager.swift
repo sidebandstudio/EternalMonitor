@@ -848,8 +848,9 @@ final class ConnectionManager: ObservableObject {
             }
         }
 
-        assembler.onFrameAssembled = { [weak self, weak decoder, weak assembler] data, seq, captureTsUs, isKeyframe in
+        assembler.onFrameAssembled = { [weak self, weak decoder, weak assembler, weak controlChannelBox] data, seq, captureTsUs, isKeyframe in
             guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+            if isKeyframe { controlChannelBox?.value?.noteKeyframeAssembled() }
             self.streamCounters.recordAssembled(bytes: data.count)
             self.streamCounters.recordParsed()
             decoder?.decode(packet: FramePacket(
