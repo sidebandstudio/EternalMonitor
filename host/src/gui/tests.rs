@@ -1,8 +1,27 @@
 use super::page_stream::{
-    audio_summary, capture_block_notice, firewall_fix_offered, firewall_notice,
-    second_screen_notice, software_fallback_body, usb_cable_notice, usb_summary,
+    audio_summary, capture_block_notice, firewall_fix_failure, firewall_fix_offered,
+    firewall_notice, second_screen_notice, software_fallback_body, usb_cable_notice, usb_summary,
 };
 use super::*;
+
+/// A fix that failed says so in its own banner, whatever the firewall
+/// reads now. One that worked, or a No to the Windows prompt, says nothing.
+#[test]
+fn a_failed_firewall_fix_shows_its_error_on_its_own() {
+    use crate::firewall_fix::{Outcome, Progress, FAILED};
+    assert_eq!(
+        firewall_fix_failure(Progress::Done(Outcome::Failed(FAILED))),
+        Some(FAILED)
+    );
+    for quiet in [
+        Progress::Idle,
+        Progress::Running,
+        Progress::Done(Outcome::Fixed),
+        Progress::Done(Outcome::Declined),
+    ] {
+        assert_eq!(firewall_fix_failure(quiet), None, "{quiet:?}");
+    }
+}
 
 #[test]
 fn the_firewall_notice_shows_only_for_a_block_it_is_sure_of() {

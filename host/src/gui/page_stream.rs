@@ -57,19 +57,36 @@ impl AnalyzerApp {
     fn notices(&mut self, ui: &mut Ui, snap: &StatsSnapshot, client: &ClientSnapshot) {
         self.port_notice(ui);
         let firewall = crate::firewall::latest();
-        if let Some((title, mut body)) = firewall_notice(firewall.as_ref(), client.peer.is_some()) {
-            let progress = crate::firewall_fix::progress();
-            if let crate::firewall_fix::Progress::Done(crate::firewall_fix::Outcome::Failed(
+        let progress = crate::firewall_fix::progress();
+        // Its own banner, whatever the firewall reads now: a fix that went
+        // part of the way can leave no notice to show the failure in.
+        if let Some(error) = firewall_fix_failure(progress) {
+            widgets::banner(
+                ui,
+                WARNING,
+                Icon::Warning,
+                FIREWALL_FIX_FAILED_TITLE,
                 error,
-            )) = progress
-            {
-                body = format!("{body} {error}");
-            }
+                220.0,
+                |ui| {
+                    if let Some(port) = crate::firewall_fix::last_port() {
+                        if widgets::button(ui, Tone::Primary, None, tr("Try again")).clicked() {
+                            crate::firewall_fix::start_for(port);
+                        }
+                    }
+                    if widgets::button(ui, Tone::Secondary, None, tr("Dismiss")).clicked() {
+                        crate::firewall_fix::dismiss();
+                    }
+                },
+            );
+            ui.add_space(GAP - 10.0);
+        }
+        if let Some((title, body)) = firewall_notice(firewall.as_ref(), client.peer.is_some()) {
             let fixable = firewall_fix_offered(firewall.as_ref());
             let width = if fixable { 110.0 } else { 0.0 };
             widgets::banner(ui, WARNING, Icon::Warning, &title, &body, width, |ui| {
-                if fixable {
-                    firewall_fix_action(ui, progress);
+                if let (true, Some(report)) = (fixable, firewall.as_ref()) {
+                    firewall_fix_action(ui, progress, report.port);
                 }
             });
             ui.add_space(GAP - 10.0);
@@ -1420,7 +1437,7 @@ pub(super) fn firewall_fix_offered(report: Option<&crate::firewall::Report>) -> 
 }
 
 /// Runs the fix; it asks Windows for administrator rights once.
-fn firewall_fix_action(ui: &mut Ui, progress: crate::firewall_fix::Progress) {
+fn firewall_fix_action(ui: &mut Ui, progress: crate::firewall_fix::Progress, port: u16) {
     let running = progress == crate::firewall_fix::Progress::Running;
     let clicked = ui
         .add_enabled_ui(!running, |ui| {
@@ -1429,7 +1446,23 @@ fn firewall_fix_action(ui: &mut Ui, progress: crate::firewall_fix::Progress) {
         .inner
         .clicked();
     if clicked {
-        crate::firewall_fix::start(crate::firewall_fix::fix_now);
+        crate::firewall_fix::start_for(port);
+    }
+}
+
+/// The title of the banner for a firewall fix that didn't work.
+pub(super) const FIREWALL_FIX_FAILED_TITLE: &str = "EternalMonitor couldn't fix Windows Firewall";
+
+/// The error to show for the last fix, until dismissed: a failure only.
+/// A fix that worked, or a No to the Windows prompt, shows nothing.
+pub(super) fn firewall_fix_failure(
+    progress: crate::firewall_fix::Progress,
+) -> Option<&'static str> {
+    match progress {
+        crate::firewall_fix::Progress::Done(crate::firewall_fix::Outcome::Failed(error)) => {
+            Some(error)
+        }
+        _ => None,
     }
 }
 

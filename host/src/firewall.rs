@@ -260,6 +260,10 @@ enum Whose {
     Other,
 }
 
+pub(crate) fn ours(rule: &Rule, exe: &Path, lookup: impl Fn(&str) -> Option<String>) -> bool {
+    whose(rule, exe, lookup) == Whose::Ours
+}
+
 fn whose(rule: &Rule, exe: &Path, lookup: impl Fn(&str) -> Option<String>) -> Whose {
     match rule.program.as_deref() {
         None => Whose::Unknown,
@@ -627,7 +631,7 @@ pub fn watch(port: u16) {
 }
 
 #[cfg(windows)]
-mod windows_policy {
+pub(crate) mod windows_policy {
     use std::path::Path;
 
     use windows::core::{IUnknown, Interface, VARIANT};
@@ -649,10 +653,10 @@ mod windows_policy {
     /// VT_DISPATCH: what the rule enumerator hands out.
     const VT_DISPATCH: u16 = 9;
 
-    struct Apartment;
+    pub(crate) struct Apartment;
 
     impl Apartment {
-        fn new() -> windows::core::Result<Self> {
+        pub(crate) fn new() -> windows::core::Result<Self> {
             unsafe { CoInitializeEx(None, COINIT_MULTITHREADED).ok()? };
             Ok(Self)
         }
@@ -749,13 +753,27 @@ mod windows_policy {
 
     /// Every inbound rule, each with what could be read of it.
     fn inbound_rules(policy: &INetFwPolicy2) -> windows::core::Result<Vec<Rule>> {
-        let all = unsafe { policy.Rules()? };
-        let each: IEnumVARIANT = unsafe { all._NewEnum()? }.cast()?;
         let mut rules = Vec::new();
+        for_each_rule(policy, |rule| {
+            if let Some(rule) = rule_from(rule).map_err(|e| windows::core::Error::new(E_FAIL, e))? {
+                rules.push(rule);
+            }
+            Ok(())
+        })?;
+        Ok(rules)
+    }
+
+    /// Hands every rule of the policy, in any direction, to `each`.
+    pub(crate) fn for_each_rule(
+        policy: &INetFwPolicy2,
+        mut each: impl FnMut(&INetFwRule) -> windows::core::Result<()>,
+    ) -> windows::core::Result<()> {
+        let all = unsafe { policy.Rules()? };
+        let rules: IEnumVARIANT = unsafe { all._NewEnum()? }.cast()?;
         loop {
             let mut item = [VARIANT::default()];
             let mut fetched = 0;
-            unsafe { each.Next(&mut item, &mut fetched).ok()? };
+            unsafe { rules.Next(&mut item, &mut fetched).ok()? };
             if fetched == 0 {
                 break;
             }
@@ -776,13 +794,9 @@ mod windows_policy {
             let Ok(rule) = unknown.cast::<INetFwRule>() else {
                 continue;
             };
-            if let Some(rule) =
-                rule_from(&rule).map_err(|e| windows::core::Error::new(E_FAIL, e))?
-            {
-                rules.push(rule);
-            }
+            each(&rule)?;
         }
-        Ok(rules)
+        Ok(())
     }
 }
 
