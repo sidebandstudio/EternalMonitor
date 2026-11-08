@@ -329,14 +329,19 @@ impl AdapterKey {
 /// EternalMonitor patch: the adapter's LUID, from DXGI on DX12, or from
 /// `VkPhysicalDeviceIDProperties` on Vulkan 1.1+.
 #[cfg(windows)]
+#[expect(unsafe_code)] // EternalMonitor patch: reads the adapter's backend objects.
 fn luid(adapter: &wgpu::Adapter) -> Option<u64> {
-    // SAFETY: the backend objects are only read, while `adapter` holds them.
-    if let Some(hal) = unsafe { adapter.as_hal::<wgpu::hal::api::Dx12>() } {
+    // SAFETY: the DX12 adapter is only read, while `adapter` holds it.
+    let dx12 = unsafe { adapter.as_hal::<wgpu::hal::api::Dx12>() };
+    if let Some(hal) = dx12 {
+        // SAFETY: `GetDesc1` only fills in a description of a live adapter.
         let desc = unsafe { hal.raw_adapter().GetDesc1() }.ok()?;
         let luid = desc.AdapterLuid;
-        return Some((u64::from(luid.HighPart as u32) << 32) | u64::from(luid.LowPart));
+        return Some((u64::from(luid.HighPart.cast_unsigned()) << 32) | u64::from(luid.LowPart));
     }
-    if let Some(hal) = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() } {
+    // SAFETY: the Vulkan adapter is only read, while `adapter` holds it.
+    let vulkan = unsafe { adapter.as_hal::<wgpu::hal::api::Vulkan>() };
+    if let Some(hal) = vulkan {
         let shared = hal.shared_instance();
         if shared.instance_api_version() < ash::vk::API_VERSION_1_1 {
             return None;
@@ -344,13 +349,15 @@ fn luid(adapter: &wgpu::Adapter) -> Option<u64> {
         let mut id = ash::vk::PhysicalDeviceIDProperties::default();
         {
             let mut properties = ash::vk::PhysicalDeviceProperties2::default().push_next(&mut id);
+            // SAFETY: a query on the instance's own physical device, core in Vulkan 1.1.
             unsafe {
                 shared
                     .raw_instance()
                     .get_physical_device_properties2(hal.raw_physical_device(), &mut properties);
             }
         }
-        return (id.device_luid_valid == ash::vk::TRUE).then(|| u64::from_le_bytes(id.device_luid));
+        return (id.device_luid_valid == ash::vk::TRUE)
+            .then_some(u64::from_le_bytes(id.device_luid));
     }
     None
 }
