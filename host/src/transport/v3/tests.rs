@@ -613,6 +613,86 @@ fn a_second_finalize_conflicts_with_one_still_being_written() {
 }
 
 #[test]
+fn a_confirm_replacing_a_record_being_removed_is_refused() {
+    // Slot 1: active 0x11, and 0x12 that replaces it.
+    let mut rig = Rig::new(&world(&[
+        (0x11, 1, None, true, 0),
+        (0x12, 1, Some(0x11), false, 0),
+    ]));
+    rig.hold_jobs = true;
+    let at = rig.at();
+    let actions = rig
+        .host
+        .remove(&mut rig.session, &[id(0x11)], &TestConfig, at);
+    rig.take(actions);
+
+    // 0x12 confirms before the Remove is written: by the time its Finalize
+    // ran, the record it replaces would be gone, so it conflicts.
+    let mut pad = Pad::new(50_000);
+    connect(&mut rig, &mut pad, 0x12);
+    assert!(rig.session.v3_session_id().is_none(), "not committed");
+    let sends = rig.pump();
+    to_pad(&mut rig, &mut pad, sends);
+    assert!(
+        pad.saw(|o| matches!(o, ClientOutput::Refused { dev_id, status }
+        if *dev_id == id(0x12) && status.tombstones.contains(&id(0x12))))
+    );
+    assert!(rig.tombstoned(0x11) && rig.tombstoned(0x12));
+    assert_eq!(rig.host.held_invalid(), 0);
+}
+
+/// A writer thread that's gone: every job comes back closed, whether it
+/// couldn't be handed over or was never answered, and the pairings become
+/// unavailable with nothing left held.
+#[test]
+fn a_writer_thats_gone_closes_the_store() {
+    for answered_never in [false, true] {
+        let world = world(&[(0x21, 2, None, true, 0)]);
+        let (store, _, _) = world.open();
+        let (jobs, job_rx) = std::sync::mpsc::channel();
+        let (done_tx, done) = std::sync::mpsc::channel();
+        // Either nothing takes jobs, or the thread took them and died.
+        let _keep = answered_never.then_some(job_rx);
+        drop(done_tx);
+        let writer = Writer {
+            jobs,
+            done,
+            notify: Arc::new(tokio::sync::Notify::new()),
+        };
+        let start = Instant::now();
+        let host = V3Host::new(
+            HOST_ID,
+            Some(store.snapshot()),
+            Pairings::Ready,
+            Box::new(SeededRandom::new(9)),
+            start,
+            WALL_S * 1_000_000,
+        );
+        let mut runtime = V3Runtime::new(host, Some(writer));
+        let mut session = Session::new(100);
+        session.require_v3();
+        runtime
+            .host
+            .remove(&mut session, &[id(0x21)], &TestConfig, start);
+        runtime.flush();
+        assert_eq!(runtime.jobs_in_flight(), 1);
+        assert_eq!(runtime.host.held_invalid(), 1);
+        let done = runtime.take_done();
+        assert_eq!(done.len(), 1);
+        assert!(done[0].closed && done[0].result.is_err());
+        assert_eq!(runtime.jobs_in_flight(), 0);
+        for done in done {
+            runtime
+                .host
+                .job_done(&mut session, done, &TestConfig, start);
+        }
+        assert!(matches!(runtime.host.pairings(), Pairings::Unavailable(_)));
+        assert!(runtime.host.snapshot().is_empty());
+        assert_eq!(runtime.host.held_invalid(), 0);
+    }
+}
+
+#[test]
 fn an_expiry_check_racing_a_finalize_leaves_the_record_active() {
     let mut rig = Rig::new(&world(&[(0x21, 2, None, false, 8)]));
     rig.hold_jobs = true;

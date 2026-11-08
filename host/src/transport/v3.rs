@@ -617,7 +617,15 @@ impl V3Host {
             .find(|q| slot.is_some() && q.slot == slot)
         {
             Some(newer) => snapshot.replaces(dev_id) != Some(newer.dev_id),
-            None => snapshot.would_conflict(dev_id),
+            // A record it replaces that is being retired (a queued Remove or
+            // Expire) won't be the slot's active record by the time this
+            // Finalize runs.
+            None => {
+                snapshot.would_conflict(dev_id)
+                    || snapshot
+                        .replaces(dev_id)
+                        .is_some_and(|old| self.creds.invalid.contains_key(&old))
+            }
         }
     }
 
@@ -1003,8 +1011,22 @@ pub struct V3Runtime {
     writer: Option<Writer>,
     /// Remove requests from outside the transport, taken on its next tick.
     removes: Vec<Vec<Id16>>,
-    /// Jobs handed to the writer whose results the transport hasn't taken.
-    in_flight: usize,
+    /// The jobs the writer has, oldest first: their results come back in
+    /// this order.
+    sent: VecDeque<StoreJob>,
+    /// Results for jobs no writer will run (it's gone, or there never was
+    /// one): each comes back closed, as from a store that can't reopen.
+    dead: Vec<JobDone>,
+}
+
+/// The result of a job no store ran: the store is closed.
+fn closed(job: StoreJob) -> JobDone {
+    JobDone {
+        job,
+        result: Err(StoreError::NeedsReopen),
+        snapshot: Arc::default(),
+        closed: true,
+    }
 }
 
 impl V3Runtime {
@@ -1013,14 +1035,15 @@ impl V3Runtime {
             host,
             writer,
             removes: Vec::new(),
-            in_flight: 0,
+            sent: VecDeque::new(),
+            dead: Vec::new(),
         }
     }
 
     /// Jobs the writer has, or finished, that the transport hasn't taken
     /// back yet. Simulations wait for 0 before moving their clock.
     pub fn jobs_in_flight(&self) -> usize {
-        self.in_flight
+        self.sent.len() + self.dead.len()
     }
 
     /// Wakes the transport when a job finished.
@@ -1035,19 +1058,41 @@ impl V3Runtime {
 
     fn flush(&mut self) {
         let jobs = self.host.take_jobs();
-        match &self.writer {
-            Some(writer) => {
-                for job in jobs {
-                    if writer.jobs.send(job).is_ok() {
-                        self.in_flight += 1;
+        for job in jobs {
+            match &self.writer {
+                Some(writer) if writer.jobs.send(job.clone()).is_ok() => self.sent.push_back(job),
+                writer => {
+                    warn!("The credential store's writer is gone: this job can't run");
+                    self.dead.push(closed(job));
+                    if let Some(writer) = writer {
+                        writer.notify.notify_one();
                     }
                 }
             }
-            None if !jobs.is_empty() => {
-                warn!(jobs = jobs.len(), "No credential store to run these jobs");
-            }
-            None => {}
         }
+    }
+
+    /// Every result that's in: the writer's, in order, and a closed one
+    /// for each job a writer that's gone never answered.
+    fn take_done(&mut self) -> Vec<JobDone> {
+        let mut done = Vec::new();
+        if let Some(writer) = &self.writer {
+            loop {
+                match writer.done.try_recv() {
+                    Ok(result) => {
+                        self.sent.pop_front();
+                        done.push(result);
+                    }
+                    Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                        done.extend(self.sent.drain(..).map(closed));
+                        break;
+                    }
+                }
+            }
+        }
+        done.append(&mut self.dead);
+        done
     }
 }
 
@@ -1088,6 +1133,12 @@ pub fn on_tick(
     for dev_ids in std::mem::take(&mut runtime.removes) {
         actions.merge(runtime.host.remove(&mut session, &dev_ids, config, now));
     }
+    runtime.flush();
+    // Without a writer nothing wakes the loop: results for jobs no store
+    // will run come back here.
+    for done in std::mem::take(&mut runtime.dead) {
+        actions.merge(runtime.host.job_done(&mut session, done, config, now));
+    }
     drop(session);
     runtime.flush();
     Some(actions)
@@ -1101,12 +1152,7 @@ pub fn on_jobs_done(
 ) -> Option<Actions> {
     let mut v3 = shared.v3.lock();
     let runtime = v3.as_mut()?;
-    let done: Vec<JobDone> = runtime
-        .writer
-        .as_ref()
-        .map(|w| w.done.try_iter().collect())
-        .unwrap_or_default();
-    runtime.in_flight -= done.len();
+    let done = runtime.take_done();
     let mut actions = Actions::default();
     let mut session = shared.session.lock();
     for done in done {
