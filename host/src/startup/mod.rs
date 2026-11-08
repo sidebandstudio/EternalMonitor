@@ -978,9 +978,12 @@ mod tests {
     fn a_panic_making_a_window_device_leaves_the_virtual_display_on() {
         use eframe::egui_wgpu::winit::{Replacement, REPLACEMENT_THREAD};
         let directory = std::env::temp_dir().join(format!(
-            "eternal-panic-hook-{}-{:?}",
+            "eternal-panic-hook-{}-{}",
             std::process::id(),
-            Instant::now()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         fs::create_dir_all(&directory).unwrap();
         let notes = directory.join("notes.txt");
