@@ -329,9 +329,12 @@ pub fn run_capture_loop(
             cursor.size(),
         )
     };
-    let mut pointer_in_image = in_picture(&cursor);
-    if pointer_in_image {
-        // A position from a mirror before this one would stay drawn.
+    let mut pointer_in_image;
+    {
+        // The feed outlives this capture: a position from the output
+        // captured before (the mirror a second screen starts from) would be
+        // drawn on this one until Desktop Duplication reports its own,
+        // which it does once the pointer is on this output.
         shared.pointer.set_position(super::pointer::Position {
             visible: false,
             x: 0,
@@ -1100,7 +1103,7 @@ impl CursorState {
     /// The pointer image's size in pixels, once there is one. A monochrome
     /// shape's buffer stacks two masks.
     fn size(&self) -> Option<(u32, u32)> {
-        self.has_shape.then(|| match self.shape_type {
+        self.has_shape.then_some(match self.shape_type {
             DXGI_POINTER_SHAPE_MONOCHROME => (self.width, self.height / 2),
             _ => (self.width, self.height),
         })
