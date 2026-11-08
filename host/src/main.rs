@@ -210,6 +210,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eternal_host::remote_config::load();
     #[cfg(windows)]
     eternal_host::capture::second_screen::load_memory(&shared);
+    #[cfg(windows)]
+    eternal_host::capture::second_screen::check_windows(&shared);
     eternal_host::remote_config::log_launch();
     shared
         .hevc_enabled

@@ -958,9 +958,10 @@ fn overwrite_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::super::{
-        attach, next_step, note_attached, note_connected, note_image, notice_failure,
-        remembered_failure, retries_later, set_facts, start_proving, Driver, Failure, Step,
-        TurnedOn, BLOCKED_EXTEND_RETRY, PANEL_LOST_BEFORE, PROVE_TIMEOUT,
+        attach, driver_supports_windows, next_step, note_attached, note_connected, note_image,
+        note_windows, notice_failure, remembered_failure, retries_later, set_facts, start_proving,
+        windows_notice, Driver, Failure, Step, TurnedOn, BLOCKED_EXTEND_RETRY, PANEL_LOST_BEFORE,
+        PROVE_TIMEOUT, WINDOWS_10, WINDOWS_10_IPAD_NOTICE,
     };
     use super::*;
     use crate::capture::tests::{connect_viewer, hybrid_laptop, refuse_moved_mirror, NVIDIA};
@@ -2566,6 +2567,109 @@ mod tests {
             Path::new("/nonexistent/remote-config.json"),
             T0
         )));
+    }
+
+    /// Windows 10: a Second screen connection mirrors at once, with no
+    /// Enable, and says why: the log names `no_driver`, and the iPad's
+    /// notice lasts a few seconds from each connection. Neither a failure
+    /// an earlier version saved, Try again, nor choosing Second screen again
+    /// turns the driver on.
+    #[test]
+    fn on_windows_10_second_screen_mirrors_without_turning_the_driver_on() {
+        let path = temp_file("windows-10");
+        let (mut memory, start) = app_run(&path, Duration::ZERO);
+        memory.note_failure("attach_timeout", start);
+        let shared = second_screen_with(memory);
+        note_windows(&shared, Some(19045), false);
+        connect_viewer(&shared);
+        note_connected(&shared, start);
+        let (log, step) = logs(|| next_step(&shared, start));
+        assert_eq!(step, Step::Nothing, "no Enable");
+        assert!(
+            log.contains("second_screen_fallback")
+                && log.contains("no_driver")
+                && log.contains(WINDOWS_10)
+                && log.contains("Second screen needs Windows 11"),
+            "{log}"
+        );
+        assert!(!log.contains("remembered"), "{log}");
+        assert!(shared.vdd_worker.queue.lock().commands.is_empty());
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
+        assert_eq!(remembered_failure(&shared), Some(WINDOWS_10));
+        assert_eq!(notice_failure(&shared), Some(WINDOWS_10));
+        let generation =
+            crate::supervisor::CURRENT_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            crate::capture::reconcile_virtual_display(
+                &CaptureTarget::VirtualExtended,
+                &shared,
+                generation
+            ),
+            Some(CaptureTarget::PrimaryAuto),
+            "the mirror"
+        );
+        // The iPad's notice, for a while from the connection.
+        assert!(windows_notice(&shared, start));
+        assert!(windows_notice(
+            &shared,
+            start + WINDOWS_10_IPAD_NOTICE - secs(1)
+        ));
+        assert!(!windows_notice(&shared, start + WINDOWS_10_IPAD_NOTICE));
+
+        // The next connection says it again, without the saved failure.
+        let later = start + Duration::from_secs(60);
+        let (log, step) = logs(|| {
+            reconnect(&shared, later);
+            next_step(&shared, later)
+        });
+        assert_eq!(step, Step::Nothing);
+        assert!(
+            log.contains("no_driver") && !log.contains("remembered"),
+            "{log}"
+        );
+        assert!(windows_notice(&shared, later));
+
+        shared.retry_second_screen();
+        assert_eq!(next_step(&shared, later), Step::Nothing, "Try again");
+        *shared.capture_target.lock() = CaptureTarget::PrimaryAuto;
+        assert_eq!(next_step(&shared, later), Step::Nothing);
+        *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
+        *shared.vdd_status.lock() = VddStatus::WaitingForClient;
+        assert_eq!(next_step(&shared, later), Step::Nothing, "chosen again");
+        assert_eq!(remembered_failure(&shared), Some(WINDOWS_10));
+        assert!(shared.vdd_worker.queue.lock().commands.is_empty());
+    }
+
+    /// Windows 11, an unknown build and the tester's override try the
+    /// second screen as before, with no Windows 10 notice.
+    #[test]
+    fn windows_11_and_the_windows_10_override_try_the_second_screen() {
+        assert!(!driver_supports_windows(Some(19045), false));
+        assert!(!driver_supports_windows(Some(21999), false));
+        assert!(driver_supports_windows(Some(22000), false));
+        assert!(driver_supports_windows(Some(26200), false));
+        assert!(driver_supports_windows(None, false));
+        assert!(driver_supports_windows(Some(19045), true));
+        for (build, forced) in [
+            (Some(26200), false),
+            (Some(22000), false),
+            (None, false),
+            (Some(19045), true),
+        ] {
+            let path = temp_file("windows-11");
+            let (memory, start) = app_run(&path, Duration::ZERO);
+            let shared = second_screen_with(memory);
+            note_windows(&shared, build, forced);
+            connect_viewer(&shared);
+            note_connected(&shared, start);
+            assert_eq!(
+                next_step(&shared, start),
+                Step::Attach,
+                "{build:?} {forced}"
+            );
+            assert_eq!(*shared.vdd_status.lock(), VddStatus::Attaching);
+            assert!(!windows_notice(&shared, start));
+        }
     }
 
     /// The manifest names this PC: Second screen sessions start in the

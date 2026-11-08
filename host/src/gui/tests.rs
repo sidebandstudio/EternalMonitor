@@ -332,18 +332,19 @@ fn screen_choice_says_what_the_ipad_shows_and_that_it_reconnects() {
     use super::page_stream::screen_mode_text;
     use crate::control::VddStatus;
 
-    let mirror = screen_mode_text("", None, VddStatus::Inactive, false);
+    let mirror = screen_mode_text("", None, VddStatus::Inactive, false, false);
     assert_eq!(
         mirror,
         "The iPad shows the same picture as your main screen."
     );
-    let running = screen_mode_text("", None, VddStatus::Inactive, true);
+    let running = screen_mode_text("", None, VddStatus::Inactive, true, false);
     assert!(running.contains("reconnects by itself"), "{running}");
 
     let monitor = screen_mode_text(
         r"\\.\DISPLAY2",
         Some("DISPLAY2"),
         VddStatus::Inactive,
+        false,
         false,
     );
     assert!(
@@ -356,12 +357,19 @@ fn screen_choice_says_what_the_ipad_shows_and_that_it_reconnects() {
         None,
         VddStatus::WaitingForClient,
         true,
+        false,
     );
     assert!(waiting.contains("as soon as it connects"), "{waiting}");
-    let active = screen_mode_text(CAPTURE_VIRTUAL_SENTINEL, None, VddStatus::Active, true);
+    let active = screen_mode_text(
+        CAPTURE_VIRTUAL_SENTINEL,
+        None,
+        VddStatus::Active,
+        true,
+        false,
+    );
     assert!(active.contains("Drag windows"), "{active}");
     for failed in [VddStatus::Failed, VddStatus::TaskFailed] {
-        let text = screen_mode_text(CAPTURE_VIRTUAL_SENTINEL, None, failed, true);
+        let text = screen_mode_text(CAPTURE_VIRTUAL_SENTINEL, None, failed, true, false);
         assert!(text.contains("mirrored"), "{text}");
     }
     // No driver or protocol words on the main screen.
@@ -924,6 +932,64 @@ fn a_lost_built_in_screen_from_before_the_restart_only_says_it_is_paused() {
         );
         assert!(paused.retry && !paused.installer);
     }
+}
+
+/// On Windows 10 Second screen isn't tried: the notice, the note beside the
+/// choice and Settings say it needs Windows 11, with no Try again, and the
+/// note goes from Windows 11's text only.
+#[test]
+fn windows_10_says_second_screen_needs_windows_11() {
+    use super::page_settings::display_description;
+    use super::page_stream::{add_later_retry, screen_mode_text, WINDOWS_10_NOTE};
+    use crate::control::VddStatus;
+    use crate::vdd::VddTaskHealth;
+    let windows_10 = Some(crate::capture::second_screen::WINDOWS_10);
+    for status in [VddStatus::Failed, VddStatus::TaskFailed] {
+        for health in [VddTaskHealth::Ok, VddTaskHealth::TasksMissing] {
+            let mut notice = second_screen_notice(status, health, None, windows_10).unwrap();
+            assert!(notice.body.starts_with(WINDOWS_10_NOTE), "{}", notice.body);
+            assert!(!notice.retry && !notice.installer);
+            // A failure saved by an earlier version doesn't offer a retry.
+            let before = notice.body.clone();
+            add_later_retry(&mut notice, true);
+            assert_eq!(notice.body, before);
+        }
+    }
+    assert!(WINDOWS_10_NOTE.contains("needs Windows 11"));
+
+    for status in [
+        VddStatus::WaitingForClient,
+        VddStatus::Failed,
+        VddStatus::Active,
+    ] {
+        let second = screen_mode_text(CAPTURE_VIRTUAL_SENTINEL, None, status, false, true);
+        assert_eq!(second, WINDOWS_10_NOTE);
+    }
+    let mirror = screen_mode_text("", None, VddStatus::Inactive, true, true);
+    assert_eq!(
+        mirror,
+        "The iPad shows the same picture as your main screen. Second screen needs Windows 11. \
+         Switching restarts the stream, and the iPad reconnects by itself."
+    );
+    assert!(display_description(true).contains("Second screen needs Windows 11"));
+
+    // Windows 11 reads as before.
+    assert!(!display_description(false).contains("Windows"));
+    for (capture, status) in [
+        ("", VddStatus::Inactive),
+        (CAPTURE_VIRTUAL_SENTINEL, VddStatus::WaitingForClient),
+        (CAPTURE_VIRTUAL_SENTINEL, VddStatus::Failed),
+    ] {
+        assert!(!screen_mode_text(capture, None, status, true, false).contains("Windows"));
+    }
+    let attach = second_screen_notice(
+        VddStatus::Failed,
+        VddTaskHealth::Ok,
+        None,
+        Some("attach_timeout"),
+    )
+    .unwrap();
+    assert!(!attach.body.contains("Windows 11") && attach.retry);
 }
 
 /// A second screen failure remembered for this PC is tried again later by

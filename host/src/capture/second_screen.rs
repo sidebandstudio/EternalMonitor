@@ -103,6 +103,33 @@ pub(crate) const EXTEND_TIMEOUT: Duration = Duration::from_secs(30);
 #[cfg(any(windows, test, debug_assertions))]
 pub(crate) const BLOCKED_EXTEND_RETRY: Duration = Duration::from_secs(120);
 
+/// Why Second screen mirrors on this PC without trying: Windows is older
+/// than the display driver needs ([`driver_supports_windows`]). Not saved:
+/// each app run reads Windows again.
+pub(crate) const WINDOWS_10: &str = "windows_10";
+
+/// The first Windows 11 build. The display driver Setup installs is built
+/// for Windows 11's display driver framework: on Windows 10 it starts, but
+/// Windows never adds its screen.
+#[cfg(any(windows, test))]
+const FIRST_WINDOWS_11_BUILD: u32 = 22000;
+
+/// Set to `1` to try Second screen on Windows 10 anyway, for testing.
+pub const WINDOWS_10_OVERRIDE: &str = "ETERNAL_SECOND_SCREEN_ON_WINDOWS_10";
+
+/// How long the iPad says that Second screen needs Windows 11, from the
+/// connection that mirrors for it. The mirror works, so the notice doesn't
+/// stay over it.
+pub(crate) const WINDOWS_10_IPAD_NOTICE: Duration = Duration::from_secs(10);
+
+/// Whether the bundled display driver can show a second screen on Windows
+/// `build`, or a tester asked to try anyway (`forced`). An unknown build is
+/// tried, as before. A driver that works on Windows 10 lifts the limit here.
+#[cfg(any(windows, test))]
+pub(crate) fn driver_supports_windows(build: Option<u32>, forced: bool) -> bool {
+    forced || build.is_none_or(|build| build >= FIRST_WINDOWS_11_BUILD)
+}
+
 /// How long quitting waits for the worker to exit after the last Enable.
 const QUIT_JOIN: Duration = Duration::from_secs(5);
 
@@ -212,6 +239,12 @@ pub(crate) struct State {
     /// The graphics cards and the screens' wiring, as last read off the
     /// transport loop: see [`facts`].
     facts: facts::Cache,
+    /// Windows is too old for the display driver: Second screen mirrors
+    /// without turning it on ([`note_windows`]).
+    windows_unsupported: bool,
+    /// When a connection last began mirroring for that, for the iPad's
+    /// notice ([`windows_notice`]).
+    windows_held_at: Option<Instant>,
     /// Whether the user's desktop is away, as an end-to-end test's fake
     /// display says in place of Windows: see [`desktop_away`].
     #[cfg(debug_assertions)]
@@ -243,6 +276,7 @@ impl State {
                 memory: std::mem::take(&mut self.memory),
                 mirror_refused: self.mirror_refused.take(),
                 facts: std::mem::take(&mut self.facts),
+                windows_unsupported: self.windows_unsupported,
                 #[cfg(debug_assertions)]
                 fake_desktop_away: self.fake_desktop_away.take(),
                 ..State::default()
@@ -254,6 +288,14 @@ impl State {
         }
         self.retry_if_back(status, connected, now);
         match *status {
+            // Before any saved failure: trying again can't help.
+            VddStatus::WaitingForClient if connected && self.windows_unsupported => {
+                *status = VddStatus::Failed;
+                self.failure = Some(WINDOWS_10);
+                self.windows_held_at = Some(now);
+                log_windows_hold();
+                Step::Nothing
+            }
             VddStatus::WaitingForClient if connected => {
                 let held = self.memory.hold(now);
                 // A blocked mirror is no reason to take the panel again.
@@ -354,6 +396,7 @@ impl State {
             memory: std::mem::take(&mut self.memory),
             mirror_refused: self.mirror_refused.take(),
             facts: std::mem::take(&mut self.facts),
+            windows_unsupported: self.windows_unsupported,
             #[cfg(debug_assertions)]
             fake_desktop_away: self.fake_desktop_away.take(),
             ..State::default()
@@ -542,6 +585,78 @@ fn log_hold(hold: Hold) {
     );
 }
 
+/// The one log line for a connection that mirrors because Windows is too
+/// old for the display driver. The summary names it `no_driver`: there is
+/// no display driver for this Windows.
+fn log_windows_hold() {
+    tracing::info!(
+        second_screen_fallback = "no_driver",
+        reason = WINDOWS_10,
+        "Second screen needs Windows 11 — mirroring the primary display without turning the \
+         display driver on"
+    );
+}
+
+/// Records whether this Windows can run the display driver (see
+/// [`driver_supports_windows`]), at startup.
+#[cfg(any(windows, test))]
+pub(crate) fn note_windows(shared: &SharedControl, build: Option<u32>, forced: bool) {
+    let supported = driver_supports_windows(build, forced);
+    if !driver_supports_windows(build, false) {
+        if forced {
+            tracing::info!(
+                "Windows is older than Windows 11, but {WINDOWS_10_OVERRIDE} asks to try Second \
+                 screen anyway"
+            );
+        } else {
+            tracing::info!(
+                "Windows is older than Windows 11 — Second screen mirrors the primary display \
+                 without turning the display driver on"
+            );
+        }
+    }
+    shared.second_screen.lock().windows_unsupported = !supported;
+}
+
+/// [`note_windows`] for this PC: its build, and the tester's override.
+#[cfg(windows)]
+pub fn check_windows(shared: &SharedControl) {
+    let forced = std::env::var(WINDOWS_10_OVERRIDE).is_ok_and(|value| value.trim() == "1");
+    note_windows(shared, windows_build(), forced);
+}
+
+/// This PC's Windows build, as the registry names it. Windows 11 keeps
+/// "Windows 10" as its product name, so only the build tells them apart.
+#[cfg(windows)]
+fn windows_build() -> Option<u32> {
+    crate::diagnostics::registry_string(
+        "SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
+        "CurrentBuildNumber",
+    )
+    .trim()
+    .parse()
+    .ok()
+}
+
+/// Whether Second screen mirrors on this PC because Windows is too old for
+/// the display driver, for the Stream page and Settings.
+pub(crate) fn windows_unsupported(shared: &SharedControl) -> bool {
+    shared.second_screen.lock().windows_unsupported
+}
+
+/// Whether the heartbeat tells the iPad now that Second screen needs
+/// Windows 11: for [`WINDOWS_10_IPAD_NOTICE`] after a connection began
+/// mirroring for it.
+pub(crate) fn windows_notice(shared: &SharedControl, now: Instant) -> bool {
+    let status = *shared.vdd_status.lock();
+    let state = shared.second_screen.lock();
+    status == VddStatus::Failed
+        && state.failure == Some(WINDOWS_10)
+        && state
+            .windows_held_at
+            .is_some_and(|at| now.saturating_duration_since(at) < WINDOWS_10_IPAD_NOTICE)
+}
+
 /// Read the failure an earlier app run saved, for this PC as it is now.
 #[cfg(windows)]
 pub fn load_memory(shared: &SharedControl) {
@@ -579,6 +694,13 @@ pub(crate) fn note_connected(shared: &SharedControl, now: Instant) {
     let blocked = mirror_blocked_now(shared, |status, _| status == VddStatus::Failed);
     let mut status = shared.vdd_status.lock();
     let mut state = shared.second_screen.lock();
+    // Nothing to try on this Windows, even when the mirror shows nothing.
+    if *status == VddStatus::Failed && state.failure == Some(WINDOWS_10) {
+        state.windows_held_at = Some(now);
+        drop((state, status));
+        log_windows_hold();
+        return;
+    }
     // The mirror would show nothing: the second screen is the only picture.
     // Not after a lost panel: the next try takes it again.
     if *status == VddStatus::Failed && blocked && state.failure != Some(PANEL_LOST) {
@@ -1938,6 +2060,30 @@ mod tests {
     use crate::transport::link::LinkId;
     use std::cell::{Cell, RefCell};
     use std::sync::atomic::Ordering;
+
+    /// Every Windows has a build number to read.
+    #[cfg(windows)]
+    #[test]
+    fn this_windows_build_reads_from_the_registry() {
+        let build = windows_build().expect("a build number");
+        assert!(build >= 10240, "{build}");
+    }
+
+    /// Native, on a Windows 11 PC: the startup check reads the real build,
+    /// and a Second screen connection starts the second screen as before.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "needs Windows 11"]
+    fn this_windows_11_pc_tries_the_second_screen() {
+        let shared = second_screen_selected();
+        check_windows(&shared);
+        assert!(!windows_unsupported(&shared), "{:?}", windows_build());
+        connect_viewer(&shared);
+        let now = Instant::now();
+        note_connected(&shared, now);
+        assert_eq!(next_step(&shared, now), Step::Attach);
+        assert!(!windows_notice(&shared, now));
+    }
 
     /// The iPad's connect timeout in 0.3.1 and 0.3.2: it disconnects when no
     /// frame has decoded this long after the handshake.

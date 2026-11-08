@@ -574,12 +574,14 @@ impl AnalyzerApp {
             }
         });
         ui.add_space(2.0);
+        let windows_10 = crate::capture::second_screen::windows_unsupported(&self.control.shared);
         ui.add(
             egui::Label::new(muted(screen_mode_text(
                 &current,
                 output.as_deref(),
                 vdd,
                 running,
+                windows_10,
             )))
             .wrap(),
         );
@@ -872,6 +874,10 @@ pub(super) fn software_fallback_body(
         "The picture may lag and the PC may run hot. Update your graphics driver from NVIDIA, AMD or Intel, then click Restart.".to_string()
     }
 }
+/// Why Second screen mirrors on Windows 10: the notice, and the note beside
+/// the choice.
+pub(super) const WINDOWS_10_NOTE: &str =
+    "Second screen needs Windows 11, so the iPad shows your main screen instead.";
 pub(super) const SECOND_SCREEN_FAILED_TITLE: &str =
     "The second screen couldn't start, so your main screen is mirrored";
 const INSTALLER_URL: &str = "https://eternalmonitor.dev/download.html";
@@ -950,6 +956,14 @@ pub(super) fn second_screen_notice(
         })
     };
     match (status, health, problem) {
+        // Nothing was tried, and trying again can't help.
+        (Failed | TaskFailed, _, _) if failure == Some(crate::capture::second_screen::WINDOWS_10) => {
+            notice(
+                &format!("{WINDOWS_10_NOTE} Mirror my screen works as usual."),
+                false,
+                false,
+            )
+        }
         // Windows left the device as not extended too, but Extend can't help.
         (Failed, _, _) if failure == Some("panel_lost") => notice(
             "Your laptop's built-in screen turned off when the second screen started, and Windows only turns it back on after a restart. Until then your desktop is on the iPad: save your work there, then restart the PC. On this PC the second screen can turn the built-in screen off again, so the iPad shows your main screen until you click Try again or choose Second screen again.",
@@ -1195,18 +1209,23 @@ pub(super) fn capture_block_notice(
 }
 
 /// What the Stream page says under the mirror / second screen choice.
+/// `windows_10`: Second screen can't run on this Windows
+/// ([`WINDOWS_10_NOTE`]).
 pub(super) fn screen_mode_text(
     capture: &str,
     output: Option<&str>,
     vdd: VddStatus,
     running: bool,
+    windows_10: bool,
 ) -> String {
     let restart = if running {
         " Switching restarts the stream, and the iPad reconnects by itself."
     } else {
         ""
     };
-    let what = if capture == CAPTURE_VIRTUAL_SENTINEL {
+    let what = if capture == CAPTURE_VIRTUAL_SENTINEL && windows_10 {
+        WINDOWS_10_NOTE.to_string()
+    } else if capture == CAPTURE_VIRTUAL_SENTINEL {
         match vdd {
             VddStatus::Active => "The iPad is an extra screen. Drag windows past the edge of your main screen to move them onto it.",
             VddStatus::Failed | VddStatus::TaskFailed => {
@@ -1222,7 +1241,12 @@ pub(super) fn screen_mode_text(
     } else {
         "The iPad shows the same picture as your main screen.".to_string()
     };
-    what + restart
+    let windows = if windows_10 && capture != CAPTURE_VIRTUAL_SENTINEL {
+        " Second screen needs Windows 11."
+    } else {
+        ""
+    };
+    what + windows + restart
 }
 
 /// The home network's address, without the port (the iPad has its own Port
