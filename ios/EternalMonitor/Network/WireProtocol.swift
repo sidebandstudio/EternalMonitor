@@ -315,6 +315,8 @@ struct HelloAck: Equatable {
     static let hostCapPen: UInt16 = 1 << 4
     /// Media frame_seq counts the frames sent in a stream epoch without gaps,
     /// so a forward gap is a frame lost in transit. Older iPads ignore it.
+    /// Every 0.3.4 and later PC sets it in replies that accept a session;
+    /// see `OldPC`.
     static let hostCapContiguousFrameSeq: UInt16 = 1 << 5
     /// The PC sends the pointer apart from the video to an iPad that said
     /// it draws it. Older iPads ignore it.

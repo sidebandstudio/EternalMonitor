@@ -8544,6 +8544,18 @@
         }
       }
     },
+    "Update EternalMonitor on %@ for faster, steadier streaming. Download it on the PC from eternalmonitor.dev." : {
+      "comment" : "Connect screen card under \"Your PC app is out of date\". The value is the PC's name. Keep eternalmonitor.dev as is",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Update EternalMonitor on %@ for faster, steadier streaming. Download it on the PC from eternalmonitor.dev."
+          }
+        }
+      }
+    },
     "Updates" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -9039,6 +9051,18 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "你也可以在连接屏幕上输入电脑的地址。"
+          }
+        }
+      }
+    },
+    "Your PC app is out of date" : {
+      "comment" : "Title of the Connect screen card shown when the PC runs an EternalMonitor older than 0.3.4",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Your PC app is out of date"
           }
         }
       }
