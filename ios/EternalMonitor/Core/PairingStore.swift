@@ -75,6 +75,14 @@ final class PairingStore: ObservableObject {
         try storage.records().first { $0.account.hasSuffix("|\(address)") && Self.valid($0.token) }?.token
     }
 
+    /// The name of the PC paired at `address`, if it gave one.
+    func pcName(address: String) -> String? {
+        guard let account = (try? storage.records())?.first(where: { $0.account.hasSuffix("|\(address)") && Self.valid($0.token) })?.account
+        else { return nil }
+        let name = String(account.dropLast(address.count + 1))
+        return name.isEmpty ? nil : name
+    }
+
     func isPaired(host: String, port: UInt16) -> Bool {
         (try? token(address: Self.address(host: host, port: port))) != nil
     }

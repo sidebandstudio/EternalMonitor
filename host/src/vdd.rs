@@ -500,7 +500,7 @@ fn request_on_turn(
     #[cfg(windows)]
     {
         TASKS.set_enabled_on_turn(enabled, purpose, progress, on_turn, |enabled, progress| {
-            let outcome = run_on_turn(enabled, progress);
+            let outcome = run_on_turn(enabled, purpose, progress);
             *ran = Some(outcome);
             outcome
         })
@@ -515,22 +515,35 @@ fn request_on_turn(
 
 /// Run the driver task for `enabled`, once the gate let a request run.
 #[cfg(windows)]
-fn run_on_turn(enabled: bool, progress: &mut dyn FnMut()) -> TaskOutcome {
+fn run_on_turn(enabled: bool, purpose: Purpose, progress: &mut dyn FnMut()) -> TaskOutcome {
     let mut outcome = TaskOutcome::Failed(None);
     // Read here, after the gate decided and before the task runs.
     let display_off = TASKS.gate.lock().known_enabled == Some(false);
     crate::startup::display::change(enabled, progress, |progress| {
-        outcome = crate::display_guard::around(
+        let change = crate::display_guard::Change {
             enabled,
-            crate::startup::ProcessId::current(),
-            log_screens,
+            owner: crate::startup::ProcessId::current(),
+            log: log_screens,
             display_off,
+            // Start-up, quit and panics: nothing streams it after.
+            cleanup: !enabled && purpose == Purpose::Cleanup,
+        };
+        outcome = crate::display_guard::around(
+            change,
             || run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress),
             |outcome| *outcome == TaskOutcome::Done,
+            // Left on: the next turn off tries again.
+            || TaskOutcome::Failed(None),
         );
         outcome == TaskOutcome::Done
     });
     outcome
+}
+
+/// `run_on_turn` for the Disable at startup, at quit and in a panic.
+#[cfg(windows)]
+fn run_cleanup(enabled: bool, progress: &mut dyn FnMut()) -> TaskOutcome {
+    run_on_turn(enabled, Purpose::Cleanup, progress)
 }
 
 /// Disable the virtual display device (best effort — failures are non-fatal).
@@ -542,7 +555,7 @@ fn run_on_turn(enabled: bool, progress: &mut dyn FnMut()) -> TaskOutcome {
 pub fn disable() -> bool {
     #[cfg(windows)]
     {
-        TASKS.disable_unless_off(|| {}, device_off, run_on_turn)
+        TASKS.disable_unless_off(|| {}, device_off, run_cleanup)
     }
     #[cfg(not(windows))]
     {
@@ -568,7 +581,7 @@ pub fn disable_in_background() {
                 let _ = held.send(());
             };
             #[cfg(windows)]
-            TASKS.disable_unless_off(on_turn, device_off, run_on_turn);
+            TASKS.disable_unless_off(on_turn, device_off, run_cleanup);
             #[cfg(not(windows))]
             request_on_turn(false, Purpose::Cleanup, || {}, on_turn, &mut None);
         });
@@ -611,14 +624,20 @@ pub(crate) fn disable_for_ended(
         || crate::startup::display::other_host(host, reporters),
         || {
             // The host's layout from before its turn on, which it kept on disk.
-            crate::display_guard::around(
-                false,
-                host,
-                crate::startup::reporter_log,
+            let change = crate::display_guard::Change {
+                enabled: false,
+                owner: host,
+                log: crate::startup::reporter_log,
                 // Only for a turn on.
-                false,
+                display_off: false,
+                // The host ended.
+                cleanup: true,
+            };
+            crate::display_guard::around(
+                change,
                 || run_task(TASK_DISABLE, &mut || {}),
                 |outcome| *outcome == TaskOutcome::Done,
+                || TaskOutcome::Failed(None),
             ) == TaskOutcome::Done
         },
     )
@@ -1073,6 +1092,7 @@ mod tests {
                 .with_max_level(tracing::Level::DEBUG)
                 .with_writer(std::io::sink)
                 .finish();
+            crate::logging::prepare_log_capture();
             let ran = tracing::subscriber::with_default(subscriber, || {
                 tasks.set_enabled(
                     true,
