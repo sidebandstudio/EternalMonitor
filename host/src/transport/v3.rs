@@ -290,6 +290,9 @@ pub struct V3Host {
     /// Decisions owed on confirms that wait for nothing: a busy host lets
     /// them time out.
     busy_logged: HashSet<u32>,
+    /// A job came back with the store closed: it stays closed until the
+    /// host restarts.
+    store_closed: bool,
     /// Finalizes handed to the writer and not yet done, oldest first: each
     /// record, its slot, and the record it retires. Conflicts and expiry
     /// are decided against these as well as the snapshot.
@@ -331,6 +334,7 @@ impl V3Host {
             streaming: None,
             outbox: VecDeque::new(),
             busy_logged: HashSet::new(),
+            store_closed: false,
             queued: Vec::new(),
             origin: now,
             wall_origin_us: wall_us,
@@ -720,7 +724,14 @@ impl V3Host {
     ) -> Actions {
         let mut actions = Actions::default();
         let at = self.at(now);
-        self.creds.snapshot = done.snapshot;
+        // A closed store stays closed: an older answer read after the close
+        // brings back no key, and acks or refuses nothing.
+        self.store_closed |= done.closed;
+        self.creds.snapshot = if self.store_closed {
+            Arc::default()
+        } else {
+            done.snapshot
+        };
         // What the store now holds supersedes what this job held in memory.
         let snapshot = &self.creds.snapshot;
         self.creds
@@ -738,7 +749,7 @@ impl V3Host {
             }
         }
         let mut out = Vec::new();
-        if done.closed {
+        if self.store_closed {
             // The store is gone: no pairing can be used, and nothing more
             // commits until the host restarts.
             if self.pairings == Pairings::Ready {
@@ -750,6 +761,8 @@ impl V3Host {
             if let Some(streaming) = self.streaming {
                 out.extend(self.end_sessions(session, &streaming.dev_id, now, &mut actions));
             }
+            self.apply(session, out, config, now, &mut actions);
+            return actions;
         }
         match (done.job, done.result) {
             (
@@ -1134,9 +1147,10 @@ pub fn on_tick(
         actions.merge(runtime.host.remove(&mut session, &dev_ids, config, now));
     }
     runtime.flush();
-    // Without a writer nothing wakes the loop: results for jobs no store
-    // will run come back here.
-    for done in std::mem::take(&mut runtime.dead) {
+    // Every result that's in, in order: the writer's answers, then its
+    // unanswered jobs as closed if it's gone (a panic wakes nobody), then
+    // jobs no writer took. The store-done wake may not have run yet.
+    for done in runtime.take_done() {
         actions.merge(runtime.host.job_done(&mut session, done, config, now));
     }
     drop(session);

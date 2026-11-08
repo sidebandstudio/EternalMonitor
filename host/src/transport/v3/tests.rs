@@ -1376,3 +1376,203 @@ fn on_windows_a_commit_goes_through_dpapi_and_the_writer() {
         Some(RecordState::Active)
     );
 }
+
+/// A writer thread over a store of its own: it waits for `go`, answers
+/// `answer` jobs, takes one more and panics, as the real writer would on a
+/// bug inside a job.
+fn panicking_writer(
+    world: &World,
+    answer: usize,
+) -> (
+    Writer,
+    Arc<CredentialSnapshot>,
+    std::sync::mpsc::Sender<()>,
+    std::thread::JoinHandle<()>,
+) {
+    let (mut store, _) = eternal_credstore::CredentialStore::open(
+        world.disk.clone(),
+        world.keyring.clone(),
+        Box::new(SeededRandom::new(4)),
+    )
+    .unwrap();
+    let snapshot = store.snapshot();
+    let (jobs, job_rx) = std::sync::mpsc::channel::<StoreJob>();
+    let (done_tx, done) = std::sync::mpsc::channel::<JobDone>();
+    let (go, go_rx) = std::sync::mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        let _ = go_rx.recv();
+        for _ in 0..answer {
+            let job = job_rx.recv().unwrap();
+            done_tx.send(run_job(&mut store, job)).unwrap();
+        }
+        let _job = job_rx.recv().unwrap();
+        panic!("the writer panics in a job");
+    });
+    let writer = Writer {
+        jobs,
+        done,
+        notify: Arc::new(tokio::sync::Notify::new()),
+    };
+    (writer, snapshot, go, thread)
+}
+
+fn runtime_with(
+    writer: Writer,
+    snapshot: Arc<CredentialSnapshot>,
+    start: Instant,
+) -> crate::control::SharedControl {
+    let host = V3Host::new(
+        HOST_ID,
+        Some(snapshot),
+        Pairings::Ready,
+        Box::new(SeededRandom::new(9)),
+        start,
+        WALL_S * 1_000_000,
+    );
+    let shared = crate::control::SharedControl::new(0, 10_000_000);
+    shared.session.lock().require_v3();
+    *shared.v3.lock() = Some(V3Runtime::new(host, Some(writer)));
+    shared
+}
+
+/// The writer panics after taking a job: nothing wakes the transport, but
+/// its next tick sees the writer gone and closes the store.
+#[test]
+fn a_writer_that_panics_mid_job_is_seen_on_the_next_tick() {
+    let world = world(&[(0x21, 2, None, true, 0)]);
+    let (writer, snapshot, go, thread) = panicking_writer(&world, 0);
+    let start = Instant::now();
+    let shared = runtime_with(writer, snapshot, start);
+    shared
+        .v3
+        .lock()
+        .as_mut()
+        .unwrap()
+        .request_remove(vec![id(0x21)]);
+    on_tick(&shared, &TestConfig, false, start).unwrap();
+    assert_eq!(shared.v3.lock().as_ref().unwrap().jobs_in_flight(), 1);
+    go.send(()).unwrap();
+    assert!(thread.join().is_err(), "the writer panicked");
+
+    on_tick(
+        &shared,
+        &TestConfig,
+        false,
+        start + Duration::from_millis(250),
+    )
+    .unwrap();
+    let v3 = shared.v3.lock();
+    let runtime = v3.as_ref().unwrap();
+    assert_eq!(runtime.jobs_in_flight(), 0);
+    assert_eq!(runtime.host.held_invalid(), 0);
+    assert!(matches!(runtime.host.pairings(), Pairings::Unavailable(_)));
+    assert!(runtime.host.snapshot().is_empty(), "no key left");
+}
+
+/// The writer is going (its job receiver is gone, its answers not yet):
+/// an answer still unread when a later job finds no writer comes before
+/// that job's close, and nothing read after the close brings a key back.
+#[test]
+fn a_close_never_comes_before_an_older_answer() {
+    let world = world(&[(0x21, 2, None, true, 0), (0x22, 3, None, true, 0)]);
+    let (mut store, _) = eternal_credstore::CredentialStore::open(
+        world.disk.clone(),
+        world.keyring.clone(),
+        Box::new(SeededRandom::new(4)),
+    )
+    .unwrap();
+    let (jobs, job_rx) = std::sync::mpsc::channel::<StoreJob>();
+    let (done_tx, done) = std::sync::mpsc::channel::<JobDone>();
+    let writer = Writer {
+        jobs,
+        done,
+        notify: Arc::new(tokio::sync::Notify::new()),
+    };
+    let start = Instant::now();
+    let shared = runtime_with(writer, store.snapshot(), start);
+    let remove = |dev: u8| {
+        shared
+            .v3
+            .lock()
+            .as_mut()
+            .unwrap()
+            .request_remove(vec![id(dev)]);
+    };
+
+    // The writer takes a Remove and answers it, but nothing reads the
+    // answer yet; then its job receiver goes.
+    remove(0x21);
+    on_tick(&shared, &TestConfig, false, start).unwrap();
+    let job = job_rx.recv().unwrap();
+    done_tx.send(run_job(&mut store, job)).unwrap();
+    drop(job_rx);
+
+    // The next job finds no writer: it closes, after the older answer.
+    remove(0x22);
+    on_tick(
+        &shared,
+        &TestConfig,
+        false,
+        start + Duration::from_millis(250),
+    )
+    .unwrap();
+    let check = |what: &str| {
+        let v3 = shared.v3.lock();
+        let runtime = v3.as_ref().unwrap();
+        assert_eq!(runtime.jobs_in_flight(), 0, "{what}");
+        assert_eq!(runtime.host.held_invalid(), 0, "{what}");
+        assert!(
+            matches!(runtime.host.pairings(), Pairings::Unavailable(_)),
+            "{what}"
+        );
+        assert!(
+            runtime.host.snapshot().is_empty(),
+            "{what}: no key comes back"
+        );
+    };
+    check("after the tick");
+    // The store-done wake runs late, and the writer's last end goes.
+    on_jobs_done(&shared, &TestConfig, start + Duration::from_millis(260)).unwrap();
+    check("after the late wake");
+    drop(done_tx);
+    on_jobs_done(&shared, &TestConfig, start + Duration::from_millis(270)).unwrap();
+    check("after the writer's end");
+}
+
+/// Once a job comes back with the store closed, an answer read after it
+/// (from before the close) changes nothing: no key comes back, and the
+/// commit it finished gets no ack.
+#[test]
+fn a_closed_store_stays_closed() {
+    let mut rig = Rig::new(&world(&[(0x21, 2, None, false, 0)]));
+    rig.hold_jobs = true;
+    let mut pad = Pad::new(50_000);
+    connect(&mut rig, &mut pad, 0x21); // its commit's write waits
+    let at = rig.at();
+    let actions = rig.host.job_done(
+        &mut rig.session,
+        JobDone {
+            job: StoreJob::Remove { dev_ids: vec![] },
+            result: Err(StoreError::NeedsReopen),
+            snapshot: Arc::default(),
+            closed: true,
+        },
+        &TestConfig,
+        at,
+    );
+    let sends = rig.take(actions);
+    to_pad(&mut rig, &mut pad, sends);
+    assert!(matches!(rig.host.pairings(), Pairings::Unavailable(_)));
+
+    // The commit's answer, from a store that was still open.
+    let sends = rig.pump();
+    to_pad(&mut rig, &mut pad, sends);
+    assert_eq!(rig.state(0x21), Some(RecordState::Active), "it was written");
+    assert!(rig.host.snapshot().is_empty(), "but no key comes back");
+    assert!(
+        !pad.saw(|o| matches!(o, ClientOutput::Status { .. })),
+        "no ack"
+    );
+    assert!(matches!(rig.host.pairings(), Pairings::Unavailable(_)));
+    assert_eq!(rig.host.held_invalid(), 0);
+}
