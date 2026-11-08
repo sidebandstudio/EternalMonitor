@@ -97,6 +97,9 @@ jobs:
       - name: Verify Setup hands its language to the app
         shell: powershell
         run: ./installer/tests/Test-InstallerLanguages.ps1
+      - name: Verify Setup leaves the virtual display driver off Windows 10
+        shell: powershell
+        run: ./installer/tests/Test-InstallerWindows10.ps1
 
   rust-macos:
     name: Rust (macOS, full workspace + E2E)
