@@ -6,6 +6,7 @@ $script = Get-Content -Raw (Join-Path $PSScriptRoot '..\..\host\src\vdd_task.ps1
 $mock = @'
 # $EMBusy[name]: how many more state reads report that task as running.
 # $EMMissing: tasks that do not exist, as Task Scheduler reports them.
+# $EMRunState: the state of the instance Run starts (3: it has finished).
 function New-Object {
     param([string]$ComObject, [Parameter(ValueFromRemainingArguments=$true)]$Rest)
     if ($ComObject -ne 'Schedule.Service') { throw "Unexpected COM object $ComObject" }
@@ -29,7 +30,7 @@ function New-Object {
                 param($arguments)
                 $busy = ($global:EMBusy.Keys | Where-Object { $global:EMBusy[$_] -gt 0 }) -join ','
                 [Console]::Out.WriteLine("RUN $($this.Name) busy=[$busy]")
-                $running = [pscustomobject]@{ State = 3 }
+                $running = [pscustomobject]@{ State = $global:EMRunState }
                 $running | Add-Member ScriptMethod Refresh {}
                 $running
             }
@@ -41,11 +42,11 @@ function New-Object {
 }
 '@
 
-function Invoke-Case([hashtable]$busy, [string]$arguments, [string[]]$missing = @()) {
+function Invoke-Case([hashtable]$busy, [string]$arguments, [string[]]$missing = @(), [int]$runState = 3) {
     $file = Join-Path $env:TEMP ('em-vdd-task-test-' + [guid]::NewGuid().ToString('N') + '.ps1')
     $busyText = ($busy.GetEnumerator() | ForEach-Object { "'$($_.Key)' = $($_.Value)" }) -join '; '
     $missingText = ($missing | ForEach-Object { "'$_'" }) -join ', '
-    $body = "`$global:EMBusy = @{ $busyText }`n`$global:EMMissing = @($missingText)`n$mock`n& {`n$script`n} $arguments`n"
+    $body = "`$global:EMBusy = @{ $busyText }`n`$global:EMMissing = @($missingText)`n`$global:EMRunState = $runState`n$mock`n& {`n$script`n} $arguments`n"
     Set-Content -Path $file -Value $body -Encoding UTF8
     # The child's stderr is expected output here, not a failure of this script.
     $ErrorActionPreference = 'Continue'
@@ -70,13 +71,19 @@ if ($case.Code -ne 0 -or $case.Output -notmatch 'RUN Disable busy=\[\]') {
 $started = Get-Date
 $case = Invoke-Case @{ Enable = 1000000 } "-Task 'Disable' -After 'Enable'"
 $took = ((Get-Date) - $started).TotalSeconds
-if ($case.Code -ne 1 -or $case.Output -notmatch 'Previous VDD task timed out: Enable' -or $case.Output -match 'RUN') {
+if ($case.Code -ne 1 -or $case.Output -notmatch 'Previous VDD task timed out: Enable \(in progress\)' -or $case.Output -match 'RUN') {
     throw "A hung Enable was not reported as a timeout: $($case.Output)"
 }
 # The script's own wait is bounded at 10 s; a cold PowerShell start for the
 # child can take tens of seconds more on a busy PC. A wait that never ended
 # would take hours with this mock.
 if ($took -gt 120) { throw "The wait took $took s" }
+# An instance Task Scheduler never starts reads as queued, so the host's log
+# tells it apart from a toggle that hangs.
+$case = Invoke-Case @{} "-Task 'Disable' -After 'Enable'" @() 2
+if ($case.Code -ne 1 -or $case.Output -notmatch 'VDD task timed out: Disable \(queued\)') {
+    throw "A queued instance was not reported as one: $($case.Output)"
+}
 # Without -After, as older hosts call it, only this task is waited for.
 $case = Invoke-Case @{ Enable = 1000000 } "-Task 'Disable'"
 if ($case.Code -ne 0 -or $case.Output -notmatch 'RUN Disable') {
@@ -92,7 +99,7 @@ $case = Invoke-Case @{} "-Task 'Disable' -After 'Enable'" @('Disable')
 if ($case.Code -ne 1 -or $case.Output -notmatch '0x80070002' -or $case.Output -match 'RUN') {
     throw "A missing requested task was not reported: $($case.Output)"
 }
-Write-Output 'VDD task checks passed: waits for the other direction, earlier runs, hung Enable bound, no -After, missing tasks'
+Write-Output 'VDD task checks passed: waits for the other direction, earlier runs, hung Enable bound, queued instance, no -After, missing tasks'
 # Some cases end their child with exit code 1 on purpose. Without this the
 # last one stays in $LASTEXITCODE, and a CI step that ends with it fails.
 # Every failure above throws, which exits 1.

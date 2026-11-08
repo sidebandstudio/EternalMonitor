@@ -19,10 +19,13 @@ try {
             if ($_.Exception.GetBaseException().HResult -ne -2147024894) { throw }
         }
     }
+    # A timeout says whether the instance was queued (Task Scheduler never
+    # started it) or in progress (the toggle itself did not finish).
+    $stateNames = @{ 2 = 'queued'; 4 = 'in progress' }
     $deadline = (Get-Date).AddSeconds(10)
     foreach ($name in $waitFor) {
-        while ($service.GetFolder('\').GetTask($name).State -in @(2,4)) {
-            if ((Get-Date) -gt $deadline) { throw "Previous VDD task timed out: $name" }
+        while (($state = $service.GetFolder('\').GetTask($name).State) -in @(2,4)) {
+            if ((Get-Date) -gt $deadline) { throw "Previous VDD task timed out: $name ($($stateNames[[int]$state]))" }
             Start-Sleep -Milliseconds 50
         }
     }
@@ -34,7 +37,7 @@ try {
     if (!$running) { throw "VDD task did not start: $Task" }
     $deadline = (Get-Date).AddSeconds(15)
     while ($true) {
-        if ((Get-Date) -gt $deadline) { throw "VDD task timed out: $Task" }
+        if ((Get-Date) -gt $deadline) { throw "VDD task timed out: $Task ($($stateNames[[int]$running.State]))" }
         try { $running.Refresh() } catch {
             # SCHED_E_TASK_NOT_RUNNING means the recorded instance completed.
             if ($_.Exception.GetBaseException().HResult -eq -2147216629) { break }
