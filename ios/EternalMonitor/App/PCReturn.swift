@@ -39,37 +39,29 @@ final class BonjourPCBrowser: PCBrowser {
 
 /// The PC that didn't answer, watched for on Bonjour from the start of the
 /// attempt. Its HELLO2s go out for two seconds only, so a PC app that opens
-/// after that never hears this iPad: the PC's service turning up, or
-/// changing, is the sign to try once more. What Bonjour already listed in
-/// the search's first second is no sign; the PC was there and didn't answer.
+/// after that never hears this iPad. While the card is up, each listing of
+/// the PC is asked to prove it holds the saved pairing: at once when it
+/// turns up or changes, then every few seconds, because a PC that closed
+/// without saying goodbye stays listed, unchanged, after it opens again.
+/// A listing that proves it gets one try; only a new or changed one gets
+/// another.
 struct PCReturn {
-    /// The first second of a search lists what Bonjour already knew. It ends
-    /// before the attempt's HELLO2s do.
-    static let settleSeconds = 1.0
-
     /// The PC's name, when this iPad knows it: its Bonjour service is the
     /// PC, wherever it is. The service at the address tried is the PC too.
     let name: String?
     let host: String
     let port: UInt16
-    /// Until when the latest search lists what Bonjour already knew.
-    private var settlesAt: Date
-    /// A search ran before this one: what it listed is what was known.
-    private var resumed = false
-    /// The PC's listings, by name, address, port and version.
-    private var listed = Set<String>()
-    /// The latest list while settling, which replaces `listed` after it.
-    private var settled: Set<String>?
-    /// The listing that turned up last and has had no try yet.
-    private(set) var appeared: DiscoveredHost?
+    /// The PC's listings now, by name, address, port and version.
+    private(set) var listed: [String: DiscoveredHost] = [:]
+    /// Listings that had their try, while they stay listed.
+    private var tried = Set<String>()
     /// When the card went up and the watch's time limit started.
     private(set) var armedAt: Date?
 
-    init(name: String?, host: String, port: UInt16, at now: Date) {
+    init(name: String?, host: String, port: UInt16) {
         self.name = name.flatMap { $0.isEmpty ? nil : $0 }
         self.host = host
         self.port = port
-        settlesAt = now.addingTimeInterval(Self.settleSeconds)
     }
 
     var service: String? { name.map(MovedPC.serviceName) }
@@ -79,35 +71,30 @@ struct PCReturn {
         return (service != nil && pc.name == service) || (address == host && pc.port == port)
     }
 
-    /// Bonjour's list now. A listing of the PC that wasn't there before is
-    /// an appearance; a new address, port or version is one too.
-    mutating func heard(_ hosts: [DiscoveredHost], at now: Date) {
-        var current: [String: DiscoveredHost] = [:]
-        for pc in hosts where matches(pc) {
-            current["\(pc.name)|\(pc.address ?? "")|\(pc.port)|\(pc.version ?? "")"] = pc
-        }
-        let keys = Set(current.keys)
-        let new = { (known: Set<String>) in keys.subtracting(known).sorted().compactMap { current[$0] }.first }
-        if now < settlesAt {
-            // A search that starts again lists only what changed meanwhile as new.
-            if resumed, let pc = new(listed) { appeared = pc }
-            listed.formUnion(keys)
-            settled = keys
-            return
-        }
-        if let settled {
-            listed = settled
-            self.settled = nil
-        }
-        if let pc = new(listed) { appeared = pc }
-        // A listing that left and comes back is a new appearance.
-        listed = keys
+    private static func key(_ pc: DiscoveredHost) -> String {
+        "\(pc.name)|\(pc.address ?? "")|\(pc.port)|\(pc.version ?? "")"
     }
 
-    /// The search starts again, as when the app comes back to the foreground.
-    mutating func restarted(at now: Date) {
-        settlesAt = now.addingTimeInterval(Self.settleSeconds)
-        resumed = true
+    /// Bonjour's list now. True when a listing of the PC turned up, or
+    /// changed address, port or version: it is asked at once. A listing
+    /// that leaves and comes back may have a try again.
+    mutating func heard(_ hosts: [DiscoveredHost]) -> Bool {
+        var current: [String: DiscoveredHost] = [:]
+        for pc in hosts where matches(pc) { current[Self.key(pc)] = pc }
+        let new = Set(current.keys).subtracting(listed.keys)
+        listed = current
+        tried.formIntersection(current.keys)
+        return !new.isEmpty
+    }
+
+    /// The listing to ask next: one that hasn't had its try.
+    var candidate: DiscoveredHost? {
+        listed.keys.sorted().first { !tried.contains($0) }.flatMap { listed[$0] }
+    }
+
+    /// `pc` had its try, or can't have one.
+    mutating func didTry(_ pc: DiscoveredHost) {
+        tried.insert(Self.key(pc))
     }
 
     /// The card is up: the time limit starts, once.
@@ -117,11 +104,5 @@ struct PCReturn {
 
     func expired(at now: Date, limit: TimeInterval) -> Bool {
         armedAt.map { now.timeIntervalSince($0) >= limit } ?? false
-    }
-
-    /// Takes the appearance for its one try: where the PC is now.
-    mutating func takeAppearance() -> DiscoveredHost? {
-        defer { appeared = nil }
-        return appeared
     }
 }

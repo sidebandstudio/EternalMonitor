@@ -4,7 +4,9 @@
 # The host is then stopped and the app opened again: it connects to the saved
 # PC, which doesn't answer, and shows "didn't answer". The host then starts
 # again and advertises with Bonjour, and the app should connect and stream by
-# itself, with no tap.
+# itself, with no tap. The app opens a second after the host stopped, while
+# Bonjour may still list the PC unchanged: the listing is asked until the PC
+# proves its pairing, so a return that changes nothing on Bonjour still counts.
 #
 # On a shared Mac this is an iOS e2e run: hold the machine's e2e lock and use
 # your own simulator (EM_SIM_UDID). The PC's port is picked free when the run
