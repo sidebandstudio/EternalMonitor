@@ -912,14 +912,20 @@ mod tests {
 
     /// Ten 20 ms blocks of tone, then it notes the audio status in `seen`
     /// and stops the stream.
+    ///
+    /// The tone starts at the first read, as a real capture's audio does.
+    /// Timed from when the source was made, it predated the session's start
+    /// whenever the Opus open between the two took over 250 ms, as it can on
+    /// a loaded PC, and the stage rightly dropped every frame as stale.
     fn tone_then_stop(
         shared: &SharedControl,
         seen: &std::rc::Rc<std::cell::RefCell<Option<Status>>>,
     ) -> Source {
         let (shared, seen) = (shared.clone(), seen.clone());
-        let start = crate::clock::host_now_us() + 50_000;
+        let mut start = None;
         let mut index = 0;
         Source::Fake(Box::new(move || {
+            let start = *start.get_or_insert_with(crate::clock::host_now_us);
             if index == 10 {
                 *seen.borrow_mut() = Some(audio_status());
                 shared.running.store(false, Ordering::SeqCst);
@@ -1103,7 +1109,11 @@ mod tests {
             if opens.borrow().len() <= 4 {
                 busy()
             } else {
-                Ok(tone_then_stop(&shared, &seen))
+                let source = tone_then_stop(&shared, &seen);
+                // Real time before the first read, as a loaded PC's Opus
+                // open takes: the tone must still be sent.
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(source)
             }
         };
         let (lines, packets) = run_stepped(&shared, open, &clock);
