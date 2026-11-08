@@ -302,6 +302,10 @@ pub const NOTICE_SECOND_SCREEN_UNSUPPORTED_GPU: u8 = 4;
 /// [`FEATURE_STANDBY_STATUS`]. (3 and 4 are taken by the graphics card
 /// notices.)
 pub const NOTICE_RESTARTING: u8 = 5;
+/// Second screen needs Windows 11, so the iPad shows the PC's main screen
+/// instead. Sent for a few seconds after the session starts mirroring for
+/// it, over a picture that works.
+pub const NOTICE_SECOND_SCREEN_NEEDS_WINDOWS_11: u8 = 6;
 
 /// Host → client, every heartbeat interval while a session is active.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1642,6 +1646,7 @@ mod tests {
             NOTICE_NO_DISPLAY,
             NOTICE_UNSUPPORTED_GPU,
             NOTICE_SECOND_SCREEN_UNSUPPORTED_GPU,
+            NOTICE_SECOND_SCREEN_NEEDS_WINDOWS_11,
             0xC8,
         ] {
             let datagram = encode_control(7, 1, &heartbeat(notice));

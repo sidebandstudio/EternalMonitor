@@ -290,6 +290,10 @@ impl ConfigSource for SharedConfigSource<'_> {
         )
     }
 
+    fn needs_windows_11(&self) -> bool {
+        second_screen::windows_notice(self.shared, Instant::now())
+    }
+
     fn host_caps(&self) -> u16 {
         // `start_sender` numbers sent frames contiguously per epoch.
         let numbering = eternal_wire::v2::control::HOSTCAP_CONTIGUOUS_FRAME_SEQ;
@@ -2154,6 +2158,50 @@ mod tests {
         assert_eq!(while_blocked, [NOTICE_PC_LOCKED, NOTICE_PC_LOCKED]);
         note_capture_resumed(&shared);
         assert_eq!(notices(), [NOTICE_NONE]);
+    }
+
+    /// On Windows 10 a Second screen session mirrors, and its heartbeats
+    /// tell the iPad why. Windows 11 starts the second screen with no
+    /// such notice.
+    #[test]
+    fn heartbeats_say_second_screen_needs_windows_11_on_windows_10() {
+        use eternal_wire::v2::control::{NOTICE_NONE, NOTICE_SECOND_SCREEN_NEEDS_WINDOWS_11};
+        for (build, step, notice) in [
+            (
+                19045,
+                second_screen::Step::Nothing,
+                NOTICE_SECOND_SCREEN_NEEDS_WINDOWS_11,
+            ),
+            (26200, second_screen::Step::Attach, NOTICE_NONE),
+        ] {
+            let shared = SharedControl::new(9876, 15_000_000);
+            shared.pairing.lock().required = false;
+            *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
+            *shared.vdd_status.lock() = VddStatus::WaitingForClient;
+            second_screen::note_windows(&shared, Some(build), false);
+            let now = Instant::now();
+            repairable_session(&shared, "127.0.0.1:50000".parse().unwrap(), now);
+            let config = SharedConfigSource {
+                shared: &shared,
+                stream_epoch: 1,
+                pen_available: false,
+                listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+            };
+            let notices = || {
+                let actions = shared.session.lock().tick(&config, true, now);
+                actions
+                    .replies
+                    .iter()
+                    .filter_map(|(_, bytes)| match parse_control(bytes) {
+                        Ok((_, ControlMessage::Heartbeat(heartbeat))) => Some(heartbeat.notice),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(notices(), [NOTICE_NONE], "{build}");
+            assert_eq!(second_screen::next_step(&shared, now), step, "{build}");
+            assert_eq!(notices(), [notice], "{build}");
+        }
     }
 
     /// A screen Windows won't share from this graphics card: the heartbeats

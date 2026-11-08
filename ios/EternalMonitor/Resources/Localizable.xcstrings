@@ -6835,6 +6835,18 @@
         }
       }
     },
+    "Second screen needs Windows 11. Showing your PC's screen instead." : {
+      "comment" : "Over the mirrored picture for a few seconds, when the PC chose Second screen but runs Windows 10, which Second screen doesn't support",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Second screen needs Windows 11. Showing your PC's screen instead."
+          }
+        }
+      }
+    },
     "Second screen or mirror" : {
       "extractionState" : "manual",
       "localizations" : {

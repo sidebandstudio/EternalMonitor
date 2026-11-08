@@ -141,6 +141,9 @@ final class ConnectionManager: ObservableObject {
     private var lastFrameAt: TimeInterval?
     /// Shows the restarting pill once the picture has been held long enough.
     private var restartNoticeTask: Task<Void, Never>?
+    /// Second screen needs Windows 11, so the PC mirrors its main screen.
+    /// Its heartbeats say so for a few seconds after the session starts.
+    @Published var secondScreenNeedsWindows11 = false
     /// Nonzero while an automatic reconnect cycle is running.
     @Published private(set) var reconnectAttempt = 0
 
@@ -673,6 +676,7 @@ final class ConnectionManager: ObservableObject {
         pcGraphicsCard = nil
         pcSentVideo = false
         clearRestartNotice()
+        secondScreenNeedsWindows11 = false
         degradedSinceUs = nil
         prevCounters = FrameAssembler.Counters()
         diagnostics.removeAll()
@@ -1138,6 +1142,11 @@ final class ConnectionManager: ObservableObject {
                 if noDisplay != self.pcNoDisplay {
                     self.pcNoDisplay = noDisplay
                     self.record(.info, "ctrl", noDisplay ? "PC has no active display: holding the picture" : "PC display back")
+                }
+                let windows10 = heartbeat.notice == Heartbeat.noticeSecondScreenNeedsWindows11
+                if windows10 != self.secondScreenNeedsWindows11 {
+                    self.secondScreenNeedsWindows11 = windows10
+                    if windows10 { self.record(.info, "ctrl", "PC mirrors: Second screen needs Windows 11") }
                 }
                 let card = PCGraphicsCard(notice: heartbeat.notice)
                 if card != self.pcGraphicsCard {
@@ -2150,6 +2159,7 @@ final class ConnectionManager: ObservableObject {
         pcNoDisplay = false
         pcGraphicsCard = nil
         clearRestartNotice()
+        secondScreenNeedsWindows11 = false
         degradedSinceUs = nil
         prevCounters = FrameAssembler.Counters()
         hostInfo = nil

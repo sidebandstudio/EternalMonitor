@@ -371,6 +371,9 @@ struct Heartbeat: Equatable {
     /// comes back by itself. Sent only to an iPad that sets
     /// `Hello2.featureStandbyStatus`. (3 and 4 are the graphics card notices.)
     static let noticeRestarting: UInt8 = 5
+    /// Second screen needs Windows 11, so the PC shows its main screen
+    /// instead. Sent for a few seconds, over a picture that works.
+    static let noticeSecondScreenNeedsWindows11: UInt8 = 6
     /// The video frames the PC sent this session, from a PC that offered
     /// `HelloAck.hostCapMediaSize`; nil from others. Appended after
     /// `notice`, which is then always written.

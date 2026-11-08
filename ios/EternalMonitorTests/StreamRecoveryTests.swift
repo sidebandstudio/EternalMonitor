@@ -177,6 +177,25 @@ final class StreamRecoveryTests: XCTestCase {
         XCTAssertFalse(manager.pcNoDisplay, "the next session starts without it")
     }
 
+    /// The PC chose Second screen, but its Windows can't run it, so it
+    /// mirrors. Its heartbeats say why for a few seconds, and the iPad says
+    /// so over the working picture until they stop.
+    func testAPCThatNeedsWindows11ForSecondScreenSaysSoWhileItMirrors() async throws {
+        let host = FakeUDPHost()
+        let manager = try await streaming(host)
+        XCTAssertFalse(manager.secondScreenNeedsWindows11)
+        host.sendHeartbeat(notice: Heartbeat.noticeSecondScreenNeedsWindows11)
+        try await until("the PC says Second screen needs Windows 11") { manager.secondScreenNeedsWindows11 }
+        XCTAssertEqual(manager.state, .connected)
+        XCTAssertFalse(manager.pcLocked || manager.pcNoDisplay)
+        host.sendHeartbeat()
+        try await until("the notice ends") { !manager.secondScreenNeedsWindows11 }
+        host.sendHeartbeat(notice: Heartbeat.noticeSecondScreenNeedsWindows11)
+        try await until("said again") { manager.secondScreenNeedsWindows11 }
+        manager.cancel()
+        XCTAssertFalse(manager.secondScreenNeedsWindows11, "the next session starts without it")
+    }
+
     /// Windows moved the PC's screen to the graphics card EternalMonitor
     /// doesn't run on, mid-stream. Its heartbeats say so, which screen, and
     /// the iPad says so over the held picture until the PC captures again.

@@ -540,6 +540,12 @@ pub trait ConfigSource {
     fn notice(&self) -> u8 {
         eternal_wire::v2::control::NOTICE_NONE
     }
+
+    /// Whether the heartbeat says now that Second screen needs Windows 11,
+    /// when it says nothing else.
+    fn needs_windows_11(&self) -> bool {
+        false
+    }
 }
 
 pub struct Session {
@@ -1646,12 +1652,16 @@ impl Session {
             // Held through a restart, until the first new frame: an iPad
             // that understands it says the picture comes back by itself,
             // unless the capture has more to say (a locked PC, no display).
+            // Last, a Second screen held on Windows 10 says why.
             let notice = match config.notice() {
                 eternal_wire::v2::control::NOTICE_NONE
                     if session.restart_held_since.is_some()
                         && session.info.feature_caps & FEATURE_STANDBY_STATUS != 0 =>
                 {
                     eternal_wire::v2::control::NOTICE_RESTARTING
+                }
+                eternal_wire::v2::control::NOTICE_NONE if config.needs_windows_11() => {
+                    eternal_wire::v2::control::NOTICE_SECOND_SCREEN_NEEDS_WINDOWS_11
                 }
                 notice => notice,
             };
@@ -6291,5 +6301,76 @@ mod tests {
                 "after notice {notice}"
             );
         }
+    }
+
+    /// The Windows 10 Second screen note comes last: a capture notice and
+    /// "restarting" each say more. Alone, it is said.
+    #[test]
+    fn the_windows_11_note_comes_after_the_capture_and_restarting_notices() {
+        use eternal_wire::v2::control::{
+            NOTICE_NONE, NOTICE_NO_DISPLAY, NOTICE_PC_LOCKED, NOTICE_RESTARTING,
+            NOTICE_SECOND_SCREEN_NEEDS_WINDOWS_11, NOTICE_SECOND_SCREEN_UNSUPPORTED_GPU,
+            NOTICE_UNSUPPORTED_GPU,
+        };
+        struct Windows10(u8);
+        impl ConfigSource for Windows10 {
+            fn stream_config(&self) -> StreamConfig {
+                TestConfig.stream_config()
+            }
+            fn host_name(&self) -> String {
+                TestConfig.host_name()
+            }
+            fn notice(&self) -> u8 {
+                self.0
+            }
+            fn needs_windows_11(&self) -> bool {
+                true
+            }
+        }
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut session = Session::new(1234);
+        let ControlMessage::Hello2(mut hello) = hello(1, 50000) else {
+            unreachable!()
+        };
+        hello.feature_caps |= FEATURE_STANDBY_STATUS;
+        session.handle_control_authed(peer, ControlMessage::Hello2(hello), &TestConfig, now);
+        session.handle_control_authed(peer, report(10), &TestConfig, now);
+        let id = session.session_id().unwrap();
+        let alone = Windows10(NOTICE_NONE);
+        assert_eq!(
+            notices(&session.tick(&alone, true, now)),
+            [NOTICE_SECOND_SCREEN_NEEDS_WINDOWS_11]
+        );
+        for notice in [
+            NOTICE_PC_LOCKED,
+            NOTICE_NO_DISPLAY,
+            NOTICE_UNSUPPORTED_GPU,
+            NOTICE_SECOND_SCREEN_UNSUPPORTED_GPU,
+        ] {
+            assert_eq!(
+                notices(&session.tick(&Windows10(notice), true, now)),
+                [notice]
+            );
+        }
+        // Held through a restart, before the next stream's first frame.
+        session.set_not_streaming(Some(NotStreaming::Restarting));
+        let at = now + Duration::from_secs(1);
+        assert_eq!(
+            notices(&session.restart_tick(&RestartConfig, at)),
+            [NOTICE_RESTARTING]
+        );
+        session.set_not_streaming(None);
+        let at = now + Duration::from_secs(2);
+        session.handle_control_authed(peer, report(10), &alone, at);
+        assert_eq!(
+            notices(&session.tick(&alone, true, at)),
+            [NOTICE_RESTARTING]
+        );
+        assert!(session.may_send_media(id, 1000, at));
+        assert_eq!(
+            notices(&session.tick(&alone, true, at)),
+            [NOTICE_SECOND_SCREEN_NEEDS_WINDOWS_11]
+        );
     }
 }
