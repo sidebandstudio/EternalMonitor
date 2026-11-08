@@ -9355,6 +9355,18 @@
         }
       }
     },
+    "Your PC is restarting the stream…" : {
+      "comment" : "Over the held picture while the PC restarts its stream and keeps the session",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Your PC is restarting the stream…"
+          }
+        }
+      }
+    },
     "⌘ key acts as" : {
       "comment" : "Values are Ctrl or Win",
       "extractionState" : "manual",

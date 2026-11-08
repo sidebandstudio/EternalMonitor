@@ -1213,7 +1213,14 @@ mod tests {
         const EVENTS: u32 = 2000;
         let taken = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&taken);
-        let thread = InputThread::with_sink(Limits::default(), move || Timed(recorded));
+        // Every event is timed: a thread the machine starves for a moment
+        // gets a backlog, which would merge moves or drop them at the bound.
+        let limits = Limits {
+            capacity: EVENTS as usize,
+            merge_from: usize::MAX,
+            ..Limits::default()
+        };
+        let thread = InputThread::with_sink(limits, move || Timed(recorded));
         let injector = thread.begin(geometry());
         let mut queued = Vec::new();
         let mut next = Instant::now();

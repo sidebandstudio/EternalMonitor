@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 
 use eternal_wire::v2::control::{
     ByeReason, ControlHeader, ControlMessage, FailedReason, HelloAck, HelloStatus, InputEvent,
-    KeyframeRequest, Nack, ReceiverReport, StreamConfig, FEATURE_MEDIA_SIZE,
+    KeyframeRequest, Nack, ReceiverReport, StreamConfig, FEATURE_MEDIA_SIZE, FEATURE_POWER_BYE,
     FEATURE_STANDBY_STATUS, FEATURE_SUPPORTS_NACK, FEATURE_WANTS_INPUT, HOSTCAP_MEDIA_SIZE,
     HOSTCAP_NACK, MIN_MEDIA_DGRAM,
 };
@@ -32,6 +32,13 @@ pub const LIVENESS_TIMEOUT: Duration = Duration::from_millis(3000);
 /// 10 s is longer than an iPad waits for a silent PC (3 s, then 5 s more)
 /// and than the uplink stalls of a congested Wi-Fi channel.
 pub const HOLD_LIMIT: Duration = Duration::from_secs(10);
+
+/// How long the host stays closed to new clients after Windows said it is
+/// going to sleep or shutting down ([`Session::power_down`]), unless it says
+/// first that it woke or that the shutdown was cancelled. A suspend that
+/// fails without a resume message, or a missed one, can't leave the PC
+/// unreachable for longer.
+pub const POWER_DOWN_HOLD: Duration = Duration::from_secs(30);
 const USB_TAKEOVER_TIMEOUT: Duration = Duration::from_secs(1);
 /// How long the late packets of a session ended for liveness get its
 /// goodbye again, at most one copy per [`ENDED_REPLY_GAP`].
@@ -129,6 +136,27 @@ pub const UNANSWERED_MEDIA_BUDGET: usize = 512 * 1024;
 const UNANSWERED_KEPT: usize = 64;
 const UNANSWERED_FOR: Duration = Duration::from_secs(60);
 
+/// How long a session is kept alive through restarts with no picture. Past
+/// this, its iPad is told to connect again: it shows why while the PC
+/// keeps restarting, instead of a frozen picture. Restarts that fail
+/// quickly end sooner, at the storm brake.
+pub const RESTART_HOLD_LIMIT: Duration = Duration::from_secs(20);
+
+/// Lets integration tests reach [`RESTART_HOLD_LIMIT`] in milliseconds.
+#[cfg(feature = "test-hooks")]
+pub static TEST_RESTART_HOLD_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(RESTART_HOLD_LIMIT.as_millis() as u64);
+
+#[cfg(feature = "test-hooks")]
+fn restart_hold_limit() -> Duration {
+    Duration::from_millis(TEST_RESTART_HOLD_MS.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn restart_hold_limit() -> Duration {
+    RESTART_HOLD_LIMIT
+}
+
 /// What the transport must do after feeding the session an event.
 #[derive(Debug, Default)]
 pub struct Actions {
@@ -204,6 +232,58 @@ impl StreamStop {
             Self::Quit | Self::Handoff => EndReason::Shutdown,
             Self::User => EndReason::Stopped,
             Self::GaveUp(stage) => EndReason::Failed(stage),
+        }
+    }
+}
+
+/// What Windows is doing to the PC ([`Session::power_down`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowerEvent {
+    /// Sleep or hibernate.
+    Sleep,
+    /// Shut down or restart.
+    Shutdown,
+    /// The user signs out.
+    Logoff,
+}
+
+impl PowerEvent {
+    /// Stable log value.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Sleep => "sleep",
+            Self::Shutdown => "shutdown",
+            Self::Logoff => "logoff",
+        }
+    }
+
+    /// The goodbye for an iPad that understands it ([`FEATURE_POWER_BYE`]).
+    fn bye(self) -> ByeReason {
+        match self {
+            Self::Sleep => ByeReason::HostSleeping,
+            Self::Shutdown | Self::Logoff => ByeReason::HostPoweringOff,
+        }
+    }
+}
+
+/// What [`Session::power_down`] did.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PowerDown {
+    /// The session ended; its summary is the caller's to write.
+    Ended(SessionEnd),
+    /// Nobody was streaming.
+    NoSession,
+    /// The PC was already going down: Windows sends some of this news twice
+    /// (the end of the session, then the session change, for a sign-out;
+    /// the broadcast and the registration, for sleep). Nothing changed.
+    Repeat,
+}
+
+impl PowerDown {
+    pub fn ended(self) -> Option<SessionEnd> {
+        match self {
+            Self::Ended(end) => Some(end),
+            Self::NoSession | Self::Repeat => None,
         }
     }
 }
@@ -305,6 +385,15 @@ struct ActiveSession {
     unanswered_sent: usize,
     /// A frame was held back for the budget: the answer asks for a keyframe.
     withheld: bool,
+    /// The stream config its last heartbeat carried, which heartbeats sent
+    /// while the PC restarts carry again.
+    last_stream_config: Option<StreamConfig>,
+    /// Since when it has been kept alive through restarts without a frame
+    /// ([`RESTART_HOLD_LIMIT`]): its last frame, or the restart if none.
+    /// Cleared by the next frame.
+    restart_held_since: Option<Instant>,
+    /// When the last frame was let through to it.
+    last_frame_at: Option<Instant>,
 }
 
 /// What a client sent last, for the liveness log lines.
@@ -424,6 +513,8 @@ pub enum NotStreaming {
 enum Closed {
     /// Turned away with Busy, logged with this line.
     Busy(&'static str),
+    /// Not answered at all, logged with this line.
+    Silent(&'static str),
     /// Told why, once it passes the pairing check.
     NotStreaming(NotStreaming),
 }
@@ -463,6 +554,13 @@ pub struct Session {
     /// has resumed since: new clients are turned away, as nothing would
     /// serve them.
     stream_stopped: bool,
+    /// Windows said the PC is going down, and when ([`Self::power_down`]).
+    powering_down: Option<(PowerEvent, Instant)>,
+    /// A session [`Self::power_down`] ended without a goodbye: the next tick
+    /// reports the client lost, as a goodbye would.
+    lost_unsaid: bool,
+    /// The queued goodbye is [`Self::power_down`]'s.
+    power_bye: bool,
     /// No stream runs: HELLO2s are told why instead of starting a session.
     not_streaming: Option<NotStreaming>,
     /// The goodbye for a stream an update or a stop ended, sent by the next
@@ -496,6 +594,9 @@ impl Session {
             last_end: None,
             updating: false,
             stream_stopped: false,
+            powering_down: None,
+            lost_unsaid: false,
+            power_bye: false,
             not_streaming: None,
             goodbye: None,
             stopped: None,
@@ -562,6 +663,8 @@ impl Session {
         };
         if session.answered {
             session.frames_sent = session.frames_sent.saturating_add(1);
+            session.restart_held_since = None;
+            session.last_frame_at = Some(now);
             return true;
         }
         if session.withheld
@@ -571,6 +674,9 @@ impl Session {
             session.withheld = true;
             return false;
         }
+        // Only a frame that goes out ends a hold through a restart.
+        session.restart_held_since = None;
+        session.last_frame_at = Some(now);
         session.unanswered_sent += bytes;
         session.frames_sent = session.frames_sent.saturating_add(1);
         self.unanswered_media = (host_spent + bytes, now);
@@ -627,6 +733,7 @@ impl Session {
         let session = self.active.as_ref()?;
         let (peer, session_id) = (session.peer, session.session_id);
         let msg_seq = self.next_msg_seq();
+        self.power_bye = false;
         self.goodbye = Some((
             peer,
             eternal_wire::v2::control::encode_control(
@@ -641,6 +748,7 @@ impl Session {
     /// The goodbye left for a stopped stream ([`Self::begin_update`],
     /// [`Self::shut_down`]), if any.
     pub fn take_goodbye(&mut self) -> Option<(PeerId, Vec<u8>)> {
+        self.power_bye = false;
         self.goodbye.take()
     }
 
@@ -671,13 +779,69 @@ impl Session {
         self.stopped.take().or(active)
     }
 
+    /// Windows said the PC is going to sleep, shutting down or signing out.
+    /// The session ends now, and its summary is returned for the caller to
+    /// write while the PC is still up. An iPad that understands it
+    /// ([`FEATURE_POWER_BYE`]) is told why by the transport's next pass; an
+    /// older one is told nothing, as before, and notices the silence. Until
+    /// [`Self::power_up`] or [`POWER_DOWN_HOLD`], HELLO2s go unanswered, as
+    /// they would a moment later from a PC that is down. The stream keeps
+    /// running, so the PC streams again when it wakes.
+    pub fn power_down(&mut self, now: Instant, event: PowerEvent) -> PowerDown {
+        if self.going_down(now) {
+            return PowerDown::Repeat;
+        }
+        self.powering_down = Some((event, now));
+        let Some(session) = self.active.as_ref() else {
+            return PowerDown::NoSession;
+        };
+        let end = if session.accepted_hello.feature_caps & FEATURE_POWER_BYE != 0 {
+            let end = self.end_saying(event.bye(), EndReason::Shutdown, now);
+            self.power_bye = true;
+            end
+        } else {
+            self.lost_unsaid = true;
+            self.end(EndReason::Shutdown, now)
+        };
+        end.map_or(PowerDown::NoSession, PowerDown::Ended)
+    }
+
+    /// Windows said the PC is going down, and hasn't said since that it is
+    /// back, within [`POWER_DOWN_HOLD`].
+    fn going_down(&self, now: Instant) -> bool {
+        self.powering_down
+            .is_some_and(|(_, since)| now.saturating_duration_since(since) < POWER_DOWN_HOLD)
+    }
+
+    /// A goodbye waits for the transport.
+    pub fn goodbye_pending(&self) -> bool {
+        self.goodbye.is_some()
+    }
+
+    /// A goodbye [`Self::power_down`] left waits for the transport.
+    pub fn power_goodbye_pending(&self) -> bool {
+        self.power_bye
+    }
+
+    /// The PC woke, or the shutdown was called off: clients may connect
+    /// again. A goodbye no transport sent before the PC went down is for a
+    /// session long over, and is dropped.
+    pub fn power_up(&mut self) {
+        self.powering_down = None;
+        if std::mem::take(&mut self.power_bye) {
+            self.goodbye = None;
+        }
+    }
+
     /// Why a HELLO2 can't start a session now, if it can't: an update is
     /// about to close the host, no stream runs (the supervisor says why), or
     /// the stream stopped and its transport is on its way out (the app
     /// quits). The first and last are turned away with Busy before anything
     /// else is looked at; a retry once the stream runs again works.
-    fn closed_to_clients(&self) -> Option<Closed> {
-        if self.updating {
+    fn closed_to_clients(&self, now: Instant) -> Option<Closed> {
+        if self.going_down(now) {
+            Some(Closed::Silent("Client unanswered while the PC goes down"))
+        } else if self.updating {
             Some(Closed::Busy("Client turned away while an update starts"))
         } else if let Some(state) = self.not_streaming {
             Some(Closed::NotStreaming(state))
@@ -995,7 +1159,11 @@ impl Session {
         }
 
         // Don't start a stream nothing will serve.
-        let closed = self.closed_to_clients();
+        let closed = self.closed_to_clients(now);
+        if let Some(Closed::Silent(why)) = closed {
+            info!(peer = %source, "{why}");
+            return actions;
+        }
         if let Some(Closed::Busy(why)) = closed {
             info!(peer = %source, "{why}");
             return self.refuse(source, HelloStatus::Busy, &hello, hello_len, config, now);
@@ -1164,6 +1332,9 @@ impl Session {
             answered,
             unanswered_sent,
             withheld: false,
+            last_stream_config: None,
+            restart_held_since: None,
+            last_frame_at: None,
         });
 
         // Only a new pairing carries the token. iPads keep the token they
@@ -1390,6 +1561,9 @@ impl Session {
             actions.goodbye = Some(goodbye);
             actions.client_lost = self.active.is_none();
         }
+        if std::mem::take(&mut self.lost_unsaid) {
+            actions.client_lost |= self.active.is_none();
+        }
         actions.ended = self.stopped.take();
         let Some(session) = self.active.as_ref() else {
             return actions;
@@ -1402,6 +1576,30 @@ impl Session {
         if revoked {
             info!(peer = %session.peer, "Pairing credentials changed — reconnect required");
             actions.ended = self.end(EndReason::Revoked, now);
+            actions.client_lost = true;
+            return actions;
+        }
+
+        // Kept alive through a restart and no frame since: past the limit,
+        // even once the next generation runs, tell the iPad to connect again.
+        // Not one that said goodbye to hand over to the cable: its takeover
+        // deadline below ends it as it said.
+        if let Some(since) = session
+            .restart_held_since
+            .filter(|since| now.saturating_duration_since(*since) >= restart_hold_limit())
+            .filter(|_| session.bye.is_none())
+        {
+            info!(
+                session_id = session.session_id,
+                held_ms = now.saturating_duration_since(since).as_millis() as u64,
+                "The stream is taking too long to restart: telling the iPad to connect again"
+            );
+            actions.ended = self.end_saying(
+                ByeReason::Error,
+                EndReason::Failed(StageFailure::Other),
+                now,
+            );
+            actions.goodbye = self.take_goodbye();
             actions.client_lost = true;
             return actions;
         }
@@ -1445,11 +1643,33 @@ impl Session {
             let session_id = session.session_id;
             let frames_sent = (session.info.feature_caps & FEATURE_MEDIA_SIZE != 0)
                 .then_some(session.frames_sent);
+            // Held through a restart, until the first new frame: an iPad
+            // that understands it says the picture comes back by itself,
+            // unless the capture has more to say (a locked PC, no display).
+            let notice = match config.notice() {
+                eternal_wire::v2::control::NOTICE_NONE
+                    if session.restart_held_since.is_some()
+                        && session.info.feature_caps & FEATURE_STANDBY_STATUS != 0 =>
+                {
+                    eternal_wire::v2::control::NOTICE_RESTARTING
+                }
+                notice => notice,
+            };
+            let stream_config = match self.not_streaming {
+                // No stream: the config of the one the iPad last had.
+                Some(_) => session
+                    .last_stream_config
+                    .unwrap_or_else(|| self.negotiated_config(config)),
+                None => self.negotiated_config(config),
+            };
+            if let Some(session) = self.active.as_mut() {
+                session.last_stream_config = Some(stream_config);
+            }
             let msg_seq = self.next_msg_seq();
             let heartbeat = ControlMessage::Heartbeat(eternal_wire::v2::control::Heartbeat {
                 host_time_us: crate::clock::host_now_us(),
-                stream_config: self.negotiated_config(config),
-                notice: config.notice(),
+                stream_config,
+                notice,
                 frames_sent,
             });
             actions.replies.push((
@@ -1458,6 +1678,29 @@ impl Session {
             ));
         }
         actions
+    }
+
+    /// One heartbeat interval while the PC restarts its stream and the
+    /// standby responder holds the port. A session kept across the restart
+    /// stays alive: its iPad gets heartbeats as from a running stream, so it
+    /// holds its last picture instead of losing the signal, and its silence
+    /// still expires it. Only an iPad that has answered gets them. Once
+    /// [`RESTART_HOLD_LIMIT`] has passed since its last frame, the session
+    /// ends with the goodbye that tells its iPad to connect again, on this
+    /// tick or the next stream's ([`Self::tick`]) until a frame goes out.
+    /// Does nothing unless the PC is restarting.
+    pub fn restart_tick(&mut self, config: &impl ConfigSource, now: Instant) -> Actions {
+        if self.not_streaming != Some(NotStreaming::Restarting) {
+            return Actions::default();
+        }
+        let Some(session) = self.active.as_mut() else {
+            return self.tick(config, false, now);
+        };
+        // Counted from the last frame, so a restart ladder keeps counting.
+        let last_frame = session.last_frame_at.unwrap_or(now);
+        session.restart_held_since.get_or_insert(last_frame);
+        let answered = session.answered;
+        self.tick(config, answered, now)
     }
 
     /// Ends the active session for liveness, with the goodbye that tells its
@@ -4146,6 +4389,193 @@ mod tests {
         );
     }
 
+    fn power_hello(nonce: u32, feature_caps: u16) -> ControlMessage {
+        let ControlMessage::Hello2(mut hello) = hello(nonce, 50000) else {
+            unreachable!()
+        };
+        hello.device_id = 77;
+        hello.feature_caps = feature_caps;
+        ControlMessage::Hello2(hello)
+    }
+
+    /// Windows taking the PC down ends the session at once, with the summary
+    /// a quit writes. An iPad that understands it is told why by the next
+    /// pass; the reason says sleep or power off.
+    #[test]
+    fn the_pc_going_down_tells_an_ipad_that_understands_it() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        for (event, bye) in [
+            (PowerEvent::Sleep, ByeReason::HostSleeping),
+            (PowerEvent::Shutdown, ByeReason::HostPoweringOff),
+            (PowerEvent::Logoff, ByeReason::HostPoweringOff),
+        ] {
+            let mut session = Session::new(500);
+            session.handle_control(peer, 0, power_hello(1, FEATURE_POWER_BYE), &TestConfig, now);
+            let id = session.session_id().unwrap();
+            let end = session
+                .power_down(now, event)
+                .ended()
+                .expect("the session ended");
+            assert_eq!((end.client_nonce, end.reason), (1, EndReason::Shutdown));
+            assert!(!session.is_active());
+            assert!(session.power_goodbye_pending());
+            let next = session.tick(&TestConfig, false, now);
+            assert_eq!(goodbye_of(&next), (peer, id, bye), "{event:?}");
+            assert!(next.client_lost);
+            assert_eq!(next.ended, None, "the summary was the caller's to write");
+            assert!(!session.power_goodbye_pending());
+        }
+    }
+
+    /// An iPad from before these reasons drops a goodbye it can't read, so
+    /// it gets none, as before. Its session still ends with a summary, and
+    /// the next pass lets the transport forget it.
+    #[test]
+    fn an_older_ipad_gets_no_goodbye_when_the_pc_goes_down() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut session = Session::new(500);
+        session.handle_control(
+            peer,
+            0,
+            power_hello(1, FEATURE_SUPPORTS_NACK),
+            &TestConfig,
+            now,
+        );
+        let end = session.power_down(now, PowerEvent::Sleep).ended().unwrap();
+        assert_eq!(end.reason, EndReason::Shutdown);
+        assert!(!session.power_goodbye_pending());
+        let next = session.tick(&TestConfig, false, now);
+        assert_eq!(next.goodbye, None);
+        assert!(next.client_lost, "the transport forgets it");
+        assert!(!session.tick(&TestConfig, false, now).client_lost, "once");
+    }
+
+    /// While the PC goes down a HELLO2 gets no answer, as it wouldn't a
+    /// moment later: a session started now would be cut without a word.
+    /// Waking opens it again, and so does a cancelled shutdown, or the hold
+    /// running out when Windows never said it woke.
+    #[test]
+    fn a_pc_going_down_answers_no_hello_until_it_is_back() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut session = Session::new(500);
+        assert_eq!(
+            session.power_down(now, PowerEvent::Sleep),
+            PowerDown::NoSession,
+            "nobody streamed"
+        );
+        let unanswered =
+            session.handle_control(peer, 0, power_hello(2, FEATURE_POWER_BYE), &TestConfig, now);
+        assert!(unanswered.replies.is_empty() && unanswered.new_target.is_none());
+        assert!(!session.is_active());
+        session.power_up();
+        let admitted =
+            session.handle_control(peer, 0, power_hello(3, FEATURE_POWER_BYE), &TestConfig, now);
+        assert_eq!(admitted.new_target, Some(peer));
+
+        let mut session = Session::new(500);
+        session.power_down(now, PowerEvent::Shutdown);
+        let later = now + POWER_DOWN_HOLD;
+        let admitted = session.handle_control(
+            peer,
+            0,
+            power_hello(4, FEATURE_POWER_BYE),
+            &TestConfig,
+            later,
+        );
+        assert_eq!(admitted.new_target, Some(peer), "the hold ran out");
+    }
+
+    /// Windows tells some of it twice: the end of the session, then the
+    /// session change, for a sign-out. The repeat changes nothing: the hold
+    /// keeps its start, and nothing is ended or told again.
+    #[test]
+    fn news_of_the_pc_going_down_counts_once() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut session = Session::new(500);
+        session.handle_control(peer, 0, power_hello(1, FEATURE_POWER_BYE), &TestConfig, now);
+        assert!(session
+            .power_down(now, PowerEvent::Logoff)
+            .ended()
+            .is_some());
+        let again = now + Duration::from_secs(20);
+        assert_eq!(
+            session.power_down(again, PowerEvent::Logoff),
+            PowerDown::Repeat
+        );
+        assert_eq!(
+            session.power_down(again, PowerEvent::Sleep),
+            PowerDown::Repeat
+        );
+        assert!(session.take_goodbye().is_some(), "told once");
+        assert_eq!(session.take_goodbye(), None);
+        // The hold still runs from the first news.
+        let admitted = session.handle_control(
+            peer,
+            0,
+            power_hello(2, FEATURE_POWER_BYE),
+            &TestConfig,
+            now + POWER_DOWN_HOLD,
+        );
+        assert_eq!(admitted.new_target, Some(peer));
+        // After waking, the next news counts again.
+        session.power_up();
+        assert_eq!(
+            session
+                .power_down(now + POWER_DOWN_HOLD, PowerEvent::Sleep)
+                .ended()
+                .map(|end| end.client_nonce),
+            Some(2)
+        );
+    }
+
+    /// A goodbye no transport sent before the PC slept is for a session
+    /// that is over by the time it wakes: dropped. Any other goodbye stays.
+    #[test]
+    fn waking_drops_only_the_goodbye_the_pc_going_down_left() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut session = Session::new(500);
+        session.handle_control(peer, 0, power_hello(1, FEATURE_POWER_BYE), &TestConfig, now);
+        session.power_down(now, PowerEvent::Sleep).ended().unwrap();
+        session.power_up();
+        assert_eq!(session.take_goodbye(), None);
+
+        let mut session = Session::new(500);
+        session.power_down(now, PowerEvent::Sleep);
+        session.power_up();
+        session.handle_control(peer, 0, power_hello(2, FEATURE_POWER_BYE), &TestConfig, now);
+        session.shut_down(now, StreamStop::Quit).unwrap();
+        session.power_up();
+        assert!(session.take_goodbye().is_some(), "a quit's goodbye stays");
+    }
+
+    /// The PC woke after hours: the session ended when it went to sleep, so
+    /// the first pass after waking ends nothing again. It used to expire the
+    /// session then, as a silence as long as the sleep.
+    #[test]
+    fn waking_ends_nothing_a_second_time() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        for caps in [FEATURE_POWER_BYE, 0] {
+            let mut session = Session::new(500);
+            session.handle_control(peer, 0, power_hello(1, caps), &TestConfig, now);
+            session.power_down(now, PowerEvent::Sleep).ended().unwrap();
+            session.tick(&TestConfig, false, now);
+            let woke = now + Duration::from_secs(3 * 3600);
+            session.power_up();
+            session.transport_resumed(woke, false);
+            let first = session.tick(&TestConfig, true, woke);
+            assert_eq!(
+                (first.ended, first.goodbye, first.client_lost),
+                (None, None, false)
+            );
+        }
+    }
+
     /// The goodbye's destination, session id and reason.
     fn goodbye_of(actions: &Actions) -> (PeerId, u32, ByeReason) {
         let (to, bytes) = actions.goodbye.clone().expect("a goodbye");
@@ -5485,5 +5915,381 @@ mod tests {
             (stopped.status, stopped.host_name.as_str()),
             (HelloStatus::Error, "TEST-HOST")
         );
+    }
+
+    /// The standby responder's config: no stream, epoch 0.
+    struct RestartConfig;
+    impl ConfigSource for RestartConfig {
+        fn stream_config(&self) -> StreamConfig {
+            StreamConfig::default()
+        }
+        fn host_name(&self) -> String {
+            "TEST-HOST".to_string()
+        }
+    }
+
+    fn heartbeats(actions: &Actions, peer: PeerId, session_id: u32) -> Vec<StreamConfig> {
+        actions
+            .replies
+            .iter()
+            .filter(|(to, _)| *to == peer)
+            .filter_map(
+                |(_, bytes)| match eternal_wire::v2::control::parse_control(bytes) {
+                    Ok((header, ControlMessage::Heartbeat(hb)))
+                        if header.session_id == session_id =>
+                    {
+                        Some(hb.stream_config)
+                    }
+                    _ => None,
+                },
+            )
+            .collect()
+    }
+
+    /// A streaming session whose iPad has answered, then the PC restarts.
+    fn restarting_session(peer: PeerId, now: Instant) -> (Session, u32) {
+        let mut session = Session::new(1234);
+        session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
+        session.handle_control_authed(peer, report(10), &TestConfig, now);
+        let id = session.session_id().unwrap();
+        assert_eq!(
+            heartbeats(&session.tick(&TestConfig, true, now), peer, id).len(),
+            1
+        );
+        session.set_not_streaming(Some(NotStreaming::Restarting));
+        (session, id)
+    }
+
+    /// While the PC restarts, the kept session gets a heartbeat each
+    /// interval, with the stream config it last had, and stays alive for as
+    /// long as its iPad keeps reporting: longer than the iPad's liveness.
+    #[test]
+    fn a_restart_keeps_the_ipads_session_alive_with_heartbeats() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let (mut session, id) = restarting_session(peer, now);
+        for second in 1..=12 {
+            let at = now + Duration::from_secs(second);
+            session.handle_control_authed(peer, report(10), &RestartConfig, at);
+            let actions = session.restart_tick(&RestartConfig, at);
+            assert!(
+                !actions.client_lost && actions.goodbye.is_none(),
+                "second {second}"
+            );
+            let configs = heartbeats(&actions, peer, id);
+            assert_eq!(configs.len(), 1, "second {second}");
+            assert_eq!(
+                configs[0].stream_epoch, 7,
+                "the last stream's config, not epoch 0"
+            );
+        }
+        assert_eq!(session.session_id(), Some(id));
+    }
+
+    /// Only an iPad that answered its session gets them, and only while the
+    /// PC restarts: not after Stop or the storm brake, nor while streaming.
+    #[test]
+    fn restart_heartbeats_go_only_to_an_answered_session_while_restarting() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut session = Session::new(1234);
+        session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
+        let id = session.session_id().unwrap();
+        session.set_not_streaming(Some(NotStreaming::Restarting));
+        let actions = session.restart_tick(&RestartConfig, now + Duration::from_millis(500));
+        assert!(heartbeats(&actions, peer, id).is_empty(), "never answered");
+
+        let (mut session, id) = restarting_session(peer, now);
+        for state in [
+            None,
+            Some(NotStreaming::Stopped),
+            Some(NotStreaming::Failed(FailedReason::Encoder)),
+        ] {
+            session.set_not_streaming(state);
+            let actions = session.restart_tick(&RestartConfig, now + Duration::from_secs(1));
+            assert!(actions.replies.is_empty(), "{state:?}");
+        }
+        assert!(session.session_id() == Some(id));
+        let mut empty = Session::new(1);
+        empty.set_not_streaming(Some(NotStreaming::Restarting));
+        assert!(empty.restart_tick(&RestartConfig, now).replies.is_empty());
+    }
+
+    /// An iPad that goes silent during the restart is still expired, with
+    /// the goodbye that tells it to connect again.
+    #[test]
+    fn a_silent_ipad_still_expires_during_a_restart() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let (mut session, _) = restarting_session(peer, now);
+        let mut lost = false;
+        for second in 1..=12 {
+            let actions = session.restart_tick(&RestartConfig, now + Duration::from_secs(second));
+            lost |= actions.client_lost;
+        }
+        assert!(lost && !session.is_active());
+    }
+
+    /// Past the hold limit without a frame, the session ends with the
+    /// goodbye that tells its iPad to connect again, and its HELLO2 then
+    /// hears that the PC is restarting. A frame resets the limit.
+    #[test]
+    fn a_restart_that_outlasts_the_hold_limit_ends_the_session() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let (mut session, id) = restarting_session(peer, now);
+        session.restart_tick(&RestartConfig, now);
+        // A frame went out in between (a generation streamed briefly).
+        let half = now + restart_hold_limit() / 2;
+        session.set_not_streaming(None);
+        assert!(session.may_send_media(id, 1000, half));
+        session.set_not_streaming(Some(NotStreaming::Restarting));
+        session.handle_control_authed(peer, report(10), &RestartConfig, half);
+        session.restart_tick(&RestartConfig, half);
+        let before = half + restart_hold_limit() - Duration::from_millis(1);
+        session.handle_control_authed(peer, report(10), &RestartConfig, before);
+        assert!(
+            !session.restart_tick(&RestartConfig, before).client_lost,
+            "the frame reset it"
+        );
+
+        let past = half + restart_hold_limit();
+        let actions = session.restart_tick(&RestartConfig, past);
+        assert!(actions.client_lost && !session.is_active());
+        assert_eq!(
+            actions.ended.unwrap().reason,
+            EndReason::Failed(StageFailure::Other)
+        );
+        let (to, bytes) = actions.goodbye.expect("a goodbye");
+        assert_eq!(to, peer);
+        assert!(matches!(
+            eternal_wire::v2::control::parse_control(&bytes),
+            Ok((header, ControlMessage::Bye(ByeReason::Error))) if header.session_id == id
+        ));
+        let mut again = match hello(2, 50000) {
+            ControlMessage::Hello2(hello) => hello,
+            _ => unreachable!(),
+        };
+        again.feature_caps |= FEATURE_STANDBY_STATUS;
+        let answer =
+            session.handle_control(peer, 0, ControlMessage::Hello2(again), &RestartConfig, past);
+        assert_eq!(
+            parse_ack(&answer.replies[0].1).status,
+            HelloStatus::Restarting
+        );
+    }
+
+    /// The supervisor clears the restart before the new generation sends a
+    /// frame. A slow start still ends at the hold limit, counted from the
+    /// last frame, on the stream's own tick.
+    #[test]
+    fn the_hold_limit_holds_after_the_stream_resumes_without_a_frame() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let (mut session, id) = restarting_session(peer, now);
+        assert!(session.may_send_media(id, 1000, now));
+        session.restart_tick(&RestartConfig, now + Duration::from_secs(1));
+        // The next generation starts; it hasn't sent a frame yet.
+        session.set_not_streaming(None);
+        session.transport_resumed(now + Duration::from_secs(2), false);
+        let before = now + restart_hold_limit() - Duration::from_millis(1);
+        session.handle_control_authed(peer, report(10), &TestConfig, before);
+        assert!(!session.tick(&TestConfig, true, before).client_lost);
+        let at = now + restart_hold_limit();
+        session.handle_control_authed(peer, report(10), &TestConfig, at);
+        let actions = session.tick(&TestConfig, true, at);
+        assert!(
+            actions.client_lost && !session.is_active(),
+            "still held past the limit"
+        );
+        assert!(matches!(
+            eternal_wire::v2::control::parse_control(&actions.goodbye.expect("a goodbye").1),
+            Ok((_, ControlMessage::Bye(ByeReason::Error)))
+        ));
+    }
+
+    /// A frame held back for an iPad that hasn't answered never went out,
+    /// so it neither resets the hold limit nor counts as the last frame.
+    #[test]
+    fn a_held_back_frame_does_not_reset_the_hold_limit() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut session = Session::new(1234);
+        session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
+        let id = session.session_id().unwrap();
+        session.set_not_streaming(Some(NotStreaming::Restarting));
+        session.restart_tick(&RestartConfig, now);
+        let held = |session: &Session| {
+            let active = session.active.as_ref().unwrap();
+            (active.restart_held_since, active.last_frame_at)
+        };
+        let before = held(&session);
+        assert!(before.0.is_some());
+        let later = now + Duration::from_millis(500);
+        assert!(!session.may_send_media(id, UNANSWERED_MEDIA_BUDGET + 1, later));
+        assert_eq!(
+            held(&session),
+            before,
+            "a frame that never went out counted"
+        );
+    }
+
+    /// An iPad that said goodbye to hand over to the cable during the pause
+    /// ends as it said, on its takeover deadline, not with the hold limit's
+    /// goodbye.
+    #[test]
+    fn an_ipads_own_goodbye_during_the_pause_ends_its_session_as_it_said() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut session = Session::new(1234);
+        session.handle_control_authed(peer, identified_hello(1, 77), &TestConfig, now);
+        session.handle_control_authed(peer, report(10), &TestConfig, now);
+        session.set_not_streaming(Some(NotStreaming::Restarting));
+        session.restart_tick(&RestartConfig, now);
+        let limit = now + restart_hold_limit();
+        let bye_at = limit - Duration::from_millis(500);
+        session.handle_control_authed(peer, report(10), &RestartConfig, bye_at);
+        session.handle_control_authed(
+            peer,
+            ControlMessage::Bye(ByeReason::Superseded),
+            &RestartConfig,
+            bye_at,
+        );
+        let mut ended = None;
+        for step in 0..20 {
+            let at = limit + Duration::from_millis(100 * step);
+            let actions = session.restart_tick(&RestartConfig, at);
+            assert!(actions.goodbye.is_none(), "told to connect again at {step}");
+            if let Some(end) = actions.ended {
+                ended = Some(end.reason);
+                break;
+            }
+        }
+        assert_eq!(ended, Some(EndReason::Goodbye(ByeReason::Superseded)));
+    }
+
+    fn notices(actions: &Actions) -> Vec<u8> {
+        actions
+            .replies
+            .iter()
+            .filter_map(
+                |(_, bytes)| match eternal_wire::v2::control::parse_control(bytes) {
+                    Ok((_, ControlMessage::Heartbeat(hb))) => Some(hb.notice),
+                    _ => None,
+                },
+            )
+            .collect()
+    }
+
+    /// While a session is held through a restart, its heartbeats say so to
+    /// an iPad that understands it, on the standby's ticks and on the next
+    /// stream's until its first frame; then they stop saying it.
+    #[test]
+    fn a_held_session_hears_that_the_pc_is_restarting() {
+        use eternal_wire::v2::control::{NOTICE_NONE, NOTICE_RESTARTING};
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut session = Session::new(1234);
+        let ControlMessage::Hello2(mut hello) = hello(1, 50000) else {
+            unreachable!()
+        };
+        hello.feature_caps |= FEATURE_STANDBY_STATUS;
+        session.handle_control_authed(peer, ControlMessage::Hello2(hello), &TestConfig, now);
+        session.handle_control_authed(peer, report(10), &TestConfig, now);
+        let id = session.session_id().unwrap();
+        assert_eq!(
+            notices(&session.tick(&TestConfig, true, now)),
+            [NOTICE_NONE]
+        );
+
+        session.set_not_streaming(Some(NotStreaming::Restarting));
+        let at = now + Duration::from_secs(1);
+        assert_eq!(
+            notices(&session.restart_tick(&RestartConfig, at)),
+            [NOTICE_RESTARTING]
+        );
+        // The next stream runs, with no frame yet.
+        session.set_not_streaming(None);
+        let at = now + Duration::from_secs(2);
+        session.handle_control_authed(peer, report(10), &TestConfig, at);
+        assert_eq!(
+            notices(&session.tick(&TestConfig, true, at)),
+            [NOTICE_RESTARTING]
+        );
+        // Its first frame.
+        assert!(session.may_send_media(id, 1000, at));
+        assert_eq!(notices(&session.tick(&TestConfig, true, at)), [NOTICE_NONE]);
+    }
+
+    /// A 0.3.4 iPad, without the feature bit, gets the heartbeats with no
+    /// notice, as from a running stream.
+    #[test]
+    fn an_old_ipad_held_through_a_restart_gets_no_notice() {
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let (mut session, _) = restarting_session(peer, now);
+        let at = now + Duration::from_secs(1);
+        assert_eq!(
+            notices(&session.restart_tick(&RestartConfig, at)),
+            [eternal_wire::v2::control::NOTICE_NONE]
+        );
+    }
+
+    /// The capture's own notice says more than "restarting": a stream that
+    /// comes back into a locked PC, one with no display, or one whose
+    /// graphics card Windows won't capture from, says that, and
+    /// "restarting" shows only when nothing else does.
+    #[test]
+    fn a_capture_notice_comes_before_the_restarting_one() {
+        use eternal_wire::v2::control::{
+            NOTICE_NONE, NOTICE_NO_DISPLAY, NOTICE_PC_LOCKED, NOTICE_RESTARTING,
+            NOTICE_SECOND_SCREEN_UNSUPPORTED_GPU, NOTICE_UNSUPPORTED_GPU,
+        };
+        struct Blocked(u8);
+        impl ConfigSource for Blocked {
+            fn stream_config(&self) -> StreamConfig {
+                TestConfig.stream_config()
+            }
+            fn host_name(&self) -> String {
+                TestConfig.host_name()
+            }
+            fn notice(&self) -> u8 {
+                self.0
+            }
+        }
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        let mut session = Session::new(1234);
+        let ControlMessage::Hello2(mut hello) = hello(1, 50000) else {
+            unreachable!()
+        };
+        hello.feature_caps |= FEATURE_STANDBY_STATUS;
+        session.handle_control_authed(peer, ControlMessage::Hello2(hello), &TestConfig, now);
+        session.handle_control_authed(peer, report(10), &TestConfig, now);
+        session.set_not_streaming(Some(NotStreaming::Restarting));
+        let at = now + Duration::from_secs(1);
+        assert_eq!(
+            notices(&session.restart_tick(&RestartConfig, at)),
+            [NOTICE_RESTARTING]
+        );
+        // The next stream runs into a blocked capture, before its first frame.
+        session.set_not_streaming(None);
+        let at = now + Duration::from_secs(2);
+        for notice in [
+            NOTICE_PC_LOCKED,
+            NOTICE_NO_DISPLAY,
+            NOTICE_UNSUPPORTED_GPU,
+            NOTICE_SECOND_SCREEN_UNSUPPORTED_GPU,
+        ] {
+            assert_ne!(notice, NOTICE_NONE);
+            session.handle_control_authed(peer, report(10), &Blocked(notice), at);
+            assert_eq!(notices(&session.tick(&Blocked(notice), true, at)), [notice]);
+            // Unblocked, still no frame: restarting again.
+            assert_eq!(
+                notices(&session.tick(&TestConfig, true, at)),
+                [NOTICE_RESTARTING],
+                "after notice {notice}"
+            );
+        }
     }
 }

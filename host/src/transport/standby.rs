@@ -12,6 +12,14 @@
 //! starts a session or a stream, and lets go of the port before the
 //! supervisor checks it for the next generation.
 //!
+//! While the PC restarts its stream, a session kept across the restart
+//! stays alive here: its iPad gets heartbeats as from a running stream, and
+//! its reports and pings are heard as there (see
+//! [`Session::restart_tick`]). It used to lose the signal after three
+//! seconds, while a restart can wait up to half a minute.
+//!
+//! [`Session::restart_tick`]: super::session::Session::restart_tick
+//!
 //! [`Session::set_not_streaming`]: super::session::Session::set_not_streaming
 
 use std::net::SocketAddr;
@@ -108,6 +116,8 @@ async fn serve(
     stopped: &mut oneshot::Receiver<()>,
 ) -> bool {
     let mut goodbyes = tokio::time::interval(GOODBYE_CHECK);
+    let mut heartbeat = tokio::time::interval(super::session::HEARTBEAT_INTERVAL);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut network_check = tokio::time::interval(NETWORK_CHECK);
     network_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -121,6 +131,11 @@ async fn serve(
                 if crate::network::listen_ip_now(&listen_on) != bound.ip() {
                     return true;
                 }
+            }
+            _ = heartbeat.tick() => {
+                let config = config(shared, bound);
+                let actions = shared.session.lock().restart_tick(&config, super::now());
+                carry_out(links, shared, actions).await;
             }
             // A Stop during a restart pause ends a session no transport
             // can tell: say it here.
@@ -185,8 +200,40 @@ async fn open(listen_port: u16, shared: &SharedControl) -> (TransportLinks, Sock
     }
 }
 
-/// Answers a HELLO2 or an IDENTIFY. Everything else waits for the next
-/// generation: a session kept across a restart picks up there.
+fn config(shared: &SharedControl, bound: SocketAddr) -> super::SharedConfigSource<'_> {
+    super::SharedConfigSource {
+        shared,
+        stream_epoch: 0,
+        pen_available: false,
+        listen: bound,
+    }
+}
+
+/// Sends what the session decided while no stream runs: heartbeats and
+/// pongs to the kept session, its goodbye, and the summary of a session
+/// that ended.
+async fn carry_out(
+    links: &TransportLinks,
+    shared: &SharedControl,
+    actions: super::session::Actions,
+) {
+    if let Some(end) = &actions.ended {
+        crate::diagnostics::log_session_end(end, shared);
+    }
+    for (destination, datagram) in &actions.replies {
+        if let Err(error) = links.send_to(datagram, *destination).await {
+            debug!(peer = %destination, %error, "Could not reach the iPad while the stream restarts");
+        }
+    }
+    if let Some(goodbye) = actions.goodbye {
+        super::say_goodbye(links, goodbye).await;
+    }
+}
+
+/// Answers a HELLO2 or an IDENTIFY, and hears the kept session's reports,
+/// pings, keyframe requests and goodbye, so it stays alive while the PC
+/// restarts (see [`super::session::Session::restart_tick`]). Input and
+/// repair requests wait for the next generation.
 async fn answer(
     links: &TransportLinks,
     shared: &SharedControl,
@@ -202,17 +249,44 @@ async fn answer(
         }
         _ => return,
     }
-    let Ok((header, message @ (ControlMessage::Hello2(_) | ControlMessage::Identify(_)))) =
-        parse_control(datagram)
-    else {
+    let Ok((header, message)) = parse_control(datagram) else {
         return;
     };
-    let config = super::SharedConfigSource {
-        shared,
-        stream_epoch: 0,
-        pen_available: false,
-        listen: bound,
-    };
+    let config = config(shared, bound);
+    if matches!(
+        message,
+        ControlMessage::ReceiverReport(_)
+            | ControlMessage::Ping(_)
+            | ControlMessage::KeyframeRequest(_)
+            | ControlMessage::Bye(_)
+    ) {
+        let actions = {
+            let mut session = shared.session.lock();
+            if session.not_streaming() != Some(super::session::NotStreaming::Restarting) {
+                return;
+            }
+            // Only the kept session's own messages get anywhere: the
+            // session checks their id and source, as the stream does.
+            session.handle_datagram(
+                peer,
+                &header,
+                message,
+                datagram.len(),
+                &config,
+                super::now(),
+            )
+        };
+        // A keyframe request asks for an IDR, which the next generation
+        // starts with anyway.
+        carry_out(links, shared, actions).await;
+        return;
+    }
+    if !matches!(
+        message,
+        ControlMessage::Hello2(_) | ControlMessage::Identify(_)
+    ) {
+        return;
+    }
     let actions = {
         let mut session = shared.session.lock();
         // The supervisor clears it only after stopping this responder;

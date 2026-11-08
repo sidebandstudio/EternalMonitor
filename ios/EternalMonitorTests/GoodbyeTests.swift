@@ -235,6 +235,27 @@ final class GoodbyeTests: XCTestCase {
         XCTAssertEqual(manager.reconnectAttempt, 0)
     }
 
+    /// The PC said it is going to sleep or shutting down: the card says so,
+    /// and the iPad doesn't keep dialling a PC that won't answer. Without
+    /// these goodbyes it showed a lost signal, then "didn't answer".
+    func testAPCGoingDownSaysWhyAndStaysAway() async throws {
+        for (reason, problem) in [(ByeReason.hostSleeping, ConnectionProblem.pcAsleep),
+                                  (.hostPoweringOff, .pcPoweringOff)] {
+            let host = FakeUDPHost()
+            let manager = try await streaming(host)
+            let advertised = (host.lastHello?.featureCaps ?? 0) & Hello2.featurePowerBye
+            XCTAssertNotEqual(advertised, 0, "the PC sends these only to an iPad that asks")
+            host.sendBye(reason)
+            try await until("disconnected") { manager.state == .disconnected }
+            XCTAssertEqual(manager.problem, problem)
+            XCTAssertEqual(manager.problem?.actions, [.retry])
+            let attempts = await Task.detached { host.helloAttempts(within: 1.5) }.value
+            XCTAssertEqual(attempts, 0, "no automatic reconnecting to a PC that went down")
+            XCTAssertEqual(manager.reconnectAttempt, 0)
+            manager.cancel()
+        }
+    }
+
     /// The PC stopped hearing this iPad (a Wi-Fi stall) and ended the session
     /// with an error. With Auto-reconnect off the card says the connection
     /// dropped, not that someone stopped the stream on the PC.
