@@ -133,7 +133,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // authoritative per-run source (including a persisted/fallback selection) is logged
     // inside the capture loop when the stream starts.
     let capture_summary = {
-        let outputs = capture::enumerate_outputs();
+        let outputs = capture::listing::outputs_before_the_host_starts();
         outputs
             .iter()
             .find(|o| o.is_primary)

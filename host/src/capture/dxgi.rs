@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 use windows::core::Interface;
 
+use super::listing::Judged;
 use super::recovery::{
     note_capture_resumed, note_gpu_outcome, CaptureBlock, CaptureUnavailable, LossRecovery,
     LossStep, OpenStep, Reopen, LOSS_GIVE_UP,
@@ -50,10 +51,10 @@ fn utf16_to_string(buf: &[u16]) -> String {
     )
 }
 
-/// Enumerate every desktop-attached display output across all adapters. Read-only and
-/// reusable by both the GUI picker and the capture loop. Never panics — on any DXGI error
-/// it returns whatever was discovered so far (possibly empty).
-pub fn enumerate_outputs() -> Vec<OutputInfo> {
+/// Every desktop-attached display output across all adapters, from a fresh
+/// factory. Read-only. Never panics — on any DXGI error it returns whatever
+/// was discovered so far (possibly empty). Through [`super::listing`].
+pub(super) fn outputs(judged: Judged) -> Vec<OutputInfo> {
     let factory: IDXGIFactory1 = match unsafe { CreateDXGIFactory1() } {
         Ok(f) => f,
         Err(error) => {
@@ -61,30 +62,25 @@ pub fn enumerate_outputs() -> Vec<OutputInfo> {
             return Vec::new();
         }
     };
-    list_outputs(&factory)
+    list_outputs(&factory, judged)
         .0
         .into_iter()
         .map(|listed| listed.info)
         .collect()
 }
 
-/// Whether a fresh enumeration lists any display attached to the desktop.
-pub fn display_attached() -> bool {
-    unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }
-        .is_ok_and(|factory| !list_outputs(&factory).0.is_empty())
-}
-
 /// A desktop-attached output with the adapter and output objects it was
 /// listed from. Capture opens these objects rather than looking the
 /// output up again by its ordinals.
-struct Listed {
-    info: OutputInfo,
+pub(super) struct Listed {
+    pub(super) info: OutputInfo,
     adapter: IDXGIAdapter1,
     output: IDXGIOutput,
 }
 
 /// Every desktop-attached output, and how many adapters were listed.
-fn list_outputs(factory: &IDXGIFactory1) -> (Vec<Listed>, u32) {
+/// Through [`super::listing`], which judges what it lists.
+pub(super) fn list_outputs(factory: &IDXGIFactory1, _: Judged) -> (Vec<Listed>, u32) {
     let mut outputs = Vec::new();
 
     let mut adapter_index = 0u32;
@@ -155,7 +151,7 @@ pub fn run_capture_loop(
     // DXGI factories snapshot adapters at creation. Enable the driver first,
     // then enumerate and open the chosen output from the same fresh factory.
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
-    let (listed, adapters) = list_outputs(&factory);
+    let (listed, adapters) = super::listing::listed(&shared, &factory);
     let outputs: Vec<OutputInfo> = listed.iter().map(|listed| listed.info.clone()).collect();
     for o in &outputs {
         info!(
@@ -1004,7 +1000,7 @@ fn target_moved(
     let started = Instant::now();
     let moved = crate::stall::run(
         Call::ListOutputs,
-        move || super::judge_listing(&shared, &enumerate_outputs(), &target, &chosen),
+        move || super::target_moved(&super::listing::outputs(&shared), &target, &chosen),
         progress,
     )
     .unwrap_or(false);

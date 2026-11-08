@@ -22,6 +22,7 @@ use crate::vdd_device::DeviceState;
 
 #[cfg(windows)]
 pub mod dxgi;
+pub mod listing;
 pub mod recovery;
 pub mod second_screen;
 pub mod synthetic;
@@ -282,19 +283,6 @@ pub struct OutputInfo {
     pub adapter_id: crate::gpu_preference::AdapterId,
 }
 
-/// Enumerate every desktop-attached display output. Windows-only in substance;
-/// other platforms have no selectable outputs (the synthetic source ignores them).
-pub fn enumerate_outputs() -> Vec<OutputInfo> {
-    #[cfg(windows)]
-    {
-        dxgi::enumerate_outputs()
-    }
-    #[cfg(not(windows))]
-    {
-        Vec::new()
-    }
-}
-
 /// Resolve which output (index into `outputs`) the capture loop should duplicate for
 /// `target`. `PrimaryAuto` picks the (0,0) output, else the first attached. `Output(name)`
 /// matches the `DeviceName`, falling back to the primary (with a warning) when not found —
@@ -355,27 +343,6 @@ pub(crate) fn target_moved(
     wanted.is_none_or(|output| {
         output.device_name != current.device_name || output.adapter_id != current.adapter_id
     })
-}
-
-/// Capture's listing after a lost duplication, judged: whether the target
-/// moved off `current` (see [`target_moved`]). A listing without `current`
-/// as it was (absent, or its name under another adapter) is also a detach
-/// for a second screen's proof: kept, a display back as the same output
-/// before the next reconciliation would inherit it.
-#[cfg(any(windows, test))]
-pub(crate) fn judge_listing(
-    shared: &SharedControl,
-    outputs: &[OutputInfo],
-    target: &crate::control::CaptureTarget,
-    current: &OutputInfo,
-) -> bool {
-    let still_attached = outputs.iter().any(|output| {
-        output.device_name == current.device_name && output.adapter_id == current.adapter_id
-    });
-    if !still_attached {
-        second_screen::note_detached(shared);
-    }
-    target_moved(outputs, target, current)
 }
 
 /// How long to wait for the virtual display to attach after enabling its driver. Overridable
@@ -577,6 +544,7 @@ fn prepare_vdd_settings(shared: &SharedControl, outputs: &[OutputInfo]) -> VddRe
 /// it ends up in, once per attach. Only the virtual display changes.
 #[cfg(windows)]
 fn settle_vdd_mode(
+    shared: &SharedControl,
     chosen: OutputInfo,
     requested: Option<crate::vdd_settings::VddMode>,
     mut heartbeat: impl FnMut(),
@@ -613,7 +581,7 @@ fn settle_vdd_mode(
     // Windows applies the change asynchronously to DXGI's view of the output.
     for _ in 0..30 {
         heartbeat();
-        if let Some(output) = enumerate_outputs()
+        if let Some(output) = listing::outputs(shared)
             .into_iter()
             .find(|output| output.device_name == chosen.device_name)
         {
@@ -797,20 +765,6 @@ pub(crate) fn client_connected(shared: &SharedControl) -> bool {
     shared.client_connected()
 }
 
-/// The displays to capture from: [`enumerate_outputs`], or in end-to-end
-/// tests the fake virtual display's.
-#[cfg(any(windows, test, debug_assertions))]
-fn outputs(shared: &SharedControl) -> Vec<OutputInfo> {
-    #[cfg(debug_assertions)]
-    if let Some(outputs) = second_screen::fake::outputs(shared) {
-        return outputs;
-    }
-    // Only the debug-build fake reads it.
-    #[cfg(not(debug_assertions))]
-    let _ = shared;
-    enumerate_outputs()
-}
-
 /// Reconcile the virtual display device to the requested target and return the concrete
 /// target to capture. `VirtualExtended` captures the virtual display once it is attached and
 /// a viewer is connected (or one left less than [`second_screen::RELEASE_GRACE`] ago), and
@@ -853,28 +807,24 @@ pub(crate) fn reconcile_virtual_display(
             // managed monitor, and the stream moves onto it this way once it
             // attaches. Reuse that output rather than turning it on again.
             let attached = owned.as_ref().and_then(|name| {
-                outputs(shared)
+                listing::outputs(shared)
                     .into_iter()
                     .find(|output| !output.is_primary && &output.device_name == name)
             });
-            match attached {
-                Some(output) => {
-                    if status == VddStatus::Active
-                        && (connected || shared.second_screen.lock().keep_without_viewer())
-                    {
-                        let proof_output = (output.adapter_id, output.device_name.clone());
-                        second_screen::start_proving_on(
-                            shared,
-                            generation,
-                            Instant::now(),
-                            Some(proof_output),
-                        );
-                        return Some(CaptureTarget::Output(output.device_name));
-                    }
+            // Gone from the desktop, the listing cleared its proof.
+            if let Some(output) = attached {
+                if status == VddStatus::Active
+                    && (connected || shared.second_screen.lock().keep_without_viewer())
+                {
+                    let proof_output = (output.adapter_id, output.device_name.clone());
+                    second_screen::start_proving_on(
+                        shared,
+                        generation,
+                        Instant::now(),
+                        Some(proof_output),
+                    );
+                    return Some(CaptureTarget::Output(output.device_name));
                 }
-                // Gone from the desktop: if it comes back, it proves itself.
-                None if owned.is_some() => second_screen::note_detached(shared),
-                None => {}
             }
             // The transport's next tick starts the display beside this mirror.
             // A viewer that arrived meanwhile may already have claimed it.
@@ -1037,7 +987,11 @@ pub fn run_capture_stage(
             }
             result
         },
-        |delay| wait_while_blocked(&shared, generation, delay, display_attached),
+        |delay| {
+            wait_while_blocked(&shared, generation, delay, || {
+                listing::any_attached(&shared)
+            })
+        },
     );
     if let Err(ref e) = result {
         error!(error = %e, "Capture loop exited with error");
@@ -1067,17 +1021,6 @@ fn note_stage_error(
 
 /// While no display is on, how often the wait looks for one to come back.
 const DISPLAY_LOOK: Duration = Duration::from_millis(250);
-
-/// Whether Windows lists a display attached to the desktop again.
-#[cfg(windows)]
-fn display_attached() -> bool {
-    dxgi::display_attached()
-}
-
-#[cfg(not(windows))]
-fn display_attached() -> bool {
-    false
-}
 
 /// Sleeps between blocked-capture retries. The watchdog has nothing to fix
 /// while Windows withholds the desktop, so the stage keeps its heartbeats.
