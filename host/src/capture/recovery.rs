@@ -446,12 +446,7 @@ pub(crate) fn run_until_unblocked_on(
         };
         // The first working frame clears the block (see
         // [`note_capture_resumed`]).
-        if shared
-            .capture_block
-            .lock()
-            .replace(unavailable.block)
-            .is_none()
-        {
+        if note_capture_blocked(shared, unavailable.block).is_none() {
             retry.resumed();
         }
         let (delay, changed) = retry.blocked(unavailable.block);
@@ -495,7 +490,9 @@ pub const GPU_NOTICE_AFTER: Duration = Duration::from_secs(2);
 /// frozen picture without a word; it clears with the block when capture
 /// works again. A screen Windows won't share from this graphics card says so
 /// once the refusal has lasted [`GPU_NOTICE_AFTER`] (`gpu_since` keeps when
-/// it began), naming the failed second screen when `second_screen_failed`.
+/// it began: [`note_capture_blocked`] sets it, and a heartbeat that finds it
+/// unset starts it), naming the failed second screen when
+/// `second_screen_failed`.
 /// The other blocks keep the held picture as before.
 pub fn heartbeat_notice(
     block: Option<CaptureBlock>,
@@ -526,9 +523,26 @@ pub fn heartbeat_notice(
     }
 }
 
+/// Records that Windows blocks capture with `block`, returning the block
+/// before. A refusal from this graphics card that begins now, after capture
+/// worked or another block, starts its own wait for the iPad's notice, so a
+/// refusal that came back between two heartbeats never inherits an earlier
+/// one's.
+pub fn note_capture_blocked(shared: &SharedControl, block: CaptureBlock) -> Option<CaptureBlock> {
+    let mut current = shared.capture_block.lock();
+    let before = current.replace(block);
+    if before != Some(block) {
+        *shared.gpu_refused_since.lock() =
+            (block == CaptureBlock::UnsupportedOnThisGpu).then(Instant::now);
+    }
+    before
+}
+
 /// Clears the blocked state once frames flow again.
 pub fn note_capture_resumed(shared: &SharedControl) {
-    if let Some(block) = shared.capture_block.lock().take() {
+    let resumed = shared.capture_block.lock().take();
+    *shared.gpu_refused_since.lock() = None;
+    if let Some(block) = resumed {
         info!(block = ?block, "Screen capture resumed");
     }
 }
@@ -678,6 +692,63 @@ mod tests {
     /// the refusal has lasted 2 s (it comes and goes for a moment while the
     /// desktop changes mode), naming the second screen when it failed too.
     /// It clears with the refusal, and a new one waits again.
+    /// Review r1: capture worked for a moment and Windows refused the card
+    /// again, all between two heartbeats. The heartbeat never saw the gap,
+    /// so the new refusal took the old one's start and the iPad was told at
+    /// once. Now the refusal's start is kept where the block is set and
+    /// cleared: a new refusal waits its own 2 s, after capture worked or
+    /// after another block, while the same refusal going on keeps its start.
+    #[test]
+    fn a_refusal_that_comes_back_between_heartbeats_waits_its_own_2_s() {
+        use eternal_wire::v2::control::{NOTICE_NONE, NOTICE_UNSUPPORTED_GPU};
+        let shared = SharedControl::new(9876, 15_000_000);
+        let notice = |shared: &SharedControl| {
+            let block = *shared.capture_block.lock();
+            heartbeat_notice(
+                block,
+                false,
+                &mut shared.gpu_refused_since.lock(),
+                Instant::now(),
+            )
+        };
+        let long_ago = || Some(Instant::now() - Duration::from_secs(3));
+        note_capture_blocked(&shared, CaptureBlock::UnsupportedOnThisGpu);
+        assert_eq!(notice(&shared), NOTICE_NONE, "a refusal that just began");
+        // The same refusal, retried 3 s on: its start stays.
+        *shared.gpu_refused_since.lock() = long_ago();
+        note_capture_blocked(&shared, CaptureBlock::UnsupportedOnThisGpu);
+        assert_eq!(notice(&shared), NOTICE_UNSUPPORTED_GPU);
+        // Capture works, then is refused again, with no heartbeat between.
+        note_capture_resumed(&shared);
+        note_capture_blocked(&shared, CaptureBlock::UnsupportedOnThisGpu);
+        assert_eq!(notice(&shared), NOTICE_NONE, "a fresh refusal waits again");
+        // Another block in between restarts it too.
+        *shared.gpu_refused_since.lock() = long_ago();
+        note_capture_blocked(&shared, CaptureBlock::DisplayChanging);
+        note_capture_blocked(&shared, CaptureBlock::UnsupportedOnThisGpu);
+        assert_eq!(notice(&shared), NOTICE_NONE);
+        // Through the capture stage's own retries: worked, then refused.
+        *shared.gpu_refused_since.lock() = long_ago();
+        note_capture_resumed(&shared);
+        let mut attempts = 0;
+        let result = run_until_unblocked(
+            &shared,
+            |_| {
+                attempts += 1;
+                if attempts == 1 {
+                    Err(blocked(CaptureBlock::UnsupportedOnThisGpu))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| {
+                assert_eq!(notice(&shared), NOTICE_NONE);
+                true
+            },
+        );
+        assert!(result.is_ok());
+    }
+
     #[test]
     fn a_screen_refused_from_this_graphics_card_is_told_to_the_ipad_after_2_s() {
         use eternal_wire::v2::control::{

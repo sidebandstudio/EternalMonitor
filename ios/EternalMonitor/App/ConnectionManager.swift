@@ -125,6 +125,8 @@ final class ConnectionManager: ObservableObject {
     /// The PC's heartbeats say Windows won't let it capture from its
     /// graphics card, and which screen.
     @Published var pcGraphicsCard: PCGraphicsCard?
+    /// The PC's heartbeats counted video frames sent this attempt.
+    private var pcSentVideo = false
     /// Nonzero while an automatic reconnect cycle is running.
     @Published private(set) var reconnectAttempt = 0
 
@@ -556,6 +558,7 @@ final class ConnectionManager: ObservableObject {
         pcLocked = false
         pcNoDisplay = false
         pcGraphicsCard = nil
+        pcSentVideo = false
         degradedSinceUs = nil
         prevCounters = FrameAssembler.Counters()
         diagnostics.removeAll()
@@ -960,6 +963,7 @@ final class ConnectionManager: ObservableObject {
                 self.hostStreamConfig = heartbeat.streamConfig
                 if let frames = heartbeat.framesSent {
                     self.noVideoFallback?.heard(framesSent: frames, at: ProcessInfo.processInfo.systemUptime)
+                    if frames > 0 { self.pcSentVideo = true }
                 }
                 let locked = heartbeat.notice == Heartbeat.noticePCLocked
                 if locked != self.pcLocked {
@@ -1765,6 +1769,7 @@ final class ConnectionManager: ObservableObject {
             end: end, isUSB: mediaLink?.isUSB ?? (transportMode == "USB"), sessionId: hostInfo?.sessionId,
             nonce: controlChannel?.helloNonce ?? 0, awaitingPairing: awaitingPairing,
             datagramsReceived: debugState.datagramsReceived, captureRefused: pcGraphicsCard != nil,
+            pcSentVideo: pcSentVideo,
             firstFrame: firstFrameAt.map { $0 - summaryStartedAt },
             duration: now - summaryStartedAt)
     }

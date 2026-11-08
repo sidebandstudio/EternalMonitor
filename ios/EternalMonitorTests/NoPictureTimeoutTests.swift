@@ -98,6 +98,27 @@ final class NoPictureTimeoutTests: XCTestCase {
         XCTAssertNil(manager.pcGraphicsCard, "the next attempt starts without it")
     }
 
+    /// The PC counted video it sent before Windows refused its card, and no
+    /// picture came: the card still says why, and the summary keeps the
+    /// lost video, as the PC's does.
+    func testVideoSentBeforeTheRefusalIsStillCountedAsLost() async throws {
+        let host = FakeUDPHost()
+        var timing = fast
+        timing.connectTimeoutSeconds = 3
+        let manager = ConnectionManager(timing: timing)
+        defer { manager.cancel() }
+        manager.connect(host: "127.0.0.1", port: host.port)
+        let accepted = await Task.detached { host.acceptSession() }.value
+        XCTAssertTrue(accepted, "the iPad never sent HELLO2")
+        host.sendHeartbeat(framesSent: 5)
+        host.sendHeartbeat(notice: Heartbeat.noticeUnsupportedGPU, framesSent: 5)
+        try await until("the PC says why") { manager.pcGraphicsCard == .screen }
+        try await until("timed out", seconds: 15) { manager.state == .disconnected }
+        XCTAssertEqual(manager.problem, .pcGraphicsCard(.screen))
+        let summary = logged(manager, "session_summary v=1 role=ipad") ?? ""
+        XCTAssertTrue(summary.contains(" outcome=no_picture failure=no_video "), summary)
+    }
+
     /// The same in Second screen mode, after the second screen failed.
     func testThePCsSecondScreenModeKeepsItsOwnCard() async throws {
         let host = FakeUDPHost()
