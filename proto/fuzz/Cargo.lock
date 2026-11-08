@@ -171,6 +171,7 @@ name = "eternal-credstore"
 version = "0.1.0"
 dependencies = [
  "eternal-wire",
+ "libc",
  "ring",
  "security-framework",
  "windows",
