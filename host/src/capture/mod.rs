@@ -261,7 +261,8 @@ pub struct RawFrame {
     /// A picture capture already had, sent again because the desktop gave
     /// no new one: the keepalive, a keyframe request's resend, the cached
     /// picture redrawn with or without the pointer, or a resend during
-    /// duplication recovery.
+    /// duplication recovery. Also a mirror's start picture read through GDI
+    /// (see `StartPicture`): no new picture is due after it either.
     pub cached: bool,
 }
 
@@ -1114,6 +1115,75 @@ impl Picture {
     }
 }
 
+/// Naps up to `total` in slices of at most 50 ms, calling `heartbeat` before
+/// each, and stops as soon as `wake` says to: a viewer that connected during
+/// the idle throttle's 250 ms nap waited out the rest of it before capture
+/// resent the picture.
+#[cfg(any(windows, test))]
+pub(crate) fn nap_unless(
+    total: Duration,
+    mut wake: impl FnMut() -> bool,
+    mut heartbeat: impl FnMut(),
+    mut sleep: impl FnMut(Duration),
+) {
+    const SLICE: Duration = Duration::from_millis(50);
+    let mut left = total;
+    while !left.is_zero() && !wake() {
+        heartbeat();
+        let nap = left.min(SLICE);
+        sleep(nap);
+        left -= nap;
+    }
+}
+
+/// How long a mirror's new duplication may go without an image before its
+/// start picture is read through GDI instead (see [`StartPicture`]).
+#[cfg(any(windows, test))]
+pub(crate) const START_PICTURE_GRACE: Duration = Duration::from_millis(100);
+
+/// A mirror's start picture when its duplication gives none. Desktop
+/// Duplication delivers an image only once the desktop presents one. A
+/// display that went to sleep, and possibly a desktop that changes nothing,
+/// presents none: the encoder then opened only at the 750 ms keepalive, which sent the
+/// black start frame, and the viewer saw black until the desktop changed.
+/// GDI still reads what the desktop shows.
+#[cfg(any(windows, test))]
+#[derive(Debug)]
+pub(crate) struct StartPicture {
+    since: Instant,
+    tried: bool,
+}
+
+#[cfg(any(windows, test))]
+impl StartPicture {
+    pub fn new(now: Instant) -> Self {
+        Self {
+            since: now,
+            tried: false,
+        }
+    }
+
+    /// A duplication was created again, or its picture size changed.
+    pub fn duplicated(&mut self, now: Instant) {
+        *self = Self::new(now);
+    }
+
+    /// Whether to read the start picture through GDI now: once per
+    /// duplication, [`START_PICTURE_GRACE`] after it was created, while the
+    /// cache holds no real picture (`real`, see [`Picture::real`]). Never on
+    /// the second screen, whose image from the duplication is its proof.
+    pub fn due(&mut self, real: bool, second_screen: bool, now: Instant) -> bool {
+        if real || second_screen || self.tried {
+            return false;
+        }
+        if now.saturating_duration_since(self.since) < START_PICTURE_GRACE {
+            return false;
+        }
+        self.tried = true;
+        true
+    }
+}
+
 /// Whether an idle keepalive may resend the last frame. Before the second
 /// screen has delivered an image, that frame is the black placeholder:
 /// sending it would replace the iPad's mirror with black, so the switch
@@ -1513,6 +1583,77 @@ mod tests {
         let taken = consumer.take_within(Duration::from_secs(1), &mut kept);
         assert!(matches!(taken, super::Taken::Frame(frame) if frame.frame_number == 1));
         assert!(kept.is_none());
+    }
+
+    #[test]
+    fn the_idle_nap_ends_when_a_viewer_connects() {
+        let slept = std::cell::RefCell::new(Vec::new());
+        let checks = std::cell::Cell::new(0);
+        super::nap_unless(
+            Duration::from_millis(250),
+            || {
+                checks.set(checks.get() + 1);
+                checks.get() > 2
+            },
+            || {},
+            |nap| slept.borrow_mut().push(nap),
+        );
+        let total: Duration = slept.borrow().iter().sum();
+        assert!(
+            total <= Duration::from_millis(100),
+            "napped {total:?} after the viewer connected"
+        );
+        assert!(slept
+            .borrow()
+            .iter()
+            .all(|nap| *nap <= Duration::from_millis(50)));
+        // Nobody connects: the whole nap.
+        let slept = std::cell::RefCell::new(Vec::new());
+        super::nap_unless(
+            Duration::from_millis(250),
+            || false,
+            || {},
+            |nap| slept.borrow_mut().push(nap),
+        );
+        assert_eq!(
+            slept.borrow().iter().sum::<Duration>(),
+            Duration::from_millis(250)
+        );
+    }
+
+    #[test]
+    fn a_mirror_without_an_image_reads_its_start_picture_once_after_the_grace() {
+        let start = Instant::now();
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let mut gdi = super::StartPicture::new(start);
+        assert!(
+            !gdi.due(false, false, at(50)),
+            "the duplication may still give one"
+        );
+        assert!(gdi.due(false, false, at(100)));
+        assert!(!gdi.due(false, false, at(200)), "once per duplication");
+        // A new duplication (after access was lost, or a size change) whose
+        // cache is black tries again.
+        gdi.duplicated(at(1000));
+        assert!(!gdi.due(false, false, at(1050)));
+        assert!(gdi.due(false, false, at(1100)));
+    }
+
+    #[test]
+    fn a_real_picture_or_a_second_screen_never_reads_the_start_picture() {
+        let start = Instant::now();
+        let later = start + Duration::from_secs(5);
+        let mut gdi = super::StartPicture::new(start);
+        assert!(
+            !gdi.due(true, false, later),
+            "the duplication gave an image"
+        );
+        assert!(
+            !gdi.due(false, true, later),
+            "a second screen proves itself"
+        );
+        // Neither used up the one try.
+        assert!(gdi.due(false, false, later));
     }
 
     #[test]
