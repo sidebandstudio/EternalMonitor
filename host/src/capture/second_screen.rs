@@ -2616,6 +2616,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Review r4 of #205: capture's own description of the output still said
+    /// attached, a re-creation failed, and the listing that followed found
+    /// the virtual display gone. The proof was kept, so the same display back
+    /// before the next reconciliation inherited it. A listing without the
+    /// output as it was clears the proof; one with it keeps the proof.
+    #[test]
+    fn a_listing_without_the_output_makes_it_prove_itself_again() {
+        let shared = second_screen_selected();
+        let (display, dir, generation) = proven_fake_second_screen(&shared, "listing");
+        let target = CaptureTarget::Output("virtual".into());
+        let streamed = Some(target.clone());
+        let current = super::super::outputs(&shared)
+            .into_iter()
+            .find(|output| output.device_name == "virtual")
+            .unwrap();
+        // The output is still there as it was: no move, and the proof stays.
+        let listed = super::super::outputs(&shared);
+        assert!(!super::super::judge_listing(
+            &shared, &listed, &target, &current
+        ));
+        assert_eq!(
+            reconcile_virtual_display(&CaptureTarget::VirtualExtended, &shared, generation),
+            streamed
+        );
+        assert!(!proving(&shared), "the same output, still attached");
+        // The listing finds it gone; it is back, the same, before the stage
+        // reconciles again.
+        assert!(Driver::set_enabled(&display, false));
+        let listed = super::super::outputs(&shared);
+        assert!(super::super::judge_listing(
+            &shared, &listed, &target, &current
+        ));
+        assert!(Driver::set_enabled(&display, true));
+        assert_eq!(
+            reconcile_virtual_display(&CaptureTarget::VirtualExtended, &shared, generation),
+            streamed
+        );
+        assert!(proving(&shared), "back after the listing saw it gone");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Review r3 of #205: the same output reopened in the generation that
     /// proved it keeps its proof, so a display gone dark reaches the
     /// watchdog (see the test above for the restart itself).

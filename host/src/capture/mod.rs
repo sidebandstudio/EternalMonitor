@@ -357,6 +357,27 @@ pub(crate) fn target_moved(
     })
 }
 
+/// Capture's listing after a lost duplication, judged: whether the target
+/// moved off `current` (see [`target_moved`]). A listing without `current`
+/// as it was (absent, or its name under another adapter) is also a detach
+/// for a second screen's proof: kept, a display back as the same output
+/// before the next reconciliation would inherit it.
+#[cfg(any(windows, test))]
+pub(crate) fn judge_listing(
+    shared: &SharedControl,
+    outputs: &[OutputInfo],
+    target: &crate::control::CaptureTarget,
+    current: &OutputInfo,
+) -> bool {
+    let still_attached = outputs.iter().any(|output| {
+        output.device_name == current.device_name && output.adapter_id == current.adapter_id
+    });
+    if !still_attached {
+        second_screen::note_detached(shared);
+    }
+    target_moved(outputs, target, current)
+}
+
 /// How long to wait for the virtual display to attach after enabling its driver. Overridable
 /// via `ETERNAL_VDD_TIMEOUT_SECS`, or within 30–60 s by the update manifest. The iPad mirrors
 /// meanwhile, so a longer wait costs the user nothing; it was 10 s while the iPad gave up 10 s

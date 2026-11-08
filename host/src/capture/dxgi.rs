@@ -972,9 +972,9 @@ fn access_lost_or(
 /// primary for a missing display, or when `list` asks after a failed
 /// re-creation. Both run under the stall limits while `progress` keeps the
 /// picture alive; one that does not return in time counts as no move, and
-/// the re-creation goes on. An output seen off the desktop or renamed is a
-/// detach for a second screen's proof (see
-/// [`super::second_screen::note_detached`]).
+/// the re-creation goes on. An output seen off the desktop or renamed, or a
+/// listing without it as it was, is a detach for a second screen's proof
+/// (see [`super::second_screen::note_detached`]).
 fn target_moved(
     shared: &SharedControl,
     output: &IDXGIOutput1,
@@ -1000,11 +1000,11 @@ fn target_moved(
         }
         super::second_screen::note_detached(shared);
     }
-    let (target, chosen) = (target.clone(), chosen.clone());
+    let (shared, target, chosen) = (shared.clone(), target.clone(), chosen.clone());
     let started = Instant::now();
     let moved = crate::stall::run(
         Call::ListOutputs,
-        move || super::target_moved(&enumerate_outputs(), &target, &chosen),
+        move || super::judge_listing(&shared, &enumerate_outputs(), &target, &chosen),
         progress,
     )
     .unwrap_or(false);
