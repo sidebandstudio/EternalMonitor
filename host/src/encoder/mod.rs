@@ -6237,9 +6237,11 @@ mod tests {
                 .any(|line| line.contains("verbose") || line.contains("avg bitrate change")),
             "{logged_lines:?}"
         );
+        // A watch never touches FFmpeg's own level, which other threads
+        // read as they log.
         assert_eq!(
             unsafe { ffmpeg_next::ffi::av_log_get_level() },
-            ffmpeg_next::ffi::AV_LOG_WARNING
+            ffmpeg_next::ffi::AV_LOG_VERBOSE
         );
     }
 

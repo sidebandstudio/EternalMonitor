@@ -51,8 +51,8 @@ thread_local! {
     static WATCHED: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
 }
 
-/// Threads watching FFmpeg's verbose lines. FFmpeg's log level is
-/// process-wide, so it is raised while any watches.
+/// Threads watching FFmpeg's verbose lines. The shim forwards them while
+/// any watches; FFmpeg's own level never changes after it is installed.
 static WATCHERS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
 
 /// Keeps FFmpeg's lines from this thread, its verbose ones included, from
