@@ -6,7 +6,9 @@
 //! answer. Between generations the supervisor now runs this responder on
 //! the same port and the USB tunnels. It answers each HELLO2 through the
 //! session, which says why nothing streams ([`Session::set_not_streaming`])
-//! after the same version, update and pairing checks as always. It never
+//! after the same version, update and pairing checks as always. It answers
+//! an IDENTIFY through the session too, so an iPad that finds the PC at a
+//! new address can check it is the saved PC while nothing streams. It never
 //! starts a session or a stream, and lets go of the port before the
 //! supervisor checks it for the next generation.
 //!
@@ -162,6 +164,11 @@ async fn open(listen_port: u16, shared: &SharedControl) -> (TransportLinks, Sock
                 if logged {
                     info!(%bind_addr, "Answering iPads while the stream is off");
                 }
+                if ip.is_unspecified() {
+                    // Lists the home network addresses before anyone asks
+                    // for them, as the stream does.
+                    crate::network::home_addresses();
+                }
                 // The Address row and QR code follow, as for the stream.
                 let shown = crate::gui::shown_address(ip, listen_port);
                 crate::stats::PIPELINE_STATS.lock().set_listen_addr(shown);
@@ -178,8 +185,8 @@ async fn open(listen_port: u16, shared: &SharedControl) -> (TransportLinks, Sock
     }
 }
 
-/// Answers a HELLO2. Everything else waits for the next generation: a
-/// session kept across a restart picks up there.
+/// Answers a HELLO2 or an IDENTIFY. Everything else waits for the next
+/// generation: a session kept across a restart picks up there.
 async fn answer(
     links: &TransportLinks,
     shared: &SharedControl,
@@ -195,7 +202,9 @@ async fn answer(
         }
         _ => return,
     }
-    let Ok((header, message @ ControlMessage::Hello2(_))) = parse_control(datagram) else {
+    let Ok((header, message @ (ControlMessage::Hello2(_) | ControlMessage::Identify(_)))) =
+        parse_control(datagram)
+    else {
         return;
     };
     let config = super::SharedConfigSource {
@@ -206,8 +215,8 @@ async fn answer(
     };
     let actions = {
         let mut session = shared.session.lock();
-        // The supervisor clears it only after stopping this responder; a
-        // HELLO2 here never starts a session.
+        // The supervisor clears it only after stopping this responder;
+        // nothing answered here starts a session.
         if session.not_streaming().is_none() {
             return;
         }
@@ -224,21 +233,22 @@ async fn answer(
         crate::diagnostics::log_session_end(end, shared);
     }
     for (destination, reply) in &actions.replies {
-        // Over Wi-Fi an answer is never larger than the HELLO2 it answers.
+        // Over Wi-Fi an answer is never larger than the request it answers.
         // iPads that understand these answers pad their HELLO2 so every
         // answer fits (`STANDBY_HELLO2_LEN`); an older one gets the short
-        // refusal, or today's silence. Answers over USB stay whole.
+        // refusal, or today's silence. An IDENTIFY is as long as its answer.
+        // Answers over USB stay whole.
         if destination.link == LinkId::Udp && reply.len() > datagram.len() {
             debug!(
                 peer = %destination,
                 reply = reply.len(),
                 request = datagram.len(),
-                "Left a HELLO2 unanswered: the answer is larger than it"
+                "Left a request unanswered: the answer is larger than it"
             );
             continue;
         }
         if let Err(error) = links.send_to(reply, *destination).await {
-            debug!(peer = %destination, %error, "Could not answer a HELLO2 while the stream is off");
+            debug!(peer = %destination, %error, "Could not answer an iPad while the stream is off");
         }
     }
 }
