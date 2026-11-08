@@ -86,7 +86,12 @@ final class ConnectionManager: ObservableObject {
     @Published var connectionError: String?
     /// A connection problem in plain words, with its next action. Shown in
     /// place of `connectionError` when set.
-    @Published var problem: ConnectionProblem?
+    @Published var problem: ConnectionProblem? {
+        didSet { problemChanged() }
+    }
+    /// The "didn't answer" card is up and this iPad connects by itself when
+    /// the PC shows up on the network (see `PCReturn`).
+    @Published private(set) var watchingForPC = false
     /// The link failure classified for the current attempt. A link's close
     /// callback that follows its own failure reports this, not a removed cable.
     private var linkFailure: ConnectionProblem?
@@ -249,6 +254,12 @@ final class ConnectionManager: ObservableObject {
         /// How long video the PC says it sent may go missing before the
         /// next no-video step (see `NoVideoFallback`).
         var noVideoStepSeconds = 1.5
+        /// How long after the PC that didn't answer shows up on the network
+        /// the one automatic try waits, so its stream can start and a few
+        /// Bonjour updates count as one.
+        var pcReturnDebounceSeconds = 1.0
+        /// How long the "didn't answer" card watches for the PC.
+        var pcReturnLimitSeconds: TimeInterval = 180
     }
     var timing: Timing
     /// The Wi-Fi link to a host's port. Tests pass a fake one, or replace it
@@ -293,6 +304,17 @@ final class ConnectionManager: ObservableObject {
     /// the step whose result isn't known yet, as its log line names it.
     private var noVideoFallback: NoVideoFallback?
     private var noVideoStep: String?
+    /// Watches Bonjour for the PC that didn't answer. Tests pass a fake.
+    var makePCBrowser: () -> any PCBrowser = { BonjourPCBrowser() }
+    /// The PC watched for, its search (stopped in the background), the
+    /// automatic try waiting out its debounce, and the time limit.
+    private var pcReturn: PCReturn?
+    private var pcReturnBrowser: (any PCBrowser)?
+    private var pcReturnPaused = false
+    private var pcReturnTry: Task<Void, Never>?
+    private var pcReturnLimit: Task<Void, Never>?
+    /// The automatic try is starting: the attempt it starts doesn't end the watch.
+    private var startingPCReturnTry = false
 
     init(timing: Timing = Timing(), udpReceiver: @escaping (UInt16) -> any MediaLink = { UDPReceiver(port: $0) },
          pairingStore: PairingStore? = nil) {
@@ -382,6 +404,7 @@ final class ConnectionManager: ObservableObject {
     /// may be looked up by name again if the address changes.
     func connect(host: String, port: UInt16, token: Data? = nil, found: Bool = false) {
         guard state == .disconnected else { return }
+        if !startingPCReturnTry { endPCReturn() }
         explicitPairingToken = token
         if found { foundAddresses.insert(PairingStore.address(host: host, port: port)) }
         if let token {
@@ -489,6 +512,8 @@ final class ConnectionManager: ObservableObject {
         guard state == .disconnected else { return }
         if case .udp(let host, let port) = target,
            host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || port == 0 { return }
+        // The user picked a PC, or a cable took over.
+        if !startingPCReturnTry { endPCReturn() }
         endReconnectCycle()
         if case .udp(let host, _) = target, let typed = ConnectionProblem.typedAddress(host) {
             connectionError = nil
@@ -630,6 +655,7 @@ final class ConnectionManager: ObservableObject {
                     self.noVideoFallback = nil
                     self.timeoutTask?.cancel()
                     self.noPictureStreak = NoPictureStreak()
+                    self.endPCReturn()
                     self.state = .connected
                     self.streamingSince = Date()
                     // A reconnect attempt that streams ends its cycle.
@@ -906,6 +932,11 @@ final class ConnectionManager: ObservableObject {
                     self.disconnect(.legacyPC)
                 } else {
                     self.record(.warning, "ctrl", "HELLO2 handshake got no reply yet")
+                    // No more HELLO2s go out: a PC app that opens from now
+                    // on is watched for.
+                    if !isUSB, self.attemptMove == nil, self.attemptRedirect == nil, self.reconnectCycleID == nil {
+                        self.watchForPC(host: normalizedHost, port: port)
+                    }
                     if self.leaveRememberedAddress(.pcMoved, result: "no_reply") {
                         // Back to the address tapped.
                     } else if !isUSB {
@@ -1433,6 +1464,129 @@ final class ConnectionManager: ObservableObject {
         reconnectAttempt = 0
     }
 
+    // MARK: - The PC that didn't answer comes back
+
+    private var showsNoReplyOverWiFi: Bool {
+        switch problem {
+        case .noReply(usb: false)?, .noReplyAtNewAddress?: return true
+        default: return false
+        }
+    }
+
+    /// Starts watching Bonjour for the PC at `host:port`, by its service
+    /// when this iPad knows its name. A watch for that PC goes on as it was.
+    private func watchForPC(host: String, port: UInt16) {
+        if let watch = pcReturn, watch.host == host, watch.port == port { return }
+        endPCReturn()
+        let address = PairingStore.address(host: host, port: port)
+        let name = RecentConnectionStore.shared.entry(host: host, port: port)?.name ?? pairingStore.pcName(address: address)
+        pcReturn = PCReturn(service: name.flatMap { $0.isEmpty ? nil : MovedPC.serviceName(pcName: $0) },
+                            host: host, port: port, at: now())
+        let browser = makePCBrowser()
+        browser.onHosts = { [weak self] hosts in self?.pcReturnHeard(hosts) }
+        pcReturnBrowser = browser
+        pcReturnPaused = !isForeground
+        if isForeground { browser.start() }
+    }
+
+    /// The "didn't answer" card is up for the PC at `host:port`: it connects
+    /// once the PC shows up, until the time limit.
+    private func armPCReturn(host: String, port: UInt16) {
+        watchForPC(host: host, port: port)
+        guard pcReturn?.armedAt == nil else { return considerPCReturn() }
+        pcReturn?.arm(at: now())
+        watchingForPC = true
+        record(.info, "connection", "pc_return result=watching")
+        let limit = timing.pcReturnLimitSeconds
+        pcReturnLimit = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(limit))
+            guard !Task.isCancelled, let self, self.pcReturn != nil else { return }
+            self.record(.info, "connection", "pc_return result=expired")
+            self.endPCReturn()
+        }
+        considerPCReturn()
+    }
+
+    private func pcReturnHeard(_ hosts: [DiscoveredHost]) {
+        guard pcReturn != nil else { return }
+        pcReturn?.heard(hosts, at: now())
+        considerPCReturn()
+    }
+
+    /// The PC showed up while the card is up, in the foreground: one try,
+    /// after the debounce. Updates meanwhile count as the same appearance.
+    private func considerPCReturn() {
+        guard let watch = pcReturn, watch.armedAt != nil, watch.appeared else { return }
+        guard !watch.expired(at: now(), limit: timing.pcReturnLimitSeconds) else {
+            record(.info, "connection", "pc_return result=expired")
+            return endPCReturn()
+        }
+        guard isForeground, state == .disconnected, showsNoReplyOverWiFi, pcReturnTry == nil else { return }
+        let wait = timing.pcReturnDebounceSeconds
+        pcReturnTry = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(wait))
+            guard !Task.isCancelled, let self else { return }
+            self.pcReturnTry = nil
+            guard self.isForeground, self.state == .disconnected, self.showsNoReplyOverWiFi,
+                  let watch = self.pcReturn, !watch.expired(at: self.now(), limit: self.timing.pcReturnLimitSeconds),
+                  self.pcReturn?.takeAppearance() == true else { return }
+            self.tryPCAgain(host: watch.host, port: watch.port)
+        }
+    }
+
+    /// Connects as Try again does, without ending the watch: if the PC
+    /// still doesn't answer, the card comes back and waits for it again.
+    private func tryPCAgain(host: String, port: UInt16) {
+        record(.info, "connection", "pc_return result=tried")
+        startingPCReturnTry = true
+        defer { startingPCReturnTry = false }
+        problem = nil
+        connectionError = nil
+        let target = lastTarget ?? (host: host, port: port)
+        connect(host: target.host, port: target.port)
+    }
+
+    /// Dismissed, or replaced by another card: the watch ends. An attempt
+    /// that starts clears the card too; a user's own ends the watch where
+    /// it starts.
+    private func problemChanged() {
+        guard pcReturn != nil, !startingPCReturnTry, !showsNoReplyOverWiFi else { return }
+        if problem == nil && state != .disconnected { return }
+        endPCReturn()
+    }
+
+    /// The app left the foreground: the search stops and no try starts.
+    private func pausePCReturn() {
+        pcReturnTry?.cancel()
+        pcReturnTry = nil
+        guard let browser = pcReturnBrowser, !pcReturnPaused else { return }
+        pcReturnPaused = true
+        browser.stop()
+    }
+
+    /// Back in the foreground: the search starts again, and a PC that
+    /// showed up meanwhile gets its try.
+    private func resumePCReturn() {
+        guard let browser = pcReturnBrowser, pcReturnPaused else { return }
+        pcReturnPaused = false
+        pcReturn?.restarted(at: now())
+        browser.start()
+        considerPCReturn()
+    }
+
+    private func endPCReturn() {
+        pcReturnTry?.cancel()
+        pcReturnTry = nil
+        pcReturnLimit?.cancel()
+        pcReturnLimit = nil
+        pcReturnBrowser?.onHosts = nil
+        pcReturnBrowser?.stop()
+        pcReturnBrowser = nil
+        pcReturnPaused = false
+        pcReturn = nil
+        if watchingForPC { watchingForPC = false }
+    }
+
     /// The session and how long the current attempt has taken, appended to
     /// the support log's first-frame and timeout lines.
     private var attemptTimings: String {
@@ -1471,6 +1625,9 @@ final class ConnectionManager: ObservableObject {
                 // The app gave up, not the user: the PC's log tells them apart.
                 self.disconnect(.connectTimeout)
                 if handshakeDone && self.noPictureStreak.stopsReconnecting { self.stopAutomaticAttempts(isUSB: isUSB) }
+                if self.showsNoReplyOverWiFi && self.reconnectCycleID == nil {
+                    self.armPCReturn(host: debug.host, port: debug.port)
+                }
             }
         }
     }
@@ -1590,6 +1747,7 @@ final class ConnectionManager: ObservableObject {
         isForeground = false
         usbListener?.stop()
         usbListener = nil
+        pausePCReturn()
         // A suspended app can't reconnect. Backgrounding ends an automatic
         // cycle where running out would, and foregrounding resumes it as an
         // interrupted session.
@@ -1643,6 +1801,7 @@ final class ConnectionManager: ObservableObject {
         recheckAppleDevicesSighting()
         usbPaused = usbStoppedForNoPicture
         refreshUSBAvailability()
+        resumePCReturn()
         guard resumeOnForeground else { return }
         resumeOnForeground = false
         guard UserDefaults.standard.flag(forKey: "autoResumeOnForeground"),
@@ -1675,6 +1834,8 @@ final class ConnectionManager: ObservableObject {
             state = .disconnected
             return
         }
+        // Only an attempt that got no answer leaves the PC watched for.
+        if ![.connectTimeout, .pcMoved, .otherPC].contains(end) { endPCReturn() }
         if state != .disconnected {
             endNoVideoStep("no_video")
             recordStreamSummary(reason: "disconnect=\(end.name)")
