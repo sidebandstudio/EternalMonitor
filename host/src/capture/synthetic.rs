@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use tracing::info;
 
-use super::{frame_budget_for, heartbeat, FrameSlot, RawFrame};
+use super::{frame_budget_for, heartbeat, keepalive_due, FrameSlot, RawFrame};
 use crate::control::SharedControl;
 use crate::stats::PIPELINE_STATS;
 
@@ -42,6 +42,14 @@ fn synthetic_size() -> (u32, u32) {
         }
     }
     (DEFAULT_WIDTH, DEFAULT_HEIGHT)
+}
+
+/// `ETERNAL_SYNTH_STILL=1`: a desktop that never changes. After its first
+/// picture the source resends it only as DXGI capture does on a still
+/// desktop, for the idle keepalive or a keyframe request (see
+/// [`keepalive_due`]), so a test can time a new viewer's first frame there.
+fn still_desktop() -> bool {
+    std::env::var("ETERNAL_SYNTH_STILL").is_ok_and(|v| v.trim() == "1")
 }
 
 /// Produce frames until `shared.running` clears or the channel closes.
@@ -78,6 +86,11 @@ pub fn run_capture_loop(
     // avoids normal sleep coalescing without burning an entire CPU core.
     let mut timer = super::timing::FrameTimer::new();
     let mut next_deadline = Instant::now();
+    // `ETERNAL_SYNTH_STILL=1`: the first picture, then only what DXGI sends
+    // for a desktop that never changes.
+    let mut still: Option<Arc<Vec<u8>>> = None;
+    let mut last_send = Instant::now();
+    let still_mode = still_desktop();
 
     loop {
         if !shared.running.load(Ordering::SeqCst)
@@ -92,8 +105,28 @@ pub fn run_capture_loop(
 
         heartbeat(&shared.hb_capture_loop_ms);
 
+        let data = match still.as_ref() {
+            Some(picture)
+                if shared.client_connected()
+                    && keepalive_due(
+                        frame_start.duration_since(last_send),
+                        shared.force_next_idr.load(Ordering::SeqCst),
+                        true,
+                    ) =>
+            {
+                Arc::clone(picture)
+            }
+            Some(_) => {
+                timer.wait_until(frame_start + frame_budget);
+                continue;
+            }
+            None => render_next_frame(&mut buffers, width, height, *frame_number + 1),
+        };
         *frame_number += 1;
-        let data = render_next_frame(&mut buffers, width, height, *frame_number);
+        last_send = frame_start;
+        if still_mode && still.is_none() {
+            still = Some(Arc::clone(&data));
+        }
 
         PIPELINE_STATS.lock().record_capture(width, height);
         heartbeat(&shared.hb_capture_frame_ms);
