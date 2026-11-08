@@ -11,15 +11,16 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 use windows::core::Interface;
 
+use super::listing::Judged;
 use super::recovery::{
     note_capture_resumed, note_gpu_outcome, CaptureBlock, CaptureUnavailable, LossRecovery,
-    LossStep, OpenStep, LOSS_GIVE_UP,
+    LossStep, OpenStep, Reopen, LOSS_GIVE_UP,
 };
 use super::{
     client_connected, frame_budget_for, frame_buffer, frame_has_image, heartbeat, idle_heartbeat,
     keepalive_allowed, keepalive_due, read_back_image, reconcile_virtual_display, recovery_poll,
-    resolve_target, FrameSlot, FrameUse, IdleGate, OutputInfo, RawFrame, ACQUIRE_TIMEOUT_MS,
-    FPS_WINDOW, FRAME_PADDING,
+    resolve_target, FrameSlot, FrameUse, IdleGate, OutputInfo, Picture, RawFrame,
+    ACQUIRE_TIMEOUT_MS, FPS_WINDOW, FRAME_PADDING, PICTURE_HOLD,
 };
 use crate::control::{CaptureTarget, SharedControl};
 use crate::gpu_preference::Outcome;
@@ -34,9 +35,10 @@ use windows::Win32::Graphics::Direct3D11::{
 };
 use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
-    CreateDXGIFactory1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1, IDXGIOutputDuplication,
-    IDXGIResource, DXGI_ADAPTER_DESC1, DXGI_ERROR_ACCESS_LOST, DXGI_ERROR_UNSUPPORTED,
-    DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO, DXGI_OUTDUPL_POINTER_SHAPE_INFO,
+    CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
+    IDXGIOutputDuplication, IDXGIResource, DXGI_ADAPTER_DESC1, DXGI_ERROR_ACCESS_LOST,
+    DXGI_ERROR_NOT_FOUND, DXGI_ERROR_UNSUPPORTED, DXGI_ERROR_WAIT_TIMEOUT, DXGI_OUTDUPL_FRAME_INFO,
+    DXGI_OUTDUPL_POINTER_SHAPE_INFO,
 };
 
 /// Parse a null-terminated UTF-16 fixed array (DXGI `DeviceName` / `Description`) to a String.
@@ -49,10 +51,10 @@ fn utf16_to_string(buf: &[u16]) -> String {
     )
 }
 
-/// Enumerate every desktop-attached display output across all adapters. Read-only and
-/// reusable by both the GUI picker and the capture loop. Never panics — on any DXGI error
-/// it returns whatever was discovered so far (possibly empty).
-pub fn enumerate_outputs() -> Vec<OutputInfo> {
+/// Every desktop-attached display output across all adapters, from a fresh
+/// factory. Read-only. Never panics — on any DXGI error it returns whatever
+/// was discovered so far (possibly empty). Through [`super::listing`].
+pub(super) fn outputs(judged: Judged) -> Vec<OutputInfo> {
     let factory: IDXGIFactory1 = match unsafe { CreateDXGIFactory1() } {
         Ok(f) => f,
         Err(error) => {
@@ -60,10 +62,25 @@ pub fn enumerate_outputs() -> Vec<OutputInfo> {
             return Vec::new();
         }
     };
-    enumerate_factory_outputs(&factory)
+    list_outputs(&factory, judged)
+        .0
+        .into_iter()
+        .map(|listed| listed.info)
+        .collect()
 }
 
-fn enumerate_factory_outputs(factory: &IDXGIFactory1) -> Vec<OutputInfo> {
+/// A desktop-attached output with the adapter and output objects it was
+/// listed from. Capture opens these objects rather than looking the
+/// output up again by its ordinals.
+pub(super) struct Listed {
+    pub(super) info: OutputInfo,
+    adapter: IDXGIAdapter1,
+    output: IDXGIOutput,
+}
+
+/// Every desktop-attached output, and how many adapters were listed.
+/// Through [`super::listing`], which judges what it lists.
+pub(super) fn list_outputs(factory: &IDXGIFactory1, _: Judged) -> (Vec<Listed>, u32) {
     let mut outputs = Vec::new();
 
     let mut adapter_index = 0u32;
@@ -72,9 +89,9 @@ fn enumerate_factory_outputs(factory: &IDXGIFactory1) -> Vec<OutputInfo> {
             Ok(a) => a,
             Err(_) => break,
         };
-        let adapter_name = match unsafe { adapter.GetDesc1() } {
-            Ok(desc) => utf16_to_string(&desc.Description),
-            Err(_) => String::new(),
+        let (adapter_name, adapter_luid) = match unsafe { adapter.GetDesc1() } {
+            Ok(desc) => (utf16_to_string(&desc.Description), adapter_id(desc)),
+            Err(_) => (String::new(), (0, 0)),
         };
 
         let mut output_index = 0u32;
@@ -86,16 +103,21 @@ fn enumerate_factory_outputs(factory: &IDXGIFactory1) -> Vec<OutputInfo> {
             if let Ok(desc) = unsafe { output.GetDesc() } {
                 if desc.AttachedToDesktop.as_bool() {
                     let r = desc.DesktopCoordinates;
-                    outputs.push(OutputInfo {
-                        adapter_index,
-                        output_index,
-                        device_name: utf16_to_string(&desc.DeviceName),
-                        width: (r.right - r.left).max(0) as u32,
-                        height: (r.bottom - r.top).max(0) as u32,
-                        left: r.left,
-                        top: r.top,
-                        is_primary: r.left == 0 && r.top == 0,
-                        adapter_name: adapter_name.clone(),
+                    outputs.push(Listed {
+                        info: OutputInfo {
+                            adapter_index,
+                            output_index,
+                            device_name: utf16_to_string(&desc.DeviceName),
+                            width: (r.right - r.left).max(0) as u32,
+                            height: (r.bottom - r.top).max(0) as u32,
+                            left: r.left,
+                            top: r.top,
+                            is_primary: r.left == 0 && r.top == 0,
+                            adapter_name: adapter_name.clone(),
+                            adapter_id: adapter_luid,
+                        },
+                        adapter: adapter.clone(),
+                        output,
                     });
                 }
             }
@@ -103,7 +125,7 @@ fn enumerate_factory_outputs(factory: &IDXGIFactory1) -> Vec<OutputInfo> {
         }
         adapter_index += 1;
     }
-    outputs
+    (outputs, adapter_index)
 }
 
 /// Enumerate adapters, select the output to duplicate, create duplication,
@@ -111,13 +133,12 @@ fn enumerate_factory_outputs(factory: &IDXGIFactory1) -> Vec<OutputInfo> {
 pub fn run_capture_loop(
     slot: &FrameSlot,
     shared: SharedControl,
-    adapter_index: u32,
     generation: u64,
     frame_number: &mut u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // The capture adapter FOLLOWS the chosen output (which may differ from the
     // encoder-detection adapter on a multi-GPU system); the encoder stays vendor-based
-    // and independent. `adapter_index` is only the last-resort fallback below.
+    // and independent.
     let requested_target = shared.capture_target.lock().clone();
     // Turn the virtual display on/off to match the request before enumerating, so the
     // managed virtual output only exists while we're capturing it (and only while an iPad
@@ -130,7 +151,8 @@ pub fn run_capture_loop(
     // DXGI factories snapshot adapters at creation. Enable the driver first,
     // then enumerate and open the chosen output from the same fresh factory.
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
-    let outputs = enumerate_factory_outputs(&factory);
+    let (listed, adapters) = super::listing::listed(&shared, &factory);
+    let outputs: Vec<OutputInfo> = listed.iter().map(|listed| listed.info.clone()).collect();
     for o in &outputs {
         info!(
             device = %o.device_name,
@@ -147,67 +169,36 @@ pub fn run_capture_loop(
     if !outputs.is_empty() && NO_OUTPUTS.swap(false, Ordering::Relaxed) {
         info!(outputs = outputs.len(), "A display output is back");
     }
-    // A missing adapter or output (DXGI_ERROR_NOT_FOUND) is a display change
-    // the stage waits out, not a failure.
-    let (adapter, output, adapter_name, capture_label) = match resolve_target(&outputs, &target) {
-        Some(idx) => {
-            let chosen = &outputs[idx];
-            let adapter = match unsafe { factory.EnumAdapters1(chosen.adapter_index) } {
-                Ok(a) => a,
-                Err(error) => {
-                    warn!(
-                        adapter_index = chosen.adapter_index,
-                        error = %error,
-                        "EnumAdapters1 failed for the chosen output's adapter — falling back to adapter 0"
-                    );
-                    unsafe { factory.EnumAdapters1(0) }.map_err(opening(OpenStep::Adapter))?
-                }
-            };
-            let adapter_name = match unsafe { adapter.GetDesc1() } {
-                Ok(desc) => utf16_to_string(&desc.Description),
-                Err(_) => chosen.adapter_name.clone(),
-            };
-            let output: IDXGIOutput = unsafe { adapter.EnumOutputs(chosen.output_index) }
-                .map_err(opening(OpenStep::ListedOutput))?;
-            let label = format!(
-                "{} ({}x{})",
-                chosen.device_name, chosen.width, chosen.height
-            );
+    // No output listed is a display change the stage waits out, not a failure.
+    let Some(index) = resolve_target(&outputs, &target) else {
+        if !NO_OUTPUTS.swap(true, Ordering::Relaxed) {
             info!(
-                device = %chosen.device_name,
-                adapter = %adapter_name,
-                width = chosen.width,
-                height = chosen.height,
-                "Capture: selected display output"
+                adapters,
+                "No display is attached to the desktop, as while a laptop's lid is closed or the screens are off"
             );
-            (adapter, output, adapter_name, label)
         }
-        None => {
-            // No outputs enumerated: a closed laptop lid or a screen that is
-            // off. Try the detection adapter's first output, as before.
-            if !NO_OUTPUTS.swap(true, Ordering::Relaxed) {
-                info!("No display outputs enumerated, as while a laptop's lid is closed — trying the detection adapter's first output");
-            }
-            let adapter = match unsafe { factory.EnumAdapters1(adapter_index) } {
-                Ok(a) => a,
-                Err(error) => {
-                    warn!(
-                        requested = adapter_index,
-                        error = %error,
-                        "EnumAdapters1 failed for requested adapter index, falling back to adapter 0"
-                    );
-                    unsafe { factory.EnumAdapters1(0) }.map_err(opening(OpenStep::Adapter))?
-                }
-            };
-            let adapter_name = match unsafe { adapter.GetDesc1() } {
-                Ok(desc) => utf16_to_string(&desc.Description),
-                Err(_) => String::new(),
-            };
-            let output: IDXGIOutput =
-                unsafe { adapter.EnumOutputs(0) }.map_err(opening(OpenStep::OnlyOutput))?;
-            (adapter, output, adapter_name, "primary (auto)".to_string())
-        }
+        return Err(Box::new(no_output_listed(adapters)));
     };
+    let Listed {
+        info: chosen,
+        adapter,
+        output,
+    } = listed
+        .into_iter()
+        .nth(index)
+        .expect("resolved from this list");
+    let adapter_name = chosen.adapter_name.clone();
+    let capture_label = format!(
+        "{} ({}x{})",
+        chosen.device_name, chosen.width, chosen.height
+    );
+    info!(
+        device = %chosen.device_name,
+        adapter = %adapter_name,
+        width = chosen.width,
+        height = chosen.height,
+        "Capture: selected display output"
+    );
 
     info!(adapter = %adapter_name, "Capture using adapter");
     // The mirror's card, by LUID, for the graphics card checks.
@@ -314,8 +305,11 @@ pub fn run_capture_loop(
     let mut recovery = LossRecovery::default();
     let mut resumed = false;
     let mut idle = IdleGate::new();
-    // Set once this duplication has delivered a real desktop image.
-    let mut seen_image = false;
+    let mut picture = Picture::default();
+    // ACCESS_LOST from a call after the acquire (ReleaseFrame, the staging
+    // Map). It is handled as if the next acquire had returned it: before,
+    // it ended the capture loop and restarted the pipeline.
+    let mut lost_after_acquire: Option<windows::core::Error> = None;
 
     loop {
         if !shared.running.load(Ordering::SeqCst)
@@ -325,6 +319,19 @@ pub fn run_capture_loop(
             break;
         }
         heartbeat(&shared.hb_capture_loop_ms);
+        if picture.held_too_long(Instant::now(), second_screen) {
+            info!(
+                device = %chosen.device_name,
+                held_s = PICTURE_HOLD.as_secs(),
+                "The second screen showed no new image since its duplication came back — opening it again"
+            );
+            return Err(Box::new(Reopen {
+                detail: format!(
+                    "no new image from {} since its duplication came back",
+                    chosen.device_name
+                ),
+            }));
+        }
 
         let wait = idle.wait_before_acquire(client_connected(&shared), Instant::now());
         if !wait.is_zero() {
@@ -361,8 +368,11 @@ pub fn run_capture_loop(
         let dupl = duplication
             .as_ref()
             .expect("the ACCESS_LOST handler re-creates the duplication before continuing");
-        let hr = unsafe {
-            dupl.AcquireNextFrame(acquire_timeout_ms, &mut frame_info, &mut desktop_resource)
+        let hr = match lost_after_acquire.take() {
+            Some(lost) => Err(lost),
+            None => unsafe {
+                dupl.AcquireNextFrame(acquire_timeout_ms, &mut frame_info, &mut desktop_resource)
+            },
         };
         let acquire_us = acquire_start.elapsed().as_micros();
         if hr.is_ok()
@@ -438,13 +448,14 @@ pub fn run_capture_loop(
 
                 // --- Copy desktop texture to staging and read pixels into a
                 // recycled buffer (the readback is the ONLY full-frame copy) ---
-                if !frame_has_image(frame_info.LastPresentTime, seen_image) {
-                    unsafe {
-                        dupl.ReleaseFrame()?;
+                if !frame_has_image(frame_info.LastPresentTime, picture.seen_image) {
+                    if let Err(error) = unsafe { dupl.ReleaseFrame() } {
+                        lost_after_acquire = Some(access_lost_or(error)?);
                     }
                     continue;
                 }
-                let frame_data = read_back_image(&shared, generation, &mut seen_image, || {
+                let seen_image = &mut picture.seen_image;
+                let frame_data = read_back_image(&shared, generation, seen_image, || {
                     windows::core::Result::Ok(if let Some(ref resource) = desktop_resource {
                         match resource.cast::<ID3D11Texture2D>() {
                             Ok(desktop_texture) => {
@@ -525,9 +536,17 @@ pub fn run_capture_loop(
                         }
                         None
                     })
-                })?;
+                });
+                let frame_data = match frame_data {
+                    Ok(frame_data) => frame_data,
+                    Err(error) => {
+                        lost_after_acquire = Some(access_lost_or(error)?);
+                        continue;
+                    }
+                };
 
                 if let Some(data) = frame_data {
+                    picture.cached();
                     if idle.on_frame(client_connected(&shared), now) == FrameUse::Publish {
                         PIPELINE_STATS.lock().record_capture(tex_width, tex_height);
                         heartbeat(&shared.hb_capture_frame_ms);
@@ -568,9 +587,9 @@ pub fn run_capture_loop(
                     && keepalive_due(
                         last_send.elapsed(),
                         shared.force_next_idr.load(Ordering::SeqCst),
-                        seen_image,
+                        picture.real(),
                     )
-                    && keepalive_allowed(seen_image, second_screen)
+                    && keepalive_allowed(picture.real(), second_screen)
                 {
                     resend_last_frame(
                         slot,
@@ -598,8 +617,29 @@ pub fn run_capture_loop(
                 // Normal during UAC prompts, the lock screen, mode changes and
                 // full-screen transitions. A duplication re-created too early is
                 // lost again at once, so the retries back off instead of spinning.
+                // Routine while it is back within a second; see `LOSS_QUIET`.
                 if !recovery.in_episode() {
-                    warn!("Desktop duplication access lost — reinitializing");
+                    info!("Desktop duplication access lost — reinitializing");
+                }
+                let allowed = keepalive_allowed(picture.real(), second_screen);
+                let dims = (tex_width, tex_height);
+                let call = super::second_screen::driver_call(&shared, generation);
+                let moved = target_moved(&shared, &output1, &chosen, &target, false, || {
+                    if crate::supervisor::generation_is_current(generation) {
+                        keep_picture_alive(
+                            slot,
+                            &shared,
+                            frame_number,
+                            &mut last_send,
+                            &last_frame,
+                            dims,
+                            allowed,
+                        );
+                    }
+                });
+                drop(call);
+                if moved {
+                    return Err(moved_away(&chosen));
                 }
                 // A second screen that shows no picture before this is
                 // re-created failed for a passing reason.
@@ -638,19 +678,16 @@ pub fn run_capture_loop(
                         {
                             return Ok(());
                         }
-                        let now_ms = crate::clock::host_now_us() / 1000;
-                        if recovery_poll(&shared, now_ms, last_send.elapsed())
-                            && keepalive_allowed(seen_image, second_screen)
-                        {
-                            resend_last_frame(
-                                slot,
-                                &shared,
-                                frame_number,
-                                &mut last_send,
-                                &last_frame,
-                                (tex_width, tex_height),
-                            );
-                        }
+                        warn_if_overdue(&mut recovery);
+                        keep_picture_alive(
+                            slot,
+                            &shared,
+                            frame_number,
+                            &mut last_send,
+                            &last_frame,
+                            (tex_width, tex_height),
+                            keepalive_allowed(picture.real(), second_screen),
+                        );
                         let now = Instant::now();
                         if now >= deadline {
                             break;
@@ -662,19 +699,16 @@ pub fn run_capture_loop(
                         if !crate::supervisor::generation_is_current(generation) {
                             return;
                         }
-                        let now_ms = crate::clock::host_now_us() / 1000;
-                        if recovery_poll(&shared, now_ms, last_send.elapsed())
-                            && keepalive_allowed(seen_image, second_screen)
-                        {
-                            resend_last_frame(
-                                slot,
-                                &shared,
-                                frame_number,
-                                &mut last_send,
-                                &last_frame,
-                                (tex_width, tex_height),
-                            );
-                        }
+                        warn_if_overdue(&mut recovery);
+                        keep_picture_alive(
+                            slot,
+                            &shared,
+                            frame_number,
+                            &mut last_send,
+                            &last_frame,
+                            (tex_width, tex_height),
+                            keepalive_allowed(picture.real(), second_screen),
+                        );
                     };
                     let call = super::second_screen::driver_call(&shared, generation);
                     let retried = duplicate_output(&output1, &device, poll);
@@ -695,7 +729,7 @@ pub fn run_capture_loop(
                     match retried {
                         Ok(d) => {
                             duplication = Some(d);
-                            seen_image = false;
+                            picture.recreated(Instant::now());
                             super::second_screen::note_recovery(
                                 &shared,
                                 generation,
@@ -713,6 +747,28 @@ pub fn run_capture_loop(
                             // Tell the GUI why while the retries continue.
                             if let Some(block) = CaptureBlock::from_hresult(last_code.0) {
                                 *shared.capture_block.lock() = Some(block);
+                            }
+                            // The output may be gone: look at the whole layout.
+                            let allowed = keepalive_allowed(picture.real(), second_screen);
+                            let dims = (tex_width, tex_height);
+                            let call = super::second_screen::driver_call(&shared, generation);
+                            let moved =
+                                target_moved(&shared, &output1, &chosen, &target, true, || {
+                                    if crate::supervisor::generation_is_current(generation) {
+                                        keep_picture_alive(
+                                            slot,
+                                            &shared,
+                                            frame_number,
+                                            &mut last_send,
+                                            &last_frame,
+                                            dims,
+                                            allowed,
+                                        );
+                                    }
+                                });
+                            drop(call);
+                            if moved {
+                                return Err(moved_away(&chosen));
                             }
                         }
                     }
@@ -736,6 +792,7 @@ pub fn run_capture_loop(
                     frame_bytes = row_bytes * tex_height as usize;
                     spare = None;
                     last_frame = Arc::new(frame_buffer(frame_bytes));
+                    picture.resized();
                     staging_texture = unsafe {
                         let mut tex = None;
                         device.CreateTexture2D(
@@ -867,11 +924,129 @@ fn blocked_or_error(error: windows::core::Error) -> Box<dyn std::error::Error + 
     unavailable_or_error(CaptureBlock::from_hresult(error.code().0), error)
 }
 
-/// [`blocked_or_error`] for the call at `step` that opens the output.
-fn opening(
-    step: OpenStep,
-) -> impl FnOnce(windows::core::Error) -> Box<dyn std::error::Error + Send + Sync> {
-    move |error| unavailable_or_error(CaptureBlock::opening(step, error.code().0), error)
+/// Enumeration listed no display attached to the desktop. The detection
+/// adapter's first output, found by its ordinal from startup, was tried
+/// next: it never captured anything in the field, and its error text
+/// (DXGI_ERROR_NOT_FOUND, "there is no adapter with the specified ordinal")
+/// hid what was wrong.
+fn no_output_listed(adapters: u32) -> CaptureUnavailable {
+    let (step, detail) = if adapters == 0 {
+        (
+            OpenStep::Adapter,
+            "no graphics adapter is listed".to_string(),
+        )
+    } else {
+        (
+            OpenStep::OnlyOutput,
+            format!("no display is attached to the desktop ({adapters} graphics adapters listed)"),
+        )
+    };
+    CaptureUnavailable {
+        block: CaptureBlock::opening(step, DXGI_ERROR_NOT_FOUND.0)
+            .expect("DXGI_ERROR_NOT_FOUND is a blocked state"),
+        detail,
+    }
+}
+
+/// `error` when it is DXGI_ERROR_ACCESS_LOST, for the loop's handler;
+/// anything else ends the capture loop, as before.
+fn access_lost_or(
+    error: windows::core::Error,
+) -> Result<windows::core::Error, Box<dyn std::error::Error + Send + Sync>> {
+    if error.code() == DXGI_ERROR_ACCESS_LOST {
+        Ok(error)
+    } else {
+        Err(error.into())
+    }
+}
+
+/// After ACCESS_LOST: whether the stage should open the target afresh,
+/// because it now resolves to another output or adapter than `chosen` (see
+/// [`super::target_moved`]). The duplicated output's own description is
+/// asked first, and the outputs are listed (a new factory and every adapter)
+/// only when it is off the desktop or renamed, while capture runs on the
+/// primary for a missing display, or when `list` asks after a failed
+/// re-creation. Both run under the stall limits while `progress` keeps the
+/// picture alive; one that does not return in time counts as no move, and
+/// the re-creation goes on. An output seen off the desktop or renamed, or a
+/// listing without it as it was, is a detach for a second screen's proof
+/// (see [`super::second_screen::note_detached`]).
+fn target_moved(
+    shared: &SharedControl,
+    output: &IDXGIOutput1,
+    chosen: &OutputInfo,
+    target: &CaptureTarget,
+    list: bool,
+    mut progress: impl FnMut(),
+) -> bool {
+    let fallback = matches!(target, CaptureTarget::Output(name) if *name != chosen.device_name);
+    if !list && !fallback {
+        let (output, name) = (output.clone(), chosen.device_name.clone());
+        let same = crate::stall::run(
+            Call::ListOutputs,
+            move || {
+                unsafe { output.GetDesc() }.is_ok_and(|desc| {
+                    desc.AttachedToDesktop.as_bool() && utf16_to_string(&desc.DeviceName) == name
+                })
+            },
+            &mut progress,
+        );
+        if same.unwrap_or(true) {
+            return false;
+        }
+        super::second_screen::note_detached(shared);
+    }
+    let (shared, target, chosen) = (shared.clone(), target.clone(), chosen.clone());
+    let started = Instant::now();
+    let moved = crate::stall::run(
+        Call::ListOutputs,
+        move || super::target_moved(&super::listing::outputs(&shared), &target, &chosen),
+        progress,
+    )
+    .unwrap_or(false);
+    info!(
+        took_ms = started.elapsed().as_millis() as u64,
+        moved, "Listed the display outputs after a lost duplication"
+    );
+    moved
+}
+
+/// [`Reopen`] for a target that moved off `chosen`.
+fn moved_away(chosen: &OutputInfo) -> Box<dyn std::error::Error + Send + Sync> {
+    info!(
+        device = %chosen.device_name,
+        "The display layout changed — opening the display to capture again"
+    );
+    Box::new(Reopen {
+        detail: format!(
+            "the display layout changed while capturing {}",
+            chosen.device_name
+        ),
+    })
+}
+
+/// While the duplication is away: resends the last picture when the viewer
+/// would otherwise go without one (see [`recovery_poll`]), if `allowed`.
+fn keep_picture_alive(
+    slot: &FrameSlot,
+    shared: &SharedControl,
+    frame_number: &mut u64,
+    last_send: &mut Instant,
+    last_frame: &Arc<Vec<u8>>,
+    dims: (u32, u32),
+    allowed: bool,
+) {
+    let now_ms = crate::clock::host_now_us() / 1000;
+    if recovery_poll(shared, now_ms, last_send.elapsed()) && allowed {
+        resend_last_frame(slot, shared, frame_number, last_send, last_frame, dims);
+    }
+}
+
+/// Logs, once per loss, that the duplication is not back within a second.
+fn warn_if_overdue(recovery: &mut LossRecovery) {
+    if recovery.overdue(Instant::now()) {
+        warn!("Desktop duplication not back within a second — still retrying");
+    }
 }
 
 fn unavailable_or_error(

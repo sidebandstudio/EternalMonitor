@@ -9187,6 +9187,18 @@
         }
       }
     },
+    "Your PC has no active display. Turn on a screen to continue." : {
+      "comment" : "Over the held picture while no display is on at the PC: a closed laptop lid, or screens that are off or unplugged",
+      "extractionState" : "manual",
+      "localizations" : {
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Your PC has no active display. Turn on a screen to continue."
+          }
+        }
+      }
+    },
     "Your PC is locked. Unlock it to continue." : {
       "comment" : "Over the held picture while the PC shows its lock screen or a permission prompt",
       "extractionState" : "manual",
