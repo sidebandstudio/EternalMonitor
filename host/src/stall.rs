@@ -41,14 +41,18 @@ pub enum Call {
     /// screen's decisions (`capture::second_screen::facts`).
     GpuFacts,
     /// The graphics calls before the window's first paint: finding the
-    /// graphics cards (`gpu::GpuInfo::detect`), listing the screens, the
-    /// window renderer's adapter list and its wgpu probe. They share one
-    /// lane: they wait on the same driver, so after one hangs the others
-    /// are refused at once instead of each waiting out its own limit.
+    /// graphics cards (`gpu::GpuInfo::detect`), listing the screens and the
+    /// window renderer's adapter list. They share one lane: they wait on the
+    /// same driver, so after one hangs the others are refused at once
+    /// instead of each waiting out its own limit.
     GpuDetect,
+    /// The window's adapters listed through wgpu on another thread before
+    /// the window's thread makes its first graphics call
+    /// (`gui::renderer::adapter_probe`).
+    GpuProbe,
 }
 
-const CALLS: usize = 7;
+const CALLS: usize = 8;
 
 /// When a call is slow enough to log, and when it is given up on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +81,7 @@ impl Call {
             Self::VddDisable => "vdd_disable",
             Self::GpuFacts => "gpu_facts",
             Self::GpuDetect => "gpu_detect",
+            Self::GpuProbe => "gpu_probe",
         }
     }
 
@@ -112,6 +117,10 @@ impl Call {
             // GpuFacts and keeps its limits. One AMD laptop's dxgkrnl
             // deadlock held it 62 s, and the window with it.
             Self::GpuDetect => Limits::ms(1_000, 4_000),
+            // Not timed in the field yet: on a test PC (RTX 5080) 340-440 ms
+            // in debug builds, which run wgpu's validation. It makes the
+            // window's own first calls, and keeps detection's limits.
+            Self::GpuProbe => Limits::ms(1_000, 4_000),
         }
     }
 }
@@ -795,6 +804,7 @@ mod tests {
             Call::VddDisable,
             Call::GpuFacts,
             Call::GpuDetect,
+            Call::GpuProbe,
         ]
         .map(Call::name)
         .into();
@@ -813,6 +823,7 @@ mod tests {
             Call::VddEnable,
             Call::GpuFacts,
             Call::GpuDetect,
+            Call::GpuProbe,
         ] {
             let limits = call.limits();
             assert!(limits.limit >= Duration::from_secs(3), "{call:?}");

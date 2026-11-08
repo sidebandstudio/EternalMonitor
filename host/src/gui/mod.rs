@@ -1775,7 +1775,13 @@ pub fn shown_address(ip: std::net::Ipv4Addr, listen_port: u16) -> String {
 }
 
 /// Launch the GUI window. Blocks the calling thread.
-pub fn run_gui(control: GuiControl) -> eframe::Result<()> {
+/// Runs the window until it closes. `quit_while_stuck` is the app's quit
+/// path, for a Cancel in the graphics driver notice while the window's
+/// thread is stuck before its first frame; it ends the process.
+pub fn run_gui(
+    control: GuiControl,
+    quit_while_stuck: Box<dyn FnOnce() + Send>,
+) -> eframe::Result<()> {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon_256.png"))
         .expect("embedded icon PNG is valid");
 
@@ -1787,19 +1793,42 @@ pub fn run_gui(control: GuiControl) -> eframe::Result<()> {
             .with_icon(std::sync::Arc::new(icon)),
         ..Default::default()
     };
-    renderer::configure(&mut options.wgpu_options);
     // The window's thread makes its first graphics call only once the
-    // driver has answered the same calls on another thread.
+    // driver has answered the same calls on another thread, and a stall
+    // after that is watched until the first frame.
     #[cfg(windows)]
-    if !driver_wait::wait_for_driver(
-        crate::stall::lanes(),
-        crate::stall::Call::GpuDetect.limits(),
-        || renderer::adapter_probe(&options.wgpu_options),
-        &mut driver_wait::MessageNotice::default(),
-        driver_wait::POLL,
-    ) {
-        renderer::window_closed();
-        return Ok(());
+    let watch = {
+        let lanes = crate::stall::lanes();
+        let limits = crate::stall::Call::GpuProbe.limits();
+        let prompt = driver_wait::Prompt::new(driver_wait::MessageNotice::default());
+        let opened = driver_wait::before_window(
+            lanes,
+            limits,
+            &prompt,
+            driver_wait::POLL,
+            || {
+                renderer::configure(&mut options.wgpu_options);
+                renderer::probe_spec(&options.wgpu_options)
+            },
+            |spec| renderer::adapter_probe(spec.clone()),
+        );
+        if !opened {
+            renderer::window_closed();
+            return Ok(());
+        }
+        driver_wait::watch_first_paint(
+            prompt,
+            limits.limit,
+            driver_wait::POLL,
+            std::time::Instant::now,
+            renderer::first_frame_painted,
+            quit_while_stuck,
+        )
+    };
+    #[cfg(not(windows))]
+    {
+        renderer::configure(&mut options.wgpu_options);
+        drop(quit_while_stuck);
     }
 
     let result = eframe::run_native(
@@ -1807,6 +1836,8 @@ pub fn run_gui(control: GuiControl) -> eframe::Result<()> {
         options,
         Box::new(|cc| Ok(Box::new(AnalyzerApp::new(cc, control)))),
     );
+    #[cfg(windows)]
+    watch.stop();
     if result.is_ok() {
         renderer::window_closed();
     }

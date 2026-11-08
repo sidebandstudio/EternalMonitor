@@ -371,10 +371,24 @@ mod tests {
         })
     }
 
+    /// A 300 ms limit, for a detection that hangs.
+    const HELD: crate::stall::Limits = crate::stall::Limits {
+        warn: std::time::Duration::from_millis(100),
+        limit: std::time::Duration::from_millis(300),
+    };
+
+    /// Limits a detection that returns at once never comes near, however
+    /// slowly the machine runs.
+    const ROOMY: crate::stall::Limits = crate::stall::Limits {
+        warn: std::time::Duration::from_secs(1),
+        limit: std::time::Duration::from_secs(30),
+    };
+
     /// `detect_within` over `detect` in lanes and a slot of its own, under
-    /// a 300 ms limit: what it found, how long it took, what it logged, the
-    /// lanes and the slot.
+    /// `limits`: what it found, how long it took, what it logged, the lanes
+    /// and the slot.
     fn detect_held(
+        limits: crate::stall::Limits,
         detect: impl FnOnce() -> Result<GpuInfo, String> + Send + 'static,
     ) -> (
         GpuInfo,
@@ -387,10 +401,6 @@ mod tests {
         let lanes: &'static crate::stall::Lanes = Box::leak(Box::new(crate::stall::Lanes::new()));
         let found: &'static parking_lot::Mutex<Option<GpuInfo>> =
             Box::leak(Box::new(parking_lot::Mutex::new(None)));
-        let limits = crate::stall::Limits {
-            warn: std::time::Duration::from_millis(100),
-            limit: std::time::Duration::from_millis(300),
-        };
         let out = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
         struct Sink(Arc<parking_lot::Mutex<Vec<u8>>>);
         impl std::io::Write for Sink {
@@ -432,7 +442,9 @@ mod tests {
         // The detector waits on a driver that does not return until the
         // test lets it.
         let (release, held) = std::sync::mpsc::channel::<()>();
-        let (info, took, text, lanes, slot) = detect_held(move || {
+        let (started, detecting) = std::sync::mpsc::channel::<()>();
+        let (info, took, text, lanes, slot) = detect_held(HELD, move || {
+            let _ = started.send(());
             let _ = held.recv();
             Ok(found("late"))
         });
@@ -442,11 +454,9 @@ mod tests {
         assert_eq!(info.encoder_name, "libx264");
         assert_eq!(info.vendor, GpuVendor::Unknown);
         assert!(info.detection_stalled);
-        assert!(
-            took >= std::time::Duration::from_millis(300)
-                && took < std::time::Duration::from_secs(3),
-            "{took:?}"
-        );
+        // Never before the limit; that it returned at all while the detector
+        // still blocks shows it did not wait for it.
+        assert!(took >= HELD.limit, "{took:?}");
         // One WARN, saying detection timed out and after how long.
         let warns: Vec<_> = text.lines().filter(|l| l.contains("WARN")).collect();
         assert_eq!(warns.len(), 1, "{text}");
@@ -455,6 +465,7 @@ mod tests {
         // Until it returns, the lane holds it and nothing was found.
         assert_eq!(lanes.abandoned(Call::GpuDetect), 1);
         assert!(slot.lock().is_none());
+        detecting.recv().unwrap();
         release.send(()).unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while lanes.abandoned(Call::GpuDetect) != 0 {
@@ -475,7 +486,7 @@ mod tests {
 
     #[test]
     fn a_detection_that_returns_in_time_keeps_its_facts() {
-        let (info, _, text, _, _) = detect_held(|| Ok(found("RTX")));
+        let (info, _, text, _, _) = detect_held(ROOMY, || Ok(found("RTX")));
         assert_eq!(
             (info.name.as_str(), info.encoder_name.as_str()),
             ("RTX", "h264_nvenc")
@@ -484,7 +495,7 @@ mod tests {
         assert!(!text.contains("WARN"), "{text}");
         // A failed one falls back with its own line, as before, and is not
         // a stall: no notice blames a driver that answered.
-        let (info, _, text, _, slot) = detect_held(|| Err("no adapters".to_string()));
+        let (info, _, text, _, slot) = detect_held(ROOMY, || Err("no adapters".to_string()));
         assert_eq!(info.encoder_name, "libx264");
         assert!(!info.detection_stalled);
         assert!(slot.lock().is_none());

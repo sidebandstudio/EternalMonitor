@@ -46,7 +46,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -119,6 +119,9 @@ static PRESENT: Mutex<PresentTracker> = Mutex::new(PresentTracker::new());
 /// Frames whose surface texture could not be acquired, so nothing was presented.
 static FAILED_ACQUIRES: AtomicU64 = AtomicU64::new(0);
 static STATUS: Mutex<Option<Status>> = Mutex::new(None);
+/// The window's first frame was presented: its thread is past every
+/// graphics call of startup.
+static FIRST_PAINT: AtomicBool = AtomicBool::new(false);
 
 /// How this launch draws its window, for Settings > Troubleshooting.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -305,16 +308,22 @@ pub(super) fn configure(config: &mut WgpuConfiguration) {
     });
 }
 
-/// The wgpu calls the window's thread makes first, for another thread to
-/// make before it: an instance with this launch's backends lists its
-/// adapters (DX12 creates a device on each to describe it). Built on the
-/// window's thread, run on another by
-/// [`super::driver_wait::wait_for_driver`]. While it lists, the marker
-/// names that thread, so a driver crash there is still the window's.
+/// The instance the window's renderer will create, for [`adapter_probe`].
+/// None when it is given an existing device.
+#[derive(Clone)]
+pub(super) struct ProbeSpec(
+    Option<(
+        Backends,
+        wgpu::InstanceFlags,
+        wgpu::BackendOptions,
+        wgpu::MemoryBudgetThresholds,
+    )>,
+);
+
+/// What `config`, as [`configure`] left it, will create.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub(super) fn adapter_probe(config: &WgpuConfiguration) -> impl FnOnce() + Send + 'static {
-    let window = current_thread();
-    let descriptor = match &config.wgpu_setup {
+pub(super) fn probe_spec(config: &WgpuConfiguration) -> ProbeSpec {
+    ProbeSpec(match &config.wgpu_setup {
         WgpuSetup::CreateNew(setup) => Some((
             setup.instance_descriptor.backends,
             setup.instance_descriptor.flags,
@@ -322,9 +331,20 @@ pub(super) fn adapter_probe(config: &WgpuConfiguration) -> impl FnOnce() + Send 
             setup.instance_descriptor.memory_budget_thresholds,
         )),
         WgpuSetup::Existing(_) => None,
-    };
+    })
+}
+
+/// The wgpu calls the window's thread makes first, for another thread to
+/// make before it: an instance with this launch's backends lists its
+/// adapters (DX12 creates a device on each to describe it). Built on the
+/// window's thread, run on another by [`super::driver_wait::before_window`].
+/// While it lists, the marker names that thread, so a driver crash there is
+/// still the window's.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn adapter_probe(spec: ProbeSpec) -> impl FnOnce() + Send + 'static {
+    let window = current_thread();
     move || {
-        let Some((backends, flags, backend_options, memory_budget_thresholds)) = descriptor else {
+        let Some((backends, flags, backend_options, memory_budget_thresholds)) = spec.0 else {
             return;
         };
         mark_thread(current_thread());
@@ -493,6 +513,10 @@ fn save_marker(directory: &Path, owner: ProcessId, marker: &Marker) -> bool {
 /// Called at the start of each UI pass; clears this launch's marker once the
 /// window has kept drawing without a surface error.
 pub(super) fn frame_started(ctx: &egui::Context) {
+    // A pass after the first: the first frame was presented.
+    if ctx.cumulative_frame_nr() >= 1 {
+        FIRST_PAINT.store(true, Ordering::SeqCst);
+    }
     crate::startup::simulate_surface_error(&FAILED_ACQUIRES);
     let visible = ctx.input(|input| input.viewport().minimized != Some(true));
     let Ok(mut tracker) = PRESENT.lock() else {
@@ -513,6 +537,12 @@ pub(super) fn frame_started(ctx: &egui::Context) {
     if drawing {
         clear_marker(true);
     }
+}
+
+/// The window's first frame was presented.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub(super) fn first_frame_painted() -> bool {
+    FIRST_PAINT.load(Ordering::SeqCst)
 }
 
 /// The window closed normally. A launch that quits before its window is
@@ -876,11 +906,35 @@ fn system_gpus() -> String {
 }
 
 /// Vendor, device and driver version of each DXGI adapter. Creates no device.
-/// Runs in the startup graphics lane: empty if it does not return within
-/// the limit, or while an earlier call there is still stuck.
+/// Runs under a limit on a thread of its own: empty if it does not return
+/// in time, or while an earlier call of its lane is still stuck. While it
+/// lists, the marker names that thread, so a driver crash there is still
+/// the window's.
 #[cfg(windows)]
 fn dxgi_adapters() -> Vec<(u32, u32, String)> {
-    crate::stall::run(crate::stall::Call::GpuDetect, list_dxgi_adapters, || {}).unwrap_or_default()
+    let window = current_thread();
+    let listed = crate::stall::run(
+        adapters_lane(first_frame_painted()),
+        || {
+            mark_thread(current_thread());
+            list_dxgi_adapters()
+        },
+        || {},
+    );
+    mark_thread(window);
+    listed.unwrap_or_default()
+}
+
+/// The lane of the window's DXGI adapter list: startup's until the first
+/// frame, then the one the second screen's graphics reads use, so a later
+/// renderer (after a lost device) neither waits behind nor holds startup's.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn adapters_lane(painted: bool) -> crate::stall::Call {
+    if painted {
+        crate::stall::Call::GpuFacts
+    } else {
+        crate::stall::Call::GpuDetect
+    }
 }
 
 #[cfg(windows)]
@@ -1684,6 +1738,16 @@ mod tests {
         assert_eq!(sweep(&directory, elsewhere), history);
         assert_eq!(read_history(&directory), history);
         fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn after_the_first_frame_the_adapter_list_leaves_the_startup_lane() {
+        use crate::stall::Call;
+        // Before it, a stuck startup call refuses it at once.
+        assert_eq!(adapters_lane(false), Call::GpuDetect);
+        // A renderer started later (after a lost device) neither waits behind
+        // nor holds startup's lane, nor logs its stalls as startup's.
+        assert_eq!(adapters_lane(true), Call::GpuFacts);
     }
 
     #[test]
