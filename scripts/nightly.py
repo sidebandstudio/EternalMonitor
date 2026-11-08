@@ -28,6 +28,7 @@ scripts/sign_beta_manifest.py has signed the build; this script never signs.
 import argparse
 import datetime
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -252,9 +253,10 @@ def verify(github, url, size, sha256=None, tries=6, wait=10, transient_tries=12,
 
     A new or renamed asset can take a few seconds to show, so a missing or different
     file is checked again: tries times, wait seconds apart. A server error (HTTP 429 or
-    5xx) or a dropped connection says nothing about the file, so those have a longer
-    window of their own: transient_tries, each wait 5 s longer up to 30 s (about four
-    minutes). Either way the size and SHA-256 must match exactly."""
+    5xx) or a dropped connection, also one cut off partway through a download, says
+    nothing about the file, so those have a longer window of their own:
+    transient_tries, each wait 5 s longer up to 30 s (about four minutes). Either way
+    the size and SHA-256 must match exactly."""
     misses = errors = 0
     while True:
         try:
@@ -271,8 +273,10 @@ def verify(github, url, size, sha256=None, tries=6, wait=10, transient_tries=12,
         except urllib.error.HTTPError as error:
             seen = f"HTTP {error.code}"
             flaky = transient(error.code)
-        except OSError as error:
-            seen = str(error)
+        except (OSError, http.client.HTTPException) as error:
+            # A dropped connection, also one cut off partway through the download
+            # (http.client.IncompleteRead, which is no OSError).
+            seen = f"{type(error).__name__}: {error}"
             flaky = True
         if flaky:
             errors += 1

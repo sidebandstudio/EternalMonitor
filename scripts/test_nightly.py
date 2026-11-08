@@ -1,6 +1,7 @@
 """Beta channel builds must sort below the release they lead to and never touch other releases."""
 import copy
 import hashlib
+import http.client
 import itertools
 import os
 import pathlib
@@ -359,6 +360,18 @@ class VerifyTest(unittest.TestCase):
         github = ScriptedDownloads([(429, -1), urllib.error.URLError("connection reset"),
                                     TimeoutError("timed out"), OK])
         self.assertEqual(self.verify(github), ([5, 10, 15], None))
+
+    def test_a_download_cut_off_partway_is_waited_out(self):
+        github = ScriptedDownloads([OK], [http.client.IncompleteRead(b"x" * 10, SIZE - 10),
+                                          http.client.RemoteDisconnected("closed"), HASH])
+        self.assertEqual(self.verify(github, HASH), ([5, 10], None))
+
+    def test_downloads_cut_off_every_time_fail_after_twelve_tries(self):
+        github = ScriptedDownloads([OK], [http.client.IncompleteRead(b"", SIZE)])
+        waits, failed = self.verify(github, HASH)
+        self.assertEqual(github.calls.count("sha256"), 12)
+        self.assertEqual(waits, [5, 10, 15, 20, 25, 30, 30, 30, 30, 30, 30])
+        self.assertIn("IncompleteRead", failed)
 
     def test_a_5xx_while_hashing_is_waited_out(self):
         github = ScriptedDownloads([OK], [http_error(504), http_error(503), HASH])
