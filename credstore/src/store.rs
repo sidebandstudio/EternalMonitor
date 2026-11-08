@@ -226,7 +226,8 @@ pub struct CredentialStore<D: Disk, K: Keyring> {
     /// that generation's key fingerprint (its header's head).
     need: (u64, [u8; 16]),
     /// A staged generation the keyring holds: a new rotation goes past it
-    /// too, so no generation number ever names two keys.
+    /// too, so this keyring never gives one generation number two keys (a
+    /// keyring rollback can; see the module docs).
     staged_floor: u64,
     /// This boot's id, recorded in every keyring blob stored (macOS); empty
     /// where stores are durable at once, or when it can't be read.

@@ -15,14 +15,17 @@
 //!   is exactly the acknowledged one, or, if an operation was killed, that
 //!   or the state after it;
 //! - damage never brings back a record;
+//! - an operation that returned Ok did what it promises: a Remove leaves
+//!   neither id held, an expire no pending record 7 days old;
 //! - the store's tombstones are those an independent model of the
-//!   operations expects (the last 8 per slot), and an add of a tombstoned
-//!   `dev_id` is refused;
+//!   operations expects (the last 8 per slot), a discard's those its files
+//!   leave, and an add of a tombstoned `dev_id` is refused;
 //! - a retired record (removed, expired, conflicted, discarded) is never
 //!   served again, also when an earlier authentic copy of the database
 //!   files, or an older keyring blob, is restored on its own; the only
-//!   exception is the out-of-scope keyring rollback below its retirement,
-//!   and only from a file that rolled-back keyring's history vouches for;
+//!   exception is the out-of-scope keyring rollback: a file that a keyring
+//!   from before its retirement vouches for, or, once the keyring has
+//!   rolled back, one whose head is above the keyring's generation;
 //! - what a reopen after a restore serves survives a further power cut.
 #![no_main]
 
@@ -30,6 +33,7 @@ use eternal_credstore::format::{key_fingerprint, parse_db, parse_keyring, Genera
 use eternal_credstore::keyring::MemKeyring;
 use eternal_credstore::testing::{check_invariants, logical, Live, Logical, Store, World};
 use eternal_credstore::{Disk, NewRecord, Recovery, StoreError};
+use eternal_wire::v3::wire::RecordState;
 use eternal_wire::v3::{Id16, Zeroizing};
 use libfuzzer_sys::fuzz_target;
 
@@ -126,9 +130,17 @@ struct Oracle {
     /// step that added it (records retired in one step have no order the
     /// model can know), the last 8 kept.
     tombs: Vec<(Id16, Vec<(Id16, u64)>)>,
-    /// Every retired `dev_id`, with the committed generation it was retired
-    /// under.
+    /// Every retired `dev_id`, with the step it was retired at.
     gone: Vec<(Id16, u64)>,
+    /// Every committed key the keyring has held, with the step it was first
+    /// current at: a keyring whose key was current before a retirement is
+    /// from before it. (Generation numbers can't tell: a keyring rollback
+    /// reuses them.)
+    keys: Vec<([u8; 32], u64)>,
+    /// A keyring rollback happened: an open found a committed key older
+    /// than the newest. From then on a file from an abandoned branch may
+    /// pass as lost stores (the documented limit).
+    rolled_back: bool,
     /// Steps so far.
     steps: u64,
 }
@@ -158,7 +170,7 @@ impl Oracle {
     /// have been refused; each slot keeps its last 8 (older steps go first;
     /// among records retired in one step, the store may keep any); and the
     /// store's tombstones must be the model's.
-    fn step(&mut self, new: Logical, generation: u64, added: Option<Id16>) {
+    fn step(&mut self, new: Logical, key: Option<[u8; 32]>, added: Option<Id16>) {
         self.steps += 1;
         let step = self.steps;
         let batch: Vec<(Id16, Id16)> = self
@@ -180,9 +192,11 @@ impl Oracle {
             if !list.iter().any(|(t, _)| t == id) {
                 list.push((*id, step));
             }
-            if !self.gone.iter().any(|(g, _)| g == id) {
-                self.gone.push((*id, generation));
-            }
+        }
+        if batch.is_empty() {
+            self.see(key);
+        } else {
+            self.retire(batch.iter().map(|(_, id)| *id), key);
         }
         if let Some(id) = added {
             let landed = new.records.iter().any(|n| n.0 == id);
@@ -236,12 +250,32 @@ impl Oracle {
         self.acked = new;
     }
 
-    /// After damage or an injected restore the store may serve other
-    /// tombstones (a discard, an earlier copy): they become the model, in the
-    /// store's order. (What it may serve is checked at the open.)
-    fn resync(&mut self, new: Logical) {
-        self.tombs = new
-            .tombstones
+    /// Notes `key` as current from this step on, if it's new.
+    fn see(&mut self, key: Option<[u8; 32]>) {
+        if let Some(key) = key {
+            if !self.keys.iter().any(|(k, _)| *k == key) {
+                self.keys.push((key, self.steps));
+            }
+        }
+    }
+
+    /// Retires `ids` at this step, whose rotation made `key` current: that
+    /// key is current only from this step on.
+    fn retire(&mut self, ids: impl Iterator<Item = Id16>, key: Option<[u8; 32]>) {
+        if let Some(key) = key {
+            self.keys.retain(|(k, _)| *k != key);
+            self.keys.push((key, self.steps));
+        }
+        for id in ids {
+            if !self.gone.iter().any(|(g, _)| *g == id) {
+                self.gone.push((id, self.steps));
+            }
+        }
+    }
+
+    /// Takes `tombs` (per slot, oldest first) as the model, in that order.
+    fn adopt(&mut self, tombs: &[(Id16, Vec<Id16>)]) {
+        self.tombs = tombs
             .iter()
             .map(|(s, ids)| {
                 let list = ids
@@ -254,59 +288,188 @@ impl Oracle {
                 (*s, list)
             })
             .collect();
+    }
+
+    /// After damage or an injected restore. Unless the open loaded a file,
+    /// its tombstones were modelled there; an earlier copy that loaded
+    /// brings its own, which become the model in the store's order. (What
+    /// it may serve is checked at the open.)
+    fn resync(&mut self, new: Logical, loaded: bool) {
+        if loaded {
+            self.adopt(&new.tombstones);
+        }
         self.acked = new;
     }
 }
 
-/// What the keyring and files of `world` let an open load, worked out
-/// independently: the keyring's committed generation, and whether the file
-/// it will load is one that keyring's history vouches for (its head is the
-/// committed or staged generation with that key's fingerprint, or above the
-/// committed one: the documented keyring-rollback limit).
-fn vouched(world: &World) -> Option<(u64, bool)> {
-    let k = parse_keyring(world.keyring.get()?).ok()?;
-    let mut candidates = vec![(k.committed.0, k.committed.1.clone())];
-    if k.base.0 != k.committed.0 {
-        candidates.push((k.base.0, k.base.1.clone()));
-    }
-    for (g, w) in candidates {
-        let Some(bytes) = world.disk.get(&format!("credentials-{g}.db")) else {
-            continue;
-        };
-        let Ok(db) = parse_db(bytes) else { continue };
-        if !GenerationKeys::new(&w, g).verify(bytes) {
-            continue;
-        }
-        let at = |g: u64, w: &[u8; 32]| db.head == g && db.head_fp == key_fingerprint(w, g);
-        let ok = db.head > k.committed.0
-            || at(k.committed.0, &k.committed.1)
-            || k.staged.as_ref().is_some_and(|(sg, sw, _)| at(*sg, sw));
-        return Some((k.committed.0, ok));
-    }
-    None
+/// What an open of `world` does, worked out from its keyring and files
+/// alone.
+enum Expect {
+    /// It loads a file the keyring vouches for: the keyring's committed
+    /// key, and whether the file's head is above its generation.
+    Load([u8; 32], bool),
+    /// No file at all: an empty store, with nothing retired.
+    Empty,
+    /// Nothing loads, so it discards: it serves no record, and these
+    /// tombstones; it retires these records.
+    Discard(Vec<(Id16, Vec<Id16>)>, Vec<Id16>),
 }
 
-/// Opens `world` and checks it serves no retired record, except one the
-/// out-of-scope keyring rollback allows: the keyring is below the generation
-/// it was retired under, and the file loaded is one that keyring's history
-/// vouches for. Such a record is forgiven.
+fn expect(world: &World) -> Expect {
+    let mut names: Vec<u64> = world
+        .disk
+        .list()
+        .unwrap()
+        .iter()
+        .filter_map(|n| {
+            n.strip_prefix("credentials-")?
+                .strip_suffix(".db")?
+                .parse()
+                .ok()
+        })
+        .collect();
+    names.sort_unstable();
+    if let Some(blob) = world.keyring.get() {
+        let k = parse_keyring(blob).expect("the fuzzer never garbles a keyring blob");
+        // The committed generation's file, then the base's: the first that
+        // verifies under its key and that this keyring's history vouches
+        // for. Its head is at least the committed generation, and a head
+        // equal to the committed or staged generation carries that key's
+        // fingerprint. (A higher head is the documented keyring-rollback
+        // limit.)
+        let mut candidates = vec![(k.committed.0, &k.committed.1)];
+        if k.base.0 != k.committed.0 {
+            candidates.push((k.base.0, &k.base.1));
+        }
+        for (g, w) in candidates {
+            let Some(bytes) = world.disk.get(&format!("credentials-{g}.db")) else {
+                continue;
+            };
+            let Ok(db) = parse_db(bytes) else { continue };
+            if !GenerationKeys::new(w, g).verify(bytes) {
+                continue;
+            }
+            let foreign =
+                |g: u64, w: &[u8; 32]| db.head == g && db.head_fp != key_fingerprint(w, g);
+            let ok = db.head >= k.committed.0
+                && !foreign(k.committed.0, &k.committed.1)
+                && !k
+                    .staged
+                    .as_ref()
+                    .is_some_and(|(sg, sw, _)| foreign(*sg, sw));
+            if ok {
+                return Expect::Load(*k.committed.1, db.head > k.committed.0);
+            }
+        }
+    }
+    if names.is_empty() {
+        return Expect::Empty;
+    }
+    // The discard: the newest of the two newest files that parses keeps its
+    // tombstones, and each of its records is retired into its slot (the last
+    // 8 kept). The fuzzer's slots stay far below the slot cap.
+    let mut tombs: Vec<(Id16, Vec<Id16>)> = Vec::new();
+    let mut retired = Vec::new();
+    for g in names.iter().rev().take(2) {
+        let Some(Ok(db)) = world
+            .disk
+            .get(&format!("credentials-{g}.db"))
+            .map(|b| parse_db(b))
+        else {
+            continue;
+        };
+        tombs = db.tombstones.clone();
+        for r in &db.records {
+            retired.push(r.dev_id);
+            let i = match tombs.iter().position(|(s, _)| *s == r.slot_id) {
+                Some(i) => i,
+                None => {
+                    tombs.push((r.slot_id, Vec::new()));
+                    tombs.len() - 1
+                }
+            };
+            let mut list = tombs.remove(i).1;
+            if !list.contains(&r.dev_id) {
+                list.push(r.dev_id);
+            }
+            if list.len() > 8 {
+                list.drain(..list.len() - 8);
+            }
+            tombs.push((r.slot_id, list));
+        }
+        break;
+    }
+    Expect::Discard(tombs, retired)
+}
+
+/// Opens `world` and checks it against [`expect`]. With no file, it's empty.
+/// A discard serves no record and the modelled tombstones, which become the
+/// model, and every record it drops (held, or in the file it read) is
+/// retired. A load serves no retired record, except one the out-of-scope
+/// keyring rollback allows: the keyring is from before its retirement, or,
+/// after a rollback, the file's head is above the keyring's generation.
+/// Such a record is forgiven.
 /// `adding` is a `dev_id` the operation being recovered may have added,
-/// which the model allows: it may be served.
-fn open_checked(world: &World, oracle: &mut Oracle, adding: Option<Id16>) -> (Store, Live) {
-    let pre = vouched(world);
+/// which the model allows: it may be served. Returns whether it loaded a
+/// file.
+fn open_checked(world: &World, oracle: &mut Oracle, adding: Option<Id16>) -> (Store, Live, bool) {
+    let pre = expect(world);
+    if let Some(blob) = world.keyring.get() {
+        let key = *parse_keyring(blob).unwrap().committed.1;
+        if let Some(&(_, from)) = oracle.keys.iter().find(|(k, _)| *k == key) {
+            oracle.rolled_back |= oracle.keys.iter().any(|(_, at)| *at > from);
+        }
+    }
+    let held: Vec<Id16> = oracle.acked.records.iter().map(|r| r.0).collect();
     let (store, live) = open(world);
+    let (committed, above) = match pre {
+        Expect::Load(committed, above) => (committed, above),
+        Expect::Empty => {
+            assert!(store.records().is_empty(), "no file, no record");
+            assert!(store.tombstones().is_empty(), "no file, no tombstone");
+            oracle.adopt(&[]);
+            oracle.see(committed_key(&live));
+            return (store, live, false);
+        }
+        Expect::Discard(tombs, retired) => {
+            assert!(store.records().is_empty(), "a discard serves no record");
+            assert_eq!(
+                tomb_sets(store.tombstones().into_iter()),
+                tomb_sets(tombs.iter().cloned()),
+                "the store's tombstones are the discard's"
+            );
+            oracle.adopt(&tombs);
+            oracle.steps += 1;
+            oracle.retire(held.into_iter().chain(retired), committed_key(&live));
+            return (store, live, false);
+        }
+    };
+    let current_from = oracle
+        .keys
+        .iter()
+        .find(|(k, _)| *k == committed)
+        .map(|(_, at)| *at);
     for r in store.records() {
         if Some(r.dev_id) == adding {
             continue;
         }
-        let Some(&(_, g)) = oracle.gone.iter().find(|(id, _)| *id == r.dev_id) else {
+        let Some(&(_, at)) = oracle.gone.iter().find(|(id, _)| *id == r.dev_id) else {
             continue;
         };
-        let allowed = pre.is_some_and(|(committed, ok)| committed < g && ok);
-        assert!(allowed, "a retired record never comes back");
+        assert!(
+            current_from.is_some_and(|from| from < at) || (oracle.rolled_back && above),
+            "a retired record never comes back"
+        );
         oracle.gone.retain(|(id, _)| *id != r.dev_id);
     }
-    (store, live)
+    oracle.see(committed_key(&live));
+    (store, live, true)
+}
+
+/// The committed key of `live`'s keyring.
+fn committed_key(live: &Live) -> Option<[u8; 32]> {
+    let keyring = live.keyring.borrow();
+    parse_keyring(keyring.get()?).ok().map(|k| *k.committed.1)
 }
 
 /// Opens `world`. A fresh keyring (first run, or after the keyring was
@@ -341,8 +504,11 @@ fuzz_target!(|data: &[u8]| {
         acked: logical(&store),
         tombs: Vec::new(),
         gone: Vec::new(),
+        keys: Vec::new(),
+        rolled_back: false,
         steps: 0,
     };
+    oracle.see(committed_key(&live));
     // Earlier authentic copies, for restores.
     let mut snapshots: Vec<Vec<(String, Vec<u8>)>> = Vec::new();
     let mut blobs: Vec<Vec<u8>> = Vec::new();
@@ -377,12 +543,13 @@ fuzz_target!(|data: &[u8]| {
                     .keyring
                     .put(Some(blobs[usize::from(a) % blobs.len()].clone()));
             }
-            (store, live) = open_checked(&restored, &mut oracle, None);
+            let loaded;
+            (store, live, loaded) = open_checked(&restored, &mut oracle, None);
             let served = logical(&store);
-            oracle.resync(served.clone());
+            oracle.resync(served.clone(), loaded);
             // What the reopen serves survives a further power cut.
             drop(store);
-            (store, live) = open_checked(
+            (store, live, _) = open_checked(
                 &live.after_crash(c & 2 != 0, usize::from(d)),
                 &mut oracle,
                 None,
@@ -396,19 +563,20 @@ fuzz_target!(|data: &[u8]| {
             let mut damaged = live.at_rest();
             let held: Vec<Id16> = oracle.acked.records.iter().map(|r| r.0).collect();
             let touched = damage(&mut damaged, kind, a, b);
-            (store, live) = open_checked(&damaged, &mut oracle, None);
+            let loaded;
+            (store, live, loaded) = open_checked(&damaged, &mut oracle, None);
             if touched {
                 for r in logical(&store).records {
                     assert!(!held.contains(&r.0), "damage never brings a record back");
                 }
             }
-            oracle.resync(logical(&store));
+            oracle.resync(logical(&store), loaded);
             continue;
         }
         if kind >= 0xE0 {
             // A restart with every write acknowledged: exactly that state.
             drop(store);
-            (store, live) = open_checked(&restart(&live, c, d), &mut oracle, None);
+            (store, live, _) = open_checked(&restart(&live, c, d), &mut oracle, None);
             assert_eq!(
                 logical(&store),
                 oracle.acked,
@@ -422,8 +590,28 @@ fuzz_target!(|data: &[u8]| {
         let after = {
             let (mut clean, _) = open(&live.same_boot());
             let mut clean_now = now;
-            let _ = run(&mut clean, kind, a, b, &mut clean_now);
-            logical(&clean)
+            let done = run(&mut clean, kind, a, b, &mut clean_now).is_ok();
+            let after = logical(&clean);
+            if done {
+                // What the operation promises, independently of the store.
+                let held = |dev: Id16| after.records.iter().any(|r| r.0 == dev);
+                match kind % 6 {
+                    2 => assert!(
+                        !held(id(1 + a % 12)) && !held(id(1 + b % 12)),
+                        "a Remove leaves neither id held"
+                    ),
+                    3 => assert!(
+                        !after
+                            .records
+                            .iter()
+                            .any(|r| r.2 == RecordState::Pending as u8
+                                && clean_now.saturating_sub(r.5) >= 7 * DAY),
+                        "an expire leaves no pending record 7 days old"
+                    ),
+                    _ => {}
+                }
+            }
+            after
         };
         let keyring_before = live.keyring.borrow().get().cloned();
         let crash_at = (c & 0x80 != 0).then(|| live.steps.count.get() + usize::from(c & 0x0F));
@@ -436,7 +624,7 @@ fuzz_target!(|data: &[u8]| {
         if !crashed {
             // Ok or a refusal: exactly what the uncrashed run did.
             assert_eq!(logical(&store), after);
-            oracle.step(after, store.generation(), added);
+            oracle.step(after, committed_key(&live), added);
             continue;
         }
         let visible = live.keyring.borrow().get().cloned() != keyring_before;
@@ -453,20 +641,21 @@ fuzz_target!(|data: &[u8]| {
             // Damage in the middle: nothing held may come back.
             let held: Vec<Id16> = before.records.iter().map(|r| r.0).collect();
             let touched = damage(&mut next, d >> 1, a, b);
-            (store, live) = open_checked(&next, &mut oracle, None);
+            let loaded;
+            (store, live, loaded) = open_checked(&next, &mut oracle, None);
             if touched {
                 for r in logical(&store).records {
                     assert!(!held.contains(&r.0), "damage never brings a record back");
                 }
             }
-            oracle.resync(logical(&store));
+            oracle.resync(logical(&store), loaded);
             continue;
         }
         // A killed add the model allows may have landed.
         let adding = added.filter(|id| {
             !oracle.tombstoned(id) && !oracle.acked.records.iter().any(|r| r.0 == *id)
         });
-        (store, live) = open_checked(&next, &mut oracle, adding);
+        (store, live, _) = open_checked(&next, &mut oracle, adding);
         let reached = logical(&store);
         if result.is_ok() {
             assert_eq!(reached, after, "it returned Ok");
@@ -476,6 +665,6 @@ fuzz_target!(|data: &[u8]| {
                 "exactly before or after"
             );
         }
-        oracle.step(reached, store.generation(), added);
+        oracle.step(reached, committed_key(&live), added);
     }
 });

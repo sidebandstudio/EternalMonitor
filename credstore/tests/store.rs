@@ -674,6 +674,62 @@ fn a_file_from_another_keyring_history_is_never_used() {
     assert!(store.snapshot().key(&id(0x11)).is_none());
 }
 
+/// The same, with the reused generation only staged: a file whose head is
+/// the staged generation under another key is never used either.
+#[test]
+fn a_file_from_another_history_at_the_staged_generation_is_never_used() {
+    let base = base_world();
+    let (mut store, _, live) = base.open();
+    let old_blob = live.keyring.borrow().get().cloned();
+    let base_g = store.base_generation();
+    store.remove(&[id(0x21)]).unwrap();
+    let reused = store.generation();
+    let backup = live.disk.borrow().get(&db_file(base_g)).unwrap().clone();
+    store.remove(&[id(0x11)]).unwrap();
+    drop(store);
+    // Roll the keyring back and delete the database.
+    let mut restored = live.same_boot();
+    restored.keyring.put(old_blob);
+    for g in db_generations(&restored) {
+        restored.disk.remove_now(&db_file(g));
+    }
+    let (mut store, _, live) = restored.open();
+    store.add_pending(new_record(0x61, 6, None), NOW).unwrap();
+    // Killed after staging the reused generation.
+    live.steps.crash_at.set(Some(live.steps.count.get() + 1));
+    assert!(store.remove(&[id(0x61)]).is_err());
+    drop(store);
+    let mut restored = live.same_boot();
+    let staged = parse_keyring(restored.keyring.get().unwrap())
+        .unwrap()
+        .staged
+        .map(|(g, _, _)| g);
+    assert_eq!(staged, Some(reused), "the same generation number, staged");
+    // Put back the file from the other history.
+    restored.disk.put(&db_file(base_g), backup);
+    let (store, report, _) = restored.open();
+    assert!(report.recovery.contains(&Recovery::Discarded));
+    assert!(store.snapshot().key(&id(0x11)).is_none());
+}
+
+/// A Remove of several ids retires each, in one rotation.
+#[test]
+fn a_remove_retires_every_id_given() {
+    let (mut store, _, _) = World::default().open();
+    store.add_pending(new_record(1, 1, None), NOW).unwrap();
+    store.finalize(&id(1)).unwrap();
+    store.add_pending(new_record(2, 2, None), NOW).unwrap();
+    store.add_pending(new_record(3, 3, None), NOW).unwrap();
+    let g = store.generation();
+    store.remove(&[id(1), id(2)]).unwrap();
+    assert_eq!(store.generation(), g + 1, "one rotation");
+    for dev in [1, 2] {
+        assert_eq!(state_of(&store, dev), None);
+        assert!(is_tombstoned(&store, dev));
+    }
+    assert_eq!(state_of(&store, 3), Some(RecordState::Pending));
+}
+
 /// A promotion interrupted after its file and keyring store, before the old
 /// file goes, again and again: files never pile up.
 #[test]
