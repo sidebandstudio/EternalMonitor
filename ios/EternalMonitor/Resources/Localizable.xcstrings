@@ -6839,6 +6839,66 @@
       "comment" : "Over the mirrored picture for a few seconds, when the PC chose Second screen but runs Windows 10, which Second screen doesn't support",
       "extractionState" : "manual",
       "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "تحتاج الشاشة الثانية إلى Windows 11. يتم عرض شاشة الكمبيوتر بدلاً منها."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der zweite Bildschirm benötigt Windows 11. Stattdessen wird der Bildschirm des PCs angezeigt."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La segunda pantalla requiere Windows 11. Se muestra la pantalla del PC."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le second écran nécessite Windows 11. L'écran du PC s'affiche à la place."
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "दूसरी स्क्रीन के लिए Windows 11 चाहिए। इसके बजाय PC की स्क्रीन दिखाई जा रही है।"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "セカンドスクリーンにはWindows 11が必要です。代わりにPCの画面を表示しています。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "두 번째 화면에는 Windows 11이 필요합니다. 대신 PC 화면을 표시합니다."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "A segunda tela requer Windows 11. Exibindo a tela do PC."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Для второго экрана нужна Windows 11. Вместо него показан экран ПК."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "第二屏幕需要 Windows 11。正在显示电脑屏幕。"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -8204,6 +8264,66 @@
       "comment" : "On the connecting card and over the held picture, in Second screen mode after the second screen failed to start: Windows won't let the PC app capture its main screen from its graphics card either, so it can't mirror it.",
       "extractionState" : "manual",
       "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "لم تبدأ الشاشة الثانية، ولا يمكن للكمبيوتر مشاركة شاشته الرئيسية باستخدام بطاقة الرسومات الحالية. تحقق من الكمبيوتر."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der zweite Bildschirm wurde nicht gestartet und der PC kann seinen Hauptbildschirm mit der aktuellen Grafikkarte nicht teilen. Überprüfe den PC."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La segunda pantalla no se inició y tu PC no puede compartir su pantalla principal con su tarjeta gráfica actual. Revisa el PC."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le second écran n'a pas démarré et le PC ne peut pas partager son écran principal avec sa carte graphique actuelle. Vérifiez le PC."
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "दूसरी स्क्रीन शुरू नहीं हुई और आपका PC मौजूदा ग्राफ़िक्स कार्ड से अपनी मुख्य स्क्रीन साझा नहीं कर सकता। PC जाँचें।"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "セカンドスクリーンが起動せず、現在のグラフィックカードではPCのメイン画面も共有できません。PCを確認してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "두 번째 화면이 시작되지 않았고 현재 그래픽 카드로는 PC의 기본 화면을 공유할 수 없습니다. PC를 확인하세요."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "A segunda tela não iniciou, e o PC não pode compartilhar a tela principal com a placa de vídeo atual. Verifique o PC."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Второй экран не запустился, а ПК не может передать основной экран с текущей видеокарты. Проверьте ПК."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "第二屏幕未能启动，电脑也无法使用当前显卡共享主屏幕。请检查电脑。"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9215,6 +9335,66 @@
       "comment" : "On the connecting card and over the held picture: Windows won't let the PC app capture its screen from the graphics card it runs on (laptops with two graphics cards). The PC app's window says how to switch.",
       "extractionState" : "manual",
       "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "لا يمكن للكمبيوتر مشاركة شاشته باستخدام بطاقة الرسومات الحالية. تحقق من الكمبيوتر."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der PC kann seinen Bildschirm mit der aktuellen Grafikkarte nicht teilen. Überprüfe den PC."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tu PC no puede compartir su pantalla con su tarjeta gráfica actual. Revisa el PC."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le PC ne peut pas partager son écran avec sa carte graphique actuelle. Vérifiez le PC."
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "आपका PC अपने मौजूदा ग्राफ़िक्स कार्ड से स्क्रीन साझा नहीं कर सकता। PC जाँचें।"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "現在のグラフィックカードではPCの画面を共有できません。PCを確認してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "현재 그래픽 카드로는 PC 화면을 공유할 수 없습니다. PC를 확인하세요."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "O PC não pode compartilhar a tela com a placa de vídeo atual. Verifique o PC."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ПК не может передать экран с текущей видеокарты. Проверьте ПК."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "电脑无法使用当前显卡共享屏幕。请检查电脑。"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
@@ -9371,6 +9551,66 @@
       "comment" : "Over the held picture while the PC restarts its stream and keeps the session",
       "extractionState" : "manual",
       "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "يعيد الكمبيوتر بدء البث…"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der PC startet den Stream neu…"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tu PC está reiniciando la transmisión…"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le PC redémarre le flux…"
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "आपका PC स्ट्रीम फिर से शुरू कर रहा है…"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PCがストリームを再起動しています…"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PC에서 스트림을 다시 시작하는 중…"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "O PC está reiniciando a transmissão…"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ПК перезапускает трансляцию…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "电脑正在重启串流…"
+          }
+        },
         "en" : {
           "stringUnit" : {
             "state" : "translated",
