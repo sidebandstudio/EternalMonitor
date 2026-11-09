@@ -26,4 +26,34 @@ final class DisplayStateTests: UITestCase {
         screenshot.lifetime = .keepAlways
         add(screenshot)
     }
+
+    func testALockedPCSaysSoOverTheHeldPicture() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO"]
+        app.launchEnvironment["EM_UI_PREVIEW"] = "locked"
+        launchCleanly(app)
+        let note = app.otherElements["display.pcLocked"]
+        XCTAssertTrue(note.waitForExistence(timeout: 10), "a locked PC must not look like a frozen picture")
+        XCTAssertEqual(note.label, "Your PC is locked. Unlock it to continue.")
+        XCTAssertFalse(app.otherElements["display.restoringPicture"].exists)
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "pc-locked"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+    }
+
+    func testAPCWithNoDisplaySaysSoOverTheHeldPicture() {
+        let app = XCUIApplication()
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO"]
+        app.launchEnvironment["EM_UI_PREVIEW"] = "no-display"
+        launchCleanly(app)
+        let note = app.otherElements["display.pcNoDisplay"]
+        XCTAssertTrue(note.waitForExistence(timeout: 10), "a PC with no display on must not look like a frozen picture")
+        XCTAssertEqual(note.label, "Your PC has no active display. Turn on a screen to continue.")
+        XCTAssertFalse(app.otherElements["display.pcLocked"].exists)
+        let screenshot = XCTAttachment(screenshot: app.screenshot())
+        screenshot.name = "pc-no-display"
+        screenshot.lifetime = .keepAlways
+        add(screenshot)
+    }
 }

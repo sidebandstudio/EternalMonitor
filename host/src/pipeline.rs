@@ -60,19 +60,14 @@ pub async fn run_pipeline_supervised(
 
     let capture_reporter = reporter.clone();
     let capture_shared = shared.clone();
-    let adapter_index = gpu_info.adapter_index;
     let capture_thread = std::thread::Builder::new()
         .name(format!("capture-g{generation}"))
         .spawn(move || {
-            let outcome = match capture::run_capture_stage(
-                frame_producer,
-                capture_shared,
-                adapter_index,
-                generation,
-            ) {
-                Ok(()) => StageOutcome::Completed,
-                Err(e) => StageOutcome::Failed(e.to_string()),
-            };
+            let outcome =
+                match capture::run_capture_stage(frame_producer, capture_shared, generation) {
+                    Ok(()) => StageOutcome::Completed,
+                    Err(e) => StageOutcome::Failed(e.to_string()),
+                };
             capture_reporter.stage_exited(Stage::Capture, outcome);
         });
     if let Err(e) = capture_thread {
@@ -103,13 +98,19 @@ pub async fn run_pipeline_supervised(
         return;
     }
 
-    let transport_outcome =
-        match transport::start_sender(nal_rx, audio_rx, listen_port, shared.clone(), supervisor_tx)
-            .await
-        {
-            Ok(()) => StageOutcome::Completed,
-            Err(e) => transport_failure(&*e),
-        };
+    let transport_outcome = match transport::start_sender(
+        nal_rx,
+        audio_rx,
+        listen_port,
+        shared.clone(),
+        supervisor_tx,
+        generation,
+    )
+    .await
+    {
+        Ok(()) => StageOutcome::Completed,
+        Err(e) => transport_failure(&*e),
+    };
     reporter.stage_exited(Stage::Transport, transport_outcome);
 
     stats::PIPELINE_STATS.lock().mark_pipeline_stopped();

@@ -13,6 +13,11 @@ enum AttemptEnd: Equatable {
     case pcGoodbye
     /// The PC turned the connection down.
     case pcRefused
+    /// The PC turned it down as Busy: it streams to another device.
+    case pcBusy
+    /// The PC turned it down as too old for this app.
+    case oldPC
+    /// A v0.1.x PC, too old to answer HELLO2.
     case legacyPC
     /// The connect watchdog ran out before a picture.
     case connectTimeout
@@ -27,6 +32,19 @@ enum AttemptEnd: Equatable {
     case closedBeforePicture
     /// This iPad's network side failed, for example Local Network denied.
     case linkFailed
+    /// iPadOS found no usable network for the path: Wi-Fi is off or
+    /// joined to none (`ConnectionProblem.wifiOff`).
+    case noNetwork
+    /// No answer at the address tried, and the same PC is known at another:
+    /// Bonjour found it there, or its video arrived there before. A new
+    /// attempt goes there.
+    case pcMoved
+    /// The PC sent video that gave no picture at this address, even in
+    /// small datagrams, and showed it is the same PC at another: a new
+    /// attempt goes there.
+    case noVideoPath
+    /// The PC found at a saved PC's new address turned out to be another PC.
+    case otherPC
     case receiverFailed
     /// The PC asked for the pairing code, and a new HELLO2 sends it: the
     /// refused one is over, the attempt goes on.
@@ -60,6 +78,10 @@ struct SessionSummary: Equatable {
     /// The PC asked for the pairing code and the attempt ended before a session.
     var awaitingPairing = false
     var datagramsReceived = 0
+    /// The PC said it can't capture its screen from its graphics card.
+    var captureRefused = false
+    /// The PC's heartbeats counted video frames sent this attempt.
+    var pcSentVideo = false
     /// Seconds from the start to the first decoded frame.
     var firstFrame: TimeInterval?
     var duration: TimeInterval
@@ -93,18 +115,26 @@ struct SessionSummary: Equatable {
         case .userDisconnect, .usbTurnedOff: return "user_ended"
         case .appBackground, .superseded, .pcGoodbye: return "app_ended"
         case .connectTimeout: return sessionId == nil ? "no_reply" : "no_picture"
-        case .closedBeforePicture: return "no_picture"
+        case .pcMoved: return "no_reply"
+        case .closedBeforePicture, .noVideoPath: return "no_picture"
         default: return "error"
         }
     }
 
     private var failure: String {
         switch end {
-        case .connectTimeout where sessionId == nil: return "no_reply"
+        case .connectTimeout where sessionId == nil, .pcMoved: return "no_reply"
+        // Only when no video went out, as the PC's summary has it: video
+        // that went out and gave no picture was lost or didn't decode.
+        case .connectTimeout where captureRefused && !pcSentVideo && datagramsReceived == 0: return "capture_failed"
         case .connectTimeout: return datagramsReceived == 0 ? "no_video" : "no_frame"
+        case .noVideoPath: return datagramsReceived == 0 ? "no_video" : "no_frame"
         case .pcStoppedResponding: return "signal_lost"
         case .cableUnplugged, .usbLinkFailed, .closedBeforePicture: return "usb_lost"
-        case .pcRefused, .legacyPC, .linkFailed, .receiverFailed, .pictureStalled: return "other"
+        case .noNetwork: return "no_network"
+        case .pcBusy: return "pc_busy"
+        case .oldPC, .legacyPC: return "old_pc"
+        case .pcRefused, .linkFailed, .receiverFailed, .pictureStalled, .otherPC: return "other"
         default: return "none"
         }
     }
@@ -113,7 +143,7 @@ struct SessionSummary: Equatable {
         switch end {
         case .userDisconnect, .usbTurnedOff: return "user"
         case .appBackground: return "background"
-        case .superseded, .retriedWithCode: return "superseded"
+        case .superseded, .retriedWithCode, .pcMoved, .noVideoPath: return "superseded"
         case .pcGoodbye: return "goodbye"
         case .connectTimeout: return "timeout"
         case .pcStoppedResponding: return "liveness"

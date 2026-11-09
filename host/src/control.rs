@@ -17,6 +17,10 @@ pub struct SharedControl {
     /// always <= `bitrate_bps`. The encoder reopens its session when this
     /// changes for hardware encoders. libx264 reconfigures the open context.
     pub abr_current_bps: Arc<AtomicU32>,
+    /// The open encoder session takes a new bitrate only by reopening (AMF,
+    /// libx265, or a session that refused a change in place), which costs a
+    /// stutter and an IDR, so ABR steps up less often for it.
+    pub encoder_reopens_for_bitrate: Arc<AtomicBool>,
     pub target_fps: Arc<AtomicU32>,
     pub client_preferred_fps: Arc<AtomicU32>,
     pub encoder_input: Arc<Mutex<crate::encoder::input::EncoderInput>>,
@@ -30,6 +34,11 @@ pub struct SharedControl {
     /// Encoder name override from the Settings tab, applied on next pipeline restart.
     /// `None` means use auto-detected encoder from GpuInfo.
     pub encoder_override: Arc<Mutex<Option<String>>>,
+    /// The DXGI adapter of the encoder that streams, for waking it when an
+    /// iPad looks for PCs (see `gpu_wake`): set at each encoder open and
+    /// when a late detection is adopted, None for a CPU encoder or one on
+    /// a card detection didn't choose.
+    pub wake_adapter: Arc<Mutex<Option<u32>>>,
     /// Which display output the capture loop should duplicate, applied on next pipeline
     /// restart. `PrimaryAuto` mirrors the primary monitor (today's behavior).
     pub capture_target: Arc<Mutex<CaptureTarget>>,
@@ -42,6 +51,14 @@ pub struct SharedControl {
     /// Set while Windows blocks screen capture (lock screen, UAC, a display
     /// it will not duplicate); the GUI explains it instead of a frozen picture.
     pub capture_block: Arc<Mutex<Option<crate::capture::recovery::CaptureBlock>>>,
+    /// Since when the heartbeats have seen Windows refuse the screen from
+    /// this graphics card, for their notice (`recovery::heartbeat_notice`).
+    pub gpu_refused_since: Arc<Mutex<Option<std::time::Instant>>>,
+    /// The stream port between two owners (a generation's transport and the
+    /// standby responder), bound and with its queue, so a HELLO2 sent while
+    /// it changes hands waits for the next one. The supervisor closes it
+    /// when it shuts down.
+    pub stream_socket: Arc<Mutex<Option<std::net::UdpSocket>>>,
     /// With `UnsupportedOnThisGpu`: the card the captured screen is wired to
     /// and the switch that would move EternalMonitor onto it.
     pub gpu_diagnosis: Arc<Mutex<Option<crate::gpu_preference::Diagnosis>>>,
@@ -76,11 +93,20 @@ pub struct SharedControl {
     pub hb_capture_loop_ms: Arc<AtomicU64>,
     pub hb_capture_frame_ms: Arc<AtomicU64>,
     pub hb_encode_frame_ms: Arc<AtomicU64>,
+    /// The transport loop's heartbeat and the step it was taking, which the
+    /// supervisor watches (`transport::beat`).
+    pub transport_beat: Arc<crate::transport::beat::Beat>,
+    /// Wakes the transport to send a goodbye the PC going down left, and
+    /// counts the goodbyes it sent (`crate::power`).
+    pub power: Arc<crate::power::Signal>,
     /// Desktop-space rectangle of the output currently being captured, set by
     /// the capture stage at (re)init. The input relay maps the client's
     /// normalized touch coordinates onto this rect. `None` until the first
     /// capture stage comes up.
     pub capture_geometry: Arc<Mutex<Option<crate::input::CaptureGeometry>>>,
+    /// The one thread that hands iPad input to Windows, for every stream
+    /// generation of this app.
+    pub input: Arc<crate::input::InputThread>,
     /// The user's "prefer HEVC" setting. The encoder switches to an H.265
     /// session only when this is on AND the connected client advertised HEVC
     /// decode in its HELLO2.
@@ -100,6 +126,11 @@ pub struct SharedControl {
     pub pairing: Arc<Mutex<crate::pairing::Pairing>>,
     /// Which network the next stream listens on.
     pub listen_on: Arc<Mutex<crate::network::ListenOn>>,
+    /// The pointer for an iPad that draws it (see `capture::pointer`).
+    pub pointer: Arc<crate::capture::pointer::PointerFeed>,
+    /// The session whose iPad reported it holds the pointer image whole
+    /// (see [`SharedControl::client_draws_pointer`]).
+    pub(crate) pointer_confirmed: Arc<AtomicU32>,
 }
 
 /// Runtime state of the managed virtual extended display.
@@ -162,9 +193,12 @@ impl SharedControl {
                 .expect("OS entropy for pairing code"),
             )),
             listen_on: Arc::new(Mutex::new(Default::default())),
+            pointer: Arc::new(Default::default()),
+            pointer_confirmed: Arc::new(AtomicU32::new(0)),
             running: Arc::new(AtomicBool::new(false)),
             bitrate_bps: Arc::new(AtomicU32::new(initial_bitrate_bps)),
             abr_current_bps: Arc::new(AtomicU32::new(initial_bitrate_bps)),
+            encoder_reopens_for_bitrate: Arc::new(AtomicBool::new(false)),
             target_fps: Arc::new(AtomicU32::new(DEFAULT_TARGET_FPS)),
             client_preferred_fps: Arc::new(AtomicU32::new(0)),
             encoder_input: Arc::new(Mutex::new(Default::default())),
@@ -175,10 +209,13 @@ impl SharedControl {
             ))))),
             force_next_idr: Arc::new(AtomicBool::new(false)),
             encoder_override: Arc::new(Mutex::new(None)),
+            wake_adapter: Arc::new(Mutex::new(None)),
             capture_target: Arc::new(Mutex::new(CaptureTarget::PrimaryAuto)),
             vdd_status: Arc::new(Mutex::new(VddStatus::Inactive)),
             vdd_problem: Arc::new(Mutex::new(None)),
             capture_block: Arc::new(Mutex::new(None)),
+            gpu_refused_since: Arc::new(Mutex::new(None)),
+            stream_socket: Arc::new(Mutex::new(None)),
             gpu_diagnosis: Arc::new(Mutex::new(None)),
             screen_watch: Arc::new(Mutex::new(crate::gpu_preference::ScreenWatch::new())),
             gpu_switch: Arc::new(Mutex::new(None)),
@@ -191,7 +228,10 @@ impl SharedControl {
             hb_capture_loop_ms: Arc::new(AtomicU64::new(0)),
             hb_capture_frame_ms: Arc::new(AtomicU64::new(0)),
             hb_encode_frame_ms: Arc::new(AtomicU64::new(0)),
+            transport_beat: Default::default(),
+            power: Default::default(),
             capture_geometry: Arc::new(Mutex::new(None)),
+            input: Arc::default(),
             hevc_enabled: Arc::new(AtomicBool::new(false)),
             audio_enabled: Arc::new(AtomicBool::new(true)),
             active_codec: Arc::new(AtomicU8::new(eternal_wire::v2::control::CODEC_H264)),
@@ -228,6 +268,26 @@ impl SharedControl {
     /// A client is connected and heard from: one whose session is on hold
     /// after a silence counts as gone for the second screen, so its display
     /// still goes the same time after the iPad's last packet.
+    /// The connected iPad draws the pointer, so capture leaves it out of
+    /// the video. From when its reports say it holds the current pointer
+    /// image whole: until then it has nothing to draw, so the pointer stays
+    /// in the video and the positions sent say hidden.
+    pub fn client_draws_pointer(&self) -> bool {
+        let session = self.session.lock().pointer_session_id();
+        session.is_some_and(|id| self.pointer_confirmed.load(Ordering::Relaxed) == id)
+    }
+
+    /// A receiver report named the pointer image its iPad holds.
+    pub(crate) fn note_pointer_report(&self, shape_id: u32) {
+        let Some(session) = self.session.lock().pointer_session_id() else {
+            return;
+        };
+        let current = self.pointer.latest().0.map(|shape| shape.id);
+        if shape_id != 0 && current == Some(shape_id) {
+            self.pointer_confirmed.store(session, Ordering::Relaxed);
+        }
+    }
+
     pub(crate) fn client_heard(&self) -> bool {
         let session = self.session.lock();
         session.is_active() && !session.on_hold()
@@ -252,6 +312,13 @@ pub fn merge_fps(host: u32, client: u32) -> u32 {
 pub enum SupervisorCommand {
     /// Tear the current pipeline down and start a fresh generation.
     Restart,
+    /// The stream of `generation` asks to start again: its chosen network
+    /// changed, or its virtual display has to go. Only while that stream
+    /// still runs: one the user stopped, or one a newer stream replaced,
+    /// stays as it is.
+    RestartStream {
+        generation: u64,
+    },
     /// Stop streaming (pipeline down, GUI stays). `Start` resumes.
     Stop,
     /// Start a fresh pipeline from Stopped/Failed.
@@ -313,6 +380,79 @@ mod tests {
             shared.client_preferred_fps.store(client, Ordering::SeqCst);
             assert_eq!(shared.effective_fps(), expected);
             assert_eq!(shared.target_fps.load(Ordering::SeqCst), host);
+        }
+    }
+
+    /// Capture asks this before leaving the pointer out of the video.
+    #[test]
+    fn capture_draws_the_pointer_unless_the_connected_ipad_does() {
+        use eternal_wire::v2::control::{ControlMessage, Hello2, FEATURE_DRAWS_POINTER};
+        let shared = SharedControl::new(9876, 15_000_000);
+        assert!(!shared.client_draws_pointer(), "nobody connected");
+        for (nonce, caps, draws) in [(1, 0, false), (2, FEATURE_DRAWS_POINTER, true)] {
+            let hello = ControlMessage::Hello2(Hello2 {
+                proto_min: 2,
+                proto_max: 2,
+                client_nonce: nonce,
+                listen_port: 50000,
+                decoder_caps: 1,
+                feature_caps: caps,
+                screen_px_w: 2420,
+                screen_px_h: 1668,
+                screen_pt_w: 1210,
+                screen_pt_h: 834,
+                refresh_hz: 120,
+                device_name: "Test iPad".into(),
+                device_id: 0,
+                preferred_fps: 0,
+                auth_token: [0; 16],
+                pairing_code: 0,
+            });
+            struct Config;
+            impl crate::transport::session::ConfigSource for Config {
+                fn stream_config(&self) -> eternal_wire::v2::control::StreamConfig {
+                    Default::default()
+                }
+                fn host_name(&self) -> String {
+                    "TEST".into()
+                }
+            }
+            shared.session.lock().handle_control(
+                PeerId::udp("10.0.0.5:50000".parse().unwrap()),
+                0,
+                hello,
+                &Config,
+                std::time::Instant::now(),
+            );
+            assert!(shared.client_connected());
+            assert!(!shared.client_draws_pointer(), "not before it answers");
+            let session_id = shared.session.lock().session_id().unwrap();
+            shared.session.lock().handle_control(
+                PeerId::udp("10.0.0.5:50000".parse().unwrap()),
+                session_id,
+                ControlMessage::ReceiverReport(Default::default()),
+                &Config,
+                std::time::Instant::now(),
+            );
+            assert!(
+                !shared.client_draws_pointer(),
+                "not before it holds the image"
+            );
+            shared
+                .pointer
+                .set_shape(crate::capture::pointer::PointerImage {
+                    source_type: 2,
+                    flags: 0,
+                    width: 1,
+                    height: 1,
+                    hot: (0, 0),
+                    bytes: vec![nonce as u8; 4],
+                });
+            let current = shared.pointer.latest().0.unwrap().id;
+            shared.note_pointer_report(current + 1);
+            assert!(!shared.client_draws_pointer(), "another image");
+            shared.note_pointer_report(current);
+            assert_eq!(shared.client_draws_pointer(), draws, "caps {caps:#x}");
         }
     }
 

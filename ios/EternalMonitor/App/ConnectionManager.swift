@@ -86,7 +86,12 @@ final class ConnectionManager: ObservableObject {
     @Published var connectionError: String?
     /// A connection problem in plain words, with its next action. Shown in
     /// place of `connectionError` when set.
-    @Published var problem: ConnectionProblem?
+    @Published var problem: ConnectionProblem? {
+        didSet { problemChanged() }
+    }
+    /// The "didn't answer" card is up and this iPad connects by itself when
+    /// the PC shows up on the network (see `PCReturn`).
+    @Published private(set) var watchingForPC = false
     /// The link failure classified for the current attempt. A link's close
     /// callback that follows its own failure reports this, not a removed cable.
     private var linkFailure: ConnectionProblem?
@@ -95,14 +100,20 @@ final class ConnectionManager: ObservableObject {
     @Published var pairingPrompt: PairingSheetModel?
 
     /// HELLO2 feature bits. Every build says it checks for its own updates,
-    /// so the PC tells only older iPad apps to update.
+    /// so the PC tells only older iPad apps to update, and that it
+    /// understands why a PC isn't streaming and why it went down. It draws
+    /// the PC's pointer itself, so pointer motion needs no video frame.
     nonisolated static func featureCaps(wantsInput: Bool, wantsAudio: Bool, isUSB: Bool) -> UInt16 {
         (wantsInput ? Hello2.featureWantsInput : 0) | (wantsAudio ? Hello2.featureWantsAudio : 0)
-            | (isUSB ? 0 : Hello2.featureSupportsNack) | Hello2.featureChecksUpdates
+            | (isUSB ? 0 : Hello2.featureSupportsNack | Hello2.featureMediaSize) | Hello2.featureChecksUpdates
+            | Hello2.featureStandbyStatus | Hello2.featurePowerBye
+            | (E2E.drawsPointer ? Hello2.featureDrawsPointer : 0)
     }
     private var awaitingPairing = false
+    /// The PC answered that it isn't streaming; the attempt waits for it.
+    private var waitingForStream = false
     private var explicitPairingToken: Data?
-    private let pairingStore = PairingStore.shared
+    private let pairingStore: PairingStore
     @Published private(set) var diagnostics: [DiagnosticEntry] = []
     /// Live stream health for the HUD, recomputed at the 4 Hz flush.
     @Published private(set) var stats = StreamStats()
@@ -111,6 +122,28 @@ final class ConnectionManager: ObservableObject {
     /// Frames still arrive, but the picture has been held for over a second
     /// waiting for the keyframe that replaces a lost frame.
     @Published var pictureRestoring = false
+    /// The PC is locked or shows a permission prompt, so it can't capture and
+    /// the picture is held. Its heartbeats say so until capture works again.
+    @Published var pcLocked = false
+    /// The PC has no display turned on, so there is nothing to capture and
+    /// the picture is held. Its heartbeats say so until one comes back.
+    @Published var pcNoDisplay = false
+    /// The PC's heartbeats say Windows won't let it capture from its
+    /// graphics card, and which screen.
+    @Published var pcGraphicsCard: PCGraphicsCard?
+    /// The PC's heartbeats counted video frames sent this attempt.
+    private var pcSentVideo = false
+    /// The PC is restarting its stream and kept this session, and no new
+    /// frame has come for `Timing.restartNoticeSeconds`. The first new frame
+    /// clears it.
+    @Published private(set) var pcRestarting = false
+    /// When the last frame was decoded, by the system uptime clock.
+    private var lastFrameAt: TimeInterval?
+    /// Shows the restarting pill once the picture has been held long enough.
+    private var restartNoticeTask: Task<Void, Never>?
+    /// Second screen needs Windows 11, so the PC mirrors its main screen.
+    /// Its heartbeats say so for a few seconds after the session starts.
+    @Published var secondScreenNeedsWindows11 = false
     /// Nonzero while an automatic reconnect cycle is running.
     @Published private(set) var reconnectAttempt = 0
 
@@ -140,6 +173,25 @@ final class ConnectionManager: ObservableObject {
     @Published private(set) var hostStreamConfig: StreamConfig?
 
     @Published private(set) var usbStatus = "USB: waiting for a cable"
+    /// A PC left the USB capability out of its HELLO_ACK: when it was
+    /// sampled, that PC couldn't reach Apple's USB service. Kept only for
+    /// the PC at that target, and only until `until`; see `USBStatusText`.
+    struct AppleDevicesSighting: Equatable {
+        static let lifetime: TimeInterval = 30 * 60
+        /// "host:port" of the PC over Wi-Fi, or "USB".
+        let target: String
+        let at: Date
+        let until: Date
+
+        func applies(now: Date) -> Bool { now >= at && now < until }
+    }
+    /// Cleared when it expires, so an idle Connect screen drops the hint too.
+    @Published private(set) var appleDevicesUnreachable: AppleDevicesSighting?
+    private var appleDevicesExpiry: Task<Void, Never>?
+    /// The wall clock for the Apple Devices sighting. Tests replace it.
+    var now: () -> Date = { Date() }
+    /// Hears, from each accepted HELLO_ACK, whether the PC is older than 0.3.4.
+    var oldPCPrompt = OldPCPrompt.shared
     private var mediaLink: (any MediaLink)?
     private var usbListener: USBListener?
     private var isForeground = true
@@ -148,6 +200,11 @@ final class ConnectionManager: ObservableObject {
     /// Disconnect, coming back to the app keeps it stopped until Try again
     /// or Connect USB.
     private var usbStoppedForNoPicture = false
+    /// The PC turned the cable down: it isn't answered until the hold ends
+    /// (see `CableHold`). Busy refusals in a row set the wait.
+    private var cableHold: CableHold?
+    private var cableBusyInARow = 0
+    private var cableHoldTask: Task<Void, Never>?
     private let currentAttempt = OSAllocatedUnfairLock<UUID?>(initialState: nil)
     private var frameAssembler: FrameAssembler?
     private var controlChannel: ControlChannel?
@@ -181,6 +238,8 @@ final class ConnectionManager: ObservableObject {
     private var summarizedNonces: [UInt32] = []
 
     let frameSlot = FrameSlot()
+    /// The PC's pointer, drawn by `MetalView` when the PC sends it apart.
+    let pointerOverlay = PointerOverlay()
     /// Lets hot-path closures reach the CURRENT control channel without
     /// retaining self (rebuilt each connect).
     private let controlChannelBox = ControlChannelBox()
@@ -213,15 +272,108 @@ final class ConnectionManager: ObservableObject {
             ?? Int(ConnectionManager.connectionTimeoutSeconds))
         var reconnectGraceSeconds = 2.0
         var reconnectBackoffSeconds: (Int) -> Double = { attempt in Double(min(1 << (attempt - 1), 15)) }
+        var appleDevicesNoteSeconds = AppleDevicesSighting.lifetime
+        /// How long video the PC says it sent may go missing before the
+        /// next no-video step (see `NoVideoFallback`).
+        var noVideoStepSeconds = 1.5
+        /// How long the cable goes unanswered after the given number of
+        /// Busy refusals in a row (see `CableHold`).
+        var cableBusyHoldSeconds: (Int) -> Double = CableHold.busySeconds
+        /// Waits out a cable hold. Tests replace it to end the wait when
+        /// they choose.
+        var cableHoldSleep: (Double) async -> Void = { try? await Task.sleep(for: .seconds($0)) }
+        /// How long the picture is held through a PC's stream restart before
+        /// the iPad says so. A quick restart shows nothing.
+        var restartNoticeSeconds = 1.5
+        /// How long after the PC that didn't answer shows up on the network
+        /// it is asked, so a few Bonjour updates count as one.
+        var pcReturnDebounceSeconds = 1.0
+        /// How often a listing of the PC that hasn't proved the pairing yet
+        /// is asked again while the card is up.
+        var pcReturnProbeSeconds = 5.0
+        /// How long the "didn't answer" card watches for the PC.
+        var pcReturnLimitSeconds: TimeInterval = 180
     }
     var timing: Timing
     /// The Wi-Fi link to a host's port. Tests pass a fake one, or replace it
     /// to fail a lookup without asking DNS.
     var makeUDPLink: (UInt16) -> any MediaLink
+    /// Looks for PCs with Bonjour, given the service name wanted. Tests
+    /// replace it.
+    var findPCs: (String) async -> [DiscoveredHost] = { await MovedPC.find($0) }
+    /// Which addresses a saved PC may move from and to. Tests on loopback
+    /// widen it.
+    var homeAddress: (String) -> Bool = MovedPC.isHomeAddress
+    /// How this iPad reaches an address. Tests replace it.
+    var localRoute: (String, UInt16) async -> MovedPC.Route? = { await MovedPC.route(to: $0, port: $1) }
+    /// Where the iPad sends to reach a PC address it was given. Tests on
+    /// loopback point the addresses a fake signs at other fakes.
+    var dialAddress: (String, UInt16) -> (host: String, port: UInt16) = { ($0, $1) }
+    /// "host:port" of each address picked from Bonjour's list in this
+    /// launch. Saved entries keep the mark once they show a picture.
+    private var foundAddresses = Set<String>()
+    /// A saved PC that didn't answer at its address and showed it is the
+    /// same PC at another.
+    private struct Move {
+        let from: (host: String, port: UInt16)
+        let name: String
+        /// Its pairing token, which the PC proved it holds.
+        let token: Data
+        /// The PC's video didn't arrive at `from`; it still answers there.
+        var noVideo = false
+    }
+    /// The move the next attempt makes, and the one the current attempt made.
+    private var pendingMove: Move?
+    private var attemptMove: Move?
+    /// The PC's video didn't arrive at the address asked for before, and did
+    /// at another: the next attempt goes there first, and back to the address
+    /// asked for (kept here) if the PC doesn't answer there.
+    private var pendingRedirect: (host: String, port: UInt16)?
+    private var attemptRedirect: (host: String, port: UInt16)?
+    /// The proof the PC at a remembered address is checked for, before any
+    /// attempt starts (see `connectViaRemembered`).
+    private var redirectCheck: UUID?
+    /// The current session's no-video steps, with a PC that takes them, and
+    /// the step whose result isn't known yet, as its log line names it.
+    private var noVideoFallback: NoVideoFallback?
+    private var noVideoStep: String?
+    /// The media size the current session runs at, when smaller than the
+    /// PC's own; whether a step this session asked for it, rather than the
+    /// size kept for this path; and where it is kept (see `NoVideoSizes`).
+    private var sessionMediaSize: UInt16?
+    private var mediaSizeFromStep = false
+    private var mediaSizeKey: NoVideoSizes.Key?
+    /// Watches Bonjour for the PC that didn't answer. Tests pass a fake.
+    var makePCBrowser: () -> any PCBrowser = { BonjourPCBrowser() }
+    /// The PC watched for, its search (stopped in the background), the
+    /// task asking its listings, and the time limit.
+    private var pcReturn: PCReturn?
+    private var pcReturnBrowser: (any PCBrowser)?
+    private var pcReturnPaused = false
+    private var pcReturnTry: Task<Void, Never>?
+    private var pcReturnLimit: Task<Void, Never>?
+    /// The PC an automatic try's session must be, for the next attempt and
+    /// the current one. The PC proved the pairing just before; a PC gives
+    /// the pairing back only when it is new, so the session must give the
+    /// saved PC's name, when this iPad knows it, and no other pairing.
+    private struct ExpectedPC {
+        let pairing: Data
+        let name: String?
 
-    init(timing: Timing = Timing(), udpReceiver: @escaping (UInt16) -> any MediaLink = { UDPReceiver(port: $0) }) {
+        func accepts(_ info: ControlChannel.SessionInfo) -> Bool {
+            (!PairingStore.valid(info.authToken) || info.authToken == pairing) && (name == nil || info.hostName == name)
+        }
+    }
+    private var pendingPC: ExpectedPC?
+    private var attemptPC: ExpectedPC?
+    /// The automatic try is starting: the attempt it starts doesn't end the watch.
+    private var startingPCReturnTry = false
+
+    init(timing: Timing = Timing(), udpReceiver: @escaping (UInt16) -> any MediaLink = { UDPReceiver(port: $0) },
+         pairingStore: PairingStore? = nil) {
         self.timing = timing
         self.makeUDPLink = udpReceiver
+        self.pairingStore = pairingStore ?? .shared
     }
 
     func refreshUSBAvailability() {
@@ -271,8 +423,45 @@ final class ConnectionManager: ObservableObject {
     func resumeUSBConnections() {
         noPictureStreak.restartCount()
         usbStoppedForNoPicture = false
+        endCableHold()
+        cableBusyInARow = 0
         usbPaused = false
         refreshUSBAvailability()
+    }
+
+    /// The PC turned this iPad down over the cable. Stop answering the cable
+    /// for the hold's wait, or until the user acts after a version refusal,
+    /// instead of taking the PC's next dial a second later.
+    private func holdCable(_ reason: CableHold.Reason) {
+        var wait: Double?
+        if reason == .busy {
+            cableBusyInARow += 1
+            wait = timing.cableBusyHoldSeconds(cableBusyInARow)
+        }
+        let hold = CableHold(reason: reason, until: wait.map { now().addingTimeInterval($0) })
+        endCableHold()
+        cableHold = hold
+        record(.info, "usb", "The PC turned the cable down (\(reason)); " + (wait.map { "answering it again in \(Int($0.rounded())) s" }
+            ?? "answering it again after Try again or Connect USB"))
+        usbPaused = true
+        usbListener?.stop()
+        usbListener = nil
+        usbStatus = "USB: disconnected"
+        guard let wait else { return }
+        let sleep = timing.cableHoldSleep
+        cableHoldTask = Task { @MainActor [weak self] in
+            await sleep(wait)
+            guard let self, !Task.isCancelled, self.cableHold == hold else { return }
+            self.endCableHold()
+            self.usbPaused = self.usbStoppedForNoPicture
+            self.refreshUSBAvailability()
+        }
+    }
+
+    private func endCableHold() {
+        cableHoldTask?.cancel()
+        cableHoldTask = nil
+        cableHold = nil
     }
 
     // MARK: - Frame slot (thread-safe single-slot)
@@ -301,14 +490,91 @@ final class ConnectionManager: ObservableObject {
 
     // MARK: - Connect / Disconnect
 
-    func connect(host: String, port: UInt16, token: Data? = nil) {
+    /// `found`: the address is the one Bonjour listed for the PC, so the PC
+    /// may be looked up by name again if the address changes.
+    func connect(host: String, port: UInt16, token: Data? = nil, found: Bool = false) {
         guard state == .disconnected else { return }
+        if !startingPCReturnTry { endPCReturn() }
         explicitPairingToken = token
+        if found { foundAddresses.insert(PairingStore.address(host: host, port: port)) }
         if let token {
             do { try pairingStore.save(token: token, hostName: "", address: PairingStore.address(host: host, port: port)) }
             catch { record(.warning, "pairing", "Could not save the scanned pairing on this iPad.") }
+        } else if let remembered = rememberedAddress(host: host, port: port) {
+            connectViaRemembered(from: (host.trimmingCharacters(in: .whitespacesAndNewlines), port), remembered)
+            return
         }
         connect(target: .udp(host: host, port: port))
+    }
+
+    /// Where the PC paired at `host:port` showed video after none arrived
+    /// there, kept for this pairing, with the pairing and the PC's name.
+    private func rememberedAddress(host: String, port: UInt16) -> (to: NoVideoPaths.Address, token: Data, name: String)? {
+        let host = host.trimmingCharacters(in: .whitespacesAndNewlines)
+        let address = PairingStore.address(host: host, port: port)
+        guard let token = (try? pairingStore.token(address: address)) ?? nil,
+              let to = NoVideoPaths.better(than: host, port: port, pairing: token),
+              let name = pairingStore.pcName(address: address) ?? RecentConnectionStore.shared.entry(host: host, port: port)?.name
+        else { return nil }
+        return (to, token, name)
+    }
+
+    /// Connecting to `from`, where the PC's video didn't arrive before, goes
+    /// to the address where it did, once that address is on this iPad's own
+    /// network and the PC there shows it holds this pairing and receives
+    /// there: the address may belong to another device now. Only then does a
+    /// HELLO2 with the token go there, as a move, with the same-PC checks of
+    /// one. Otherwise the entry is forgotten and the attempt goes to `from`,
+    /// as it does if that move fails (see `leaveRememberedAddress`).
+    private func connectViaRemembered(from: (host: String, port: UInt16),
+                                      _ remembered: (to: NoVideoPaths.Address, token: Data, name: String)) {
+        endReconnectCycle()
+        // Try again and a resume go to the address tapped.
+        lastTarget = from
+        let check = UUID()
+        redirectCheck = check
+        connectionError = nil
+        problem = nil
+        state = .connecting
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let to = remembered.to
+            let toFrom = { [weak self] (result: String) in
+                guard let self else { return }
+                self.redirectCheck = nil
+                self.state = .disconnected
+                NoVideoPaths.forget(from: .init(host: from.host, port: from.port))
+                self.startAttempt(.udp(host: from.host, port: from.port))
+                self.record(.info, "connection", "no_video_fallback step=remembered result=\(result)")
+            }
+            let route = await self.localRoute(to.host, to.port)
+            guard self.redirectCheck == check else { return }
+            guard let route, MovedPC.isLocal(to.host, over: route) else { return toFrom("not_local") }
+            let same = await MovedPC.confirm(host: to.host, port: to.port, token: remembered.token,
+                                             link: self.makeUDPLink(to.port))
+            guard self.redirectCheck == check else { return }
+            guard same else { return toFrom("not_confirmed") }
+            self.redirectCheck = nil
+            self.state = .disconnected
+            self.pendingMove = Move(from: from, name: remembered.name, token: remembered.token, noVideo: true)
+            self.pendingRedirect = from
+            self.explicitPairingToken = remembered.token
+            self.startAttempt(.udp(host: to.host, port: to.port))
+            self.pendingRedirect = nil
+        }
+    }
+
+    /// The attempt at a remembered address (see `connectViaRemembered`)
+    /// passed its proof and failed after it: it ends with `end`, the entry is
+    /// forgotten, and a new attempt goes to the address tapped. False when
+    /// this attempt didn't go to a remembered address.
+    private func leaveRememberedAddress(_ end: AttemptEnd, result: String) -> Bool {
+        guard let from = attemptRedirect else { return false }
+        NoVideoPaths.forget(from: .init(host: from.host, port: from.port))
+        record(.info, "connection", "no_video_fallback step=remembered result=\(result)")
+        disconnect(end)
+        startAttempt(.udp(host: from.host, port: from.port))
+        return true
     }
 
     func submitPairing() {
@@ -327,6 +593,8 @@ final class ConnectionManager: ObservableObject {
     func forgetPairedHosts() {
         do { try pairingStore.forgetAll() }
         catch { connectionError = "Could not remove saved pairings from this iPad." }
+        NoVideoPaths.forgetAll()
+        NoVideoSizes.forgetAll()
     }
 
     /// A connection the user or a cable starts. It replaces any automatic
@@ -335,6 +603,8 @@ final class ConnectionManager: ObservableObject {
         guard state == .disconnected else { return }
         if case .udp(let host, let port) = target,
            host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || port == 0 { return }
+        // The user picked a PC, or a cable took over.
+        if !startingPCReturnTry { endPCReturn() }
         endReconnectCycle()
         if case .udp(let host, _) = target, let typed = ConnectionProblem.typedAddress(host) {
             connectionError = nil
@@ -359,7 +629,9 @@ final class ConnectionManager: ObservableObject {
             SupportDiagnostics.noteTypedAddress(normalizedHost)
             port = targetPort
             receiver = makeUDPLink(port)
-            lastTarget = (normalizedHost, port)
+            // A moved attempt becomes the target to retry only once the PC
+            // there is the saved one (see onSessionEstablished).
+            if pendingMove == nil { lastTarget = (normalizedHost, port) }
         case .usb(let link):
             normalizedHost = "USB"
             port = 9877
@@ -371,8 +643,22 @@ final class ConnectionManager: ObservableObject {
         }
         let isUSB = receiver.isUSB
         let pairingAddress = isUSB ? "USB" : PairingStore.address(host: normalizedHost, port: port)
+        let pcTarget = isUSB ? "USB" : "\(normalizedHost):\(port)"
+        // What one PC said about Apple Devices says nothing about another.
+        if appleDevicesUnreachable?.target != pcTarget { keepAppleDevicesSighting(nil) }
         let pairingToken = explicitPairingToken ?? ((try? pairingStore.token(address: pairingAddress)) ?? Data(repeating: 0, count: 16))
         explicitPairingToken = nil
+        attemptMove = isUSB ? nil : pendingMove
+        pendingMove = nil
+        attemptRedirect = isUSB ? nil : pendingRedirect
+        pendingRedirect = nil
+        attemptPC = isUSB ? nil : pendingPC
+        pendingPC = nil
+        noVideoFallback = nil
+        noVideoStep = nil
+        sessionMediaSize = nil
+        mediaSizeFromStep = false
+        mediaSizeKey = nil
         let connectionID = UUID()
         currentAttempt.withLock { $0 = connectionID }
         transportMode = isUSB ? "USB" : "WiFi"
@@ -385,10 +671,17 @@ final class ConnectionManager: ObservableObject {
         linkFailure = nil
         versionMismatch = nil
         signalLost = false
+        pcLocked = false
+        pcNoDisplay = false
+        pcGraphicsCard = nil
+        pcSentVideo = false
+        clearRestartNotice()
+        secondScreenNeedsWindows11 = false
         degradedSinceUs = nil
         prevCounters = FrameAssembler.Counters()
         diagnostics.removeAll()
         didExtendTimeout = false
+        waitingForStream = false
         attemptStartedAt = ProcessInfo.processInfo.systemUptime
         sessionAcceptedAt = nil
         firstFrameAt = nil
@@ -402,7 +695,18 @@ final class ConnectionManager: ObservableObject {
         sessionWantsAudio = wantsAudio
         audioStats = AudioStats()
         debugState = ConnectionDebugState(host: normalizedHost, port: port)
+        // Watched for from the start: a PC listed by the time the card goes
+        // up is asked then.
+        if !isUSB, attemptMove == nil, attemptRedirect == nil, reconnectCycleID == nil {
+            watchForPC(host: normalizedHost, port: port)
+        }
         record(.info, "connection", "Starting connection attempt=\(connectionID) transport=\(transportMode) to \(normalizedHost):\(port) drawing=\(drawing.enabled) input=\(wantsInput) audio=\(wantsAudio)")
+        if attemptMove != nil {
+            record(.info, "connection", attemptMove?.noVideo == true
+                ? "Trying the PC at another of its addresses: its video didn't arrive at the first"
+                : "Trying the saved PC at the new address Bonjour gave")
+        }
+        if attemptRedirect != nil { record(.info, "connection", "no_video_fallback step=remembered result=tried") }
 
         let decoder = VideoDecoder()
         let metrics = ReceiverMetrics()
@@ -449,11 +753,18 @@ final class ConnectionManager: ObservableObject {
                 guard self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 self.debugState.decodedFrames += 1
                 self.debugState.lastDecodedTimestampUs = ts
+                self.lastFrameAt = ProcessInfo.processInfo.systemUptime
+                if self.pcRestarting { self.record(.info, "ctrl", "Picture back after the PC's stream restart") }
+                self.clearRestartNotice()
                 if self.debugState.decodedFrames == 1 {
                     self.firstFrameAt = ProcessInfo.processInfo.systemUptime
                     self.record(.info, "decode", "First frame decoded successfully" + self.attemptTimings)
+                    self.endNoVideoStep("video")
+                    self.noVideoFallback = nil
+                    self.settleMediaSize()
                     self.timeoutTask?.cancel()
                     self.noPictureStreak = NoPictureStreak()
+                    self.endPCReturn()
                     self.state = .connected
                     self.streamingSince = Date()
                     // A reconnect attempt that streams ends its cycle.
@@ -464,9 +775,15 @@ final class ConnectionManager: ObservableObject {
                     UIApplication.shared.isIdleTimerDisabled =
                         UserDefaults.standard.flag(forKey: "keepScreenAwake")
                     E2E.firstFrame(width: frameWidth, height: frameHeight, link: isUSB ? "usb" : "udp")
-                    RecentConnectionStore.shared.add(host: isUSB ? (self.hostInfo?.hostName ?? "USB host") : normalizedHost,
-                        port: port, isUSB: isUSB)
-                    if !isUSB {
+                    var saved = true
+                    if let move = self.attemptMove {
+                        saved = self.savedMove(move, to: (normalizedHost, port), pairingAddress: pairingAddress)
+                    } else {
+                        RecentConnectionStore.shared.add(host: isUSB ? (self.hostInfo?.hostName ?? "USB host") : normalizedHost,
+                            port: port, isUSB: isUSB, name: self.hostInfo?.hostName,
+                            found: self.foundAddresses.contains(pairingAddress))
+                    }
+                    if !isUSB && saved {
                         UserDefaults.standard.set(normalizedHost, forKey: "lastHost")
                         UserDefaults.standard.set(Int(port), forKey: "lastPort")
                     }
@@ -531,8 +848,9 @@ final class ConnectionManager: ObservableObject {
             }
         }
 
-        assembler.onFrameAssembled = { [weak self, weak decoder, weak assembler] data, seq, captureTsUs, isKeyframe in
+        assembler.onFrameAssembled = { [weak self, weak decoder, weak assembler, weak controlChannelBox] data, seq, captureTsUs, isKeyframe in
             guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+            if isKeyframe { controlChannelBox?.value?.noteKeyframeAssembled() }
             self.streamCounters.recordAssembled(bytes: data.count)
             self.streamCounters.recordParsed()
             decoder?.decode(packet: FramePacket(
@@ -553,10 +871,22 @@ final class ConnectionManager: ObservableObject {
             receiver?.send(data)
         })
         controlChannelBox.value = channel
+        pointerOverlay.reset()
+        channel.pointer = pointerOverlay
         assembler.rttUs = { [weak channel] in channel?.clockSnapshot.withLock { $0.rttUs } ?? 10_000 }
         assembler.onNack = { [weak channel] nack in channel?.sendNack(nack) }
         assembler.onNeedsKeyframe = { [weak channel] epoch, seq in
             channel?.sendKeyframeRequest(streamEpoch: epoch, lastCompleteSeq: seq, reason: .gapLoss)
+        }
+        // Video arrives but the first frame never completes: ask for a fresh
+        // keyframe. The PC's packet size is its own setting; no message
+        // asks it for smaller datagrams.
+        assembler.onNoFrameYet = { [weak self, weak channel] epoch, missing in
+            channel?.sendKeyframeRequest(streamEpoch: epoch, lastCompleteSeq: 0, reason: .startup)
+            Task { @MainActor in
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                self.record(.warning, "assembly", "Video arrives but no frame completed in 2 s; asked the PC for a fresh keyframe: \(missing)")
+            }
         }
         channel.reportProvider = { [weak assembler, weak channel, weak decoder, weak audio] in
             var report = metrics.makeReport(assembler: assembler?.counters.withLock { $0 } ?? .init(),
@@ -566,6 +896,7 @@ final class ConnectionManager: ObservableObject {
             let stats = audio?.stats ?? AudioStats()
             report.audioPacketsLost = UInt32(clamping: stats.lost)
             report.audioBufferMs = UInt16(clamping: stats.bufferMs)
+            report.pointerShapeId = channel?.pointer?.completeShapeId ?? 0
             return report
         }
         channel.onHelloAttempt = { [weak self] attempt, total in
@@ -589,12 +920,49 @@ final class ConnectionManager: ObservableObject {
             let acceptedAt = ProcessInfo.processInfo.systemUptime
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                // An automatic try streams only from the PC it expects,
+                // whatever answered at that address.
+                if let expected = self.attemptPC, !expected.accepts(info) {
+                    self.record(.warning, "connection", "pc_return result=other_pc")
+                    self.disconnect(.otherPC)
+                    self.problem = .noReply(usb: false)
+                    return
+                }
+                if let move = self.attemptMove {
+                    guard Self.isSamePC(move, info) else {
+                        self.record(.warning, "connection", "The PC at the new address isn't the saved one")
+                        if self.leaveRememberedAddress(.otherPC, result: "other_pc") { return }
+                        self.disconnect(.otherPC)
+                        self.problem = .noReply(usb: false)
+                        return
+                    }
+                    self.lastTarget = (normalizedHost, port)
+                }
                 self.sessionAcceptedAt = acceptedAt
+                self.noVideoFallback = !isUSB && info.hostCaps & HelloAck.hostCapMediaSize != 0
+                    ? NoVideoFallback(wait: self.timing.noVideoStepSeconds) : nil
+                let sessionToken = PairingStore.valid(info.authToken) ? info.authToken : pairingToken
+                if self.noVideoFallback != nil, PairingStore.valid(sessionToken) {
+                    self.startWithRememberedSize(connectionID, address: .init(host: normalizedHost, port: port),
+                                                 pairing: sessionToken)
+                }
                 self.acceptedAddresses.insert("\(normalizedHost):\(port)")
                 self.noPictureStreak.answered(by: info.hostName, pairingToken: info.authToken,
                                               at: isUSB ? nil : "\(normalizedHost):\(port)")
                 self.livenessTimeoutUs = UInt64(info.livenessTimeoutMs) * 1000
                 self.hostInfo = info
+                self.oldPCPrompt.answered(hostName: info.hostName, pairingToken: info.authToken,
+                                          hostCaps: info.hostCaps, address: isUSB ? nil : normalizedHost)
+                if self.waitingForStream {
+                    self.waitingForStream = false
+                    if case .pcNotStreaming = self.problem { self.problem = nil }
+                    self.armConnectTimeout(seconds: self.timing.connectTimeoutSeconds)
+                }
+                let seen = self.now()
+                self.keepAppleDevicesSighting(info.hostCaps & HelloAck.hostCapUSB == 0
+                    ? AppleDevicesSighting(target: pcTarget, at: seen,
+                                           until: seen.addingTimeInterval(self.timing.appleDevicesNoteSeconds))
+                    : nil)
                 if self.awaitingPairing {
                     self.awaitingPairing = false
                     self.pairingPrompt = nil
@@ -604,7 +972,10 @@ final class ConnectionManager: ObservableObject {
                     do { try self.pairingStore.save(token: info.authToken, hostName: info.hostName, address: pairingAddress) }
                     catch { self.record(.warning, "pairing", "Pairing was not saved on this iPad. Pair again next time.") }
                 }
-                if isUSB { self.usbStatus = "USB: connected to \(info.hostName)" }
+                if isUSB {
+                    self.usbStatus = "USB: connected to \(info.hostName)"
+                    self.cableBusyInARow = 0
+                }
                 self.hostStreamConfig = info.streamConfig
                 self.record(
                     .info, "ctrl",
@@ -617,6 +988,23 @@ final class ConnectionManager: ObservableObject {
             let mismatch = channel?.lastMismatch
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+                // Nor did the PC an automatic try reached: no pairing prompt,
+                // and the saved pairing stays.
+                if self.attemptPC != nil, self.attemptMove == nil, status == .unauthorized || status == .rateLimited {
+                    self.record(.warning, "connection", "pc_return result=other_pc")
+                    self.disconnect(.otherPC)
+                    self.problem = .noReply(usb: false)
+                    return
+                }
+                // A PC that wants a code didn't take the saved PC's pairing:
+                // it is another PC, and the saved pairing stays.
+                if self.attemptMove != nil, status == .unauthorized || status == .rateLimited {
+                    self.record(.warning, "connection", "The PC at the new address isn't the saved one: it asked for pairing")
+                    if self.leaveRememberedAddress(.otherPC, result: "other_pc") { return }
+                    self.disconnect(.otherPC)
+                    self.problem = .noReply(usb: false)
+                    return
+                }
                 // Busy passes: the PC is streaming elsewhere, often to this
                 // iPad's own cable session that hasn't closed yet. An
                 // automatic cycle keeps retrying and shows it if it runs out.
@@ -646,7 +1034,30 @@ final class ConnectionManager: ObservableObject {
                     self.connectionError = "Your PC turned down the connection."
                 }
                 self.record(.error, "ctrl", self.connectionError ?? self.problem?.title ?? "rejected")
-                self.disconnect(.pcRefused)
+                switch status {
+                case .busy: self.disconnect(.pcBusy)
+                case .versionUnsupported where mismatch == .pcOlder: self.disconnect(.oldPC)
+                default: self.disconnect(.pcRefused)
+                }
+                // Over the cable the PC dials again a second later, and would
+                // be turned down again: wait for a change instead.
+                if isUSB, status == .busy || status == .versionUnsupported {
+                    self.holdCable(status == .busy ? .busy : .version)
+                }
+            }
+        }
+        channel.onPCNotStreaming = { [weak self] status, reason in
+            Task { @MainActor in
+                guard let self, self.currentAttempt.withLock({ $0 == connectionID }),
+                      let wait = ConnectionProblem.StreamWait(status, reason: reason) else { return }
+                if self.problem != .pcNotStreaming(wait) {
+                    self.record(.info, "ctrl", "PC isn't streaming (\(status)\(reason.isEmpty ? "" : " \(reason)")); waiting for it")
+                }
+                // No reconnect attempt is spent while the PC says why it
+                // isn't streaming. If it stops answering, the timeout says so.
+                self.waitingForStream = true
+                self.problem = .pcNotStreaming(wait)
+                self.armConnectTimeout(seconds: self.timing.connectTimeoutSeconds)
             }
         }
         channel.onHandshakeTimeout = { [weak self, weak receiver] in
@@ -662,8 +1073,14 @@ final class ConnectionManager: ObservableObject {
                     self.connectionError = VersionMismatch.pcLegacy.message
                     self.record(.error, "ctrl", "Legacy v1 host detected")
                     self.disconnect(.legacyPC)
+                    if isUSB { self.holdCable(.version) }
                 } else {
                     self.record(.warning, "ctrl", "HELLO2 handshake got no reply yet")
+                    if self.leaveRememberedAddress(.pcMoved, result: "no_reply") {
+                        // Back to the address tapped.
+                    } else if !isUSB {
+                        self.lookForMovedPC(connectionID, host: normalizedHost, port: port)
+                    }
                 }
             }
         }
@@ -683,9 +1100,10 @@ final class ConnectionManager: ObservableObject {
                     } else {
                         self.beginReconnect(.pcStoppedResponding, failure: failure, end: .pcGoodbye)
                     }
-                case .userDisconnect, .superseded:
-                    // Disconnected from the PC, or another device took over:
-                    // stay away until the user connects again.
+                case .userDisconnect, .superseded, .hostSleeping, .hostPoweringOff:
+                    // Disconnected from the PC, another device took over, or
+                    // the PC is going down and won't answer: stay away until
+                    // the user connects again.
                     self.endReconnectCycle()
                     self.disconnect(.pcGoodbye)
                     self.problem = failure
@@ -707,6 +1125,36 @@ final class ConnectionManager: ObservableObject {
             Task { @MainActor in
                 guard let self, self.currentAttempt.withLock({ $0 == connectionID }) else { return }
                 self.hostStreamConfig = heartbeat.streamConfig
+                if let frames = heartbeat.framesSent {
+                    self.noVideoFallback?.heard(framesSent: frames, at: ProcessInfo.processInfo.systemUptime)
+                    if frames > 0 { self.pcSentVideo = true }
+                }
+                let locked = heartbeat.notice == Heartbeat.noticePCLocked
+                if locked != self.pcLocked {
+                    self.pcLocked = locked
+                    self.record(.info, "ctrl", locked ? "PC locked: holding the picture" : "PC unlocked")
+                }
+                if heartbeat.notice == Heartbeat.noticeRestarting {
+                    self.noteRestartNotice()
+                } else {
+                    self.clearRestartNotice()
+                }
+                let noDisplay = heartbeat.notice == Heartbeat.noticeNoDisplay
+                if noDisplay != self.pcNoDisplay {
+                    self.pcNoDisplay = noDisplay
+                    self.record(.info, "ctrl", noDisplay ? "PC has no active display: holding the picture" : "PC display back")
+                }
+                let windows10 = heartbeat.notice == Heartbeat.noticeSecondScreenNeedsWindows11
+                if windows10 != self.secondScreenNeedsWindows11 {
+                    self.secondScreenNeedsWindows11 = windows10
+                    if windows10 { self.record(.info, "ctrl", "PC mirrors: Second screen needs Windows 11") }
+                }
+                let card = PCGraphicsCard(notice: heartbeat.notice)
+                if card != self.pcGraphicsCard {
+                    self.pcGraphicsCard = card
+                    self.record(.info, "ctrl", card.map { "PC can't capture from its graphics card screen=\($0)" }
+                        ?? "PC captures from its graphics card again")
+                }
             }
         }
         channel.onStreamConfig = { [weak self, weak assembler] config in
@@ -778,7 +1226,7 @@ final class ConnectionManager: ObservableObject {
                     return
                 }
                 guard isUSB else {
-                    self.disconnect(.linkFailed)
+                    self.disconnect(failure == .wifiOff ? .noNetwork : .linkFailed)
                     self.problem = failure
                     return
                 }
@@ -864,10 +1312,14 @@ final class ConnectionManager: ObservableObject {
                     }
                 }
 
+                self.advanceNoVideoFallback()
                 // Runs on EVERY tick, including silent ones: a dead host sends
                 // neither media nor heartbeats, so skipping this when nothing
                 // arrived is exactly when the liveness watchdog is needed.
                 self.refreshStatsAndWatchdog()
+                if E2E.enabled, self.state == .connected {
+                    E2E.pointer(self.pointerOverlay.counters, decoded: self.debugState.decodedFrames)
+                }
                 if ProcessInfo.processInfo.systemUptime - lastSummary >= 10 {
                     lastSummary = ProcessInfo.processInfo.systemUptime
                     self.recordStreamSummary(reason: "periodic")
@@ -940,6 +1392,29 @@ final class ConnectionManager: ObservableObject {
         }
     }
 
+    /// The PC said it is restarting its stream and holds this session. Once
+    /// the picture has been held `restartNoticeSeconds` since its last
+    /// frame, say so; a frame first means a quick restart, and nothing shows.
+    private func noteRestartNotice() {
+        guard state == .connected, !pcRestarting, restartNoticeTask == nil else { return }
+        let heldFor = ProcessInfo.processInfo.systemUptime - (lastFrameAt ?? ProcessInfo.processInfo.systemUptime)
+        let wait = max(0, timing.restartNoticeSeconds - heldFor)
+        let frameAt = lastFrameAt
+        restartNoticeTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(wait))
+            guard !Task.isCancelled, let self, self.state == .connected, self.lastFrameAt == frameAt else { return }
+            self.restartNoticeTask = nil
+            self.pcRestarting = true
+            self.record(.info, "ctrl", "PC is restarting its stream: holding the picture")
+        }
+    }
+
+    private func clearRestartNotice() {
+        restartNoticeTask?.cancel()
+        restartNoticeTask = nil
+        pcRestarting = false
+    }
+
     /// Ends the session that `reason` interrupted (`end` when it was not
     /// the link: the PC said goodbye) and reconnects if that is on.
     private func beginReconnect(_ reason: ConnectionProblem.LostReason, failure: ConnectionProblem? = nil,
@@ -1000,6 +1475,199 @@ final class ConnectionManager: ObservableObject {
         }
     }
 
+    /// The attempt's HELLO2 got no answer at `host:port`. A paired PC that
+    /// this iPad found with Bonjour is looked for by name. Where Bonjour has
+    /// it at another home network address that this iPad reaches directly,
+    /// the iPad checks that it is the same PC, at that address, and only
+    /// then moves the attempt there with its pairing.
+    /// Otherwise the attempt goes on as before.
+    private func lookForMovedPC(_ connectionID: UUID, host: String, port: UInt16) {
+        let address = PairingStore.address(host: host, port: port)
+        let saved = RecentConnectionStore.shared.entry(host: host, port: port)
+        let name = saved?.name ?? pairingStore.pcName(address: address)
+        let token = (try? pairingStore.token(address: address)) ?? nil
+        guard attemptMove == nil, let name, let token,
+              MovedPC.canLookUp(host: host, pcName: name, found: foundAddresses.contains(address) || saved?.found == true,
+                                paired: PairingStore.valid(token), homeAddress: homeAddress)
+        else { return }
+        record(.info, "connection", "Looking for the saved PC by name: no answer at its address")
+        let current = { [weak self] in
+            // The PC may have answered meanwhile, or the attempt ended.
+            guard let self else { return false }
+            return self.currentAttempt.withLock { $0 == connectionID } && self.state == .connecting
+                && self.hostInfo == nil && !self.awaitingPairing
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let found = await self.findPCs(MovedPC.serviceName(pcName: name))
+            guard current() else { return }
+            guard let moved = MovedPC.newAddress(pcName: name, host: host, port: port, found: found,
+                                                 homeAddress: self.homeAddress) else {
+                self.record(.info, "connection", "The saved PC wasn't found at another address")
+                return
+            }
+            let route = await self.localRoute(moved.host, moved.port)
+            guard current() else { return }
+            guard let route, MovedPC.isLocal(moved.host, over: route) else {
+                self.record(.info, "connection", "The saved PC was found, but not on this iPad's local network: staying at the saved address")
+                return
+            }
+            self.record(.info, "connection", "Checking that the PC at \(moved.host):\(moved.port) is the saved one")
+            let same = await MovedPC.confirm(host: moved.host, port: moved.port, token: token,
+                                             link: self.makeUDPLink(moved.port))
+            guard current() else { return }
+            guard same else {
+                self.record(.info, "connection", "The PC there didn't show it is the saved one: staying at the saved address")
+                return
+            }
+            self.record(.info, "connection", "It is the saved PC: connecting there")
+            self.disconnect(.pcMoved)
+            self.pendingMove = Move(from: (host, port), name: name, token: token)
+            self.explicitPairingToken = token
+            self.startAttempt(.udp(host: moved.host, port: moved.port))
+        }
+    }
+
+    /// The PC that accepted a moved attempt is the saved one: it has the
+    /// saved name, and gives back the saved pairing token, or none if its
+    /// pairing is off now.
+    private static func isSamePC(_ move: Move, _ info: ControlChannel.SessionInfo) -> Bool {
+        info.hostName == move.name && (!PairingStore.valid(info.authToken) || info.authToken == move.token)
+    }
+
+    /// The moved PC showed a picture: its pairing is saved at the new
+    /// address, then the new entry replaces the old one. If the pairing
+    /// couldn't be saved, the old entry and pairing stay as they were.
+    private func savedMove(_ move: Move, to new: (host: String, port: UInt16), pairingAddress: String) -> Bool {
+        do {
+            try pairingStore.save(token: move.token, hostName: hostInfo?.hostName ?? move.name, address: pairingAddress)
+            guard try pairingStore.token(address: pairingAddress) == move.token else { throw CocoaError(.fileWriteUnknown) }
+        } catch {
+            record(.warning, "pairing", "The PC's new address wasn't saved on this iPad; keeping the saved one")
+            return false
+        }
+        RecentConnectionStore.shared.moved(from: move.from, to: new, name: hostInfo?.hostName ?? move.name,
+                                           replacesOld: move.noVideo || homeAddress(move.from.host))
+        if move.noVideo {
+            // The PC still answers at the old address: its pairing stays,
+            // and connecting there goes here first.
+            NoVideoPaths.remember(from: .init(host: move.from.host, port: move.from.port),
+                                  to: .init(host: new.host, port: new.port), pairing: move.token)
+        } else if homeAddress(move.from.host) {
+            try? pairingStore.remove(address: PairingStore.address(host: move.from.host, port: move.from.port))
+        }
+        return true
+    }
+
+    /// Takes the next no-video step once it is due: the PC said it sent
+    /// video and no picture came of it (see `NoVideoFallback`). A path that
+    /// drops large datagrams often lets a frame's small last fragment by.
+    private func advanceNoVideoFallback() {
+        guard noVideoFallback != nil, state == .connecting, hostInfo != nil, !awaitingPairing, !waitingForStream,
+              let step = noVideoFallback?.next(at: ProcessInfo.processInfo.systemUptime) else { return }
+        endNoVideoStep("no_video")
+        switch step {
+        case .smallerPackets(let size):
+            // The PC is sending and the iPad is working on it: one fresh
+            // window, as when data starts to arrive.
+            if !didExtendTimeout {
+                didExtendTimeout = true
+                armConnectTimeout(seconds: timing.connectTimeoutSeconds)
+            }
+            noVideoStep = "step=smaller_packets size=\(size)"
+            sessionMediaSize = size
+            mediaSizeFromStep = true
+            controlChannel?.sendKeyframeRequest(streamEpoch: 0, lastCompleteSeq: 0, reason: .startup, maxMediaDgram: size)
+        case .otherAddress:
+            tryOtherAddress()
+        }
+    }
+
+    /// A session at an address where the PC's video needed a smaller media
+    /// size before, over the same network, asks for it at once instead of
+    /// waiting through the steps again (see `NoVideoSizes`).
+    private func startWithRememberedSize(_ connectionID: UUID, address: NoVideoPaths.Address, pairing: Data) {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let route = await self.localRoute(address.host, address.port)
+            guard self.currentAttempt.withLock({ $0 == connectionID }) else { return }
+            let key = NoVideoSizes.Key(address: address, pairing: pairing, network: NoVideoSizes.network(route))
+            self.mediaSizeKey = key
+            // A picture came first, at the PC's size or after a step.
+            guard self.state == .connecting else { return self.settleMediaSize() }
+            guard self.sessionMediaSize == nil, let size = NoVideoSizes.size(for: key, now: self.now()) else { return }
+            self.sessionMediaSize = size
+            self.noVideoFallback?.skipSizes(downTo: size)
+            self.controlChannel?.sendKeyframeRequest(streamEpoch: 0, lastCompleteSeq: 0, reason: .startup, maxMediaDgram: size)
+            self.record(.info, "connection", "no_video_fallback step=remembered_size size=\(size) result=asked")
+        }
+    }
+
+    /// The session shows a picture: keep the smaller size a step found, or
+    /// forget the size kept for this address once the PC's own size works,
+    /// as after a change of network.
+    private func settleMediaSize() {
+        guard let key = mediaSizeKey else { return }
+        if let size = sessionMediaSize {
+            if mediaSizeFromStep { NoVideoSizes.remember(size, for: key, now: now()) }
+        } else if NoVideoSizes.forget(key) {
+            record(.info, "connection", "no_video_fallback step=remembered_size result=forgotten")
+        }
+    }
+
+    /// Logs the pending no-video step's `result`.
+    private func endNoVideoStep(_ result: String) {
+        guard let step = noVideoStep else { return }
+        noVideoStep = nil
+        record(.info, "connection", "no_video_fallback \(step) result=\(result)")
+    }
+
+    /// No picture came of the PC's video at this address, even in small
+    /// datagrams. Asked here, the PC signs its home network addresses with
+    /// this iPad's pairing; the first other one on this iPad's own network,
+    /// where the PC shows again that it holds the pairing and receives
+    /// there, gets a new attempt. A forwarded or spoofed
+    /// address can't make either answer.
+    private func tryOtherAddress() {
+        let host = debugState.host, port = debugState.port
+        let done = { [weak self] (result: String) -> Void in
+            self?.record(.info, "connection", "no_video_fallback step=other_address result=\(result)")
+        }
+        guard attemptMove == nil else { return done("moved_before") }
+        guard let connectionID = currentAttempt.withLock({ $0 }), let name = hostInfo?.hostName,
+              let token = (try? pairingStore.token(address: PairingStore.address(host: host, port: port))) ?? nil
+        else { return done("unpaired") }
+        let current = { [weak self] in
+            guard let self else { return false }
+            return self.currentAttempt.withLock { $0 == connectionID } && self.state == .connecting
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let identity = await MovedPC.identify(host: host, port: port, token: token, link: self.makeUDPLink(port))
+            guard current() else { return }
+            guard let identity else { return done("no_answer") }
+            for other in MovedPC.otherAddresses(identity, asked: host, homeAddress: self.homeAddress) {
+                let target = self.dialAddress(other, identity.port)
+                let route = await self.localRoute(target.host, target.port)
+                guard current() else { return }
+                // As for a PC Bonjour moved: only an address on this iPad's
+                // own network, so nothing relays the stream elsewhere.
+                guard let route, MovedPC.isLocal(target.host, over: route) else { continue }
+                let same = await MovedPC.confirm(host: target.host, port: target.port, token: token,
+                                                 link: self.makeUDPLink(target.port))
+                guard current() else { return }
+                guard same else { continue }
+                done("moved")
+                self.disconnect(.noVideoPath)
+                self.pendingMove = Move(from: (host, port), name: name, token: token, noVideo: true)
+                self.explicitPairingToken = token
+                self.startAttempt(.udp(host: target.host, port: target.port))
+                return
+            }
+            done("none")
+        }
+    }
+
     /// Retires the automatic reconnect cycle, if one is running: its task
     /// stops at its next check and can no longer write state.
     private func endReconnectCycle() {
@@ -1008,6 +1676,184 @@ final class ConnectionManager: ObservableObject {
         reconnectCycleID = nil
         reconnectFailure = nil
         reconnectAttempt = 0
+    }
+
+    // MARK: - The PC that didn't answer comes back
+
+    private var showsNoReplyOverWiFi: Bool {
+        switch problem {
+        case .noReply(usb: false)?, .noReplyAtNewAddress?: return true
+        default: return false
+        }
+    }
+
+    /// The pairing saved for the PC at `host:port`, if a valid one.
+    private func savedPairing(host: String, port: UInt16) -> Data? {
+        let token = (try? pairingStore.token(address: PairingStore.address(host: host, port: port))) ?? nil
+        return token.flatMap { PairingStore.valid($0) ? $0 : nil }
+    }
+
+    /// Starts watching Bonjour for the paired PC at `host:port`, by its
+    /// service when this iPad knows its name, as an attempt to it starts. An
+    /// automatic try must prove it is the same PC with the pairing, so an
+    /// unpaired PC isn't watched for. A watch for that PC goes on as it was.
+    private func watchForPC(host: String, port: UInt16) {
+        if let watch = pcReturn, watch.host == host, watch.port == port { return }
+        endPCReturn()
+        guard savedPairing(host: host, port: port) != nil else { return }
+        let name = RecentConnectionStore.shared.entry(host: host, port: port)?.name
+            ?? pairingStore.pcName(address: PairingStore.address(host: host, port: port))
+        pcReturn = PCReturn(name: name, host: host, port: port)
+        let browser = makePCBrowser()
+        browser.onHosts = { [weak self] hosts in self?.pcReturnHeard(hosts) }
+        pcReturnBrowser = browser
+        pcReturnPaused = !isForeground
+        if isForeground { browser.start() }
+    }
+
+    /// The "didn't answer" card is up for the PC watched for: its listings
+    /// are asked until one proves the pairing, until the time limit.
+    private func armPCReturn() {
+        guard pcReturn != nil else { return }
+        if pcReturn?.armedAt == nil {
+            pcReturn?.arm(at: now())
+            watchingForPC = true
+            record(.info, "connection", "pc_return result=watching")
+            let limit = timing.pcReturnLimitSeconds
+            pcReturnLimit = Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(limit))
+                guard !Task.isCancelled, let self, self.pcReturn != nil else { return }
+                self.record(.info, "connection", "pc_return result=expired")
+                self.endPCReturn()
+            }
+        }
+        askPCReturn(after: timing.pcReturnDebounceSeconds)
+    }
+
+    private func pcReturnHeard(_ hosts: [DiscoveredHost]) {
+        guard pcReturn != nil else { return }
+        if pcReturn?.heard(hosts) == true { askPCReturn(after: timing.pcReturnDebounceSeconds) }
+    }
+
+    /// The card is up, in the foreground, within the time limit.
+    private var pcReturnMayTry: Bool {
+        guard let watch = pcReturn, watch.armedAt != nil else { return false }
+        return isForeground && state == .disconnected && showsNoReplyOverWiFi
+            && !watch.expired(at: now(), limit: timing.pcReturnLimitSeconds)
+    }
+
+    /// Asks each of the PC's listings in turn after `delay`, so a few
+    /// Bonjour updates count as one, then again every few seconds, until one
+    /// proves the pairing and has its try or none is left to ask. A newer
+    /// call starts over.
+    private func askPCReturn(after delay: Double) {
+        guard let watch = pcReturn, watch.armedAt != nil else { return }
+        guard !watch.expired(at: now(), limit: timing.pcReturnLimitSeconds) else {
+            record(.info, "connection", "pc_return result=expired")
+            return endPCReturn()
+        }
+        pcReturnTry?.cancel()
+        pcReturnTry = Task { @MainActor [weak self] in
+            var wait = delay
+            while true {
+                try? await Task.sleep(for: .seconds(wait))
+                guard !Task.isCancelled, let self, self.pcReturnMayTry,
+                      let round = self.pcReturn?.candidates, !round.isEmpty else { return }
+                for pc in round where self.pcReturn?.awaits(pc) == true {
+                    let proved = await self.provePCReturn(pc)
+                    guard !Task.isCancelled, self.pcReturnMayTry else { return }
+                    if proved {
+                        self.pcReturnTry = nil
+                        self.pcReturn?.didTry(pc)
+                        return self.tryPCAgain(at: pc)
+                    }
+                }
+                wait = self.timing.pcReturnProbeSeconds
+            }
+        }
+    }
+
+    /// Whether the PC at `pc`'s address shows it holds the saved pairing,
+    /// as a moved PC does; nothing with the pairing goes to it before. An
+    /// address other than the one tried must be on this iPad's own network
+    /// first: one that isn't never gets a try.
+    private func provePCReturn(_ pc: DiscoveredHost) async -> Bool {
+        guard let watch = pcReturn, let host = pc.address,
+              let token = savedPairing(host: watch.host, port: watch.port) else { return false }
+        if host != watch.host {
+            let route = homeAddress(host) ? await localRoute(host, pc.port) : nil
+            guard let route, MovedPC.isLocal(host, over: route) else {
+                if !Task.isCancelled, pcReturn != nil {
+                    pcReturn?.didTry(pc)
+                    record(.info, "connection", "pc_return result=not_local")
+                }
+                return false
+            }
+        }
+        return await MovedPC.confirm(host: host, port: pc.port, token: token, link: makeUDPLink(pc.port))
+    }
+
+    /// The one try at where Bonjour has the PC now, which proved the
+    /// pairing. The attempt carries the pairing, and only a session from
+    /// the PC it expects counts (see `ExpectedPC`). A PC at a new address or port moves the saved
+    /// entry once it shows a picture. If the PC still doesn't answer, the
+    /// card comes back and waits again.
+    private func tryPCAgain(at found: DiscoveredHost) {
+        guard let watch = pcReturn, let host = found.address,
+              let token = savedPairing(host: watch.host, port: watch.port) else { return }
+        record(.info, "connection", "pc_return result=tried")
+        startingPCReturnTry = true
+        defer { startingPCReturnTry = false }
+        problem = nil
+        connectionError = nil
+        if host != watch.host || found.port != watch.port, let name = watch.name {
+            pendingMove = Move(from: (watch.host, watch.port), name: name, token: token)
+        }
+        pendingPC = ExpectedPC(pairing: token, name: watch.name)
+        explicitPairingToken = token
+        connect(target: .udp(host: host, port: found.port))
+        pendingMove = nil
+        pendingPC = nil
+    }
+
+    /// Dismissed, or replaced by another card: the watch ends. An attempt
+    /// that starts clears the card too; a user's own ends the watch where
+    /// it starts.
+    private func problemChanged() {
+        guard pcReturn != nil, !startingPCReturnTry, !showsNoReplyOverWiFi else { return }
+        if problem == nil && state != .disconnected { return }
+        endPCReturn()
+    }
+
+    /// The app left the foreground: the search stops and nothing is asked.
+    private func pausePCReturn() {
+        pcReturnTry?.cancel()
+        pcReturnTry = nil
+        guard let browser = pcReturnBrowser, !pcReturnPaused else { return }
+        pcReturnPaused = true
+        browser.stop()
+    }
+
+    /// Back in the foreground: the search starts again, and the PC's
+    /// listings are asked again.
+    private func resumePCReturn() {
+        guard let browser = pcReturnBrowser, pcReturnPaused else { return }
+        pcReturnPaused = false
+        browser.start()
+        askPCReturn(after: timing.pcReturnDebounceSeconds)
+    }
+
+    private func endPCReturn() {
+        pcReturnTry?.cancel()
+        pcReturnTry = nil
+        pcReturnLimit?.cancel()
+        pcReturnLimit = nil
+        pcReturnBrowser?.onHosts = nil
+        pcReturnBrowser?.stop()
+        pcReturnBrowser = nil
+        pcReturnPaused = false
+        pcReturn = nil
+        if watchingForPC { watchingForPC = false }
     }
 
     /// The session and how long the current attempt has taken, appended to
@@ -1034,15 +1880,25 @@ final class ConnectionManager: ObservableObject {
                 let level = debug.timeoutLevel(handshakeDone: handshakeDone,
                                                answeredHereBefore: self.acceptedAddresses.contains("\(debug.host):\(debug.port)"))
                 self.record(level, "timeout", debug.timeoutSummary(handshakeDone: handshakeDone) + self.attemptTimings)
+                if self.leaveRememberedAddress(.connectTimeout, result: "no_picture") { return }
                 // Only an attempt the PC answered counts.
                 if handshakeDone { self.noPictureStreak.endedWithoutPicture() }
-                self.problem = self.noPictureStreak.shown(.timeout(
+                // A PC that said it isn't streaming and then went quiet (it
+                // closed, or slept) didn't answer: its answers were no picture.
+                // A PC that said why (its graphics card, which only the PC
+                // can switch) gets that card instead of "no picture".
+                let card = handshakeDone ? self.pcGraphicsCard : nil
+                let problem: ConnectionProblem = self.waitingForStream ? .noReply(usb: isUSB)
+                    : card.map { .pcGraphicsCard($0) } ?? self.noPictureStreak.shown(.timeout(
                     listenerReady: debug.listenerReadyPort != nil, helloAttempts: debug.helloAttempts,
                     handshakeDone: handshakeDone, datagramsReceived: debug.datagramsReceived,
                     isUSB: isUSB, host: debug.host), at: isUSB ? nil : "\(debug.host):\(debug.port)")
+                self.problem = problem == .noReply(usb: false) && self.attemptMove != nil
+                    ? .noReplyAtNewAddress(debug.host) : problem
                 // The app gave up, not the user: the PC's log tells them apart.
                 self.disconnect(.connectTimeout)
                 if handshakeDone && self.noPictureStreak.stopsReconnecting { self.stopAutomaticAttempts(isUSB: isUSB) }
+                if self.showsNoReplyOverWiFi && self.reconnectCycleID == nil { self.armPCReturn() }
             }
         }
     }
@@ -1088,6 +1944,8 @@ final class ConnectionManager: ObservableObject {
         timeoutTask?.cancel()
         endReconnectCycle()
         disconnect()
+        // The user stopped waiting for the PC to stream.
+        if case .pcNotStreaming = problem { problem = nil }
     }
 
     /// Try the last connection again: the cable when that is what failed,
@@ -1160,6 +2018,7 @@ final class ConnectionManager: ObservableObject {
         isForeground = false
         usbListener?.stop()
         usbListener = nil
+        pausePCReturn()
         // A suspended app can't reconnect. Backgrounding ends an automatic
         // cycle where running out would, and foregrounding resumes it as an
         // interrupted session.
@@ -1182,12 +2041,40 @@ final class ConnectionManager: ObservableObject {
         }
     }
 
+    /// Shows `sighting` until it expires, then clears it, as long as no
+    /// newer one has replaced it.
+    private func keepAppleDevicesSighting(_ sighting: AppleDevicesSighting?) {
+        appleDevicesExpiry?.cancel()
+        appleDevicesExpiry = nil
+        guard let sighting, sighting.applies(now: now()) else {
+            appleDevicesUnreachable = nil
+            return
+        }
+        appleDevicesUnreachable = sighting
+        let wait = sighting.until.timeIntervalSince(now())
+        appleDevicesExpiry = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(wait))
+            guard !Task.isCancelled, let self, self.appleDevicesUnreachable == sighting else { return }
+            self.appleDevicesUnreachable = nil
+        }
+    }
+
+    /// A suspended app's timer may not have fired on time: check the
+    /// sighting against the clock again, and wait out what is left of it.
+    func recheckAppleDevicesSighting() {
+        if let sighting = appleDevicesUnreachable { keepAppleDevicesSighting(sighting) }
+    }
+
     /// Resume the session that backgrounding interrupted (opt-out toggle).
     func handleAppForegrounded() {
         endBackgroundGoodbye()
         isForeground = true
-        usbPaused = usbStoppedForNoPicture
+        recheckAppleDevicesSighting()
+        // A hold whose wait ran out in the background ends here.
+        if let hold = cableHold, !hold.holds(at: now()) { endCableHold() }
+        usbPaused = usbStoppedForNoPicture || cableHold != nil
         refreshUSBAvailability()
+        resumePCReturn()
         guard resumeOnForeground else { return }
         resumeOnForeground = false
         guard UserDefaults.standard.flag(forKey: "autoResumeOnForeground"),
@@ -1214,12 +2101,23 @@ final class ConnectionManager: ObservableObject {
     /// Ends the attempt. `end` says why; only the user's own action is
     /// `.userDisconnect`.
     func disconnect(_ end: AttemptEnd = .userDisconnect) {
+        // Still checking the remembered address: nothing went out yet.
+        if redirectCheck != nil {
+            redirectCheck = nil
+            state = .disconnected
+            return
+        }
+        // Only an attempt that got no answer leaves the PC watched for.
+        if ![.connectTimeout, .pcMoved, .otherPC].contains(end) { endPCReturn() }
         if state != .disconnected {
+            endNoVideoStep("no_video")
             recordStreamSummary(reason: "disconnect=\(end.name)")
             record(.info, "connection", "Disconnect state=\(state) reason=\(end.name)")
             recordSummary(end)
         }
         awaitingPairing = false
+        waitingForStream = false
+        noVideoFallback = nil
         pairingPrompt = nil
         currentAttempt.withLock { $0 = nil }
         timeoutTask?.cancel()
@@ -1258,6 +2156,11 @@ final class ConnectionManager: ObservableObject {
         stats = StreamStats()
         signalLost = false
         pictureRestoring = false
+        pcLocked = false
+        pcNoDisplay = false
+        pcGraphicsCard = nil
+        clearRestartNotice()
+        secondScreenNeedsWindows11 = false
         degradedSinceUs = nil
         prevCounters = FrameAssembler.Counters()
         hostInfo = nil
@@ -1283,7 +2186,9 @@ final class ConnectionManager: ObservableObject {
         return SessionSummary(
             end: end, isUSB: mediaLink?.isUSB ?? (transportMode == "USB"), sessionId: hostInfo?.sessionId,
             nonce: controlChannel?.helloNonce ?? 0, awaitingPairing: awaitingPairing,
-            datagramsReceived: debugState.datagramsReceived, firstFrame: firstFrameAt.map { $0 - summaryStartedAt },
+            datagramsReceived: debugState.datagramsReceived, captureRefused: pcGraphicsCard != nil,
+            pcSentVideo: pcSentVideo,
+            firstFrame: firstFrameAt.map { $0 - summaryStartedAt },
             duration: now - summaryStartedAt)
     }
 
@@ -1545,6 +2450,11 @@ struct RecentConnection: Codable, Identifiable {
     let port: UInt16
     let lastUsed: Date
     let isUSB: Bool
+    /// The name the PC gave. Entries saved before 0.3.5 have none.
+    var name: String? = nil
+    /// The address is the one Bonjour listed for the PC. Only such an
+    /// entry may move to a new address by itself; nil is unknown.
+    var found: Bool? = nil
 }
 
 extension RecentConnection {
@@ -1568,14 +2478,34 @@ final class RecentConnectionStore: ObservableObject {
         load()
     }
 
-    func add(host: String, port: UInt16, isUSB: Bool) {
+    /// Saves a connection that showed a picture. A Wi-Fi entry keeps its
+    /// name and found mark when this connection gives none.
+    func add(host: String, port: UInt16, isUSB: Bool, name: String? = nil, found: Bool = false) {
+        let previous = isUSB ? nil : entry(host: host, port: port)
         connections.removeAll { $0.host == host && $0.port == port && $0.isUSB == isUSB }
         connections.insert(
-            RecentConnection(host: host, port: port, lastUsed: Date(), isUSB: isUSB),
+            RecentConnection(host: host, port: port, lastUsed: Date(), isUSB: isUSB,
+                             name: isUSB ? nil : name.flatMap { $0.isEmpty ? nil : $0 } ?? previous?.name,
+                             found: isUSB ? nil : (found || previous?.found == true)),
             at: 0
         )
         if connections.count > 10 { connections = Array(connections.prefix(10)) }
         save()
+    }
+
+    /// The saved Wi-Fi entry for `host:port`.
+    func entry(host: String, port: UInt16) -> RecentConnection? {
+        connections.first { !$0.isUSB && $0.host == host && $0.port == port }
+    }
+
+    /// The PC moved from `old` to `new`, an address Bonjour gave. A home
+    /// network entry gives way to it (`replacesOld`).
+    func moved(from old: (host: String, port: UInt16), to new: (host: String, port: UInt16), name: String,
+               replacesOld: Bool) {
+        if replacesOld {
+            connections.removeAll { !$0.isUSB && $0.host == old.host && $0.port == old.port }
+        }
+        add(host: new.host, port: new.port, isUSB: false, name: name, found: true)
     }
 
     private func load() {

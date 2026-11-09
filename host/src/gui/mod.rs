@@ -19,6 +19,7 @@
 //! `author_id`, see `widgets::automation_id`): scripts and tests find them by
 //! that id first, then by name, so the same name works in every language.
 
+mod driver_wait;
 mod feedback_panel;
 mod fonts;
 mod icons;
@@ -44,7 +45,7 @@ use tracing::{info, warn};
 
 use crate::autostart::{first_lan_ipv4, read_startup_registry, set_startup_registry};
 use crate::capture::recovery::CaptureBlock;
-use crate::capture::{enumerate_outputs, OutputInfo};
+use crate::capture::{listing, OutputInfo};
 use crate::control::{CaptureTarget, GuiControl};
 use crate::gpu_preference::{Change, Preference, SwitchRecord};
 use crate::handoff::Handoff;
@@ -81,6 +82,8 @@ struct StatsSnapshot {
     codec_name: String,
     using_software_fallback: bool,
     nvidia_driver_outdated: bool,
+    gpu_detection_stalled: bool,
+    driver_update_vendors: Vec<crate::gpu::GpuVendor>,
     gpu_name: String,
     capture_display: String,
     transport_fps: f64,
@@ -119,6 +122,8 @@ impl StatsSnapshot {
             codec_name: s.codec_name.clone(),
             using_software_fallback: s.using_software_fallback,
             nvidia_driver_outdated: s.nvidia_driver_outdated,
+            gpu_detection_stalled: s.gpu_detection_stalled,
+            driver_update_vendors: s.driver_update_vendors.clone(),
             gpu_name: s.gpu_name.clone(),
             capture_display: s.capture_display.clone(),
             transport_fps: s.transport_fps,
@@ -303,6 +308,7 @@ pub struct AnalyzerApp {
     settings_fps_target: u32,
     settings_encoder_input: crate::encoder::input::EncoderInput,
     settings_check_updates: bool,
+    settings_beta_updates: bool,
     updates: crate::updates::Updater,
     /// The update popup is on screen; it stays until a button is chosen.
     update_popup_open: bool,
@@ -363,7 +369,9 @@ pub struct AnalyzerApp {
     update_refused: bool,
     history: History,
     quality: QualityMeter,
-    logo: Option<(f32, egui::TextureHandle)>,
+    /// The logo for a scale and the window renderer's device it was made
+    /// on: textures go with a lost device.
+    logo: Option<(f32, u64, egui::TextureHandle)>,
     /// The saved language choice (see `i18n::resolve`).
     settings_language: Option<String>,
     /// A language whose fonts were just installed; it shows from the next
@@ -375,6 +383,7 @@ pub struct AnalyzerApp {
 
 impl AnalyzerApp {
     pub fn new(cc: &eframe::CreationContext<'_>, control: GuiControl) -> Self {
+        renderer::remember_window(cc);
         // Load persisted settings first; values fall back to the live runtime state when the
         // file is missing or unreadable.
         let persisted = SettingsFile::load();
@@ -441,7 +450,8 @@ impl AnalyzerApp {
                 String::new()
             }
         };
-        let available_outputs = enumerate_outputs();
+        // Before the first paint, so a stuck driver must not hold it.
+        let available_outputs = listing::outputs_at_startup(&control.shared);
 
         // Same model as encoder_override: push the persisted preference into
         // SharedControl so the encoder honours it without a restart.
@@ -473,6 +483,7 @@ impl AnalyzerApp {
             let ctx = cc.egui_ctx.clone();
             crate::updates::Updater::start(
                 persisted.check_for_updates,
+                persisted.beta_updates,
                 control.shared.session.clone(),
                 control.shared.handoff.clone(),
                 std::sync::Arc::new(move |version: Option<&str>| {
@@ -489,6 +500,7 @@ impl AnalyzerApp {
         Self {
             settings_encoder_input: persisted.encoder_input,
             settings_check_updates: persisted.check_for_updates,
+            settings_beta_updates: persisted.beta_updates,
             updates,
             update_popup_open: false,
             ipad_last_seen: Some(popup_now()),
@@ -565,6 +577,7 @@ impl AnalyzerApp {
             encoder_override,
             encoder_input: self.settings_encoder_input,
             check_for_updates: self.settings_check_updates,
+            beta_updates: self.settings_beta_updates,
             capture_display: if self.settings_capture_display.is_empty() {
                 None
             } else {
@@ -704,7 +717,7 @@ impl AnalyzerApp {
     }
 
     fn refresh_outputs(&mut self) {
-        self.available_outputs = enumerate_outputs();
+        self.available_outputs = listing::outputs(&self.control.shared);
         info!(
             count = self.available_outputs.len(),
             "Re-enumerated display outputs"
@@ -787,11 +800,17 @@ impl AnalyzerApp {
         self.persist_settings();
     }
 
+    fn set_beta_updates(&mut self, enabled: bool) {
+        self.settings_beta_updates = enabled;
+        self.updates.set_beta(enabled);
+        self.persist_settings();
+    }
+
     fn set_require_pairing(&mut self, required: bool) {
         {
             let mut pairing = self.control.shared.pairing.lock();
             pairing.required = required;
-            pairing.warn_if_off();
+            pairing.log_if_off();
         }
         self.persist_settings();
     }
@@ -820,6 +839,8 @@ impl AnalyzerApp {
 
     fn restart_stream(&mut self) {
         self.restart_pending = false;
+        // The user may have updated a driver, as the fallback notice asks.
+        crate::encoder::forget_launch_failures();
         self.control.request_restart();
     }
 
@@ -1074,8 +1095,9 @@ impl eframe::App for AnalyzerApp {
         CANVAS.to_normalized_gamma_f32()
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         renderer::frame_started(ui.ctx());
+        renderer::release_render_state(frame);
         crate::startup::simulate_window_failure();
         let ctx = ui.ctx().clone();
         if let Some(language) = self.pending_language.take() {
@@ -1270,14 +1292,19 @@ impl AnalyzerApp {
     fn draw_brand(&mut self, ui: &mut egui::Ui) {
         const LOGO: f32 = 30.0;
         let ppp = ui.ctx().pixels_per_point();
-        if self.logo.as_ref().is_none_or(|(scale, _)| *scale != ppp) {
+        let device = renderer::devices();
+        if self
+            .logo
+            .as_ref()
+            .is_none_or(|(scale, made_on, _)| (*scale, *made_on) != (ppp, device))
+        {
             let pixels = (LOGO * ppp).round().max(1.0) as usize;
-            self.logo = logo_texture(ui.ctx(), pixels).map(|texture| (ppp, texture));
+            self.logo = logo_texture(ui.ctx(), pixels).map(|texture| (ppp, device, texture));
         }
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
             let (rect, _) = ui.allocate_exact_size(vec2(LOGO, LOGO), Sense::hover());
-            if let Some((_, texture)) = &self.logo {
+            if let Some((_, _, texture)) = &self.logo {
                 ui.painter().image(
                     texture.id(),
                     rect,
@@ -1760,8 +1787,23 @@ pub fn shown_address(ip: std::net::Ipv4Addr, listen_port: u16) -> String {
     }
 }
 
+/// The app quits from outside its window, as when Windows closes it for an
+/// installer, perhaps before the window is confirmed drawing. As for a quit
+/// from the graphics driver notice, this launch's renderer marker goes
+/// without counting, so the next launch avoids no backend, and nothing still
+/// in the driver saves it again.
+pub fn quitting_from_outside() {
+    renderer::abandon();
+}
+
 /// Launch the GUI window. Blocks the calling thread.
-pub fn run_gui(control: GuiControl) -> eframe::Result<()> {
+/// Runs the window until it closes. `quit_while_stuck` is the app's quit
+/// path, for a Cancel in the graphics driver notice while the window's
+/// thread is stuck before its first frame; it ends the process.
+pub fn run_gui(
+    control: GuiControl,
+    quit_while_stuck: Box<dyn FnOnce() + Send>,
+) -> eframe::Result<()> {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon_256.png"))
         .expect("embedded icon PNG is valid");
 
@@ -1773,13 +1815,61 @@ pub fn run_gui(control: GuiControl) -> eframe::Result<()> {
             .with_icon(std::sync::Arc::new(icon)),
         ..Default::default()
     };
-    renderer::configure(&mut options.wgpu_options);
+    // The window's thread makes its first graphics call only once the
+    // driver has answered the same calls on another thread, and is watched
+    // until it is confirmed drawing.
+    let prepared = renderer::prepare();
+    #[cfg(windows)]
+    let watch = {
+        let prompt = driver_wait::Prompt::new(driver_wait::MessageNotice::default());
+        let skip_listing = prepared.listing_avoided();
+        let probe_limits = crate::stall::Call::GpuProbe.limits();
+        let opened = driver_wait::before_window(
+            crate::stall::lanes(),
+            crate::stall::Call::GpuDetect.limits(),
+            probe_limits,
+            &prompt,
+            driver_wait::POLL,
+            || renderer::adapter_list(skip_listing),
+            |adapters| {
+                renderer::configure(&mut options.wgpu_options, prepared, adapters);
+                renderer::probe_spec(&options.wgpu_options)
+            },
+            |spec| renderer::adapter_probe(spec.clone()),
+        );
+        if !opened {
+            renderer::abandon();
+            return Ok(());
+        }
+        let watch = driver_wait::watch_first_paint(
+            prompt,
+            probe_limits.limit,
+            driver_wait::PROOF_WITHIN,
+            driver_wait::POLL,
+            std::time::Instant::now,
+            renderer::last_pass,
+            renderer::window_held,
+            move || {
+                renderer::abandon();
+                quit_while_stuck();
+            },
+        );
+        renderer::when_drawing(watch.finisher());
+        watch
+    };
+    #[cfg(not(windows))]
+    {
+        renderer::configure(&mut options.wgpu_options, prepared, Vec::new());
+        drop(quit_while_stuck);
+    }
 
     let result = eframe::run_native(
         "EternalMonitor",
         options,
         Box::new(|cc| Ok(Box::new(AnalyzerApp::new(cc, control)))),
     );
+    #[cfg(windows)]
+    let _ = watch.stop();
     if result.is_ok() {
         renderer::window_closed();
     }

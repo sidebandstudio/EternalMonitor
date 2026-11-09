@@ -24,10 +24,11 @@ impl AnalyzerApp {
         widgets::list_card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             let mut refresh = false;
+            let windows_10 = crate::capture::second_screen::windows_unsupported(&self.control.shared);
             widgets::setting_row(
                 ui,
                 tr("How the iPad shows your PC"),
-                "Mirror my screen shows your main screen. Second screen adds the iPad as an extra screen while it is connected. You can also mirror one particular monitor.",
+                display_description(windows_10),
                 300.0,
                 |ui| {
                     refresh = widgets::icon_button(ui, super::icons::Icon::Refresh, tr("Refresh displays")).clicked();
@@ -229,7 +230,7 @@ impl AnalyzerApp {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 14.0;
                 let (rect, _) = ui.allocate_exact_size(vec2(44.0, 44.0), Sense::hover());
-                if let Some((_, texture)) = &self.logo {
+                if let Some((_, _, texture)) = &self.logo {
                     ui.painter().image(
                         texture.id(),
                         rect,
@@ -328,6 +329,16 @@ pub(super) fn env_or(env: Option<&str>, description: &str) -> String {
 /// What "Match the iPad's resolution" does, and when a change applies: the
 /// driver reads the modes when the second screen starts, and restarting
 /// the stream keeps the second screen that is already there.
+/// What the display choice does, and on Windows 10 that Second screen
+/// can't run there.
+pub(super) fn display_description(windows_10: bool) -> &'static str {
+    if windows_10 {
+        "Mirror my screen shows your main screen. You can also mirror one particular monitor. Second screen needs Windows 11, so on this PC the iPad shows your main screen instead."
+    } else {
+        "Mirror my screen shows your main screen. Second screen adds the iPad as an extra screen while it is connected. You can also mirror one particular monitor."
+    }
+}
+
 pub(super) fn vdd_match_description(extending: bool) -> &'static str {
     if extending {
         "Makes the second screen exactly as sharp and smooth as the iPad's display. A change applies the next time the second screen starts, when the iPad connects again."

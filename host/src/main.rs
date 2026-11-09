@@ -14,6 +14,10 @@ use tracing_subscriber::prelude::*;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The Stream page's "Fix it" for a Windows Firewall block starts this
+    // exe as administrator to change the firewall rules for this exe, and
+    // nothing else: no settings, log, window or single-instance check.
+    eternal_host::firewall_fix::run_if_requested();
     // Before anything below creates the settings folder or a file in it: a
     // folder that held nothing means a fresh install, which opens first-run
     // setup. Upgrades never see it.
@@ -98,9 +102,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Never leave a virtual display attached across runs. If a previous run crashed or was
     // force-killed while streaming the virtual extended display, the VDD device is still enabled
-    // and shows up as a phantom monitor. Disabling it unconditionally at startup guarantees the
-    // managed display only ever exists while EternalMonitor is actively using it. It runs beside
-    // startup: a slow or hung task used to hold a Mirror stream's first frame for up to 30 s.
+    // and shows up as a phantom monitor. Disabling it at startup, unless Windows already reports it
+    // disabled, guarantees the managed display only ever exists while EternalMonitor is actively
+    // using it. It runs beside startup: a slow or hung task used to hold a Mirror stream's first
+    // frame for up to 30 s.
     vdd::disable_in_background();
 
     // Belt-and-suspenders: a panic anywhere (GUI, supervisor, pipeline threads) must still tear
@@ -130,16 +135,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Best-effort capture source for the banner — reflects the default (primary). The
     // authoritative per-run source (including a persisted/fallback selection) is logged
-    // inside the capture loop when the stream starts.
-    let capture_summary = {
-        let outputs = capture::enumerate_outputs();
-        outputs
-            .iter()
-            .find(|o| o.is_primary)
-            .or_else(|| outputs.first())
-            .map(|o| format!("{} ({}x{})", o.device_name, o.width, o.height))
-            .unwrap_or_else(|| "unknown".to_string())
-    };
+    // inside the capture loop when the stream starts. Time-boxed with GPU
+    // detection: it would wait on the same driver.
+    let capture_summary = capture::listing::startup_display_label();
 
     // Load persisted settings BEFORE the first pipeline spawns, so generation
     // 0 already streams with the user's bitrate/fps/encoder/display/codec.
@@ -160,6 +158,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("  Listen:  {}:{}", listen_ip, listen_port);
     info!("══════════════════════════════════");
     eternal_host::network::log_addresses();
+    eternal_host::firewall::watch(listen_port);
 
     let auth_token = persisted
         .ensure_auth_token()
@@ -175,7 +174,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut pairing = shared.pairing.lock();
         pairing.configure(persisted.require_pairing, auth_token);
         pairing.log_code();
-        pairing.warn_if_off();
+        pairing.log_if_off();
     }
     // Each Troubleshooting knob: an environment variable (developers, CI)
     // wins, then the saved setting, then Automatic.
@@ -215,6 +214,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     eternal_host::remote_config::load();
     #[cfg(windows)]
     eternal_host::capture::second_screen::load_memory(&shared);
+    #[cfg(windows)]
+    eternal_host::capture::second_screen::check_windows(&shared);
     eternal_host::remote_config::log_launch();
     shared
         .hevc_enabled
@@ -246,7 +247,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         shared: shared.clone(),
         supervisor_tx: supervisor_tx.clone(),
     };
-
     /// Set by the termination-signal handler; the headless loop polls it.
     static SHUTDOWN_REQUESTED: std::sync::atomic::AtomicBool =
         std::sync::atomic::AtomicBool::new(false);
@@ -266,11 +266,119 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
+    // An iPad looking for PCs starts waking the encoder's graphics card, which
+    // a laptop powers off when idle (see `gpu_wake`).
+    let wake_shared = shared.clone();
+    let mut wake_gate = eternal_host::gpu_wake::WakeGate::default();
+    let on_browse = move || {
+        // The card of the encoder that streams, as its last open published.
+        let Some(adapter_index) = *wake_shared.wake_adapter.lock() else {
+            return;
+        };
+        let sessions = wake_shared.session.lock().sessions_started();
+        if wake_gate.browse(
+            std::time::Instant::now(),
+            wake_shared.client_connected(),
+            sessions,
+        ) {
+            // A HELLO between here and the wake's device takes priority.
+            let shared = wake_shared.clone();
+            eternal_host::gpu_wake::wake(adapter_index, move || {
+                !shared.client_connected() && shared.session.lock().sessions_started() == sessions
+            });
+        }
+    };
+
     let supervisor_thread = std::thread::spawn(move || {
         eternal_host::supervisor::run(listen_port, shared, gpu_info, supervisor_tx, supervisor_rx);
     });
 
-    let mdns = discovery::advertise_service(listen_port);
+    let mdns = discovery::advertise_service(listen_port, on_browse);
+
+    // The quit path, once: after the window closes (or the headless loop
+    // ends), or from the first-paint watcher when the user quits while the
+    // window's thread is stuck in the graphics driver and may never return.
+    let quit_control = gui_control.clone();
+    let quit_once: QuitOnce = std::sync::Arc::new(parking_lot::Mutex::new(Some(Box::new(
+        move |window_error: Option<String>| {
+            let stop_streaming = || {
+                eternal_host::diagnostics::log_session_end_at_quit(&quit_control.shared);
+                quit_control.shared.stop();
+                quit_control.request_shutdown();
+
+                // Never leave the virtual display attached after we exit — it should only exist while
+                // EternalMonitor is actively using it. No Enable starts once the second screen worker
+                // is shut down, so this Disable is the last change. If it may still be on, the failure
+                // reporter turns it off after this process exits.
+                eternal_host::capture::second_screen::shut_down(&quit_control.shared);
+                eternal_host::startup::display_off_at_quit(vdd::disable);
+            };
+            // A window error is saved first and shown after the cleanup, as a panic is.
+            match window_error {
+                Some(detail) => eternal_host::startup::report_after(&detail, stop_streaming),
+                None => stop_streaming(),
+            }
+
+            // Give the supervisor a bounded amount of time to shut down cleanly,
+            // exiting the moment it finishes instead of always burning the full
+            // window. If it doesn't finish (blocked on DXGI acquire, etc.),
+            // force-exit so the process never lingers as an invisible zombie.
+            let (supervisor_done_tx, supervisor_done_rx) = mpsc::channel();
+            std::thread::spawn(move || {
+                if let Err(error) = supervisor_thread.join() {
+                    error!(error = ?error, "Supervisor thread panicked");
+                }
+                let _ = supervisor_done_tx.send(());
+            });
+
+            // Say goodbye on mDNS while the supervisor winds down, so iPads drop the
+            // host from their scan list promptly (process::exit skips destructors —
+            // without this no goodbye is ever sent).
+            if let Some(mdns) = mdns {
+                discovery::say_goodbye(mdns);
+            }
+
+            if supervisor_done_rx
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .is_err()
+            {
+                tracing::warn!("Supervisor did not shut down within 3s — forcing exit");
+            }
+
+            // Release every key and button the iPad left held, behind whatever the
+            // last stream queued, unless Windows is stuck.
+            quit_control
+                .shared
+                .input
+                .finish(std::time::Duration::from_millis(500));
+
+            // The window is gone and the display is off, so a slow disk keeps no one
+            // waiting on screen: give the second screen record up to 30 s to land.
+            eternal_host::capture::second_screen::finish_saving(&quit_control.shared);
+
+            eternal_host::startup::simulate_slow_exit();
+            info!("EternalMonitor shutting down");
+            // process::exit skips destructors. Flush the log writers and the upload
+            // outbox first, so a normal quit is told apart from a crash.
+            logging::flush_before_exit(_session_guard, _uploads, _stdout_guard);
+            eternal_host::startup::finish();
+            std::process::exit(0);
+        },
+    ))));
+
+    // Sleep, shutdown and sign-out end the iPad's session with a goodbye. An
+    // installer closing the app takes the quit path, as closing the window does.
+    #[cfg(windows)]
+    eternal_host::power::watch(gui_control.shared.clone(), {
+        let quit_once = std::sync::Arc::clone(&quit_once);
+        Box::new(move || {
+            gui::quitting_from_outside();
+            let quit = quit_once.lock().take();
+            if let Some(quit) = quit {
+                quit(None);
+            }
+        })
+    });
 
     // Headless mode for automation (the iOS E2E harness runs the host without
     // a window): stream until SIGTERM/SIGINT, then fall through to the same
@@ -317,64 +425,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         info!("Termination signal received — shutting down cleanly");
-    } else if let Err(e) = gui::run_gui(gui_control.clone()) {
+    } else if let Err(e) = gui::run_gui(gui_control.clone(), {
+        let quit_once = std::sync::Arc::clone(&quit_once);
+        Box::new(move || {
+            let quit = quit_once.lock().take();
+            if let Some(quit) = quit {
+                quit(None);
+            }
+        })
+    }) {
         error!(error = %e, "GUI exited with error");
         window_error = Some(format!("Window error: {e}"));
     }
 
-    let stop_streaming = || {
-        eternal_host::diagnostics::log_session_end_at_quit(&gui_control.shared);
-        gui_control.shared.stop();
-        gui_control.request_shutdown();
-
-        // Never leave the virtual display attached after we exit — it should only exist while
-        // EternalMonitor is actively using it. No Enable starts once the second screen worker
-        // is shut down, so this Disable is the last change. If it may still be on, the failure
-        // reporter turns it off after this process exits.
-        eternal_host::capture::second_screen::shut_down(&gui_control.shared);
-        eternal_host::startup::display_off_at_quit(vdd::disable);
-    };
-    // A window error is saved first and shown after the cleanup, as a panic is.
-    match window_error {
-        Some(detail) => eternal_host::startup::report_after(&detail, stop_streaming),
-        None => stop_streaming(),
+    // The quit path ends the process. Without it, the first-paint watcher
+    // took it and is ending the process.
+    let quit = quit_once.lock().take();
+    if let Some(quit) = quit {
+        quit(window_error);
     }
-
-    // Give the supervisor a bounded amount of time to shut down cleanly,
-    // exiting the moment it finishes instead of always burning the full
-    // window. If it doesn't finish (blocked on DXGI acquire, etc.),
-    // force-exit so the process never lingers as an invisible zombie.
-    let (supervisor_done_tx, supervisor_done_rx) = mpsc::channel();
-    std::thread::spawn(move || {
-        if let Err(error) = supervisor_thread.join() {
-            error!(error = ?error, "Supervisor thread panicked");
-        }
-        let _ = supervisor_done_tx.send(());
-    });
-
-    // Say goodbye on mDNS while the supervisor winds down, so iPads drop the
-    // host from their scan list promptly (process::exit skips destructors —
-    // without this no goodbye is ever sent).
-    if let Some(mdns) = mdns {
-        discovery::say_goodbye(mdns);
+    loop {
+        std::thread::park();
     }
-
-    if supervisor_done_rx
-        .recv_timeout(std::time::Duration::from_secs(3))
-        .is_err()
-    {
-        tracing::warn!("Supervisor did not shut down within 3s — forcing exit");
-    }
-
-    // The window is gone and the display is off, so a slow disk keeps no one
-    // waiting on screen: give the second screen record up to 30 s to land.
-    eternal_host::capture::second_screen::finish_saving(&gui_control.shared);
-
-    eternal_host::startup::simulate_slow_exit();
-    info!("EternalMonitor shutting down");
-    // process::exit skips destructors. Flush the log writers and the upload
-    // outbox first, so a normal quit is told apart from a crash.
-    logging::flush_before_exit(_session_guard, _uploads, _stdout_guard);
-    eternal_host::startup::finish();
-    std::process::exit(0);
 }
+
+/// The quit path; taken by whichever ends the process first.
+type QuitOnce = std::sync::Arc<parking_lot::Mutex<Option<Box<dyn FnOnce(Option<String>) + Send>>>>;

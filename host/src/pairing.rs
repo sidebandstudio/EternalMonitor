@@ -41,6 +41,14 @@ pub fn parse_token(text: &str) -> Option<[u8; 16]> {
     (token != [0; 16]).then_some(token)
 }
 
+fn identity_proof(token: &[u8; 16], message: &[u8]) -> [u8; 32] {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, token);
+    ring::hmac::sign(&key, message)
+        .as_ref()
+        .try_into()
+        .expect("SHA-256 is 32 bytes")
+}
+
 fn random_code(previous: u32) -> Result<u32, getrandom::Error> {
     // Rejection sampling avoids modulo bias. Exclude 000000 (wire sentinel)
     // and the preceding code so a rotation always changes what the user sees.
@@ -105,10 +113,11 @@ impl Pairing {
         }
     }
 
-    /// Said at startup and whenever pairing is turned off.
-    pub fn warn_if_off(&self) {
+    /// Said at startup and whenever pairing is turned off. The user chose
+    /// it, so it is not a warning.
+    pub fn log_if_off(&self) {
         if !self.required {
-            warn!("Pairing is off: any iPad on the network can connect without a code");
+            info!("Pairing is off: any iPad on the network can connect without a code");
         }
     }
 
@@ -139,6 +148,18 @@ impl Pairing {
         self.limiter = RateLimiter::default();
         info!("Code pairing resumed from the PC");
         Ok(())
+    }
+
+    /// The answer to an iPad checking that this is the PC it paired with, at
+    /// the address it asked: HMAC-SHA256 keyed with the pairing token over
+    /// the nonce, the port and the addresses this PC receives the stream on
+    /// (`identity_message`). Only a PC holding the token can make it, and the
+    /// token never leaves.
+    pub fn identity_proof(&self, nonce: &[u8; 16], port: u16, addresses: &[[u8; 4]]) -> [u8; 32] {
+        identity_proof(
+            &self.token,
+            &eternal_wire::v2::control::identity_message(nonce, port, addresses),
+        )
     }
 
     pub fn regenerate_token(&mut self) -> Result<(), getrandom::Error> {
@@ -354,6 +375,73 @@ impl RateLimiter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The known answer the wire golden vector and the iPad's tests share.
+    #[test]
+    fn identity_proof_is_the_shared_known_answer() {
+        let token = std::array::from_fn(|index| index as u8 + 1);
+        let nonce = std::array::from_fn(|index| 0xA0 + index as u8);
+        let pairing = Pairing::new(true, token).unwrap();
+        let addresses = [[192, 0, 2, 10], [198, 51, 100, 10]];
+        let proof = |nonce: &[u8; 16], port, addresses: &[[u8; 4]]| {
+            pairing.identity_proof(nonce, port, addresses)
+        };
+        let hex: String = proof(&nonce, 9876, &addresses)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(
+            hex,
+            "18fb81d76bbb96e91101119775ad9766b0c332b2c49441e6f07ec33be1c6d94e"
+        );
+        // Another token, nonce, port or address gives another proof.
+        let other = Pairing::new(true, [9; 16]).unwrap();
+        let signed = proof(&nonce, 9876, &addresses);
+        assert_ne!(other.identity_proof(&nonce, 9876, &addresses), signed);
+        assert_ne!(proof(&[0; 16], 9876, &addresses), signed);
+        assert_ne!(proof(&nonce, 9877, &addresses), signed);
+        assert_ne!(proof(&nonce, 9876, &addresses[..1]), signed);
+        assert_ne!(
+            proof(&nonce, 9876, &[[192, 0, 2, 10], [198, 51, 100, 11]]),
+            signed
+        );
+    }
+
+    /// Log lines `run` writes on this thread.
+    fn logged(run: impl FnOnce()) -> String {
+        let buffer = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || Captured(writer.clone()))
+            .finish();
+        crate::logging::prepare_log_capture();
+        tracing::subscriber::with_default(subscriber, run);
+        let text = String::from_utf8_lossy(&buffer.lock()).into_owned();
+        text
+    }
+
+    struct Captured(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+    impl std::io::Write for Captured {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The user turned pairing off: that is a setting, not a warning.
+    #[test]
+    fn pairing_off_is_logged_at_info() {
+        let off = Pairing::new(false, [7; 16]).unwrap();
+        let text = logged(|| off.log_if_off());
+        assert!(text.contains(" INFO "), "{text}");
+        assert!(text.contains("Pairing is off"), "{text}");
+        let on = Pairing::new(true, [7; 16]).unwrap();
+        assert_eq!(logged(|| on.log_if_off()), "");
+    }
 
     fn guess(nonce: u32) -> FailedRequest {
         FailedRequest {

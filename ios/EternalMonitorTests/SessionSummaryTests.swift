@@ -1,3 +1,4 @@
+import Network
 import XCTest
 @testable import EternalMonitor
 
@@ -13,7 +14,7 @@ final class SessionSummaryTests: XCTestCase {
             + #" transport=(usb|wifi) mode=(mirror|second_screen|unknown)"#
             + #" stage=(started|hello_sent|accepted|video_sent|first_frame|steady)"#
             + #" outcome=(streamed|no_reply|no_picture|pairing|user_ended|app_ended|error)"#
-            + #" failure=(none|no_reply|no_video|no_frame|vdd_enable_failed|vdd_attach_timeout|vdd_not_attached|capture_failed|encoder_failed|usb_lost|signal_lost|other)"#
+            + #" failure=(none|no_reply|no_video|no_frame|vdd_enable_failed|vdd_attach_timeout|vdd_not_attached|capture_failed|encoder_failed|usb_lost|signal_lost|no_network|pc_busy|old_pc|other)"#
             + #" fallback=(none|attach_timeout|enable_failed|no_driver|no_frames|duplication_failed|remembered|other)"#
             + #" end=(goodbye|liveness|superseded|shutdown|timeout|user|background|error)"#
             + #" ttff_ms=(0|[1-9][0-9]{0,5}|-) duration_ms=(0|[1-9][0-9]{0,9})"#
@@ -62,6 +63,8 @@ final class SessionSummaryTests: XCTestCase {
     func testEachWayAnAttemptEndsHasItsSummary() {
         var noFrame = summary(.connectTimeout, duration: 10)
         noFrame.datagramsReceived = 12
+        var movedNoFrame = summary(.noVideoPath, duration: 7)
+        movedNoFrame.datagramsReceived = 3
         var pairing = summary(.userDisconnect, session: nil, duration: 30)
         pairing.awaitingPairing = true
         var retried = summary(.retriedWithCode, session: nil, duration: 4)
@@ -75,16 +78,25 @@ final class SessionSummaryTests: XCTestCase {
             (summary(.pcGoodbye), ["accepted", "app_ended", "none", "goodbye"]),
             (summary(.pcRefused, session: nil), ["hello_sent", "error", "other", "error"]),
             (pairing, ["hello_sent", "pairing", "none", "user"]),
-            (summary(.legacyPC, session: nil), ["hello_sent", "error", "other", "error"]),
+            (summary(.pcBusy, session: nil), ["hello_sent", "error", "pc_busy", "error"]),
+            (summary(.oldPC, session: nil), ["hello_sent", "error", "old_pc", "error"]),
+            (summary(.legacyPC, session: nil), ["hello_sent", "error", "old_pc", "error"]),
             (summary(.connectTimeout, session: nil, duration: 10), ["hello_sent", "no_reply", "no_reply", "timeout"]),
+            (summary(.pcMoved, session: nil, duration: 3), ["hello_sent", "no_reply", "no_reply", "superseded"]),
+            (summary(.otherPC), ["accepted", "error", "other", "error"]),
             (summary(.connectTimeout, duration: 10), ["accepted", "no_picture", "no_video", "timeout"]),
             (noFrame, ["accepted", "no_picture", "no_frame", "timeout"]),
+            // Moved to the PC's other address: as the PC says, nothing came,
+            // or no frame of what came completed.
+            (summary(.noVideoPath, duration: 7), ["accepted", "no_picture", "no_video", "superseded"]),
+            (movedNoFrame, ["accepted", "no_picture", "no_frame", "superseded"]),
             (summary(.pcStoppedResponding, firstFrame: 0.3, duration: 90), ["steady", "streamed", "signal_lost", "liveness"]),
             (summary(.pictureStalled, firstFrame: 0.3, duration: 90), ["steady", "streamed", "other", "error"]),
             (summary(.cableUnplugged, usb: true, firstFrame: 0.3), ["first_frame", "streamed", "usb_lost", "error"]),
             (summary(.usbLinkFailed, usb: true), ["accepted", "error", "usb_lost", "error"]),
             (summary(.closedBeforePicture, usb: true), ["accepted", "no_picture", "usb_lost", "error"]),
             (summary(.linkFailed, session: nil, nonce: 0, duration: 0.2), ["started", "error", "other", "error"]),
+            (summary(.noNetwork, session: nil, nonce: 0, duration: 0.2), ["started", "error", "no_network", "error"]),
             (summary(.receiverFailed, session: nil, nonce: 0, duration: 0), ["started", "error", "other", "error"]),
             (retried, ["hello_sent", "pairing", "none", "superseded"]),
         ]
@@ -97,14 +109,42 @@ final class SessionSummaryTests: XCTestCase {
         XCTAssertTrue(summary(.cableUnplugged, usb: true).line.contains(" transport=usb "))
     }
 
+    /// The PC said Windows won't let it capture from its graphics card, and
+    /// the wait for a picture ran out: a capture failure, as the PC's own
+    /// summary says, not lost video. A picture that came later keeps its tokens.
+    func testATimeoutAfterThePCSaidItCantCaptureIsACaptureFailure() {
+        var refused = summary(.connectTimeout, duration: 10)
+        refused.captureRefused = true
+        XCTAssertEqual(tokens(refused.line), ["accepted", "no_picture", "capture_failed", "timeout"])
+        Self.assertContract(refused.line)
+        var streamed = summary(.pcStoppedResponding, firstFrame: 0.3, duration: 90)
+        streamed.captureRefused = true
+        XCTAssertEqual(tokens(streamed.line), ["steady", "streamed", "signal_lost", "liveness"])
+    }
+
+    /// Review r1: the PC sent video before Windows refused its card, and
+    /// none of it gave a picture. That is lost or undecodable video, as the
+    /// PC's summary says (it names a capture failure only when no video went
+    /// out), and the refusal mustn't hide it.
+    func testVideoThePCSentBeforeTheRefusalKeepsItsDeliveryFailure() {
+        var counted = summary(.connectTimeout, duration: 10)
+        (counted.captureRefused, counted.pcSentVideo) = (true, true)
+        XCTAssertEqual(tokens(counted.line), ["accepted", "no_picture", "no_video", "timeout"])
+        var arrived = summary(.connectTimeout, duration: 10)
+        (arrived.captureRefused, arrived.datagramsReceived) = (true, 12)
+        XCTAssertEqual(tokens(arrived.line), ["accepted", "no_picture", "no_frame", "timeout"])
+        Self.assertContract(counted.line)
+        Self.assertContract(arrived.line)
+    }
+
     func testOnlyTheUsersOwnActionSaysUserDisconnectToThePC() {
         XCTAssertEqual(AttemptEnd.userDisconnect.bye, .userDisconnect)
         XCTAssertEqual(AttemptEnd.usbTurnedOff.bye, .userDisconnect)
         XCTAssertEqual(AttemptEnd.appBackground.bye, .appBackground)
         XCTAssertEqual(AttemptEnd.superseded.bye, .superseded)
-        for end in [AttemptEnd.pcGoodbye, .pcRefused, .legacyPC, .connectTimeout, .pcStoppedResponding,
+        for end in [AttemptEnd.pcGoodbye, .pcRefused, .pcBusy, .oldPC, .legacyPC, .connectTimeout, .pcStoppedResponding,
                     .pictureStalled, .cableUnplugged, .usbLinkFailed, .closedBeforePicture, .linkFailed,
-                    .receiverFailed, .retriedWithCode] {
+                    .noNetwork, .receiverFailed, .retriedWithCode] {
             XCTAssertEqual(end.bye, .error, "\(end)")
         }
         XCTAssertEqual(AttemptEnd.linkFailed.name, "linkFailed")
@@ -163,6 +203,44 @@ final class SessionSummaryTests: XCTestCase {
             + " stage=started outcome=error failure=other fallback=none end=error ttff_ms=- duration_ms="), line)
         XCTAssertFalse(line.contains("192.168"), line)
         Self.assertContract(line)
+    }
+
+    /// Wi-Fi is off: Network.framework waits with "Network is down". The
+    /// card says so, and the summary gives it its own failure instead of
+    /// `other`.
+    func testWiFiOffHasItsOwnCardAndFailure() async throws {
+        let link = DeniedLink()
+        let manager = ConnectionManager(udpReceiver: { _ in link })
+        manager.connect(host: "192.168.1.20", port: 9876)
+        link.onError?(UDPReceiver.waitingError(.posix(.ENETDOWN), status: .unsatisfied, reason: .notAvailable))
+        try await until("ended") { manager.state == .disconnected }
+        XCTAssertEqual(manager.problem, .wifiOff)
+        XCTAssertEqual(manager.problem?.title, "Wi-Fi is off")
+        XCTAssertEqual(logged(manager, "connection").filter { $0.hasPrefix("Disconnect ") },
+                       ["Disconnect state=connecting reason=noNetwork"])
+        let line = logged(manager, "summary").first ?? ""
+        XCTAssertTrue(line.contains(" stage=started outcome=error failure=no_network fallback=none end=error "), line)
+        Self.assertContract(line)
+    }
+
+    /// No route to the PC or its network while the path is up: the PC is
+    /// asleep or elsewhere, not this iPad's Wi-Fi off. It keeps the card
+    /// and the `other` failure it had before Wi-Fi off got its own.
+    func testUnreachableWhileWaitingIsNotWiFiOff() async throws {
+        for code: POSIXErrorCode in [.EHOSTUNREACH, .ENETUNREACH] {
+            let link = DeniedLink()
+            let manager = ConnectionManager(udpReceiver: { _ in link })
+            manager.connect(host: "192.168.1.20", port: 9876)
+            link.onError?(UDPReceiver.waitingError(.posix(code), status: .satisfied, reason: nil))
+            try await until("ended") { manager.state == .disconnected }
+            XCTAssertNotEqual(manager.problem, .wifiOff, "\(code)")
+            XCTAssertNotEqual(manager.problem?.title, "Wi-Fi is off", "\(code)")
+            XCTAssertEqual(logged(manager, "connection").filter { $0.hasPrefix("Disconnect ") },
+                           ["Disconnect state=connecting reason=linkFailed"], "\(code)")
+            let line = logged(manager, "summary").first ?? ""
+            XCTAssertTrue(line.contains(" failure=other "), line)
+            Self.assertContract(line)
+        }
     }
 
     /// Try again opens a new connection, which asks iPadOS again: once

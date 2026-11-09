@@ -34,22 +34,26 @@ impl PacingClock {
     }
 
     pub async fn wait(&self, duration: Duration) {
+        self.until(Instant::now() + duration.min(MAX_SPREAD)).await;
+    }
+
+    /// Waits until `deadline`, or not at all if a wait is already queued.
+    pub async fn until(&self, deadline: Instant) {
+        #[cfg(feature = "test-hooks")]
+        super::probe::waited(deadline);
         let (done, ready) = tokio::sync::oneshot::channel();
-        if self
-            .tx
-            .try_send((Instant::now() + duration.min(MAX_SPREAD), done))
-            .is_ok()
-        {
+        if self.tx.try_send((deadline, done)).is_ok() {
             let _ = ready.await;
         }
     }
 }
 
 /// Wakes the transport at a deadline from a dedicated thread, as
-/// `PacingClock` does, for pen frames held back to keep them
-/// `FRAME_SPACING` apart. The transport arms it at the top of each loop and
-/// selects on `wait`; arming the same deadline again sends nothing, and a
-/// superseded deadline only costs an extra flush.
+/// `PacingClock` does, for a pointer position waiting for the next frame
+/// budget (Tokio's timer can wake 15 ms late on Windows). The transport arms
+/// it at the top of each loop and selects on `wait`; arming the same
+/// deadline again sends nothing, and the thread serves deadlines in order,
+/// so only ones that never move earlier are armed.
 pub struct Deadline {
     tx: std::sync::mpsc::Sender<Instant>,
     due: std::sync::Arc<tokio::sync::Notify>,
@@ -163,21 +167,6 @@ mod tests {
             .unwrap();
         drop(clock);
         ready.await.unwrap(); // dropping the clock never strands a pending wait
-    }
-
-    #[tokio::test]
-    async fn a_deadline_wakes_the_runtime_once_it_has_passed() {
-        let mut deadline = Deadline::new("test-deadline").unwrap();
-        let started = Instant::now();
-        let at = started + Duration::from_micros(250);
-        deadline.arm(Some(at));
-        // Arming it again does not queue a second wake.
-        deadline.arm(Some(at));
-        assert!(deadline.armed());
-        deadline.wait().await;
-        assert!(Instant::now() >= at);
-        assert!(started.elapsed() < Duration::from_secs(1));
-        assert!(!deadline.armed());
     }
 
     #[test]

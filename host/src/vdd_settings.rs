@@ -17,6 +17,8 @@ use std::io;
 use std::ops::Range;
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 /// A display mode for the virtual display's mode list.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VddMode {
@@ -126,8 +128,354 @@ pub fn render(modes: &[VddMode], gpu: Option<&str>) -> String {
         ));
     }
     xml.push_str("    </resolutions>\n");
+    xml.push_str(CURSOR);
     xml.push_str("</vdd_settings>\n");
     xml
+}
+
+/// The driver's hardware cursor, as its own sample file sets it. Without
+/// `<cursor>` the driver leaves it off, and Windows draws the pointer into
+/// the virtual display's image, so Desktop Duplication has no pointer to
+/// report apart from it and an iPad can't draw it. With it on, the second
+/// screen reports the pointer like any other screen. The driver reads a
+/// missing size as -1, so the whole block is written.
+const CURSOR: &str = "    <cursor>\n        <HardwareCursor>true</HardwareCursor>\n        \
+                      <CursorMaxY>128</CursorMaxY>\n        <CursorMaxX>128</CursorMaxX>\n        \
+                      <AlphaCursorSupport>true</AlphaCursorSupport>\n        \
+                      <XorCursorSupportLevel>2</XorCursorSupportLevel>\n    </cursor>\n";
+
+/// The hardware cursor a driver gives Windows when it starts, as its
+/// settings set it. Windows draws a pointer image larger than this into
+/// the picture itself (measured on the reference PC with a 160 px pointer
+/// and a 128 px cap).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorCaps {
+    pub max_x: u32,
+    pub max_y: u32,
+    /// `AlphaCursorSupport`, and the XOR level as the driver reads it.
+    pub alpha: bool,
+    pub xor: i32,
+}
+
+impl CursorCaps {
+    /// Whether a pointer image of this size goes to the hardware cursor.
+    pub fn takes(&self, (width, height): (u32, u32)) -> bool {
+        width <= self.max_x && height <= self.max_y
+    }
+}
+
+/// What the running driver does with the pointer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DriverCursor {
+    /// It gives Windows a hardware cursor with these caps, which takes
+    /// every pointer type up to their size.
+    Hardware(CursorCaps),
+    /// It has none: Windows draws the pointer into the picture.
+    Software,
+    /// This host can't tell. Then the pointer is handled as in 0.3.4
+    /// (`capture::PointerPlace::Unknown`).
+    Unknown,
+}
+
+/// The cursor a settings document gives the driver, read as the driver
+/// reads it (`EnabledQuery` and `GetIntegerSetting` in its `Driver.cpp`):
+/// for each setting, the first element of that name whose first child is
+/// text decides. Only the text `true` turns a switch on, and numbers are
+/// read as `std::stoi` reads them, a missing or unreadable one as -1. A
+/// document that is not well-formed is `Unknown`.
+///
+/// Only a cursor that takes every pointer type counts as `Hardware`: with
+/// alpha off, or XOR support off (the driver reads the level but, in
+/// 25.5.2, always gives full support), Windows' choice for the types it
+/// doesn't take isn't documented, and so is a size the driver can't use.
+pub fn cursor_set_by(xml: &str) -> DriverCursor {
+    use quick_xml::events::Event;
+    const NAMES: [&[u8]; 5] = [
+        b"HardwareCursor",
+        b"AlphaCursorSupport",
+        b"CursorMaxX",
+        b"CursorMaxY",
+        b"XorCursorSupportLevel",
+    ];
+    let mut reader = quick_xml::Reader::from_str(xml);
+    reader.config_mut().trim_text(false);
+    let mut values: [Option<String>; 5] = Default::default();
+    // The setting whose first child is next, and whether a setting's
+    // element is open.
+    let (mut current, mut inside) = (None, false);
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(tag)) => {
+                current = NAMES
+                    .iter()
+                    .position(|name| tag.local_name().as_ref() == *name);
+                inside |= current.is_some();
+            }
+            Ok(Event::End(_)) => (current, inside) = (None, false),
+            // XmlLite expands `&#116;` and `&amp;` into the text; quick-xml
+            // reports them apart. Where that could change a setting, the
+            // answer is not known.
+            Ok(Event::GeneralRef(_)) if inside => return DriverCursor::Unknown,
+            // XmlLite reads white space alone as another kind of node.
+            Ok(Event::Text(text)) if text.iter().all(u8::is_ascii_whitespace) => current = None,
+            Ok(Event::Text(text)) => {
+                if let Some(slot) = current.take().filter(|&slot| values[slot].is_none()) {
+                    values[slot] = Some(String::from_utf8_lossy(text.as_ref()).into_owned());
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => return DriverCursor::Unknown,
+            Ok(_) => current = None,
+        }
+    }
+    let switch = |slot: usize| values[slot].as_deref() == Some("true");
+    let number = |slot: usize| values[slot].as_deref().map_or(-1, stoi);
+    if !switch(0) {
+        return DriverCursor::Software;
+    }
+    let xor = match number(4) {
+        level @ 0..=3 => level,
+        // The driver's default for a level it doesn't know: full support.
+        _ => 2,
+    };
+    match (u32::try_from(number(2)), u32::try_from(number(3))) {
+        (Ok(max_x @ 1..), Ok(max_y @ 1..)) if switch(1) && matches!(xor, 2 | 3) => {
+            DriverCursor::Hardware(CursorCaps {
+                max_x,
+                max_y,
+                alpha: true,
+                xor,
+            })
+        }
+        _ => DriverCursor::Unknown,
+    }
+}
+
+/// `std::stoi` as the driver uses it: leading white space, a sign and
+/// digits, ignoring what follows them; -1 (the driver's "unset") when
+/// there are no digits or the number doesn't fit.
+fn stoi(text: &str) -> i32 {
+    let text = text.trim_start();
+    let (sign, digits) = match text.as_bytes().first() {
+        Some(b'-') => (-1, &text[1..]),
+        Some(b'+') => (1, &text[1..]),
+        _ => (1, text),
+    };
+    let end = digits
+        .find(|c: char| !c.is_ascii_digit())
+        .unwrap_or(digits.len());
+    digits[..end]
+        .parse::<i64>()
+        .ok()
+        .and_then(|value| i32::try_from(sign * value).ok())
+        .unwrap_or(-1)
+}
+
+/// One start of the driver: the boot, and the device's last arrival
+/// (`DEVPKEY_Device_LastArrivalDate`, a FILETIME). On the reference PC each
+/// Enable changed the arrival and a driver turned off kept it; an arrival
+/// only counts with the boot it came in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DriverInstance {
+    pub boot_id: u32,
+    pub arrival: u64,
+}
+
+/// The driver as Configuration Manager reads it: one start running, none
+/// running, or a read that failed or was ambiguous.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DriverRun {
+    Running(DriverInstance),
+    Off,
+    Unreadable,
+}
+
+/// What a driver start read, kept on disk so a relaunched host knows it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorRecord {
+    pub instance: DriverInstance,
+    /// SHA-256 of the settings file it started with, for the logs.
+    pub settings_sha256: String,
+    pub cursor: DriverCursor,
+}
+
+/// What the driver starts with when this host's Enable starts it: the
+/// file's cursor (`cursor_set_by`), if the driver reads `<cursor>`
+/// (`reads_cursor`) and the registry leaves the file in charge
+/// (`overridden` when it doesn't, see `file_in_charge`). The version that
+/// says whether it reads `<cursor>` is the installer's, which may not be
+/// the running driver's, so an older one is not taken to mean no cursor.
+pub fn starting_cursor(xml: Option<&str>, reads_cursor: bool, overridden: bool) -> DriverCursor {
+    match xml {
+        Some(xml) if reads_cursor && !overridden => cursor_set_by(xml),
+        _ => DriverCursor::Unknown,
+    }
+}
+
+/// The record to keep after an Enable that succeeded: a driver running
+/// after it (`after`) that was seen off before it (`before`) started in
+/// this Enable, with the file this host just wrote (`xml`, read as
+/// `starting_cursor`). An Enable that found it running (AlreadyDone, or a
+/// relaunch with the driver left on), or couldn't tell, keeps no record:
+/// the one on disk decides (`running_cursor`).
+pub fn record_after_enable(
+    before: DriverRun,
+    after: DriverRun,
+    xml: Option<&str>,
+    cursor: DriverCursor,
+) -> Option<CursorRecord> {
+    let (DriverRun::Off, DriverRun::Running(instance)) = (before, after) else {
+        return None;
+    };
+    Some(CursorRecord {
+        instance,
+        settings_sha256: xml.map_or_else(String::new, |xml| {
+            let digest = ring::digest::digest(&ring::digest::SHA256, xml.as_bytes());
+            digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+        }),
+        cursor,
+    })
+}
+
+/// What the running driver does with the pointer: what the record says,
+/// when it is of this very start of the driver (same boot, same arrival);
+/// `Unknown` for any other, and when the driver is not running.
+pub fn running_cursor(record: Option<&CursorRecord>, running: DriverRun) -> DriverCursor {
+    match (record, running) {
+        (Some(record), DriverRun::Running(running)) if record.instance == running => record.cursor,
+        _ => DriverCursor::Unknown,
+    }
+}
+
+/// Where the record is kept, beside the app's other files.
+pub const CURSOR_RECORD: &str = "vdd-cursor.json";
+
+pub fn load_record(path: &Path) -> Option<CursorRecord> {
+    serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()
+}
+
+pub fn save_record(path: &Path, record: &CursorRecord) -> io::Result<()> {
+    replace(
+        path,
+        &serde_json::to_string(record).map_err(io::Error::other)?,
+    )
+}
+
+/// Whether the installed driver reads `<cursor>` at all: releases from
+/// 24.10.27 on do. `version` is its installer's display version, such as
+/// `25.05.03`; not one that doesn't read as a version.
+pub fn driver_reads_cursor(version: &str) -> bool {
+    let parts: Option<Vec<u32>> = version
+        .trim()
+        .split('.')
+        .map(|part| part.parse().ok())
+        .collect();
+    match parts.as_deref() {
+        Some([year, month, day, ..]) => (*year, *month, *day) >= (24, 10, 27),
+        _ => false,
+    }
+}
+
+/// A value under the driver's registry key, as read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RegValue {
+    /// The key or the value doesn't exist.
+    Absent,
+    /// It exists; the text, for a string read as one.
+    Present(String),
+    /// Any other error.
+    Failed,
+}
+
+/// The settings folder the driver uses without `VDDPATH`, and the one this
+/// host writes to.
+const DRIVER_FOLDER: &str = r"C:\VirtualDisplayDriver";
+
+/// The cursor values the driver reads from its registry key before the
+/// file (`EnabledQuery`, `GetIntegerSetting`).
+pub const REGISTRY_CURSOR_VALUES: [&str; 5] = [
+    "HARDWARECURSOR",
+    "ALPHACURSORSUPPORT",
+    "CURSORMAXX",
+    "CURSORMAXY",
+    "XORCURSORSUPPORTLEVEL",
+];
+
+/// Whether the driver reads its cursor from the file this host writes: its
+/// `VDDPATH` (read at `DriverEntry`) is unset or names
+/// `C:\VirtualDisplayDriver`, ignoring case and a trailing `\`, as
+/// `vdd_snapshot::collect` compares it, and no cursor value is set under
+/// its key. A value that couldn't be read may be either.
+pub fn file_in_charge(vddpath: &RegValue, cursor_values: &[RegValue]) -> bool {
+    let folder = match vddpath {
+        RegValue::Absent => true,
+        RegValue::Present(path) => path
+            .trim_end_matches('\\')
+            .eq_ignore_ascii_case(DRIVER_FOLDER),
+        RegValue::Failed => false,
+    };
+    folder && cursor_values.iter().all(|value| *value == RegValue::Absent)
+}
+
+/// Whether the driver's registry key may take the cursor away from the
+/// file this host writes (`file_in_charge`, read now).
+#[cfg(windows)]
+pub fn registry_overrides_cursor() -> bool {
+    let vddpath = registry_value("VDDPATH", true);
+    let cursor: Vec<RegValue> = REGISTRY_CURSOR_VALUES
+        .iter()
+        .map(|name| registry_value(name, false))
+        .collect();
+    !file_in_charge(&vddpath, &cursor)
+}
+
+/// One value under HKLM\SOFTWARE\MikeTheTech\VirtualDisplayDriver, with its
+/// text when `text` (a REG_SZ; any other type fails).
+#[cfg(windows)]
+fn registry_value(name: &str, text: bool) -> RegValue {
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_SUCCESS};
+    use windows::Win32::System::Registry::{
+        RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_ANY, RRF_RT_REG_SZ,
+    };
+    let key = w!(r"SOFTWARE\MikeTheTech\VirtualDisplayDriver");
+    let name: Vec<u16> = name.encode_utf16().chain(Some(0)).collect();
+    let mut buffer = [0u16; 1024];
+    let mut bytes = std::mem::size_of_val(&buffer) as u32;
+    let result = unsafe {
+        if text {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                key,
+                PCWSTR(name.as_ptr()),
+                RRF_RT_REG_SZ,
+                None,
+                Some(buffer.as_mut_ptr().cast()),
+                Some(&mut bytes),
+            )
+        } else {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                key,
+                PCWSTR(name.as_ptr()),
+                RRF_RT_ANY,
+                None,
+                None,
+                None,
+            )
+        }
+    };
+    match result {
+        ERROR_SUCCESS => {
+            let end = buffer
+                .iter()
+                .position(|&unit| unit == 0)
+                .unwrap_or(buffer.len());
+            RegValue::Present(String::from_utf16_lossy(&buffer[..end]))
+        }
+        ERROR_FILE_NOT_FOUND => RegValue::Absent,
+        _ => RegValue::Failed,
+    }
 }
 
 fn escape(text: &str) -> String {
@@ -384,18 +732,19 @@ pub fn with_gpu(xml: &str, gpu: &str) -> Option<String> {
 }
 
 /// Point the settings file the host does not otherwise write at `gpu`.
-/// True when it changed. A missing file stays missing: without one the
-/// driver offers its built-in modes, and a document holding only a GPU
-/// would leave it none. A file that does not parse as expected is left
-/// alone, and the error says why.
+/// True when it changed: a file read from a code page is written back as
+/// UTF-8 even when it already names `gpu`. A missing file stays missing:
+/// without one the driver offers its built-in modes, and a document holding
+/// only a GPU would leave it none. A file that does not parse as expected
+/// is left alone, and the error says why.
 pub fn pin_gpu_in(path: &Path, gpu: &str) -> io::Result<bool> {
-    let current = std::fs::read_to_string(path)?;
+    let (current, legacy) = read_settings(path)?;
     let updated = gpu_edit(&current, gpu)
         .map_err(|reason| io::Error::new(io::ErrorKind::InvalidData, reason))?;
-    if updated == current {
+    if updated == current && !legacy {
         return Ok(false);
     }
-    replace(path, &updated)?;
+    write_settings(path, legacy, || replace(path, &updated))?;
     Ok(true)
 }
 
@@ -543,7 +892,9 @@ pub fn remember_pins(record: &Path, names: &[&str]) -> io::Result<()> {
 /// Make the settings file at `path` name `wanted`, changing only the card,
 /// under the rules of `pin_change`. `record` holds the names this host
 /// recorded writing. A missing file stays missing, and one that does not
-/// parse as expected is left alone; the error says why.
+/// parse as expected is left alone; the error says why. A file read from a
+/// code page is written back as UTF-8 even when its card stays, so the
+/// driver reads all of it.
 pub fn apply_pin(
     path: &Path,
     record: &Path,
@@ -551,19 +902,27 @@ pub fn apply_pin(
     wanted: Option<&str>,
 ) -> io::Result<PinOutcome> {
     let invalid = |reason| io::Error::new(io::ErrorKind::InvalidData, reason);
-    let current = std::fs::read_to_string(path)?;
+    let (current, legacy) = read_settings(path)?;
     let named = named_gpu(&current).map_err(invalid)?;
     let ours = recorded_pins(record);
     let ours: Vec<&str> = ours.iter().map(String::as_str).collect();
+    let unchanged = |outcome| {
+        if legacy {
+            write_settings(path, legacy, || replace(path, &current))?;
+        }
+        Ok(outcome)
+    };
     let (name, outcome) = match pin_change(named.as_deref(), wanted, owned, &ours) {
-        PinChange::Leave => return Ok(PinOutcome::Unchanged),
-        PinChange::Refuse(reason) => return Ok(PinOutcome::Kept(reason)),
+        PinChange::Leave => return unchanged(PinOutcome::Unchanged),
+        PinChange::Refuse(reason) => return unchanged(PinOutcome::Kept(reason)),
         PinChange::Write(card) => (card, PinOutcome::Named),
         PinChange::Reset => ("default".to_string(), PinOutcome::Reset),
     };
     let updated = gpu_edit(&current, &name).map_err(invalid)?;
     let new_record = (outcome == PinOutcome::Named).then_some(name.as_str());
-    record_around(record, new_record, &ours, || replace(path, &updated))?;
+    record_around(record, new_record, &ours, || {
+        write_settings(path, legacy, || replace(path, &updated))
+    })?;
     Ok(outcome)
 }
 
@@ -622,13 +981,13 @@ pub fn write_with_pin(
     modes: &[VddMode],
     wanted: Option<&str>,
 ) -> io::Result<PinOutcome> {
-    let named = match std::fs::read_to_string(path) {
-        Ok(current) => match named_gpu(&current) {
-            Ok(named) => named,
-            Err(_) if owned && wanted.is_some() => None,
+    let (named, legacy) = match read_settings(path) {
+        Ok((current, legacy)) => match named_gpu(&current) {
+            Ok(named) => (named, legacy),
+            Err(_) if owned && wanted.is_some() => (None, legacy),
             Err(reason) => return Err(io::Error::new(io::ErrorKind::InvalidData, reason)),
         },
-        Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => (None, false),
         Err(error) => return Err(error),
     };
     let ours = recorded_pins(record);
@@ -639,7 +998,7 @@ pub fn write_with_pin(
         PinChange::Write(card) => (Some(card), PinOutcome::Named),
         PinChange::Reset => (None, PinOutcome::Reset),
     };
-    let write = || write_to(path, modes, name.as_deref());
+    let write = || write_settings(path, legacy, || write_to(path, modes, name.as_deref()));
     match outcome {
         PinOutcome::Named => record_around(record, name.as_deref(), &ours, write)?,
         PinOutcome::Reset => record_around(record, None, &ours, write)?,
@@ -660,6 +1019,253 @@ pub fn pin_result(
         (Ok(_), Err(_)) => Err("the settings file was left as it is"),
         (Ok(card), Ok(_)) => Ok(card.to_string()),
     }
+}
+
+/// The settings file as text, and whether it was in a legacy code page.
+/// Another tool may have saved it as UTF-16 (Windows PowerShell's
+/// `Out-File` does), with a byte order mark or, as XML allows, without one;
+/// or in a Windows code page, as Notepad's ANSI does, keeping the driver's
+/// `encoding='utf-8'` declaration or naming the code page. It is read and,
+/// when this host writes it, written back as UTF-8, the encoding the
+/// driver's own file has and every file this host writes. The driver's XML
+/// reader takes UTF-8 and UTF-16 but not double-byte code pages: declared,
+/// it reads nothing; otherwise it stops at the first byte it cannot read,
+/// keeping only the settings before it. A UTF-16 or code page
+/// document's declaration names UTF-8 with it, so the declaration always
+/// names what is on disk. UTF-8 keeps any byte order mark. Any other
+/// encoding, UTF-32 included, is left alone, and the error says so.
+fn read_settings(path: &Path) -> io::Result<(String, bool)> {
+    decode_settings(&std::fs::read(path)?, ANSI).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "the settings file is in no encoding this host reads",
+        )
+    })
+}
+
+/// `CP_ACP`: the system's ANSI code page, which Notepad and other older
+/// tools save text in.
+const ANSI: u32 = 0;
+
+/// `bytes` as text, and whether they were in a code page; text that is not
+/// UTF and declares no other encoding is in code page `ansi`.
+fn decode_settings(bytes: &[u8], ansi: u32) -> Option<(String, bool)> {
+    let (text, legacy) = decode_text(bytes, ansi)?;
+    // XML never holds NUL: text with one was read in the wrong encoding,
+    // such as UTF-32 without a byte order mark, which reads as UTF-8.
+    (!text.contains('\0')).then_some((text, legacy))
+}
+
+fn decode_text(bytes: &[u8], ansi: u32) -> Option<(String, bool)> {
+    // UTF-32's byte order marks; the little-endian one starts like UTF-16's.
+    if bytes.starts_with(&[0xFF, 0xFE, 0, 0]) || bytes.starts_with(&[0, 0, 0xFE, 0xFF]) {
+        return None;
+    }
+    let (units, big_endian): (&[u8], bool) = match bytes {
+        [0xFF, 0xFE, rest @ ..] => (rest, false),
+        [0xFE, 0xFF, rest @ ..] => (rest, true),
+        // "<?" without a byte order mark (XML 1.0, appendix F).
+        [b'<', 0, b'?', 0, ..] => (bytes, false),
+        [0, b'<', 0, b'?', ..] => (bytes, true),
+        _ => return decode_bytes(bytes, ansi),
+    };
+    let (pairs, odd) = units.as_chunks::<2>();
+    if !odd.is_empty() {
+        return None;
+    }
+    let units = pairs.iter().map(|&pair| {
+        if big_endian {
+            u16::from_be_bytes(pair)
+        } else {
+            u16::from_le_bytes(pair)
+        }
+    });
+    let text = char::decode_utf16(units)
+        .collect::<Result<String, _>>()
+        .ok()?;
+    let label = encoding_label(text.as_bytes()).map(|label| text[label].to_ascii_lowercase());
+    match label.as_deref() {
+        Some("utf-16" | "utf-16le" | "utf-16be") => Some((declared_utf8(text), false)),
+        _ => Some((text, false)),
+    }
+}
+
+/// Bytes in an 8-bit encoding: UTF-8, or the code page the declaration
+/// names. Without one, bytes that are not UTF-8 are in code page `ansi`;
+/// so are bytes declared UTF-8 that are not, as Notepad leaves the driver's
+/// file when it saves it as ANSI. A UTF-8 file with stray bytes is neither:
+/// one with a byte order mark, or, in a single-byte code page, one that
+/// still holds UTF-8 beyond ASCII, which that code page's text all but
+/// never does. Read in the code page, its UTF-8 text would be garbled.
+fn decode_bytes(bytes: &[u8], ansi: u32) -> Option<(String, bool)> {
+    let label = encoding_label(bytes).map(|label| bytes[label].to_ascii_lowercase());
+    let code_page = match label.as_deref() {
+        None | Some(b"utf-8") => match String::from_utf8(bytes.to_vec()) {
+            Ok(text) => return Some((text, false)),
+            Err(_) if bytes.starts_with(&[0xEF, 0xBB, 0xBF]) => return None,
+            Err(_) if single_byte(ansi) && holds_utf8(bytes) => return None,
+            Err(_) => ansi,
+        },
+        Some(label) => match std::str::from_utf8(label).ok().and_then(code_page) {
+            Some(code_page) => code_page,
+            // The declaration is not one this host edits.
+            None => {
+                return String::from_utf8(bytes.to_vec())
+                    .ok()
+                    .map(|text| (text, false))
+            }
+        },
+    };
+    let text = decode_code_page(bytes, code_page)?;
+    Some((declared_utf8(text), true))
+}
+
+/// The Windows multi-byte code page an XML encoding name stands for. The
+/// driver's reader takes none of these, declared or not; it does take the
+/// single-byte ones, so a file declaring one stays as it is.
+fn code_page(label: &str) -> Option<u32> {
+    let numbered = ["windows-", "x-windows-", "cp", "x-cp"]
+        .iter()
+        .find_map(|prefix| label.strip_prefix(prefix)?.parse().ok());
+    let code_page = numbered.or(match label {
+        "shift_jis" | "shift-jis" | "sjis" | "ms_kanji" | "windows-31j" => Some(932),
+        "gb2312" | "gbk" | "x-gbk" => Some(936),
+        "euc-kr" | "ks_c_5601-1987" | "ks_c_5601-1989" | "ksc5601" | "uhc" => Some(949),
+        "big5" => Some(950),
+        "gb18030" => Some(54936),
+        _ => None,
+    })?;
+    [932, 936, 949, 950, 54936]
+        .contains(&code_page)
+        .then_some(code_page)
+}
+
+/// `bytes` in Windows code page `code_page`; `None` when any byte is not
+/// a character there, or off Windows.
+#[cfg(windows)]
+fn decode_code_page(bytes: &[u8], code_page: u32) -> Option<String> {
+    use windows::Win32::Globalization::{MultiByteToWideChar, MB_ERR_INVALID_CHARS};
+    if bytes.is_empty() {
+        return Some(String::new());
+    }
+    let length = unsafe { MultiByteToWideChar(code_page, MB_ERR_INVALID_CHARS, bytes, None) };
+    let mut wide = vec![0u16; usize::try_from(length).ok().filter(|&n| n > 0)?];
+    let length =
+        unsafe { MultiByteToWideChar(code_page, MB_ERR_INVALID_CHARS, bytes, Some(&mut wide)) };
+    String::from_utf16(wide.get(..usize::try_from(length).ok().filter(|&n| n > 0)?)?).ok()
+}
+
+#[cfg(not(windows))]
+fn decode_code_page(_bytes: &[u8], _code_page: u32) -> Option<String> {
+    None
+}
+
+/// Whether Windows code page `code_page` has one byte per character.
+#[cfg(windows)]
+fn single_byte(code_page: u32) -> bool {
+    use windows::Win32::Globalization::{GetCPInfo, CPINFO};
+    let mut info = CPINFO::default();
+    unsafe { GetCPInfo(code_page, &mut info) }.is_ok() && info.MaxCharSize == 1
+}
+
+#[cfg(not(windows))]
+fn single_byte(_code_page: u32) -> bool {
+    false
+}
+
+/// Whether `bytes` hold a UTF-8 character beyond ASCII anywhere.
+fn holds_utf8(bytes: &[u8]) -> bool {
+    bytes.utf8_chunks().any(|chunk| !chunk.valid().is_ascii())
+}
+
+/// Where the XML declaration at the start of `xml` names its encoding.
+fn encoding_label(xml: &[u8]) -> Option<std::ops::Range<usize>> {
+    let end = xml
+        .starts_with(b"<?xml")
+        .then(|| xml.windows(2).position(|w| w == b"?>"))??;
+    let declaration = &xml[..end];
+    let at = declaration.windows(9).position(|w| w == b"encoding=")? + 9;
+    let quote = *declaration.get(at).filter(|&&c| c == b'"' || c == b'\'')?;
+    let length = declaration[at + 1..].iter().position(|&c| c == quote)?;
+    Some(at + 1..at + 1 + length)
+}
+
+/// `xml` with its declaration's encoding named as UTF-8, quote and all else
+/// unchanged.
+fn declared_utf8(xml: String) -> String {
+    match encoding_label(xml.as_bytes()) {
+        Some(label) => format!("{}utf-8{}", &xml[..label.start], &xml[label.end..]),
+        None => xml,
+    }
+}
+
+/// Keep the file at `path` as it is, beside it, as
+/// `vdd_settings.xml.bak-<YYYYMMDD>`, or `-2`, `-3`… when today's backups
+/// hold something else; one that holds the same bytes is kept as it is.
+/// The backup's file name.
+fn back_up(path: &Path) -> io::Result<String> {
+    back_up_dated(path, &utc_date(std::time::SystemTime::now()))
+}
+
+/// `back_up` on `date`.
+fn back_up_dated(path: &Path, date: &str) -> io::Result<String> {
+    use std::io::Write;
+    let original = std::fs::read(path)?;
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let mut n = 1;
+    loop {
+        let backup = match n {
+            1 => format!("{name}.bak-{date}"),
+            n => format!("{name}.bak-{date}-{n}"),
+        };
+        let at = path.with_file_name(&backup);
+        match std::fs::read(&at) {
+            Ok(held) if held == original => return Ok(backup),
+            Ok(_) => n += 1,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let mut file = std::fs::File::create_new(&at)?;
+                file.write_all(&original)?;
+                file.sync_all()?;
+                return Ok(backup);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// `time`'s UTC date as `YYYYMMDD` (Howard Hinnant's civil_from_days).
+fn utc_date(time: std::time::SystemTime) -> String {
+    let seconds = time
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |since| since.as_secs());
+    let days = (seconds / 86_400) as i64 + 719_468;
+    let era = days / 146_097;
+    let doe = days - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!("{year:04}{month:02}{day:02}")
+}
+
+/// Replace the settings file with `write`. One read from a code page
+/// (`legacy`) is backed up first, and its conversion logged once done.
+fn write_settings(
+    path: &Path,
+    legacy: bool,
+    write: impl FnOnce() -> io::Result<()>,
+) -> io::Result<()> {
+    let backup = legacy.then(|| back_up(path)).transpose()?;
+    write()?;
+    if let Some(backup) = backup {
+        tracing::info!(
+            backup,
+            "Wrote vdd_settings.xml as UTF-8; the original is kept beside it"
+        );
+    }
+    Ok(())
 }
 
 /// Write atomically (tmp + rename) so the driver never reads a torn file.
@@ -792,6 +1398,364 @@ mod tests {
              <refresh_rate>120</refresh_rate>"
         ));
         assert!(xml.ends_with("</vdd_settings>\n"));
+        assert_ne!(
+            cursor_set_by(&xml),
+            DriverCursor::Unknown,
+            "the second screen's pointer is reported apart"
+        );
+        assert!(xml.contains(
+            "    <cursor>\n        <HardwareCursor>true</HardwareCursor>\n        \
+             <CursorMaxY>128</CursorMaxY>\n        <CursorMaxX>128</CursorMaxX>\n        \
+             <AlphaCursorSupport>true</AlphaCursorSupport>\n        \
+             <XorCursorSupportLevel>2</XorCursorSupportLevel>\n    </cursor>\n</vdd_settings>"
+        ));
+    }
+
+    /// A settings file with this cursor block.
+    fn with_cursor(block: &str) -> String {
+        format!("<?xml version=\"1.0\"?>\n<vdd_settings><monitors><count>1</count></monitors><cursor>{block}</cursor></vdd_settings>")
+    }
+
+    fn hardware(max_x: u32, max_y: u32) -> DriverCursor {
+        DriverCursor::Hardware(CursorCaps {
+            max_x,
+            max_y,
+            alpha: true,
+            xor: 2,
+        })
+    }
+
+    /// The driver turns its hardware cursor on only when the file says so;
+    /// a file from before this version, or the vendor's with it off, keeps
+    /// the pointer in the second screen's picture. Read as the driver reads
+    /// it: comments don't count, only the text `true` does, and numbers as
+    /// `std::stoi` reads them.
+    #[test]
+    fn the_cursor_is_read_as_the_driver_reads_it() {
+        assert_eq!(cursor_set_by(VENDOR), DriverCursor::Software);
+        let v032 = render(&modes_for_client(1668, 2420, 60), None).replace(CURSOR, "");
+        assert_eq!(cursor_set_by(&v032), DriverCursor::Software);
+        let caps = "<CursorMaxX>128</CursorMaxX><CursorMaxY>128</CursorMaxY><AlphaCursorSupport>true</AlphaCursorSupport>";
+        for (text, on) in [
+            ("true", true),
+            (" true", false),
+            ("1", false),
+            ("false", false),
+            ("TRUE", false),
+        ] {
+            let xml = with_cursor(&format!("<HardwareCursor>{text}</HardwareCursor>{caps}"));
+            assert_eq!(cursor_set_by(&xml) == hardware(128, 128), on, "{text:?}");
+        }
+        let commented = format!("<vdd_settings><!-- <HardwareCursor>true</HardwareCursor> --><cursor><HardwareCursor>false</HardwareCursor>{caps}</cursor></vdd_settings>");
+        assert_eq!(
+            cursor_set_by(&commented),
+            DriverCursor::Software,
+            "a commented-out line is not a setting"
+        );
+        let first_wins = format!("<vdd_settings><HardwareCursor>false</HardwareCursor><HardwareCursor>true</HardwareCursor>{caps}</vdd_settings>");
+        assert_eq!(cursor_set_by(&first_wins), DriverCursor::Software);
+        let blank_skipped = format!("<vdd_settings><HardwareCursor> </HardwareCursor><HardwareCursor>true</HardwareCursor>{caps}</vdd_settings>");
+        assert_eq!(
+            cursor_set_by(&blank_skipped),
+            hardware(128, 128),
+            "white space alone is not text to XmlLite"
+        );
+        assert_eq!(
+            cursor_set_by("<vdd_settings><HardwareCursor>true</vdd_settings>"),
+            DriverCursor::Unknown,
+            "not well-formed"
+        );
+        for (x, y, cursor) in [
+            ("64", "64", hardware(64, 64)),
+            ("256", "256", hardware(256, 256)),
+            (" 96px", "+48", hardware(96, 48)),
+            ("0", "128", DriverCursor::Unknown),
+            ("-64", "128", DriverCursor::Unknown),
+            ("big", "128", DriverCursor::Unknown),
+            ("99999999999", "128", DriverCursor::Unknown),
+        ] {
+            let xml = with_cursor(&format!("<HardwareCursor>true</HardwareCursor><CursorMaxX>{x}</CursorMaxX><CursorMaxY>{y}</CursorMaxY><AlphaCursorSupport>true</AlphaCursorSupport>"));
+            assert_eq!(cursor_set_by(&xml), cursor, "{x:?} x {y:?}");
+        }
+        let missing = with_cursor("<HardwareCursor>true</HardwareCursor><CursorMaxX>64</CursorMaxX><AlphaCursorSupport>true</AlphaCursorSupport>");
+        assert_eq!(
+            cursor_set_by(&missing),
+            DriverCursor::Unknown,
+            "a missing size reads as -1"
+        );
+        let no_alpha = with_cursor("<HardwareCursor>true</HardwareCursor><CursorMaxX>64</CursorMaxX><CursorMaxY>64</CursorMaxY><AlphaCursorSupport>false</AlphaCursorSupport>");
+        assert_eq!(
+            cursor_set_by(&no_alpha),
+            DriverCursor::Unknown,
+            "not every pointer type"
+        );
+        for (level, cursor) in [
+            ("1", DriverCursor::Unknown),
+            ("0", DriverCursor::Unknown),
+            (
+                "3",
+                DriverCursor::Hardware(CursorCaps {
+                    max_x: 64,
+                    max_y: 64,
+                    alpha: true,
+                    xor: 3,
+                }),
+            ),
+            ("7", hardware(64, 64)),
+        ] {
+            let xml = with_cursor(&format!("<HardwareCursor>true</HardwareCursor><CursorMaxX>64</CursorMaxX><CursorMaxY>64</CursorMaxY><AlphaCursorSupport>true</AlphaCursorSupport><XorCursorSupportLevel>{level}</XorCursorSupportLevel>"));
+            assert_eq!(cursor_set_by(&xml), cursor, "XOR level {level}");
+        }
+    }
+
+    #[test]
+    fn this_hosts_file_gives_a_128_px_cursor_that_takes_every_pointer_type() {
+        let xml = render(&modes_for_client(1668, 2420, 60), None);
+        assert_eq!(cursor_set_by(&xml), hardware(128, 128));
+        assert_eq!(starting_cursor(Some(&xml), true, false), hardware(128, 128));
+        assert_eq!(
+            starting_cursor(Some(&xml), true, true),
+            DriverCursor::Unknown,
+            "the driver's registry key overrides the file"
+        );
+        assert_eq!(
+            starting_cursor(None, true, false),
+            DriverCursor::Unknown,
+            "no file read"
+        );
+    }
+
+    /// Review r5: whether the driver reads `<cursor>` comes from the
+    /// installer's version, which may not be the running driver's. An old
+    /// or unreadable version is Unknown, never Software: the pointer is
+    /// then handled as in 0.3.4, which for a truly old driver gives the
+    /// same picture.
+    #[test]
+    fn a_driver_version_that_doesnt_read_the_cursor_is_unknown_not_software() {
+        let xml = render(&modes_for_client(1668, 2420, 60), None);
+        for version in ["24.10.16", "23.12.2", "24.10", "beta", ""] {
+            let reads = driver_reads_cursor(version);
+            assert!(!reads, "{version:?}");
+            assert_eq!(
+                starting_cursor(Some(&xml), reads, false),
+                DriverCursor::Unknown,
+                "{version:?}"
+            );
+            assert_eq!(
+                starting_cursor(Some(VENDOR), reads, false),
+                DriverCursor::Unknown,
+                "{version:?}"
+            );
+        }
+        assert_eq!(
+            starting_cursor(Some(VENDOR), true, false),
+            DriverCursor::Software,
+            "only the file a driver that reads it started with says Software"
+        );
+    }
+
+    /// Review r5: XmlLite expands character and entity references into a
+    /// setting's text; quick-xml reports them apart, so a setting with one
+    /// is not known.
+    #[test]
+    fn a_reference_inside_a_cursor_setting_is_unknown() {
+        let caps = "<CursorMaxX>64</CursorMaxX><CursorMaxY>64</CursorMaxY><AlphaCursorSupport>true</AlphaCursorSupport>";
+        for setting in [
+            "<HardwareCursor>&#116;rue</HardwareCursor>",
+            "<HardwareCursor>t&#114;ue</HardwareCursor>",
+            "<HardwareCursor>tru&#x65;</HardwareCursor>",
+        ] {
+            let xml = with_cursor(&format!("{setting}{caps}"));
+            assert_eq!(cursor_set_by(&xml), DriverCursor::Unknown, "{setting}");
+        }
+        let size = with_cursor("<HardwareCursor>true</HardwareCursor><CursorMaxX>&#54;4</CursorMaxX><CursorMaxY>64</CursorMaxY><AlphaCursorSupport>true</AlphaCursorSupport>");
+        assert_eq!(cursor_set_by(&size), DriverCursor::Unknown);
+        let elsewhere = format!(
+            "<vdd_settings><gpu><friendlyname>A &amp; B</friendlyname></gpu><cursor><HardwareCursor>true</HardwareCursor>{caps}</cursor></vdd_settings>"
+        );
+        assert_eq!(
+            cursor_set_by(&elsewhere),
+            hardware(64, 64),
+            "a reference in another setting"
+        );
+    }
+
+    /// Review r5: the driver reads its settings folder from `VDDPATH`, and
+    /// its cursor values first from its registry key. Only a read that
+    /// finds nothing leaves the file this host writes in charge; a failed
+    /// read could be either.
+    #[test]
+    fn the_registry_leaves_the_file_in_charge_only_when_it_says_nothing() {
+        use RegValue::{Absent, Failed, Present};
+        let none = [Absent, Absent, Absent, Absent, Absent];
+        assert!(file_in_charge(&Absent, &none));
+        for path in [
+            r"C:\VirtualDisplayDriver",
+            r"C:\VirtualDisplayDriver\",
+            r"c:\virtualdisplaydriver",
+            r"C:\VIRTUALDISPLAYDRIVER\\",
+        ] {
+            assert!(file_in_charge(&Present(path.into()), &none), "{path:?}");
+        }
+        for path in [
+            r"D:\VirtualDisplayDriver",
+            r"C:\VirtualDisplayDriver\sub",
+            "",
+            r"C:\VirtualDisplayDriver2",
+        ] {
+            assert!(!file_in_charge(&Present(path.into()), &none), "{path:?}");
+        }
+        assert!(!file_in_charge(&Failed, &none), "VDDPATH unreadable");
+        for at in 0..none.len() {
+            for value in [Present(String::new()), Failed] {
+                let mut cursor = none.clone();
+                cursor[at] = value.clone();
+                assert!(
+                    !file_in_charge(&Absent, &cursor),
+                    "{} {value:?}",
+                    REGISTRY_CURSOR_VALUES[at]
+                );
+            }
+        }
+    }
+
+    /// Review r4: what the running driver does with the pointer is tied to
+    /// its start (boot and device arrival), kept on disk.
+    #[test]
+    fn the_cursor_record_belongs_to_one_start_of_the_driver() {
+        let dir = std::env::temp_dir().join(format!("vdd-cursor-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(CURSOR_RECORD);
+        let start = |arrival| DriverInstance {
+            boot_id: 205,
+            arrival,
+        };
+        let run = |arrival| DriverRun::Running(start(arrival));
+        let ours = render(&modes_for_client(1668, 2420, 60), None);
+        let cursor = starting_cursor(Some(&ours), true, false);
+
+        // Enable from off: the driver started with the file just written.
+        let record = record_after_enable(DriverRun::Off, run(10), Some(&ours), cursor).unwrap();
+        assert_eq!(record.cursor, hardware(128, 128));
+        assert_eq!(record.settings_sha256.len(), 64);
+        save_record(&path, &record).unwrap();
+        assert_eq!(
+            running_cursor(load_record(&path).as_ref(), run(10)),
+            hardware(128, 128)
+        );
+
+        // AlreadyDone with a matching record: the driver kept what it read,
+        // whatever the file says now.
+        let vendor = starting_cursor(Some(VENDOR), true, false);
+        assert_eq!(
+            record_after_enable(run(10), run(10), Some(VENDOR), vendor),
+            None
+        );
+        assert_eq!(
+            running_cursor(load_record(&path).as_ref(), run(10)),
+            hardware(128, 128)
+        );
+
+        // AlreadyDone with a changed arrival: someone else restarted it.
+        assert_eq!(
+            running_cursor(load_record(&path).as_ref(), run(11)),
+            DriverCursor::Unknown
+        );
+
+        // Relaunch: a new host reads the record from disk. Same start, same
+        // answer; after a reboot the same arrival counts for nothing; with
+        // no record, the driver off, or a failed read, nothing is known.
+        let relaunched = load_record(&path);
+        assert_eq!(
+            running_cursor(relaunched.as_ref(), run(10)),
+            hardware(128, 128)
+        );
+        let rebooted = DriverInstance {
+            boot_id: 206,
+            arrival: 10,
+        };
+        assert_eq!(
+            running_cursor(relaunched.as_ref(), DriverRun::Running(rebooted)),
+            DriverCursor::Unknown
+        );
+        assert_eq!(running_cursor(None, run(10)), DriverCursor::Unknown);
+        for state in [DriverRun::Off, DriverRun::Unreadable] {
+            assert_eq!(
+                running_cursor(relaunched.as_ref(), state),
+                DriverCursor::Unknown
+            );
+        }
+
+        // Enables from off with the user's own caps of 64 and then 256:
+        // each start keeps its own.
+        for (arrival, max) in [(12, 64), (13, 256)] {
+            let users = with_cursor(&format!("<HardwareCursor>true</HardwareCursor><CursorMaxX>{max}</CursorMaxX><CursorMaxY>{max}</CursorMaxY><AlphaCursorSupport>true</AlphaCursorSupport>"));
+            let cursor = starting_cursor(Some(&users), true, false);
+            let record =
+                record_after_enable(DriverRun::Off, run(arrival), Some(&users), cursor).unwrap();
+            save_record(&path, &record).unwrap();
+            let running = running_cursor(load_record(&path).as_ref(), run(arrival));
+            assert_eq!(running, hardware(max, max));
+            let DriverCursor::Hardware(caps) = running else {
+                unreachable!()
+            };
+            assert!(caps.takes((max, max)));
+            assert!(!caps.takes((max + 1, 1)));
+        }
+
+        // A start with a file that leaves the cursor off is kept as such.
+        let record = record_after_enable(DriverRun::Off, run(14), Some(VENDOR), vendor).unwrap();
+        assert_eq!(record.cursor, DriverCursor::Software);
+        // A driver that is not running after the Enable keeps no record.
+        for after in [DriverRun::Off, DriverRun::Unreadable] {
+            assert_eq!(
+                record_after_enable(DriverRun::Off, after, Some(&ours), cursor),
+                None
+            );
+        }
+        // A damaged record is no record.
+        std::fs::write(&path, "{").unwrap();
+        assert_eq!(load_record(&path), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Review r5: only a driver seen off before the Enable started in it.
+    /// A failed read before it, or one that was running (even another
+    /// start than after it), may have read another file.
+    #[test]
+    fn a_record_is_kept_only_for_a_driver_seen_off_before_the_enable() {
+        let run = |arrival| {
+            DriverRun::Running(DriverInstance {
+                boot_id: 205,
+                arrival,
+            })
+        };
+        let ours = render(&modes_for_client(1668, 2420, 60), None);
+        let cursor = starting_cursor(Some(&ours), true, false);
+        assert!(record_after_enable(DriverRun::Off, run(20), Some(&ours), cursor).is_some());
+        for before in [DriverRun::Unreadable, run(20), run(19)] {
+            assert_eq!(
+                record_after_enable(before, run(20), Some(&ours), cursor),
+                None,
+                "{before:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_drivers_that_read_the_cursor_block_are_trusted_with_it() {
+        for (version, reads) in [
+            ("25.05.03", true),
+            ("24.10.27", true),
+            ("24.12.24", true),
+            ("24.10.16", false),
+            ("23.12.2", false),
+            ("24.10", false),
+            ("", false),
+            ("beta", false),
+        ] {
+            assert_eq!(driver_reads_cursor(version), reads, "{version:?}");
+        }
     }
 
     #[test]
@@ -1551,5 +2515,527 @@ mod tests {
         assert!(written.contains("<width>2420</width>"));
         assert!(!path.with_extension("xml.tmp").exists(), "tmp cleaned up");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `text` as UTF-16, little or big endian, with or without a byte order
+    /// mark.
+    fn utf16(text: &str, big_endian: bool, bom: bool) -> Vec<u8> {
+        let units = bom.then_some(0xFEFF).into_iter().chain(text.encode_utf16());
+        units
+            .flat_map(|unit| {
+                if big_endian {
+                    unit.to_be_bytes()
+                } else {
+                    unit.to_le_bytes()
+                }
+            })
+            .collect()
+    }
+
+    /// Field triage round 2: a settings file saved as UTF-16 was "not valid
+    /// UTF-8", so the second screen kept the driver's old modes and the card
+    /// was never named.
+    #[test]
+    fn a_utf16_or_bom_settings_file_is_read_and_written_back_as_utf8() {
+        let dir = std::env::temp_dir().join(format!("vdd-encoding-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, record) = (
+            dir.join("vdd_settings.xml"),
+            dir.join("app").join("vdd-pin.txt"),
+        );
+        const INTEL: &str = "Intel(R) HD Graphics 630";
+        let declared16 = VENDOR.replace("encoding='utf-8'", "encoding='UTF-16'");
+        let fixtures: Vec<(&str, Vec<u8>)> = vec![
+            ("utf-16 le, bom", utf16(&declared16, false, true)),
+            ("utf-16 be, bom", utf16(&declared16, true, true)),
+            ("utf-16 le, no bom", utf16(&declared16, false, false)),
+            ("utf-16 be, no bom", utf16(&declared16, true, false)),
+            ("utf-16 le, bom, utf-8 declared", utf16(VENDOR, false, true)),
+            (
+                "utf-8, bom",
+                [&[0xEF, 0xBB, 0xBF][..], VENDOR.as_bytes()].concat(),
+            ),
+        ];
+        for (name, bytes) in &fixtures {
+            // Only the card changes, as the driver will read it.
+            std::fs::write(&path, bytes).unwrap();
+            let _ = std::fs::remove_file(&record);
+            let pinned = apply_pin(&path, &record, false, Some(INTEL));
+            assert_eq!(pinned.ok(), Some(PinOutcome::Named), "{name}");
+            let written = std::fs::read(&path).unwrap();
+            let text = String::from_utf8(written.clone()).expect(name);
+            let body = text.strip_prefix('\u{feff}').unwrap_or(&text);
+            assert!(
+                body.starts_with("<?xml version='1.0' encoding='utf-8'?>\r\n"),
+                "{name}: {body:?}"
+            );
+            assert_eq!(named_gpu(&text), Ok(Some(INTEL.to_string())), "{name}");
+            assert_eq!(
+                text.starts_with('\u{feff}'),
+                name.starts_with("utf-8"),
+                "{name}"
+            );
+            assert_eq!(
+                body,
+                VENDOR.replace(">default<", &format!(">{INTEL}<")),
+                "{name}"
+            );
+
+            // Match the iPad's resolution writes the whole file, as UTF-8.
+            std::fs::write(&path, bytes).unwrap();
+            let _ = std::fs::remove_file(&record);
+            let modes = modes_for_client(1640, 2360, 60);
+            let written = write_with_pin(&path, &record, false, &modes, Some(INTEL));
+            assert_eq!(written.ok(), Some(PinOutcome::Named), "{name}");
+            let text = std::fs::read_to_string(&path).expect(name);
+            assert_eq!(text, render(&modes, Some(INTEL)), "{name}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Review r1: UTF-32's little-endian byte order mark starts like
+    /// UTF-16's. Read as UTF-16 it held NULs, did not parse, and a driver
+    /// Setup installed with a card to name had the whole file replaced.
+    #[test]
+    fn a_utf32_settings_file_is_left_byte_for_byte() {
+        let dir = std::env::temp_dir().join(format!("vdd-encoding-32-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, record) = (
+            dir.join("vdd_settings.xml"),
+            dir.join("app").join("vdd-pin.txt"),
+        );
+        const INTEL: &str = "Intel(R) HD Graphics 630";
+        let utf32 = |big_endian: bool, bom: bool| -> Vec<u8> {
+            bom.then_some('\u{feff}')
+                .into_iter()
+                .chain(VENDOR.chars())
+                .flat_map(|c| {
+                    let c = c as u32;
+                    if big_endian {
+                        c.to_be_bytes()
+                    } else {
+                        c.to_le_bytes()
+                    }
+                })
+                .collect()
+        };
+        for (name, bytes) in [
+            ("utf-32 le, bom", utf32(false, true)),
+            ("utf-32 be, bom", utf32(true, true)),
+            ("utf-32 le, no bom", utf32(false, false)),
+            ("utf-32 be, no bom", utf32(true, false)),
+        ] {
+            for owned in [false, true] {
+                std::fs::write(&path, &bytes).unwrap();
+                let written = write_with_pin(&path, &record, owned, &default_modes(), Some(INTEL));
+                assert!(written.is_err(), "{name} owned={owned}");
+                assert!(
+                    apply_pin(&path, &record, owned, Some(INTEL)).is_err(),
+                    "{name}"
+                );
+                assert!(pin_gpu_in(&path, INTEL).is_err(), "{name}");
+                assert_eq!(std::fs::read(&path).unwrap(), bytes, "{name} owned={owned}");
+                assert!(!record.exists(), "{name} owned={owned}");
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A file in another encoding, or broken UTF-16, may hold anything:
+    /// it stays byte for byte, and the error says why.
+    #[test]
+    fn a_settings_file_in_another_encoding_is_left_alone() {
+        let dir = std::env::temp_dir().join(format!("vdd-encoding-other-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (path, record) = (
+            dir.join("vdd_settings.xml"),
+            dir.join("app").join("vdd-pin.txt"),
+        );
+        // Not UTF-8, in an encoding this host does not know.
+        let unknown = stray_byte(&VENDOR.replace("encoding='utf-8'", "encoding='x-unknown'"));
+        // UTF-8 with a stray byte: after a byte order mark, or with UTF-8
+        // beyond ASCII after it (the vendor file's comments) or before it.
+        let bom = [&[0xEF, 0xBB, 0xBF][..], &stray_byte(VENDOR)].concat();
+        // A double-byte system code page may read these as its own text, so
+        // they are refused only in a single-byte one (and off Windows, where
+        // no code page is read); utf8_with_a_stray_byte_is_not_read_in_a_
+        // single_byte_code_page tests both in 1252 on any system.
+        let mixed = if cfg!(not(windows)) || single_byte(ANSI) {
+            vec![
+                ("utf-8 after a stray byte", mixed_after()),
+                ("utf-8 before a stray byte", mixed_before()),
+            ]
+        } else {
+            eprintln!("skipped the mixed UTF-8 cases: the system's code page is not single-byte");
+            Vec::new()
+        };
+        // A double-byte character cut short.
+        let mut broken = declared(CP949, "euc-kr");
+        let at = broken.iter().position(|&b| b >= 0x80).unwrap();
+        broken[at + 1] = b' ';
+        let mut odd = utf16(VENDOR, false, true);
+        odd.push(b' ');
+        let mut lone = utf16(VENDOR, false, true);
+        lone.extend_from_slice(&0xD800u16.to_le_bytes());
+        // Off Windows no code page is read; on it, the system's code page
+        // reads this (a_file_in_the_systems_code_page_is_written_back_as_utf8).
+        let ansi = cfg!(not(windows)).then(|| ("ansi", stray_byte(VENDOR)));
+        for (name, bytes) in [
+            ("unknown encoding", unknown),
+            ("utf-8 bom, stray byte", bom),
+            ("broken code page", broken),
+            ("odd utf-16", odd),
+            ("lone surrogate", lone),
+        ]
+        .into_iter()
+        .chain(mixed)
+        .chain(ansi)
+        {
+            std::fs::write(&path, &bytes).unwrap();
+            let pinned = apply_pin(&path, &record, false, Some("Intel(R) HD Graphics 630"));
+            let error = pinned.expect_err(name);
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{name}");
+            assert_eq!(
+                error.to_string(),
+                "the settings file is in no encoding this host reads"
+            );
+            for owned in [false, true] {
+                let written = write_with_pin(&path, &record, owned, &default_modes(), Some("x"));
+                assert!(written.is_err(), "{name}");
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), bytes, "{name}");
+            assert_eq!(backups(&dir), Vec::<Vec<u8>>::new(), "{name}");
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `text` naming the card `Radeon` followed by the byte 0xAE, which is
+    /// `®` in code page 1252 and not UTF-8.
+    fn stray_byte(text: &str) -> Vec<u8> {
+        let mut bytes = text.replace(">default<", ">Radeon<").into_bytes();
+        let at = bytes.windows(7).position(|w| w == b"Radeon<").unwrap() + 6;
+        bytes.insert(at, 0xAE);
+        bytes
+    }
+
+    /// UTF-8 beyond ASCII after a stray byte: the vendor file's comments.
+    fn mixed_after() -> Vec<u8> {
+        stray_byte(VENDOR_FILE)
+    }
+
+    /// UTF-8 beyond ASCII before a stray byte.
+    fn mixed_before() -> Vec<u8> {
+        stray_byte(&VENDOR.replace("<vdd_settings>", "<vdd_settings><!-- \u{E9} -->"))
+    }
+
+    /// The driver's file saved in code page 949 as Notepad's ANSI does: its
+    /// `encoding='utf-8'` declaration stays. A comment holds a folder path in
+    /// non-ASCII text, and so does the card's name.
+    const CP949: &[u8] = include_bytes!("../tests/fixtures/vdd_settings-25.5.2-cp949.xml");
+    const VENDOR_DECLARATION: &str = "<?xml version='1.0' encoding='utf-8'?>\r\n";
+
+    /// The code page 949 fixture and its code page 936 twin, each with its
+    /// code page, the text it holds, and the card it names.
+    #[cfg(windows)]
+    fn code_page_fixtures() -> [(&'static [u8], u32, String, &'static str); 2] {
+        let text = |comment: &str, card: &str| {
+            VENDOR_FILE
+                .replacen(
+                    "<vdd_settings>\r\n",
+                    &format!("<vdd_settings>\r\n    <!-- {comment} -->\r\n"),
+                    1,
+                )
+                .replace(">default<", &format!(">{card}<"))
+        };
+        const CP949_CARD: &str = "Microsoft 기본 렌더링 드라이버";
+        const CP936_CARD: &str = "Microsoft 基本呈现驱动程序";
+        [
+            (
+                CP949,
+                949,
+                text("가상 디스플레이 설정: D:\\도구\\디스플레이", CP949_CARD),
+                CP949_CARD,
+            ),
+            (
+                include_bytes!("../tests/fixtures/vdd_settings-25.5.2-cp936.xml"),
+                936,
+                text("虚拟显示器设置: D:\\工具\\显示器", CP936_CARD),
+                CP936_CARD,
+            ),
+        ]
+    }
+
+    /// A code page fixture declaring `label` as its encoding instead.
+    fn declared(fixture: &[u8], label: &str) -> Vec<u8> {
+        let body = fixture.strip_prefix(VENDOR_DECLARATION.as_bytes()).unwrap();
+        let declaration = format!("<?xml version=\"1.0\" encoding=\"{label}\"?>\r\n");
+        [declaration.as_bytes(), body].concat()
+    }
+
+    /// The backups beside the settings file in `dir`.
+    fn backups(dir: &Path) -> Vec<Vec<u8>> {
+        let mut found: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                let name = path.file_name().unwrap().to_string_lossy().into_owned();
+                name.starts_with("vdd_settings.xml.bak-")
+            })
+            .collect();
+        found.sort();
+        found
+            .iter()
+            .map(|path| std::fs::read(path).unwrap())
+            .collect()
+    }
+
+    /// Field triage round 3: a settings file saved in a Windows code page
+    /// was "not valid UTF-8", so the second screen kept the driver's old
+    /// modes and the card was never named. Declared UTF-8 as Notepad leaves
+    /// it, or not declared, it is in the system's code page, given here.
+    #[cfg(windows)]
+    #[test]
+    fn a_code_page_settings_file_is_read_in_the_systems_code_page() {
+        const INTEL: &str = "Intel(R) HD Graphics 630";
+        for (bytes, code_page, text, card) in code_page_fixtures() {
+            let undeclared = bytes.strip_prefix(VENDOR_DECLARATION.as_bytes()).unwrap();
+            let body = text.strip_prefix(VENDOR_DECLARATION).unwrap();
+            for (bytes, text) in [(bytes, text.as_str()), (undeclared, body)] {
+                assert_eq!(
+                    decode_settings(bytes, code_page),
+                    Some((text.to_string(), true)),
+                    "{code_page}"
+                );
+                assert_eq!(named_gpu(text), Ok(Some(card.to_string())));
+                assert_eq!(with_gpu(text, INTEL), Some(text.replace(card, INTEL)));
+            }
+            // UTF-8 stays UTF-8 whatever the system's code page.
+            assert_eq!(
+                decode_settings(text.as_bytes(), code_page),
+                Some((text.clone(), false))
+            );
+        }
+    }
+
+    /// A declaration may name the code page instead. Either way the file is
+    /// written back as UTF-8, declared so, which the driver's reader takes to
+    /// the end, and the file as it was is kept beside it.
+    #[cfg(windows)]
+    #[test]
+    fn a_code_page_settings_file_is_written_back_as_utf8_with_a_backup() {
+        let dir = std::env::temp_dir().join(format!("vdd-encoding-cp-{}", std::process::id()));
+        let (path, record) = (
+            dir.join("vdd_settings.xml"),
+            dir.join("app").join("vdd-pin.txt"),
+        );
+        const INTEL: &str = "Intel(R) HD Graphics 630";
+        const AMD: &str = "AMD Radeon(TM) Graphics";
+        let modes = modes_for_client(1640, 2360, 60);
+        let labels = [
+            (
+                949,
+                &["euc-kr", "ks_c_5601-1987", "windows-949", "CP949"][..],
+            ),
+            (936, &["gb2312", "GBK", "windows-936", "cp936"][..]),
+        ];
+        for (bytes, code_page, text, card) in code_page_fixtures() {
+            let utf8 = text.replacen(
+                VENDOR_DECLARATION,
+                "<?xml version=\"1.0\" encoding=\"utf-8\"?>\r\n",
+                1,
+            );
+            let (_, labels) = labels.iter().find(|(page, _)| *page == code_page).unwrap();
+            for label in *labels {
+                let declared = declared(bytes, label);
+                let fresh = || {
+                    let _ = std::fs::remove_dir_all(&dir);
+                    std::fs::create_dir_all(&dir).unwrap();
+                    std::fs::write(&path, &declared).unwrap();
+                };
+
+                // Only the card changes, as the driver will read it.
+                fresh();
+                let pinned = apply_pin(&path, &record, true, Some(INTEL));
+                assert_eq!(pinned.ok(), Some(PinOutcome::Named), "{label}");
+                let written = std::fs::read_to_string(&path).expect(label);
+                assert_eq!(written, utf8.replace(card, INTEL), "{label}");
+                assert_eq!(backups(&dir), vec![declared.clone()], "{label}");
+                // The file is UTF-8 now: the next write keeps the backup.
+                let pinned = apply_pin(&path, &record, true, Some(AMD));
+                assert_eq!(pinned.ok(), Some(PinOutcome::Named), "{label}");
+                assert_eq!(
+                    std::fs::read_to_string(&path).unwrap(),
+                    utf8.replace(card, AMD)
+                );
+                assert_eq!(backups(&dir), vec![declared.clone()], "{label}");
+
+                // When the card stays, another app's or the driver's choice,
+                // the file is still written as UTF-8, so the driver reads it
+                // to the end.
+                for (wanted, outcome) in [
+                    (Some(INTEL), PinOutcome::Kept(NAMED_ELSEWHERE)),
+                    (Some(card), PinOutcome::Unchanged),
+                    (None, PinOutcome::Unchanged),
+                ] {
+                    fresh();
+                    let pinned = apply_pin(&path, &record, false, wanted);
+                    assert_eq!(pinned.ok(), Some(outcome), "{label} {wanted:?}");
+                    assert_eq!(std::fs::read_to_string(&path).unwrap(), utf8, "{label}");
+                    assert_eq!(backups(&dir), vec![declared.clone()], "{label}");
+                }
+                fresh();
+                assert_eq!(pin_gpu_in(&path, card).ok(), Some(true), "{label}");
+                assert_eq!(std::fs::read_to_string(&path).unwrap(), utf8, "{label}");
+                assert_eq!(backups(&dir), vec![declared.clone()], "{label}");
+
+                // Match the iPad's resolution writes the whole file, keeping
+                // the card another app named.
+                fresh();
+                let written = write_with_pin(&path, &record, false, &modes, Some(INTEL));
+                assert_eq!(
+                    written.ok(),
+                    Some(PinOutcome::Kept(NAMED_ELSEWHERE)),
+                    "{label}"
+                );
+                let text = std::fs::read_to_string(&path).expect(label);
+                assert_eq!(text, render(&modes, Some(card)), "{label}");
+                assert_eq!(backups(&dir), vec![declared.clone()], "{label}");
+            }
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Review r1: the system's code page, which reads a file declared UTF-8
+    /// that is not or declaring nothing, had no test of its own. Here it is
+    /// the driver's file saved as ANSI on a system whose code page is 1252,
+    /// as on CI and the test PC, naming a card outside ASCII. Another code
+    /// page reads these bytes as other characters, so the test needs 1252.
+    #[cfg(windows)]
+    #[test]
+    fn a_file_in_the_systems_code_page_is_written_back_as_utf8() {
+        let ansi_code_page = unsafe { windows::Win32::Globalization::GetACP() };
+        if ansi_code_page != 1252 {
+            eprintln!("skipped: the system's code page is {ansi_code_page}, not 1252");
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("vdd-encoding-acp-{}", std::process::id()));
+        let (path, record) = (
+            dir.join("vdd_settings.xml"),
+            dir.join("app").join("vdd-pin.txt"),
+        );
+        const INTEL: &str = "Intel(R) HD Graphics 630";
+        const CARD: &str = "Radeon\u{AE}";
+        let text = VENDOR_FILE.replace(">default<", &format!(">{CARD}<"));
+        // As Notepad saves it: `®` is 0xAE and the comments' `’` 0x92.
+        let ansi: Vec<u8> = text
+            .chars()
+            .map(|c| match c {
+                '\u{AE}' => 0xAE,
+                '\u{2019}' => 0x92,
+                c => u8::try_from(c).ok().filter(u8::is_ascii).unwrap(),
+            })
+            .collect();
+        let fresh = || {
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(&path, &ansi).unwrap();
+        };
+        assert_eq!(decode_settings(&ansi, ANSI), Some((text.clone(), true)));
+
+        // The card another app named stays, or this one, or the driver's
+        // choice; the file is written as UTF-8 all the same.
+        for (owned, wanted, outcome, card) in [
+            (false, Some(INTEL), PinOutcome::Kept(NAMED_ELSEWHERE), CARD),
+            (false, Some(CARD), PinOutcome::Unchanged, CARD),
+            (true, Some(INTEL), PinOutcome::Named, INTEL),
+        ] {
+            fresh();
+            let pinned = apply_pin(&path, &record, owned, wanted);
+            assert_eq!(pinned.ok(), Some(outcome), "{wanted:?}");
+            let written = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(written, text.replace(CARD, card), "{wanted:?}");
+            assert_eq!(backups(&dir), vec![ansi.clone()], "{wanted:?}");
+        }
+
+        // Match the iPad's resolution writes the whole file.
+        fresh();
+        let modes = modes_for_client(1640, 2360, 60);
+        let written = write_with_pin(&path, &record, false, &modes, Some(INTEL));
+        assert_eq!(written.ok(), Some(PinOutcome::Kept(NAMED_ELSEWHERE)));
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(written, render(&modes, Some(CARD)));
+        assert_eq!(backups(&dir), vec![ansi.clone()]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Review r1: UTF-8 with a stray byte read in a single-byte code page
+    /// garbles its UTF-8 text. A double-byte code page's text may hold
+    /// what reads as UTF-8, so only single-byte code pages refuse it.
+    #[cfg(windows)]
+    #[test]
+    fn utf8_with_a_stray_byte_is_not_read_in_a_single_byte_code_page() {
+        let text = VENDOR.replace(">default<", ">Radeon\u{AE}<");
+        assert_eq!(
+            decode_settings(&stray_byte(VENDOR), 1252),
+            Some((text, true))
+        );
+        let bom = [&[0xEF, 0xBB, 0xBF][..], &stray_byte(VENDOR)].concat();
+        assert_eq!(decode_settings(&bom, 1252), None);
+        assert_eq!(decode_settings(&mixed_after(), 1252), None);
+        assert_eq!(decode_settings(&mixed_before(), 1252), None);
+        assert!(single_byte(1252) && !single_byte(949) && !single_byte(936));
+    }
+
+    /// Review r1: a second conversion the same day kept no copy of the file
+    /// it replaced.
+    #[test]
+    fn each_original_of_a_day_is_backed_up_once() {
+        let dir = std::env::temp_dir().join(format!("vdd-backup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("vdd_settings.xml");
+        let date = "20261108";
+        let mut names = Vec::new();
+        for original in ["one", "two", "one", "three", "two"] {
+            std::fs::write(&path, original).unwrap();
+            names.push(back_up_dated(&path, date).unwrap());
+        }
+        let name = |suffix: &str| format!("vdd_settings.xml.bak-{date}{suffix}");
+        assert_eq!(
+            names,
+            [name(""), name("-2"), name(""), name("-3"), name("-2")]
+        );
+        assert_eq!(
+            backups(&dir),
+            [b"one".to_vec(), b"two".to_vec(), b"three".to_vec()]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn encoding_names_are_windows_code_pages() {
+        for (label, expected) in [
+            ("euc-kr", Some(949)),
+            ("ks_c_5601-1987", Some(949)),
+            ("windows-949", Some(949)),
+            ("cp949", Some(949)),
+            ("gb2312", Some(936)),
+            ("gbk", Some(936)),
+            ("x-windows-936", Some(936)),
+            ("windows-1252", None),
+            ("iso-8859-1", None),
+            ("utf-16", None),
+            ("x-unknown", None),
+        ] {
+            assert_eq!(code_page(label), expected, "{label}");
+        }
+        let at = |seconds| std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds);
+        assert_eq!(utc_date(at(0)), "19700101");
+        assert_eq!(utc_date(at(951_868_800)), "20000301");
+        assert_eq!(utc_date(at(1_709_251_199)), "20240229");
+        assert_eq!(utc_date(at(1_794_096_000)), "20261108");
     }
 }

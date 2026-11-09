@@ -18,6 +18,9 @@ pub struct PipelineStats {
 
     // Capture
     pub capture_fps: f64,
+    /// The size the stream encodes at: capture's, without an odd last
+    /// column or row (see [`crate::encoder::encoded_size`]). The iPad's
+    /// stream config, the GUI and the stats summary report it.
     pub capture_resolution: (u32, u32),
     pub capture_frame_count: u64,
     pub gpu_name: String,
@@ -39,10 +42,19 @@ pub struct PipelineStats {
     /// (CPU) encoding. Surfaced as a warning banner in the GUI so a tester is never silently
     /// stuck on slow software encoding.
     pub using_software_fallback: bool,
+    /// Pictures given to an encoder again to bring out a keyframe it held
+    /// (see `encoder::holds_last_frame`), for the connected viewer.
+    pub keyframe_resubmits: u64,
     /// NVENC refused to open because the NVIDIA driver is older than the
     /// linked FFmpeg's NVENC needs. The fallback notice then says to update
     /// it.
     pub nvidia_driver_outdated: bool,
+    /// The processor encodes because startup's GPU detection did not return
+    /// in time. The fallback notice then says the driver did not answer.
+    pub gpu_detection_stalled: bool,
+    /// AMD and Intel cards on the PC whose encoder failed to open: the
+    /// fallback notice says to update their driver.
+    pub driver_update_vendors: Vec<crate::gpu::GpuVendor>,
     encode_timestamps: VecDeque<Instant>,
 
     // Transport
@@ -51,6 +63,9 @@ pub struct PipelineStats {
     pub transport_packets_sent: u64,
     pub transport_fragments_sent: u64,
     pub transport_retransmits: u64,
+    /// Pointer positions and images sent to an iPad that draws the pointer.
+    pub pointer_states_sent: u64,
+    pub pointer_shapes_sent: u64,
     pub usb_service_reachable: bool,
     pub usb_devices: usize,
     pub usb_link_state: String,
@@ -105,7 +120,10 @@ impl PipelineStats {
             bitrate_bps: 0,
             codec_name: String::new(),
             using_software_fallback: false,
+            keyframe_resubmits: 0,
             nvidia_driver_outdated: false,
+            gpu_detection_stalled: false,
+            driver_update_vendors: Vec::new(),
             encode_timestamps: VecDeque::with_capacity(128),
 
             transport_fps: 0.0,
@@ -113,6 +131,8 @@ impl PipelineStats {
             transport_packets_sent: 0,
             transport_fragments_sent: 0,
             transport_retransmits: 0,
+            pointer_states_sent: 0,
+            pointer_shapes_sent: 0,
             usb_service_reachable: false,
             usb_devices: 0,
             usb_link_state: "Checking Apple device service".into(),
@@ -147,6 +167,8 @@ impl PipelineStats {
         self.codec_name = previous.codec_name;
         self.using_software_fallback = previous.using_software_fallback;
         self.nvidia_driver_outdated = previous.nvidia_driver_outdated;
+        self.gpu_detection_stalled = previous.gpu_detection_stalled;
+        self.driver_update_vendors = previous.driver_update_vendors;
         self.mdns_active = previous.mdns_active;
         previous.audio
     }
@@ -160,6 +182,9 @@ impl PipelineStats {
         self.transport_packets_sent = 0;
         self.transport_fragments_sent = 0;
         self.transport_retransmits = 0;
+        self.pointer_states_sent = 0;
+        self.pointer_shapes_sent = 0;
+        self.keyframe_resubmits = 0;
         self.transport_timestamps.clear();
         self.bandwidth_samples.clear();
         self.bandwidth_bps = 0.0;
@@ -207,7 +232,7 @@ impl PipelineStats {
     pub fn record_capture(&mut self, width: u32, height: u32) {
         let now = Instant::now();
         self.capture_frame_count += 1;
-        self.capture_resolution = (width, height);
+        self.capture_resolution = crate::encoder::encoded_size(width, height);
         self.capture_timestamps.push_back(now);
         self.capture_fps = Self::calc_fps(&mut self.capture_timestamps, now);
     }
@@ -293,6 +318,16 @@ impl PipelineStats {
 #[cfg(test)]
 mod tests {
     use super::PipelineStats;
+
+    #[test]
+    fn a_new_viewer_starts_counting_pictures_given_again_from_zero() {
+        let mut stats = PipelineStats {
+            keyframe_resubmits: 3,
+            ..PipelineStats::default()
+        };
+        stats.reset_connection_stats();
+        assert_eq!(stats.keyframe_resubmits, 0);
+    }
 
     #[test]
     fn reset_for_restart_preserves_runtime_configuration() {

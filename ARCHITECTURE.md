@@ -75,6 +75,7 @@ Rust and Swift share golden vectors and stable packet-type registry tests.
 | KEYFRAME_REQUEST | Recovery after repair expiry or decoder error |
 | PING / PONG | Min-RTT clock estimate for end-to-end latency |
 | INPUT_EVENT | Normalized mouse/touch events, HID keys and UTF-16 text |
+| POINTER_SHAPE / POINTER_STATE | The Mirror's pointer image (chunked premultiplied BGRA and an invert mask) and its position, at most once a frame budget, for an iPad that draws the pointer itself (feature bit 5, host capability bit 6); the video then leaves the pointer out. The Second screen does the same when the running virtual display driver started with a hardware cursor (as the host's settings file sets it), which the host knows from its record of that start (boot and device arrival); a pointer image larger than that cursor's caps stays in the video. When the host can't tell, it does as 0.3.4: no pointer messages, and the pointer in the video. |
 | Audio | Sequenced Opus packets with discontinuity and capture timing |
 | BYE | User, background or shutdown teardown; the host ending a silent session |
 
@@ -196,7 +197,15 @@ connected client, writes the requested mode first in VDD XML, and reports actual
 task failures. Setup and the host log the active display paths around every
 driver change; when a change leaves the PC without any real screen it had, they
 re-apply the saved layout once, else switch to "PC screen only" if the built-in
-panel was on (`display_guard.rs`, `display-guard.ps1`). It also ships a UDP
+panel was on (`display_guard.rs`, `display-guard.ps1`). At runtime the host also
+acts while the virtual display is still on: a turn on that leaves it alone
+switches Windows to "Extend" (else the saved layout or "PC screen only"), and a
+turn off never runs while it is the only screen, until Windows ends the session.
+On a hybrid laptop whose panel the virtual display takes away until a restart
+(Windows withdraws its target while the lid is open), it tries nothing and
+keeps the display on while the host runs; the turn offs at start-up, quit and
+in the failure reporter run, so the restart starts without it. Second screen
+mirrors there until the user chooses it again. It also ships a UDP
 firewall rule. Runtime upgrade, task-ACL and
 uninstall checks remain hardware gates.
 

@@ -124,6 +124,8 @@ const DIAGNOSTIC_KEYS: &[&str] = &[
     "avoided",
     "attached",
     "advertised_formats",
+    "capture_size",
+    "encoded_size",
     "usb_state",
     "wire_stream",
     "running",
@@ -136,6 +138,7 @@ const DIAGNOSTIC_KEYS: &[&str] = &[
     "ss_rule",
     // A silent client's session held, kept or ended.
     "silent_ms",
+    "stalled_ms",
     "held_ms",
     "last_heard",
     "heard",
@@ -164,6 +167,16 @@ const DIAGNOSTIC_KEYS: &[&str] = &[
     "choice",
     // The startup network line.
     "route",
+    "lan_adapters",
+    // The Windows Firewall line.
+    "profiles",
+    "allow_rules",
+    "block_rules",
+    "all_programs_block_rules",
+    "scoped_block_rules",
+    "bypass_rules",
+    "lan",
+    "verdict",
     // The virtual display snapshot.
     "driver",
     "tech",
@@ -1308,6 +1321,7 @@ mod tests {
                 .with_ansi(false)
                 .with_writer(move || Captured(writer.clone())),
         );
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(subscriber, log);
         let line = String::from_utf8(out.lock().clone()).unwrap();
         line.trim_end().to_owned()
@@ -1940,6 +1954,11 @@ mod tests {
                 "modes",
                 "INFO Second screen mode mode=2732x2048 requested=the driver's modes",
             ),
+            (
+                "1680x945",
+                "INFO Encoding without the capture's odd last column or row \
+                 capture_size=1680x945 encoded_size=1680x944",
+            ),
             ("arm64", "INFO EternalMonitor host 0.3.4 revision=x | OS=Windows arch=arm64 logical_cpus=8"),
             (
                 "Client",
@@ -1976,6 +1995,10 @@ mod tests {
                 "input",
                 "WARN Client liveness expired — tearing session down peer=192.0.2.7:50000 silent_ms=10000 \
                  held_ms=7000 last_heard=input late_input=0 device=iPad",
+            ),
+            (
+                "2750",
+                "INFO The stream's transport loop moved again phase=input stalled_ms=2750",
             ),
         ];
         for (name, message) in cases {

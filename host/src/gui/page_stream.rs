@@ -56,6 +56,41 @@ impl AnalyzerApp {
     /// Update, restart and fault notices, most urgent first.
     fn notices(&mut self, ui: &mut Ui, snap: &StatsSnapshot, client: &ClientSnapshot) {
         self.port_notice(ui);
+        let firewall = crate::firewall::latest();
+        let progress = crate::firewall_fix::progress();
+        // Its own banner, whatever the firewall reads now: a fix that went
+        // part of the way can leave no notice to show the failure in.
+        if let Some(error) = firewall_fix_failure(progress) {
+            widgets::banner(
+                ui,
+                WARNING,
+                Icon::Warning,
+                FIREWALL_FIX_FAILED_TITLE,
+                error,
+                220.0,
+                |ui| {
+                    if let Some(port) = crate::firewall_fix::last_port() {
+                        if widgets::button(ui, Tone::Primary, None, tr("Try again")).clicked() {
+                            crate::firewall_fix::start_for(port);
+                        }
+                    }
+                    if widgets::button(ui, Tone::Secondary, None, tr("Dismiss")).clicked() {
+                        crate::firewall_fix::dismiss();
+                    }
+                },
+            );
+            ui.add_space(GAP - 10.0);
+        }
+        if let Some((title, body)) = firewall_notice(firewall.as_ref(), client.peer.is_some()) {
+            let fixable = firewall_fix_offered(firewall.as_ref());
+            let width = if fixable { 110.0 } else { 0.0 };
+            widgets::banner(ui, WARNING, Icon::Warning, &title, &body, width, |ui| {
+                if let (true, Some(report)) = (fixable, firewall.as_ref()) {
+                    firewall_fix_action(ui, progress, report.port);
+                }
+            });
+            ui.add_space(GAP - 10.0);
+        }
         if let Some((title, body)) = usb_cable_notice(
             snap.usb_service_reachable,
             snap.usb_cabled_devices,
@@ -69,9 +104,12 @@ impl AnalyzerApp {
         }
         if snap.using_software_fallback {
             // Choices made while troubleshooting are the usual reason a
-            // working graphics card is skipped, so offer to undo them first.
-            let customized = self.settings_encoder_choice != ENCODER_AUTO_LABEL
-                || self.settings_encoder_input != crate::encoder::input::EncoderInput::default();
+            // working graphics card is skipped, so offer to undo them first,
+            // unless the driver did not answer at startup: then Restart.
+            let customized = !snap.gpu_detection_stalled
+                && (self.settings_encoder_choice != ENCODER_AUTO_LABEL
+                    || self.settings_encoder_input
+                        != crate::encoder::input::EncoderInput::default());
             let mut reset = false;
             let mut restart = false;
             widgets::banner(
@@ -79,7 +117,12 @@ impl AnalyzerApp {
                 WARNING,
                 Icon::Warning,
                 SOFTWARE_FALLBACK_TITLE,
-                &software_fallback_body(customized, snap.nvidia_driver_outdated),
+                &software_fallback_body(
+                    customized,
+                    snap.nvidia_driver_outdated,
+                    snap.gpu_detection_stalled,
+                    &snap.driver_update_vendors,
+                ),
                 if customized { 230.0 } else { 110.0 },
                 |ui| {
                     if customized {
@@ -127,7 +170,7 @@ impl AnalyzerApp {
         }
         // The user asked for the extended (virtual) display but it could not be brought up,
         // so capture silently fell back to the primary monitor. Say so.
-        let vdd_failure = crate::capture::second_screen::remembered_failure(&self.control.shared);
+        let vdd_failure = crate::capture::second_screen::notice_failure(&self.control.shared);
         if let Some(mut notice) =
             second_screen_notice(vdd_status, vdd_health, vdd_problem, vdd_failure)
         {
@@ -560,12 +603,14 @@ impl AnalyzerApp {
             }
         });
         ui.add_space(2.0);
+        let windows_10 = crate::capture::second_screen::windows_unsupported(&self.control.shared);
         ui.add(
             egui::Label::new(muted(screen_mode_text(
                 &current,
                 output.as_deref(),
                 vdd,
                 running,
+                windows_10,
             )))
             .wrap(),
         );
@@ -824,21 +869,44 @@ enum HeaderAction {
 pub(super) const SOFTWARE_FALLBACK_TITLE: &str =
     "Video is using the processor instead of the graphics card";
 
-/// What the CPU fallback notice says: undo custom settings first, say the
-/// NVIDIA driver is too old when that is what the graphics card refused, or
+/// What the CPU fallback notice says: that the graphics driver did not
+/// answer at startup, undo custom settings first, say the NVIDIA driver is
+/// too old when that is what the graphics card refused, name the AMD or
+/// Intel driver whose card could not start encoding (`driver_vendors`), or
 /// suggest a driver update.
-pub(super) fn software_fallback_body(customized: bool, nvidia_driver_outdated: bool) -> String {
-    if customized {
+pub(super) fn software_fallback_body(
+    customized: bool,
+    nvidia_driver_outdated: bool,
+    detection_stalled: bool,
+    driver_vendors: &[crate::gpu::GpuVendor],
+) -> String {
+    use crate::gpu::GpuVendor::{Amd, Intel};
+    let amd = driver_vendors.contains(&Amd);
+    let intel = driver_vendors.contains(&Intel);
+    if detection_stalled {
+        "The graphics driver did not respond when EternalMonitor started, so the processor encodes the video for now. The picture may lag and the PC may run hot. Click Restart to try the graphics card again.".to_string()
+    } else if customized {
         "The graphics card could not encode video with the options chosen in Settings, so the picture may lag and the PC may run hot. Go back to the recommended options first.".to_string()
     } else if nvidia_driver_outdated {
         format!(
             "The NVIDIA graphics driver on this PC is too old for the graphics card to encode video, so the picture may lag and the PC may run hot. Update the NVIDIA driver to version {} or newer, if your graphics card supports it, then click Restart. Older cards keep using the processor.",
             crate::encoder::NVENC_MIN_DRIVER
         )
+    } else if amd && intel {
+        "The AMD and Intel graphics drivers on this PC could not start video encoding on the graphics cards, so the picture may lag and the PC may run hot. Update the AMD and Intel graphics drivers, then click Restart.".to_string()
+    } else if amd || intel {
+        let vendor = if amd { "AMD" } else { "Intel" };
+        format!(
+            "The {vendor} graphics driver on this PC could not start video encoding on the graphics card, so the picture may lag and the PC may run hot. Update the {vendor} graphics driver, then click Restart."
+        )
     } else {
         "The picture may lag and the PC may run hot. Update your graphics driver from NVIDIA, AMD or Intel, then click Restart.".to_string()
     }
 }
+/// Why Second screen mirrors on Windows 10: the notice, and the note beside
+/// the choice.
+pub(super) const WINDOWS_10_NOTE: &str =
+    "Second screen needs Windows 11, so the iPad shows your main screen instead.";
 pub(super) const SECOND_SCREEN_FAILED_TITLE: &str =
     "The second screen couldn't start, so your main screen is mirrored";
 const INSTALLER_URL: &str = "https://eternalmonitor.dev/download.html";
@@ -917,6 +985,26 @@ pub(super) fn second_screen_notice(
         })
     };
     match (status, health, problem) {
+        // Nothing was tried, and trying again can't help.
+        (Failed | TaskFailed, _, _) if failure == Some(crate::capture::second_screen::WINDOWS_10) => {
+            notice(
+                &format!("{WINDOWS_10_NOTE} Mirror my screen works as usual."),
+                false,
+                false,
+            )
+        }
+        // Windows left the device as not extended too, but Extend can't help.
+        (Failed, _, _) if failure == Some("panel_lost") => notice(
+            "Your laptop's built-in screen turned off when the second screen started, and Windows only turns it back on after a restart. Until then your desktop is on the iPad: save your work there, then restart the PC. On this PC the second screen can turn the built-in screen off again, so the iPad shows your main screen until you click Try again or choose Second screen again.",
+            true,
+            false,
+        ),
+        // The same, after the restart that brought the panel back.
+        (Failed, _, _) if failure == Some("panel_lost_before") => notice(
+            "Second screen is paused on this laptop because it turned off the built-in screen last time. Click Try again to use it.",
+            true,
+            false,
+        ),
         (Failed | TaskFailed, VddTaskHealth::NotResponding, _) => notice(
             "Windows' display driver stopped responding. Restart the PC to use the second screen.",
             false,
@@ -1150,18 +1238,23 @@ pub(super) fn capture_block_notice(
 }
 
 /// What the Stream page says under the mirror / second screen choice.
+/// `windows_10`: Second screen can't run on this Windows
+/// ([`WINDOWS_10_NOTE`]).
 pub(super) fn screen_mode_text(
     capture: &str,
     output: Option<&str>,
     vdd: VddStatus,
     running: bool,
+    windows_10: bool,
 ) -> String {
     let restart = if running {
         " Switching restarts the stream, and the iPad reconnects by itself."
     } else {
         ""
     };
-    let what = if capture == CAPTURE_VIRTUAL_SENTINEL {
+    let what = if capture == CAPTURE_VIRTUAL_SENTINEL && windows_10 {
+        WINDOWS_10_NOTE.to_string()
+    } else if capture == CAPTURE_VIRTUAL_SENTINEL {
         match vdd {
             VddStatus::Active => "The iPad is an extra screen. Drag windows past the edge of your main screen to move them onto it.",
             VddStatus::Failed | VddStatus::TaskFailed => {
@@ -1177,7 +1270,12 @@ pub(super) fn screen_mode_text(
     } else {
         "The iPad shows the same picture as your main screen.".to_string()
     };
-    what + restart
+    let windows = if windows_10 && capture != CAPTURE_VIRTUAL_SENTINEL {
+        " Second screen needs Windows 11."
+    } else {
+        ""
+    };
+    what + windows + restart
 }
 
 /// The home network's address, without the port (the iPad has its own Port
@@ -1352,6 +1450,85 @@ pub(super) fn usb_cable_notice(
     })
 }
 
+/// "Fix it" on the firewall notice: for this exe's own Block rule, which
+/// the fix removes, not for "Blocks all incoming connections", which only
+/// the user's switch in Windows Security turns off.
+pub(super) fn firewall_fix_offered(report: Option<&crate::firewall::Report>) -> bool {
+    matches!(
+        report.and_then(crate::firewall::Report::certain_block),
+        Some(crate::firewall::CertainBlock::Rule { .. })
+    )
+}
+
+/// Runs the fix; it asks Windows for administrator rights once.
+fn firewall_fix_action(ui: &mut Ui, progress: crate::firewall_fix::Progress, port: u16) {
+    let running = progress == crate::firewall_fix::Progress::Running;
+    let clicked = ui
+        .add_enabled_ui(!running, |ui| {
+            widgets::button(ui, Tone::Primary, None, tr("Fix it"))
+        })
+        .inner
+        .clicked();
+    if clicked {
+        crate::firewall_fix::start_for(port);
+    }
+}
+
+/// The title of the banner for a firewall fix that didn't work.
+pub(super) const FIREWALL_FIX_FAILED_TITLE: &str = "EternalMonitor couldn't fix Windows Firewall";
+
+/// The error to show for the last fix, until dismissed: a failure only.
+/// A fix that worked, or a No to the Windows prompt, shows nothing.
+pub(super) fn firewall_fix_failure(
+    progress: crate::firewall_fix::Progress,
+) -> Option<&'static str> {
+    match progress {
+        crate::firewall_fix::Progress::Done(crate::firewall_fix::Outcome::Failed(error)) => {
+            Some(error)
+        }
+        _ => None,
+    }
+}
+
+/// What the Stream page says while Windows Firewall keeps iPads out: only
+/// for a block certain on the network an iPad would use that Setup or one
+/// switch removes (see [`crate::firewall::Report::certain_block`]), and
+/// never while an iPad is connected, over Wi-Fi or the cable.
+pub(super) fn firewall_notice(
+    report: Option<&crate::firewall::Report>,
+    session_active: bool,
+) -> Option<(String, String)> {
+    use crate::firewall::CertainBlock;
+    if session_active {
+        return None;
+    }
+    let lead = "iPads on Wi-Fi can't reach this PC, so they say it didn't answer.";
+    let usb = "A USB cable still works.";
+    let turn_off = |networks: &[&str]| {
+        format!(
+            "In Windows Security, open Firewall & network protection, choose the {} network and turn off Blocks all incoming connections.",
+            networks.join(" and ")
+        )
+    };
+    Some(match report?.certain_block()? {
+        CertainBlock::Rule { all_blocked } => {
+            let mut body =
+                format!("{lead} Run the EternalMonitor installer again: it removes the block.");
+            if !all_blocked.is_empty() {
+                body = format!("{body} {}", turn_off(&all_blocked));
+            }
+            (
+                "Windows Firewall is blocking EternalMonitor".into(),
+                format!("{body} {usb}"),
+            )
+        }
+        CertainBlock::AllIncoming(networks) => (
+            "Windows Firewall blocks every incoming connection".into(),
+            format!("{lead} {} {usb}", turn_off(&networks)),
+        ),
+    })
+}
+
 /// What the USB row says. The Apple Devices hint appears only when Apple's
 /// device service cannot be reached.
 pub(super) fn usb_summary(
@@ -1437,6 +1614,13 @@ pub(super) fn audio_summary(
                 audio.kbps, audio.packets_per_sec
             ),
             ACCENT,
+        );
+    }
+    if audio.status == crate::audio::DEVICE_IN_USE_STATUS {
+        return (
+            "Another app is using your speakers on its own. PC audio comes back when it lets go."
+                .into(),
+            WARNING,
         );
     }
     // The audio stage's idle status names the protocol, not the device.

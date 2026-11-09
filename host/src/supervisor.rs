@@ -16,6 +16,8 @@ use tracing::{error, info, warn};
 use crate::control::{SharedControl, SupervisorCommand};
 use crate::gpu::GpuInfo;
 use crate::stats::PIPELINE_STATS;
+use crate::transport::session::{NotStreaming, StageFailure, StreamStop};
+use crate::transport::standby::Standby;
 
 /// The current pipeline generation. Stage health reports carry the generation
 /// they belong to; anything from an older generation is ignored (a "poisoned"
@@ -70,6 +72,33 @@ const BACKOFF_MAX: Duration = Duration::from_secs(30);
 const STORM_WINDOW: Duration = Duration::from_secs(60);
 const STORM_LIMIT: usize = 6;
 
+/// The supervisor looks at the stage heartbeats every 250 ms. A longer gap
+/// between two looks means this process did not run in between: the PC
+/// slept or hibernated (Windows' monotonic clock counts the time asleep), or
+/// the whole host was starved. Heartbeats stamped before such a gap say
+/// nothing about whether a stage is wedged.
+const WATCH_GAP_MS: u64 = 2_000;
+
+/// After such a gap the stages get this long before the watchdog judges
+/// them. Waking displays and drivers can hold capture for seconds while
+/// nothing is wrong; a stage still silent after it is restarted then.
+const WAKE_GRACE_MS: u64 = 10_000;
+
+/// Lets integration tests trip the storm brake in milliseconds instead of
+/// half a minute: the first backoff, in ms.
+#[cfg(feature = "test-hooks")]
+pub static TEST_BACKOFF_BASE_MS: AtomicU64 = AtomicU64::new(BACKOFF_BASE.as_millis() as u64);
+
+#[cfg(feature = "test-hooks")]
+fn backoff_base() -> Duration {
+    Duration::from_millis(TEST_BACKOFF_BASE_MS.load(Ordering::SeqCst))
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn backoff_base() -> Duration {
+    BACKOFF_BASE
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SupervisorState {
     Running {
@@ -88,6 +117,8 @@ pub enum SupervisorState {
     /// Too many automatic restarts in the window; a manual Start is required.
     Failed {
         reason: String,
+        /// The stage that kept failing (a wedge counts as capture).
+        stage: Stage,
     },
     Stopped,
     ShutDown,
@@ -112,6 +143,10 @@ pub struct Machine {
     pub state: SupervisorState,
     restarts: Vec<Instant>,
     attempt: u32,
+    /// When the watchdog last looked at the live generation's heartbeats.
+    watched_ms: Option<u64>,
+    /// When the watchdog last found such a gap, during [`WAKE_GRACE_MS`].
+    woke_ms: Option<u64>,
 }
 
 impl Machine {
@@ -122,6 +157,8 @@ impl Machine {
             },
             restarts: Vec::new(),
             attempt: 0,
+            watched_ms: None,
+            woke_ms: None,
         }
     }
 
@@ -134,6 +171,22 @@ impl Machine {
                     self.attempt = 0;
                     self.restarts.clear();
                     Effect::Restart
+                }
+            },
+            SupervisorCommand::RestartStream { generation } => match self.state {
+                SupervisorState::Running {
+                    generation: live_generation,
+                } if live_generation == *generation => {
+                    self.attempt = 0;
+                    self.restarts.clear();
+                    Effect::Restart
+                }
+                _ => {
+                    info!(
+                        generation,
+                        "A stream that no longer runs asked to start again: left as it is"
+                    );
+                    Effect::None
                 }
             },
             SupervisorCommand::Stop => match self.state {
@@ -222,12 +275,15 @@ impl Machine {
                 STORM_WINDOW.as_secs()
             );
             error!("{message} — giving up until a manual Start");
-            self.state = SupervisorState::Failed { reason: message };
+            self.state = SupervisorState::Failed {
+                reason: message,
+                stage,
+            };
             return Effect::StopPipeline;
         }
         self.restarts.push(now);
         self.attempt += 1;
-        let backoff = BACKOFF_BASE
+        let backoff = backoff_base()
             .saturating_mul(1u32 << (self.attempt - 1).min(6))
             .min(BACKOFF_MAX);
         warn!(
@@ -260,6 +316,9 @@ impl Machine {
 
     pub fn note_started(&mut self, generation: u64) {
         self.state = SupervisorState::Running { generation };
+        // Joining the old generation can take seconds; that is no sleep.
+        self.watched_ms = None;
+        self.woke_ms = None;
     }
 
     /// A successful stretch of running clears the failure budget.
@@ -277,6 +336,11 @@ pub struct HealthReporter {
 }
 
 impl HealthReporter {
+    #[cfg(test)]
+    pub(crate) fn new(tx: mpsc::Sender<SupMsg>, generation: u64) -> Self {
+        Self { tx, generation }
+    }
+
     pub fn stage_exited(&self, stage: Stage, outcome: StageOutcome) {
         let _ = self.tx.send(SupMsg::Health {
             generation: self.generation,
@@ -292,7 +356,7 @@ impl HealthReporter {
 pub fn run(
     listen_port: u16,
     shared: SharedControl,
-    gpu_info: GpuInfo,
+    mut gpu_info: GpuInfo,
     command_tx: mpsc::Sender<SupervisorCommand>,
     command_rx: mpsc::Receiver<SupervisorCommand>,
 ) {
@@ -326,11 +390,17 @@ pub fn run(
     } else {
         machine.wait_for_port(Instant::now() + crate::startup::port::RECHECK);
     }
+    let mut standby = None;
+    settle(&machine, &shared, &mut standby, listen_port);
     let mut healthy_since = Instant::now();
+    let mut transport_watch = crate::transport::beat::Watch::default();
 
     loop {
         let message = sup_rx.recv_timeout(Duration::from_millis(250));
         let now = Instant::now();
+        // A stuck transport stays in its generation's thread, which no join
+        // can end: this line says where it is stuck.
+        transport_watch.check_and_log(&shared.transport_beat, crate::clock::host_now_us() / 1000);
 
         // A minute of health clears the storm budget.
         if matches!(machine.state, SupervisorState::Running { .. })
@@ -351,7 +421,7 @@ pub fn run(
                 let ticked = machine.on_tick(now);
                 if ticked != Effect::None {
                     ticked
-                } else if let Some(reason) = wedge_reason(&shared, &machine) {
+                } else if let Some(reason) = wedge_reason(&shared, &mut machine) {
                     machine.on_wedged(&reason, now)
                 } else {
                     Effect::None
@@ -363,16 +433,34 @@ pub fn run(
         match effect {
             Effect::None => {}
             Effect::StopPipeline => {
-                shared.stop();
+                // Before the join: a HELLO2 the stopping transport still
+                // takes hears why.
+                shared
+                    .session
+                    .lock()
+                    .set_not_streaming(not_streaming(&machine.state, &shared));
+                stop_pipeline(&shared, &machine.state);
                 bounded_join(&mut pipeline, generation);
             }
             Effect::Restart | Effect::Start => {
+                // A HELLO2 meanwhile is told to ask again in a moment.
+                shared
+                    .session
+                    .lock()
+                    .set_not_streaming(Some(NotStreaming::Restarting));
                 shared.stop();
                 bounded_join(&mut pipeline, generation);
+                // The check below binds the port: the standby lets go first.
+                if let Some(standby) = standby.take() {
+                    standby.stop();
+                }
                 // Before anything of the new generation starts: a held port
-                // leaves capture and the encoder closed while it waits.
-                if !crate::startup::port::check(listen_port) {
+                // leaves capture and the encoder closed while it waits. One
+                // the last owner left bound is this host's own.
+                let ours = shared.stream_socket.lock().is_some();
+                if !ours && !crate::startup::port::check(listen_port) {
                     machine.wait_for_port(now + crate::startup::port::RECHECK);
+                    settle(&machine, &shared, &mut standby, listen_port);
                     continue;
                 }
                 crate::audio::restart_stats(&PIPELINE_STATS, |stats| {
@@ -381,7 +469,13 @@ pub fn run(
                 });
                 generation = CURRENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
                 machine.note_started(generation);
+                settle(&machine, &shared, &mut standby, listen_port);
                 healthy_since = Instant::now();
+                if adopt_late_detection(&mut gpu_info, &shared, crate::gpu::take_late_detection) {
+                    let mut stats = PIPELINE_STATS.lock();
+                    stats.set_gpu_name(gpu_info.name.clone());
+                    stats.set_codec_name(gpu_info.codec_display_name.clone());
+                }
                 pipeline = Some(spawn_generation(
                     generation,
                     listen_port,
@@ -394,30 +488,195 @@ pub fn run(
             Effect::Shutdown => {
                 shared.stop();
                 bounded_join(&mut pipeline, generation);
+                // The port closes as the stream ends, as it always did: a
+                // copy that takes over after this one quits binds it.
+                shared.stream_socket.lock().take();
                 break;
             }
         }
+        settle(&machine, &shared, &mut standby, listen_port);
         // Stopped by the user (or given up) while waiting: no notice.
         if !matches!(machine.state, SupervisorState::WaitingForPort { .. }) {
             crate::startup::port::forget();
         }
     }
+    if let Some(standby) = standby.take() {
+        standby.stop();
+    }
+    shared.stream_socket.lock().take();
     info!("Supervisor loop ended");
+}
+
+/// Swap startup's software facts for what a detection given up on at
+/// startup found once it returned (`late`), so this and later pipelines
+/// encode on the graphics card. True when they changed.
+fn take_late_detection(gpu: &mut GpuInfo, late: impl FnOnce() -> Option<GpuInfo>) -> bool {
+    if !gpu.detection_stalled {
+        return false;
+    }
+    let Some(found) = late() else {
+        return false;
+    };
+    info!(
+        gpu = %found.name,
+        encoder = %found.encoder_name,
+        "GPU detection returned after startup went on without it; this pipeline uses its graphics card"
+    );
+    *gpu = found;
+    true
+}
+
+/// [`take_late_detection`], and the card it found becomes the one to wake
+/// for an iPad that looks for PCs, until the new pipeline's encoder opens
+/// and says which it uses.
+fn adopt_late_detection(
+    gpu: &mut GpuInfo,
+    shared: &SharedControl,
+    late: impl FnOnce() -> Option<GpuInfo>,
+) -> bool {
+    if !take_late_detection(gpu, late) {
+        return false;
+    }
+    *shared.wake_adapter.lock() = crate::gpu_wake::wake_adapter_for(&gpu.encoder_name, gpu);
+    true
+}
+
+/// Makes what iPads hear match `machine`: the session's answer to a HELLO2,
+/// and the standby responder on the port while no generation streams.
+fn settle(
+    machine: &Machine,
+    shared: &SharedControl,
+    standby: &mut Option<Standby>,
+    listen_port: u16,
+) {
+    if !standby_answers(&machine.state) {
+        if let Some(standby) = standby.take() {
+            standby.stop();
+        }
+    }
+    // Cleared only once the standby has stopped: it never starts a session.
+    shared
+        .session
+        .lock()
+        .set_not_streaming(not_streaming(&machine.state, shared));
+    if standby_answers(&machine.state) && standby.is_none() {
+        *standby = Standby::start(listen_port, shared.clone());
+    }
+}
+
+/// Whether the standby responder holds the port in `state`. Not while a
+/// generation runs, and not while another program holds the port.
+fn standby_answers(state: &SupervisorState) -> bool {
+    matches!(
+        state,
+        SupervisorState::BackingOff { .. }
+            | SupervisorState::Stopped
+            | SupervisorState::Failed { .. }
+    )
+}
+
+/// What a HELLO2 hears in `state`. Nothing starts streaming by itself after
+/// Stop or the storm brake: only Start does.
+fn not_streaming(state: &SupervisorState, shared: &SharedControl) -> Option<NotStreaming> {
+    use eternal_wire::v2::control::FailedReason;
+    match state {
+        SupervisorState::Running { .. } => None,
+        SupervisorState::BackingOff { .. } | SupervisorState::WaitingForPort { .. } => {
+            Some(NotStreaming::Restarting)
+        }
+        SupervisorState::Stopped | SupervisorState::ShutDown => Some(NotStreaming::Stopped),
+        SupervisorState::Failed { stage, .. } => {
+            let block = *shared.capture_block.lock();
+            Some(NotStreaming::Failed(block.map_or(
+                match stage {
+                    Stage::Capture | Stage::Audio => FailedReason::Capture,
+                    Stage::Encoder => FailedReason::Encoder,
+                    Stage::Transport => FailedReason::Transport,
+                },
+                crate::capture::recovery::CaptureBlock::failed_reason,
+            )))
+        }
+    }
+}
+
+/// Stops the pipeline that the machine stopped in `state`, first ending the
+/// session as [`stop_when_stopped`] says: its goodbye goes out with the
+/// transport, which runs until it sees `running` false.
+fn stop_pipeline(shared: &SharedControl, state: &SupervisorState) {
+    if let Some(why) = stop_when_stopped(state) {
+        crate::diagnostics::stop_session(shared, why);
+    }
+    shared.stop();
+}
+
+/// How a session ends when the pipeline stops in `state`. Stopped and
+/// Failed wait for a manual Start, so the session ends now: kept, it went on
+/// unanswered while its iPad lost the signal and every HELLO it sent went
+/// unanswered. Stop says the PC ended the session; giving up says connect
+/// again, and names the stage in the summary. A backoff or a held port
+/// restarts the stream by itself, and its session goes on.
+fn stop_when_stopped(state: &SupervisorState) -> Option<StreamStop> {
+    match state {
+        SupervisorState::Stopped => Some(StreamStop::User),
+        SupervisorState::Failed { stage, .. } => Some(StreamStop::GaveUp(match stage {
+            Stage::Capture => StageFailure::Capture,
+            Stage::Encoder => StageFailure::Encoder,
+            Stage::Transport | Stage::Audio => StageFailure::Other,
+        })),
+        SupervisorState::Running { .. }
+        | SupervisorState::BackingOff { .. }
+        | SupervisorState::WaitingForPort { .. }
+        | SupervisorState::ShutDown => None,
+    }
 }
 
 /// Watchdog rules over the heartbeat atomics. Only meaningful while Running
 /// and after the pipeline has had a moment to warm up.
-fn wedge_reason(shared: &SharedControl, machine: &Machine) -> Option<String> {
+fn wedge_reason(shared: &SharedControl, machine: &mut Machine) -> Option<String> {
     wedge_reason_at(shared, machine, crate::clock::host_now_us() / 1000)
 }
 
 pub(crate) fn wedge_reason_at(
     shared: &SharedControl,
-    machine: &Machine,
+    machine: &mut Machine,
     now_ms: u64,
 ) -> Option<String> {
     if !matches!(machine.state, SupervisorState::Running { .. }) {
+        machine.watched_ms = None;
+        machine.woke_ms = None;
         return None;
+    }
+    // After a sleep the first look can come before any stage has run again,
+    // and every heartbeat looks as old as the sleep: 7 of 10 "capture loop
+    // silent" restarts in the field were PCs waking after 3 min to 3.5 h.
+    // Give the stages a fresh window instead, with a grace while the
+    // displays wake; a real wedge still shows when the grace ends.
+    let last_look = machine.watched_ms.replace(now_ms);
+    if let Some(gap_ms) = last_look
+        .map(|last| now_ms.saturating_sub(last))
+        .filter(|&gap| gap > WATCH_GAP_MS)
+    {
+        info!(
+            gap_ms,
+            "The host did not run for a while (the PC slept?) — restarting the pipeline watchdog's clock"
+        );
+        for beat in [
+            &shared.hb_capture_loop_ms,
+            &shared.hb_capture_frame_ms,
+            &shared.hb_encode_frame_ms,
+        ] {
+            if beat.load(Ordering::Relaxed) > 0 {
+                beat.store(now_ms, Ordering::Relaxed);
+            }
+        }
+        machine.woke_ms = Some(now_ms);
+        return None;
+    }
+    if let Some(woke_ms) = machine.woke_ms {
+        if now_ms.saturating_sub(woke_ms) < WAKE_GRACE_MS {
+            return None;
+        }
+        machine.woke_ms = None;
     }
     let loop_ms = shared.hb_capture_loop_ms.load(Ordering::Relaxed);
     let frame_ms = shared.hb_capture_frame_ms.load(Ordering::Relaxed);
@@ -561,6 +820,62 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_late_detection_is_used_by_the_next_pipeline_only_after_a_stall() {
+        let late = || {
+            Some(GpuInfo {
+                name: "late".to_string(),
+                encoder_name: "h264_amf".to_string(),
+                ..GpuInfo::software_fallback()
+            })
+        };
+        // Startup gave up: the next pipeline takes what it found since.
+        let mut gpu = GpuInfo {
+            detection_stalled: true,
+            ..GpuInfo::software_fallback()
+        };
+        assert!(take_late_detection(&mut gpu, late));
+        assert_eq!(
+            (
+                gpu.name.as_str(),
+                gpu.encoder_name.as_str(),
+                gpu.detection_stalled
+            ),
+            ("late", "h264_amf", false)
+        );
+        // Not returned yet: the processor goes on encoding, still marked.
+        let mut gpu = GpuInfo {
+            detection_stalled: true,
+            ..GpuInfo::software_fallback()
+        };
+        assert!(!take_late_detection(&mut gpu, || None));
+        assert!(gpu.detection_stalled);
+        // A detection that answered at startup is never replaced.
+        let mut gpu = GpuInfo::software_fallback();
+        assert!(!take_late_detection(&mut gpu, late));
+        assert_eq!(gpu.name, "Software");
+    }
+    #[test]
+    fn an_adopted_late_detection_becomes_the_card_to_wake() {
+        let shared = SharedControl::new(0, 8_000_000);
+        // Startup gave up and encodes on the CPU: nothing to wake.
+        let mut gpu = GpuInfo {
+            detection_stalled: true,
+            ..GpuInfo::software_fallback()
+        };
+        assert!(!adopt_late_detection(&mut gpu, &shared, || None));
+        assert_eq!(*shared.wake_adapter.lock(), None);
+        let late = || {
+            Some(GpuInfo {
+                encoder_name: "h264_amf".to_string(),
+                adapter_index: 1,
+                ..GpuInfo::software_fallback()
+            })
+        };
+        assert!(adopt_late_detection(&mut gpu, &shared, late));
+        assert_eq!(*shared.wake_adapter.lock(), Some(1));
+    }
+
+    #[test]
     fn audio_failures_never_restart_or_exhaust_the_video_failure_budget() {
         let mut machine = Machine::new(7);
         for _ in 0..20 {
@@ -629,6 +944,111 @@ mod tests {
         .unwrap();
     }
 
+    /// Stop and giving up wait for a manual Start: their session ends with
+    /// a goodbye. A stream that restarts by itself keeps its session.
+    #[test]
+    fn only_a_stop_that_waits_for_start_ends_the_session() {
+        use crate::transport::link::PeerId;
+        use crate::transport::session::ConfigSource;
+        use eternal_wire::v2::control::{
+            parse_control, ByeReason, ControlMessage, Hello2, StreamConfig, CAP_DECODE_H264,
+        };
+        struct Config;
+        impl ConfigSource for Config {
+            fn stream_config(&self) -> StreamConfig {
+                StreamConfig {
+                    stream_epoch: 1,
+                    width: 1280,
+                    height: 720,
+                    fps: 60,
+                    codec: 0,
+                    flags: 0,
+                    bitrate_bps: 10_000_000,
+                }
+            }
+            fn host_name(&self) -> String {
+                "TEST-HOST".into()
+            }
+        }
+        // Stops the pipeline as the run loop does, with an iPad streaming,
+        // and returns the goodbye left for the transport to send.
+        let stop = |state: &SupervisorState| {
+            let shared = SharedControl::new(19899, 10_000_000);
+            shared.pairing.lock().required = false;
+            shared.running.store(true, Ordering::SeqCst);
+            let peer = PeerId::udp("127.0.0.1:19898".parse().unwrap());
+            let hello = ControlMessage::Hello2(Hello2 {
+                proto_min: 2,
+                proto_max: 2,
+                client_nonce: 1,
+                listen_port: 19898,
+                decoder_caps: CAP_DECODE_H264,
+                feature_caps: 0,
+                screen_px_w: 1280,
+                screen_px_h: 720,
+                screen_pt_w: 1280,
+                screen_pt_h: 720,
+                refresh_hz: 60,
+                device_name: "stop test".into(),
+                device_id: 0,
+                preferred_fps: 0,
+                auth_token: [0; 16],
+                pairing_code: 0,
+            });
+            shared
+                .session
+                .lock()
+                .handle_control(peer, 0, hello, &Config, Instant::now());
+            stop_pipeline(&shared, state);
+            assert!(!shared.running.load(Ordering::SeqCst));
+            let goodbye = shared.session.lock().take_goodbye();
+            let ended = !shared.client_connected();
+            goodbye.map(|(to, bytes)| {
+                assert_eq!(to, peer);
+                assert!(ended, "a goodbye ends the session");
+                match parse_control(&bytes) {
+                    Ok((_, ControlMessage::Bye(reason))) => reason,
+                    other => panic!("not a goodbye: {other:?}"),
+                }
+            })
+        };
+
+        let mut machine = Machine::new(1);
+        assert_eq!(
+            machine.on_command(&SupervisorCommand::Stop),
+            Effect::StopPipeline
+        );
+        assert_eq!(stop(&machine.state), Some(ByeReason::UserDisconnect));
+
+        let mut machine = Machine::new(1);
+        let t0 = Instant::now();
+        let mut effect = Effect::None;
+        for _ in 0..=STORM_LIMIT {
+            effect = machine.on_stage_exit(1, Stage::Encoder, &failed("x"), t0);
+            if let SupervisorState::BackingOff { .. } = machine.state {
+                assert_eq!(stop(&machine.state), None, "a backoff keeps the session");
+                machine.note_started(1);
+            }
+        }
+        assert_eq!(effect, Effect::StopPipeline);
+        assert!(matches!(
+            machine.state,
+            SupervisorState::Failed {
+                stage: Stage::Encoder,
+                ..
+            }
+        ));
+        assert_eq!(
+            stop_when_stopped(&machine.state),
+            Some(StreamStop::GaveUp(StageFailure::Encoder))
+        );
+        assert_eq!(stop(&machine.state), Some(ByeReason::Error));
+
+        let mut machine = Machine::new(1);
+        machine.wait_for_port(t0);
+        assert_eq!(stop(&machine.state), None, "a held port keeps the session");
+    }
+
     fn failed(reason: &str) -> StageOutcome {
         StageOutcome::Failed(reason.to_string())
     }
@@ -665,6 +1085,35 @@ mod tests {
         let effect = machine.on_stage_exit(3, Stage::Encoder, &failed("zombie"), Instant::now());
         assert_eq!(effect, Effect::None);
         assert!(matches!(machine.state, SupervisorState::Running { .. }));
+    }
+
+    /// A stream asks to start again on its own only while it runs: after
+    /// Stop, the storm brake or a newer stream, nothing starts.
+    #[test]
+    fn a_stream_restarts_itself_only_while_it_runs() {
+        let restart = |generation| SupervisorCommand::RestartStream { generation };
+        let mut machine = Machine::new(5);
+        assert_eq!(machine.on_command(&restart(4)), Effect::None);
+        assert_eq!(machine.on_command(&restart(5)), Effect::Restart);
+        machine.note_started(6);
+
+        assert_eq!(
+            machine.on_command(&SupervisorCommand::Stop),
+            Effect::StopPipeline
+        );
+        assert_eq!(machine.on_command(&restart(6)), Effect::None);
+        assert_eq!(machine.state, SupervisorState::Stopped);
+
+        machine.state = SupervisorState::Failed {
+            reason: "encoder".into(),
+            stage: Stage::Encoder,
+        };
+        assert_eq!(machine.on_command(&restart(6)), Effect::None);
+        let t0 = Instant::now();
+        machine.note_started(7);
+        machine.on_stage_exit(7, Stage::Capture, &failed("dxgi died"), t0);
+        assert_eq!(machine.on_command(&restart(7)), Effect::None);
+        assert!(matches!(machine.state, SupervisorState::BackingOff { .. }));
     }
 
     #[test]
@@ -708,6 +1157,100 @@ mod tests {
             Effect::None
         );
         assert_eq!(machine.on_command(&SupervisorCommand::Start), Effect::Start);
+    }
+
+    /// The PC sleeps for two hours mid-stream. Windows' clock counts the time
+    /// asleep, so at the supervisor's first look after waking, before capture
+    /// has run again, every heartbeat looks two hours old. The field logged
+    /// "capture loop silent for 184184ms" up to 12886316ms this way.
+    #[test]
+    fn a_pc_that_slept_is_not_a_wedged_pipeline() {
+        let shared = SharedControl::new(0, 1);
+        let mut machine = Machine::new(1);
+        let beat = |now_ms: u64| {
+            shared.hb_capture_loop_ms.store(now_ms, Ordering::Relaxed);
+            shared.hb_capture_frame_ms.store(now_ms, Ordering::Relaxed);
+            shared.hb_encode_frame_ms.store(now_ms, Ordering::Relaxed);
+        };
+        let mut now_ms = 10_000;
+        beat(now_ms);
+        for _ in 0..8 {
+            now_ms += 250;
+            beat(now_ms);
+            assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
+        }
+        // Asleep: no thread runs, the clock moves on two hours.
+        now_ms += 2 * 3600 * 1000;
+        assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
+        // The displays wake slowly: capture is stuck in a driver call for
+        // 6 s, then runs again. No restart.
+        let woke = now_ms;
+        while now_ms < woke + 6_000 {
+            now_ms += 250;
+            assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
+        }
+        while now_ms < woke + 12_000 {
+            now_ms += 250;
+            beat(now_ms);
+            assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
+        }
+
+        // A real wedge once awake is caught as before: 3 s after the capture
+        // loop stops.
+        let stuck = now_ms;
+        while now_ms < stuck + 3_000 {
+            now_ms += 250;
+            assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
+        }
+        now_ms += 250;
+        assert_eq!(
+            wedge_reason_at(&shared, &mut machine, now_ms),
+            Some("capture loop silent for 3250ms".into())
+        );
+
+        // A capture loop that never runs again after waking is restarted
+        // when the grace ends.
+        let mut machine = Machine::new(2);
+        beat(now_ms);
+        assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
+        now_ms += 250;
+        assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
+        now_ms += 3600 * 1000;
+        assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
+        let woke = now_ms;
+        while now_ms < woke + WAKE_GRACE_MS - 250 {
+            now_ms += 250;
+            assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
+        }
+        now_ms += 250;
+        assert_eq!(
+            wedge_reason_at(&shared, &mut machine, now_ms),
+            Some("capture loop silent for 10000ms".into())
+        );
+    }
+
+    /// A restart joins the old generation for up to 5 s between two looks;
+    /// the new generation's watchdog starts from its own first look.
+    #[test]
+    fn a_restart_is_not_taken_for_a_sleep() {
+        let shared = SharedControl::new(0, 1);
+        let mut machine = Machine::new(1);
+        let mut now_ms = 10_000;
+        shared.hb_capture_loop_ms.store(now_ms, Ordering::Relaxed);
+        assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
+        assert_eq!(
+            machine.on_wedged("capture loop silent", Instant::now()),
+            Effect::StopPipeline
+        );
+        now_ms += 100;
+        assert_eq!(wedge_reason_at(&shared, &mut machine, now_ms), None);
+        // The join took 5 s, then the new generation started.
+        now_ms += 5_000;
+        machine.note_started(2);
+        shared
+            .hb_capture_loop_ms
+            .store(now_ms - 3_500, Ordering::Relaxed);
+        assert!(wedge_reason_at(&shared, &mut machine, now_ms).is_some());
     }
 
     #[test]

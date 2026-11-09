@@ -19,6 +19,12 @@
 //! picture, or where Try again was clicked, is exempt from every rule for
 //! good: a rule never moves a PC that works into the mirror.
 //!
+//! One failure has no wait that ends by itself: [`PANEL_LOST`], a hybrid
+//! laptop whose built-in panel the virtual display took away until a
+//! restart. Each try costs the user a black screen and a restart, so only
+//! choosing Second screen again (Try again, or another mode and back) tries
+//! it again, also after an update changes the fingerprint.
+//!
 //! The files are written by a [`Saver`] thread, never by the caller: the
 //! caller holds the locks the transport takes at every pass, and a write on
 //! a slow disk took 3 s, long enough for the iPad to give up. The thread
@@ -43,6 +49,12 @@ pub(super) const RULE_FILE_NAME: &str = "second-screen-rule.json";
 
 /// Saved for a manifest rule: nothing was tried.
 const HARDWARE_RULE: &str = "hardware_rule";
+
+/// The virtual display took the built-in panel away until the PC restarts.
+/// Saved as an `attach_timeout` with `panel_lost` set: an older version
+/// reads that as a timeout and waits, where it would drop a reason it
+/// doesn't know and try again at once.
+pub(crate) const PANEL_LOST: &str = "panel_lost";
 
 /// The file's layout. Another value is ignored, like an unreadable file.
 const FORMAT: u32 = 1;
@@ -72,11 +84,12 @@ const BACKOFF: [Duration; 5] = [
 /// no usable display. A failed Enable task is not one: its notice already
 /// says how to repair the install, and it costs no wait. Nor is a manifest
 /// rule, but it is saved the same way.
-const REMEMBERED: [&str; 4] = [
+const REMEMBERED: [&str; 5] = [
     "attach_timeout",
     "no_frames",
     "duplication_failed",
     HARDWARE_RULE,
+    PANEL_LOST,
 ];
 
 /// What decides whether the second screen can work on this PC. Every value
@@ -189,6 +202,9 @@ struct Record {
     failures: u32,
     /// When the last one failed, in seconds since 1970.
     failed_at: u64,
+    /// The failure is [`PANEL_LOST`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    panel_lost: bool,
 }
 
 /// Connections mirror without trying: why, and when the host tries again.
@@ -197,6 +213,9 @@ pub(crate) struct Hold {
     pub reason: &'static str,
     pub failures: u32,
     pub retry_in: Duration,
+    /// No wait ends it: only choosing Second screen again ([`PANEL_LOST`]).
+    /// `retry_in` is then zero.
+    pub until_chosen: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -204,6 +223,8 @@ struct Failed {
     reason: &'static str,
     failures: u32,
     failed_at: u64,
+    /// Noted by this app run, not read from the file.
+    this_run: bool,
 }
 
 /// Where the failure is saved and what it is for. Without one, as in unit
@@ -250,6 +271,8 @@ pub(crate) struct Memory {
     /// failure and its count stay for the next app run.
     excused: bool,
     rule: Option<Rule>,
+    /// When Windows last started, in seconds since 1970, once known.
+    booted_at: Option<u64>,
 }
 
 impl Memory {
@@ -277,7 +300,10 @@ impl Memory {
                 let _ = remove_file(&path);
                 None
             }
-            Ok(Some((record, _))) if record.fingerprint != fingerprint => {
+            // A lost panel stays saved through an update: see [`PANEL_LOST`].
+            Ok(Some((record, reason)))
+                if record.fingerprint != fingerprint && reason != PANEL_LOST =>
+            {
                 tracing::info!(
                     reason = %record.reason,
                     changed = %record.fingerprint.changes(&fingerprint).join(","),
@@ -291,6 +317,7 @@ impl Memory {
                 reason,
                 failures: record.failures,
                 failed_at: record.failed_at,
+                this_run: false,
             }),
         };
         let saver = Arc::new(Saver::new(spawn));
@@ -309,12 +336,15 @@ impl Memory {
             failed,
             excused: false,
             rule: None,
+            booted_at: None,
         };
         if let Some(failed) = memory.failed {
+            let hold = memory.hold(now);
             tracing::info!(
                 reason = failed.reason,
                 failures = failed.failures,
-                retry_in_s = memory.hold(now).map_or(0, |hold| hold.retry_in.as_secs()),
+                retry_in_s = hold.map_or(0, |hold| hold.retry_in.as_secs()),
+                until_chosen = hold.is_some_and(|hold| hold.until_chosen),
                 "The second screen failed on this PC before"
             );
         }
@@ -403,6 +433,14 @@ impl Memory {
     /// waiting longer.
     pub(crate) fn hold(&self, now: Instant) -> Option<Hold> {
         let failed = self.failed?;
+        if failed.reason == PANEL_LOST {
+            return Some(Hold {
+                reason: failed.reason,
+                failures: failed.failures,
+                retry_in: Duration::ZERO,
+                until_chosen: true,
+            });
+        }
         let wall = self.wall(now)?;
         let retry_at = failed
             .failed_at
@@ -411,6 +449,27 @@ impl Memory {
             reason: failed.reason,
             failures: failed.failures,
             retry_in: Duration::from_secs(retry_at - wall),
+            until_chosen: false,
+        })
+    }
+
+    /// When Windows last started, in seconds since 1970: a lost panel saved
+    /// before it was mended by that restart.
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))] // Windows reads the start.
+    pub(crate) fn set_boot(&mut self, booted_at: u64) {
+        self.booted_at = Some(booted_at);
+    }
+
+    /// Whether the saved failure is a lost panel that is still off: noted by
+    /// this app run, or saved since Windows last started. Not one from before
+    /// a restart, nor any while the start is unknown.
+    pub(crate) fn panel_lost_now(&self) -> bool {
+        self.failed.is_some_and(|failed| {
+            failed.reason == PANEL_LOST
+                && (failed.this_run
+                    || self
+                        .booted_at
+                        .is_some_and(|booted_at| failed.failed_at >= booted_at))
         })
     }
 
@@ -433,11 +492,13 @@ impl Memory {
         let failed_at = self.wall(now)?;
         let store = self.store.as_ref()?;
         let failures = self.failed.map_or(0, |f| f.failures).saturating_add(1);
+        let panel_lost = reason == PANEL_LOST;
         match encode(Some(Record {
             fingerprint: store.fingerprint.clone(),
-            reason: reason.to_string(),
+            reason: if panel_lost { "attach_timeout" } else { reason }.to_string(),
             failures,
             failed_at,
+            panel_lost,
         })) {
             Ok(data) => store.save(store.path.clone(), Save::Failure(data), now),
             Err(error) => warn!(%error, "{}", FAILURE_NOT_SAVED),
@@ -447,6 +508,7 @@ impl Memory {
             reason,
             failures,
             failed_at,
+            this_run: true,
         });
         self.hold(now)
     }
@@ -861,6 +923,11 @@ fn read(path: &Path) -> Result<Option<(Record, &'static str)>, String> {
         return Err("no failures".to_string());
     }
     let reason = remembered(&record.reason).ok_or_else(|| format!("reason {}", record.reason))?;
+    let reason = if record.panel_lost {
+        PANEL_LOST
+    } else {
+        reason
+    };
     Ok(Some((record, reason)))
 }
 
@@ -891,9 +958,10 @@ fn overwrite_file(path: &Path, data: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::super::{
-        attach, next_step, note_attached, note_connected, note_image, remembered_failure,
-        retries_later, set_facts, start_proving, Driver, Failure, Step, BLOCKED_EXTEND_RETRY,
-        PROVE_TIMEOUT,
+        attach, driver_supports_windows, next_step, note_attached, note_connected, note_image,
+        note_windows, notice_failure, remembered_failure, retries_later, set_facts, start_proving,
+        windows_notice, Driver, Failure, Step, TurnedOn, BLOCKED_EXTEND_RETRY, PANEL_LOST_BEFORE,
+        PROVE_TIMEOUT, WINDOWS_10, WINDOWS_10_IPAD_NOTICE,
     };
     use super::*;
     use crate::capture::tests::{connect_viewer, hybrid_laptop, refuse_moved_mirror, NVIDIA};
@@ -1011,11 +1079,14 @@ mod tests {
         store.saver.saving.lock().clear_failure_logged
     }
 
-    /// A display that never attaches, on a paused clock.
+    /// A display that never attaches, on a paused clock. `turned_on` says
+    /// how its Enable left the PC's screens.
     struct NeverAttaches {
         start: Instant,
         elapsed: Cell<Duration>,
         enables: Cell<u32>,
+        disables: Cell<u32>,
+        turned_on: TurnedOn,
     }
 
     impl NeverAttaches {
@@ -1024,6 +1095,8 @@ mod tests {
                 start,
                 elapsed: Cell::new(Duration::ZERO),
                 enables: Cell::new(0),
+                disables: Cell::new(0),
+                turned_on: TurnedOn::Beside,
             }
         }
     }
@@ -1040,16 +1113,24 @@ mod tests {
                 top: 0,
                 is_primary: true,
                 adapter_name: "Test GPU".to_string(),
+                adapter_id: (0, 1),
             }]
         }
 
         fn prepare(&self, _outputs: &[OutputInfo]) {}
 
         fn set_enabled(&self, enabled: bool) -> bool {
-            if enabled {
-                self.enables.set(self.enables.get() + 1);
-            }
+            let count = if enabled {
+                &self.enables
+            } else {
+                &self.disables
+            };
+            count.set(count.get() + 1);
             true
+        }
+
+        fn turned_on(&self) -> TurnedOn {
+            self.turned_on
         }
 
         fn now(&self) -> Instant {
@@ -1059,6 +1140,116 @@ mod tests {
         fn sleep(&self, duration: Duration) {
             self.elapsed.set(self.elapsed.get() + duration);
         }
+    }
+
+    /// The hybrid laptop: the Enable took the built-in panel away until a
+    /// restart. The display stays on, so the desktop stays on the iPad, and
+    /// no wait ends the hold: not the next app run a week later, not an
+    /// update, not a blocked mirror. Only choosing Second screen again tries
+    /// it. The record reads as a timeout to an older version, which then
+    /// waits instead of trying at once.
+    #[test]
+    fn a_lost_panel_is_held_until_second_screen_is_chosen_again() {
+        let path = temp_file("panel-lost");
+        let (memory, start) = app_run(&path, Duration::ZERO);
+        let shared = second_screen_with(memory);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        let driver = NeverAttaches {
+            turned_on: TurnedOn::PanelLost,
+            ..NeverAttaches::new(start)
+        };
+        attach(&shared, &driver, ATTACH_TIMEOUT);
+        assert_eq!((driver.enables.get(), driver.disables.get()), (1, 0));
+        assert_eq!(driver.now(), start, "no attach wait, no toggle gap");
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
+        assert_eq!(remembered_failure(&shared), Some(PANEL_LOST));
+        assert!(!retries_later(&shared), "the notice says how to try again");
+        let record = &saved(&path)["failure"];
+        assert_eq!(
+            (
+                &record["reason"],
+                &record["panel_lost"],
+                &record["failures"]
+            ),
+            (
+                &serde_json::json!("attach_timeout"),
+                &serde_json::json!(true),
+                &serde_json::json!(1)
+            )
+        );
+
+        // A week later, after an update, with Windows refusing the mirror.
+        written(&path);
+        let later = Instant::now();
+        let updated = Fingerprint {
+            app: "0.3.6".to_string(),
+            ..laptop()
+        };
+        let memory = Memory::load(path.clone(), updated, T0 + 7 * DAY, later);
+        let shared = second_screen_with(memory);
+        refuse_moved_mirror(&shared);
+        connect_viewer(&shared);
+        note_connected(&shared, later);
+        for day in [0, 1, 30] {
+            let now = later + Duration::from_secs(day * DAY);
+            reconnect(&shared, now);
+            assert_eq!(next_step(&shared, now), Step::Nothing, "day {day}");
+        }
+        assert_eq!(remembered_failure(&shared), Some(PANEL_LOST));
+        let hold = shared.second_screen.lock().memory.hold(later).unwrap();
+        assert!(hold.until_chosen);
+
+        // Choosing it again (another mode, then Second screen) tries it.
+        *shared.capture_target.lock() = CaptureTarget::PrimaryAuto;
+        assert_eq!(next_step(&shared, later), Step::Nothing);
+        assert!(!exists(&path));
+        *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
+        *shared.vdd_status.lock() = VddStatus::WaitingForClient;
+        assert_eq!(next_step(&shared, later), Step::Attach);
+        remove_folder(&path);
+    }
+
+    /// The Stream page asks for a restart only while the panel is off: in
+    /// the app run that lost it, and in a later one before the PC restarts.
+    /// After the restart the panel is back, and the notice only says that
+    /// Second screen waits to be chosen again.
+    #[test]
+    fn a_lost_panel_asks_for_a_restart_only_until_the_pc_restarted() {
+        let path = temp_file("panel-lost-notice");
+        let (memory, start) = app_run(&path, Duration::ZERO);
+        let shared = second_screen_with(memory);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        let driver = NeverAttaches {
+            turned_on: TurnedOn::PanelLost,
+            ..NeverAttaches::new(start)
+        };
+        attach(&shared, &driver, ATTACH_TIMEOUT);
+        assert_eq!(notice_failure(&shared), Some(PANEL_LOST));
+        // The user quits and starts the app again, with no restart between:
+        // Windows started an hour before the failure.
+        for (booted_at, notice) in [
+            (T0 - HOUR, PANEL_LOST),
+            // The restart, ten minutes after it.
+            (T0 + 600, PANEL_LOST_BEFORE),
+        ] {
+            let (mut memory, later) = app_run(&path, Duration::from_secs(1200));
+            memory.set_boot(booted_at);
+            let shared = second_screen_with(memory);
+            connect_viewer(&shared);
+            note_connected(&shared, later);
+            assert_eq!(next_step(&shared, later), Step::Nothing, "held");
+            assert_eq!(remembered_failure(&shared), Some(PANEL_LOST));
+            assert_eq!(notice_failure(&shared), Some(notice), "{booted_at}");
+        }
+        // Without the start known, a saved one counts as from before.
+        let (memory, later) = app_run(&path, Duration::from_secs(1200));
+        let shared = second_screen_with(memory);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, later), Step::Nothing);
+        assert_eq!(notice_failure(&shared), Some(PANEL_LOST_BEFORE));
+        remove_folder(&path);
     }
 
     /// The field case: the display never attaches. The next app run mirrors
@@ -2378,6 +2569,111 @@ mod tests {
         )));
     }
 
+    /// Windows 10: a Second screen connection mirrors at once, with no
+    /// Enable, and says why: its own log line, and the iPad's
+    /// notice lasts a few seconds from each connection. Neither a failure
+    /// an earlier version saved, Try again, nor choosing Second screen again
+    /// turns the driver on.
+    #[test]
+    fn on_windows_10_second_screen_mirrors_without_turning_the_driver_on() {
+        let path = temp_file("windows-10");
+        let (mut memory, start) = app_run(&path, Duration::ZERO);
+        memory.note_failure("attach_timeout", start);
+        let shared = second_screen_with(memory);
+        note_windows(&shared, Some(19045), false);
+        connect_viewer(&shared);
+        note_connected(&shared, start);
+        let (log, step) = logs(|| next_step(&shared, start));
+        assert_eq!(step, Step::Nothing, "no Enable");
+        assert!(
+            log.contains("Second screen held: needs Windows 11") && log.contains(WINDOWS_10),
+            "{log}"
+        );
+        assert!(
+            !log.contains("second_screen_fallback") && !log.contains("remembered"),
+            "an expected hold is no fallback for the daily check: {log}"
+        );
+        assert!(shared.vdd_worker.queue.lock().commands.is_empty());
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
+        assert_eq!(remembered_failure(&shared), Some(WINDOWS_10));
+        assert_eq!(notice_failure(&shared), Some(WINDOWS_10));
+        let generation =
+            crate::supervisor::CURRENT_GENERATION.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            crate::capture::reconcile_virtual_display(
+                &CaptureTarget::VirtualExtended,
+                &shared,
+                generation
+            ),
+            Some(CaptureTarget::PrimaryAuto),
+            "the mirror"
+        );
+        // The iPad's notice, for a while from the connection.
+        assert!(windows_notice(&shared, start));
+        assert!(windows_notice(
+            &shared,
+            start + WINDOWS_10_IPAD_NOTICE - secs(1)
+        ));
+        assert!(!windows_notice(&shared, start + WINDOWS_10_IPAD_NOTICE));
+
+        // The next connection says it again, without the saved failure.
+        let later = start + Duration::from_secs(60);
+        let (log, step) = logs(|| {
+            reconnect(&shared, later);
+            next_step(&shared, later)
+        });
+        assert_eq!(step, Step::Nothing);
+        assert!(
+            log.contains("Second screen held: needs Windows 11")
+                && !log.contains("second_screen_fallback")
+                && !log.contains("remembered"),
+            "{log}"
+        );
+        assert!(windows_notice(&shared, later));
+
+        shared.retry_second_screen();
+        assert_eq!(next_step(&shared, later), Step::Nothing, "Try again");
+        *shared.capture_target.lock() = CaptureTarget::PrimaryAuto;
+        assert_eq!(next_step(&shared, later), Step::Nothing);
+        *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
+        *shared.vdd_status.lock() = VddStatus::WaitingForClient;
+        assert_eq!(next_step(&shared, later), Step::Nothing, "chosen again");
+        assert_eq!(remembered_failure(&shared), Some(WINDOWS_10));
+        assert!(shared.vdd_worker.queue.lock().commands.is_empty());
+    }
+
+    /// Windows 11, an unknown build and the tester's override try the
+    /// second screen as before, with no Windows 10 notice.
+    #[test]
+    fn windows_11_and_the_windows_10_override_try_the_second_screen() {
+        assert!(!driver_supports_windows(Some(19045), false));
+        assert!(!driver_supports_windows(Some(21999), false));
+        assert!(driver_supports_windows(Some(22000), false));
+        assert!(driver_supports_windows(Some(26200), false));
+        assert!(driver_supports_windows(None, false));
+        assert!(driver_supports_windows(Some(19045), true));
+        for (build, forced) in [
+            (Some(26200), false),
+            (Some(22000), false),
+            (None, false),
+            (Some(19045), true),
+        ] {
+            let path = temp_file("windows-11");
+            let (memory, start) = app_run(&path, Duration::ZERO);
+            let shared = second_screen_with(memory);
+            note_windows(&shared, build, forced);
+            connect_viewer(&shared);
+            note_connected(&shared, start);
+            assert_eq!(
+                next_step(&shared, start),
+                Step::Attach,
+                "{build:?} {forced}"
+            );
+            assert_eq!(*shared.vdd_status.lock(), VddStatus::Attaching);
+            assert!(!windows_notice(&shared, start));
+        }
+    }
+
     /// The manifest names this PC: Second screen sessions start in the
     /// mirror with the usual notice, and Try again works and is kept for
     /// this PC's cards, through driver and Windows updates.
@@ -3002,6 +3298,7 @@ mod tests {
             .with_ansi(false)
             .with_writer(move || sink.clone())
             .finish();
+        crate::logging::prepare_log_capture();
         let value = tracing::subscriber::with_default(subscriber, act);
         let log = String::from_utf8(out.lock().clone()).unwrap();
         (log, value)

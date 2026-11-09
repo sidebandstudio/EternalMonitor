@@ -1,8 +1,137 @@
 use super::page_stream::{
-    audio_summary, capture_block_notice, second_screen_notice, software_fallback_body,
-    usb_cable_notice, usb_summary,
+    audio_summary, capture_block_notice, firewall_fix_failure, firewall_fix_offered,
+    firewall_notice, second_screen_notice, software_fallback_body, usb_cable_notice, usb_summary,
 };
 use super::*;
+
+/// A fix that failed says so in its own banner, whatever the firewall
+/// reads now. One that worked, or a No to the Windows prompt, says nothing.
+#[test]
+fn a_failed_firewall_fix_shows_its_error_on_its_own() {
+    use crate::firewall_fix::{Outcome, Progress, FAILED};
+    assert_eq!(
+        firewall_fix_failure(Progress::Done(Outcome::Failed(FAILED))),
+        Some(FAILED)
+    );
+    for quiet in [
+        Progress::Idle,
+        Progress::Running,
+        Progress::Done(Outcome::Fixed),
+        Progress::Done(Outcome::Declined),
+    ] {
+        assert_eq!(firewall_fix_failure(quiet), None, "{quiet:?}");
+    }
+}
+
+#[test]
+fn the_firewall_notice_shows_only_for_a_block_it_is_sure_of() {
+    use crate::firewall::{judge, Profile, Rule, PRIVATE, PUBLIC};
+    let exe = std::path::Path::new(r"C:\Program Files\EternalMonitor\EternalMonitor-host.exe");
+    let profile = |bit, block_all_inbound| Profile {
+        bit,
+        on: true,
+        block_all_inbound,
+    };
+    let block = |profiles| Rule::unscoped(&exe.to_string_lossy().to_lowercase(), false, profiles);
+    let allow = Rule::unscoped(&exe.to_string_lossy(), true, 0x7fff_ffff);
+    let report = |profiles: &[Profile], rules: &[Rule], lan| {
+        judge(profiles, rules, exe, 9876, lan, |_| None)
+    };
+
+    let blocked = report(
+        &[profile(PUBLIC, false)],
+        &[allow.clone(), block(PUBLIC)],
+        true,
+    );
+    let (title, body) = firewall_notice(Some(&blocked), false).unwrap();
+    assert_eq!(title, "Windows Firewall is blocking EternalMonitor");
+    // This exe's own Block rule: "Fix it" removes it.
+    assert!(firewall_fix_offered(Some(&blocked)));
+    assert!(
+        body.contains("Run the EternalMonitor installer again"),
+        "{body}"
+    );
+    assert!(body.contains("A USB cable still works."), "{body}");
+    // Any connected iPad, over Wi-Fi or the cable, hides it.
+    assert_eq!(firewall_notice(Some(&blocked), true), None);
+    // No reading, or the last read failed.
+    assert_eq!(firewall_notice(None, false), None);
+
+    let shields = report(&[profile(PUBLIC, true)], std::slice::from_ref(&allow), true);
+    let (title, body) = firewall_notice(Some(&shields), false).unwrap();
+    assert_eq!(title, "Windows Firewall blocks every incoming connection");
+    // Only the user's switch turns that off: no button.
+    assert!(!firewall_fix_offered(Some(&shields)));
+    assert!(!firewall_fix_offered(None));
+    assert!(body.contains("choose the public network"), "{body}");
+    let both = report(
+        &[profile(PRIVATE, false), profile(PUBLIC, true)],
+        &[block(PRIVATE)],
+        true,
+    );
+    let (title, body) = firewall_notice(Some(&both), false).unwrap();
+    assert_eq!(title, "Windows Firewall is blocking EternalMonitor");
+    assert!(
+        body.contains("installer again") && body.contains("choose the public network"),
+        "{body}"
+    );
+    // The rule part has the button; the switch keeps its instructions.
+    assert!(firewall_fix_offered(Some(&both)));
+
+    // A rule for every program: Setup can't remove it, so it is only
+    // logged, alone or beside this exe's own block.
+    let everyone = report(
+        &[profile(PUBLIC, false)],
+        &[allow.clone(), Rule::unscoped("", false, PUBLIC)],
+        true,
+    );
+    assert_eq!(firewall_notice(Some(&everyone), false), None);
+    let mine_too = report(
+        &[profile(PUBLIC, false)],
+        &[block(PUBLIC), Rule::unscoped("", false, PUBLIC)],
+        true,
+    );
+    assert_eq!(firewall_notice(Some(&mine_too), false), None);
+    // An Allow rule that asks for IPsec may let traffic past: not shown.
+    let bypass = Rule {
+        secure_flags: Some(2),
+        ..allow.clone()
+    };
+    let maybe = report(&[profile(PUBLIC, false)], &[bypass, block(PUBLIC)], true);
+    assert_eq!(firewall_notice(Some(&maybe), false), None);
+
+    // Not certain for the network an iPad uses: logged, not shown.
+    let one_of_two = report(
+        &[profile(PRIVATE, false), profile(PUBLIC, false)],
+        &[allow.clone(), block(PUBLIC)],
+        true,
+    );
+    assert_eq!(firewall_notice(Some(&one_of_two), false), None);
+    let scoped = Rule {
+        remote_addresses: Some("LocalSubnet".into()),
+        ..block(PUBLIC)
+    };
+    assert_eq!(
+        firewall_notice(
+            Some(&report(&[profile(PUBLIC, false)], &[scoped], true)),
+            false
+        ),
+        None
+    );
+    let no_lan = report(&[profile(PUBLIC, false)], &[block(PUBLIC)], false);
+    assert_eq!(firewall_notice(Some(&no_lan), false), None);
+    assert_eq!(
+        firewall_notice(
+            Some(&report(&[profile(PUBLIC, false)], &[allow], true)),
+            false
+        ),
+        None
+    );
+    assert_eq!(
+        firewall_notice(Some(&report(&[profile(PUBLIC, false)], &[], true)), false),
+        None
+    );
+}
 
 #[test]
 fn audio_row_reports_rate_and_keeps_failure_separate_from_video() {
@@ -35,6 +164,25 @@ fn audio_row_reports_rate_and_keeps_failure_separate_from_video() {
     let (text, color) = audio_summary(&crate::audio::AudioStats::default(), true);
     assert_eq!(text, "Starts when an iPad connects.");
     assert_eq!(color, TEXT_MUTED);
+}
+
+#[test]
+fn audio_row_says_why_while_another_app_has_the_output() {
+    let mut audio = crate::audio::AudioStats::started("Speakers");
+    audio.stopped(crate::audio::DEVICE_IN_USE_STATUS);
+    let (text, color) = audio_summary(&audio, true);
+    assert_eq!(
+        text,
+        "Another app is using your speakers on its own. PC audio comes back when it lets go."
+    );
+    assert_eq!(color, WARNING);
+
+    // Gone once audio is back.
+    let mut audio = crate::audio::AudioStats::started("Speakers");
+    audio.kbps = 128.0;
+    let (text, color) = audio_summary(&audio, true);
+    assert!(text.starts_with("Streaming Speakers"), "{text}");
+    assert_eq!(color, ACCENT);
 }
 
 #[test]
@@ -210,18 +358,19 @@ fn screen_choice_says_what_the_ipad_shows_and_that_it_reconnects() {
     use super::page_stream::screen_mode_text;
     use crate::control::VddStatus;
 
-    let mirror = screen_mode_text("", None, VddStatus::Inactive, false);
+    let mirror = screen_mode_text("", None, VddStatus::Inactive, false, false);
     assert_eq!(
         mirror,
         "The iPad shows the same picture as your main screen."
     );
-    let running = screen_mode_text("", None, VddStatus::Inactive, true);
+    let running = screen_mode_text("", None, VddStatus::Inactive, true, false);
     assert!(running.contains("reconnects by itself"), "{running}");
 
     let monitor = screen_mode_text(
         r"\\.\DISPLAY2",
         Some("DISPLAY2"),
         VddStatus::Inactive,
+        false,
         false,
     );
     assert!(
@@ -234,12 +383,19 @@ fn screen_choice_says_what_the_ipad_shows_and_that_it_reconnects() {
         None,
         VddStatus::WaitingForClient,
         true,
+        false,
     );
     assert!(waiting.contains("as soon as it connects"), "{waiting}");
-    let active = screen_mode_text(CAPTURE_VIRTUAL_SENTINEL, None, VddStatus::Active, true);
+    let active = screen_mode_text(
+        CAPTURE_VIRTUAL_SENTINEL,
+        None,
+        VddStatus::Active,
+        true,
+        false,
+    );
     assert!(active.contains("Drag windows"), "{active}");
     for failed in [VddStatus::Failed, VddStatus::TaskFailed] {
-        let text = screen_mode_text(CAPTURE_VIRTUAL_SENTINEL, None, failed, true);
+        let text = screen_mode_text(CAPTURE_VIRTUAL_SENTINEL, None, failed, true, false);
         assert!(text.contains("mirrored"), "{text}");
     }
     // No driver or protocol words on the main screen.
@@ -321,7 +477,7 @@ fn display_choices_use_the_names_shared_with_the_ipad() {
 
 #[test]
 fn an_outdated_nvidia_driver_is_named_with_the_version_to_install() {
-    let body = software_fallback_body(false, true);
+    let body = software_fallback_body(false, true, false, &[]);
     assert!(
         body.contains("NVIDIA driver to version 570 or newer"),
         "{body}"
@@ -338,10 +494,82 @@ fn an_outdated_nvidia_driver_is_named_with_the_version_to_install() {
     }
     // Custom settings are still the first thing to undo.
     assert_eq!(
-        software_fallback_body(true, true),
-        software_fallback_body(true, false)
+        software_fallback_body(true, true, false, &[]),
+        software_fallback_body(true, false, false, &[])
     );
-    assert!(!software_fallback_body(false, false).contains("570"));
+    assert!(!software_fallback_body(false, false, false, &[]).contains("570"));
+}
+
+#[test]
+fn an_amd_or_intel_card_that_could_not_encode_is_named_for_its_driver_update() {
+    use crate::gpu::GpuVendor::{Amd, Intel, Nvidia};
+    let amd = software_fallback_body(false, false, false, &[Amd]);
+    assert!(
+        amd.contains("The AMD graphics driver on this PC could not start video encoding"),
+        "{amd}"
+    );
+    assert!(
+        amd.contains("Update the AMD graphics driver, then click Restart"),
+        "{amd}"
+    );
+    let intel = software_fallback_body(false, false, false, &[Intel]);
+    assert!(
+        intel.contains("Update the Intel graphics driver, then click Restart"),
+        "{intel}"
+    );
+    assert!(!intel.contains("AMD"), "{intel}");
+    let both = software_fallback_body(false, false, false, &[Intel, Amd]);
+    assert!(
+        both.contains("Update the AMD and Intel graphics drivers, then click Restart"),
+        "{both}"
+    );
+    for body in [&amd, &intel, &both] {
+        for jargon in [
+            "AMF",
+            "Quick Sync",
+            "QSV",
+            "MFX",
+            "libx264",
+            "encoder",
+            "http",
+        ] {
+            assert!(!body.contains(jargon), "{body}");
+        }
+    }
+    // An outdated NVIDIA driver names the version to install, and custom
+    // settings are still the first thing to undo.
+    assert_eq!(
+        software_fallback_body(false, true, false, &[Amd]),
+        software_fallback_body(false, true, false, &[])
+    );
+    assert_eq!(
+        software_fallback_body(true, false, false, &[Amd]),
+        software_fallback_body(true, false, false, &[])
+    );
+    // No vendor named: the general advice, as before.
+    assert_eq!(
+        software_fallback_body(false, false, false, &[Nvidia]),
+        software_fallback_body(false, false, false, &[])
+    );
+    assert!(software_fallback_body(false, false, false, &[]).contains("NVIDIA, AMD or Intel"));
+}
+
+#[test]
+fn a_driver_that_did_not_answer_at_startup_is_named_with_a_restart() {
+    let body = software_fallback_body(false, false, true, &[]);
+    assert!(
+        body.contains("graphics driver did not respond when EternalMonitor started"),
+        "{body}"
+    );
+    assert!(body.contains("Click Restart"), "{body}");
+    for jargon in ["DXGI", "libx264", "encoder", "timed out"] {
+        assert!(!body.contains(jargon), "{body}");
+    }
+    // It is the reason, whatever else is true.
+    assert_eq!(
+        body,
+        software_fallback_body(true, true, true, &[crate::gpu::GpuVendor::Amd])
+    );
 }
 
 #[test]
@@ -678,6 +906,116 @@ fn the_update_popup_waits_until_no_ipad_has_been_connected_for_a_while() {
         quiet
     ));
     assert!(!ipad_nearby(false, &mut last, gone + quiet, quiet));
+}
+
+/// The hybrid laptop's lost panel: Windows also leaves the display "not
+/// extended", but Extend can't bring the panel back, so the notice says to
+/// restart, and that Try again can take the panel again.
+#[test]
+fn a_lost_built_in_screen_says_to_restart_not_to_extend() {
+    use crate::control::VddStatus;
+    use crate::vdd::VddTaskHealth;
+    use crate::vdd_device::VddProblem;
+    for problem in [None, Some(VddProblem::NotExtended)] {
+        let lost = second_screen_notice(
+            VddStatus::Failed,
+            VddTaskHealth::Ok,
+            problem,
+            Some("panel_lost"),
+        )
+        .unwrap();
+        assert!(
+            lost.body.starts_with(
+                "Your laptop's built-in screen turned off when the second screen started"
+            ),
+            "{}",
+            lost.body
+        );
+        assert!(lost.body.contains("restart the PC"), "{}", lost.body);
+        assert!(!lost.body.contains("Extend"), "{}", lost.body);
+        assert!(lost.retry && !lost.installer);
+    }
+}
+
+/// After the restart that brought the panel back, the notice is calm: no
+/// restart, only that Second screen is paused until it is chosen again.
+#[test]
+fn a_lost_built_in_screen_from_before_the_restart_only_says_it_is_paused() {
+    use crate::control::VddStatus;
+    use crate::vdd::VddTaskHealth;
+    use crate::vdd_device::VddProblem;
+    for problem in [None, Some(VddProblem::NotExtended)] {
+        let paused = second_screen_notice(
+            VddStatus::Failed,
+            VddTaskHealth::Ok,
+            problem,
+            Some("panel_lost_before"),
+        )
+        .unwrap();
+        assert_eq!(
+            paused.body,
+            "Second screen is paused on this laptop because it turned off the built-in screen last time. Click Try again to use it."
+        );
+        assert!(paused.retry && !paused.installer);
+    }
+}
+
+/// On Windows 10 Second screen isn't tried: the notice, the note beside the
+/// choice and Settings say it needs Windows 11, with no Try again, and the
+/// note goes from Windows 11's text only.
+#[test]
+fn windows_10_says_second_screen_needs_windows_11() {
+    use super::page_settings::display_description;
+    use super::page_stream::{add_later_retry, screen_mode_text, WINDOWS_10_NOTE};
+    use crate::control::VddStatus;
+    use crate::vdd::VddTaskHealth;
+    let windows_10 = Some(crate::capture::second_screen::WINDOWS_10);
+    for status in [VddStatus::Failed, VddStatus::TaskFailed] {
+        for health in [VddTaskHealth::Ok, VddTaskHealth::TasksMissing] {
+            let mut notice = second_screen_notice(status, health, None, windows_10).unwrap();
+            assert!(notice.body.starts_with(WINDOWS_10_NOTE), "{}", notice.body);
+            assert!(!notice.retry && !notice.installer);
+            // A failure saved by an earlier version doesn't offer a retry.
+            let before = notice.body.clone();
+            add_later_retry(&mut notice, true);
+            assert_eq!(notice.body, before);
+        }
+    }
+    assert!(WINDOWS_10_NOTE.contains("needs Windows 11"));
+
+    for status in [
+        VddStatus::WaitingForClient,
+        VddStatus::Failed,
+        VddStatus::Active,
+    ] {
+        let second = screen_mode_text(CAPTURE_VIRTUAL_SENTINEL, None, status, false, true);
+        assert_eq!(second, WINDOWS_10_NOTE);
+    }
+    let mirror = screen_mode_text("", None, VddStatus::Inactive, true, true);
+    assert_eq!(
+        mirror,
+        "The iPad shows the same picture as your main screen. Second screen needs Windows 11. \
+         Switching restarts the stream, and the iPad reconnects by itself."
+    );
+    assert!(display_description(true).contains("Second screen needs Windows 11"));
+
+    // Windows 11 reads as before.
+    assert!(!display_description(false).contains("Windows"));
+    for (capture, status) in [
+        ("", VddStatus::Inactive),
+        (CAPTURE_VIRTUAL_SENTINEL, VddStatus::WaitingForClient),
+        (CAPTURE_VIRTUAL_SENTINEL, VddStatus::Failed),
+    ] {
+        assert!(!screen_mode_text(capture, None, status, true, false).contains("Windows"));
+    }
+    let attach = second_screen_notice(
+        VddStatus::Failed,
+        VddTaskHealth::Ok,
+        None,
+        Some("attach_timeout"),
+    )
+    .unwrap();
+    assert!(!attach.body.contains("Windows 11") && attach.retry);
 }
 
 /// A second screen failure remembered for this PC is tried again later by

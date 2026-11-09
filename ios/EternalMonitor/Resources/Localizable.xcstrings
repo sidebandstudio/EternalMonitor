@@ -6835,6 +6835,78 @@
         }
       }
     },
+    "Second screen needs Windows 11. Showing your PC's screen instead." : {
+      "comment" : "Over the mirrored picture for a few seconds, when the PC chose Second screen but runs Windows 10, which Second screen doesn't support",
+      "extractionState" : "manual",
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "تحتاج الشاشة الثانية إلى Windows 11. يتم عرض شاشة الكمبيوتر بدلاً منها."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der zweite Bildschirm benötigt Windows 11. Stattdessen wird der Bildschirm des PCs angezeigt."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La segunda pantalla requiere Windows 11. Se muestra la pantalla del PC."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le second écran nécessite Windows 11. L'écran du PC s'affiche à la place."
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "दूसरी स्क्रीन के लिए Windows 11 चाहिए। इसके बजाय PC की स्क्रीन दिखाई जा रही है।"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "セカンドスクリーンにはWindows 11が必要です。代わりにPCの画面を表示しています。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "두 번째 화면에는 Windows 11이 필요합니다. 대신 PC 화면을 표시합니다."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "A segunda tela requer Windows 11. Exibindo a tela do PC."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Для второго экрана нужна Windows 11. Вместо него показан экран ПК."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "第二屏幕需要 Windows 11。正在显示电脑屏幕。"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Second screen needs Windows 11. Showing your PC's screen instead."
+          }
+        }
+      }
+    },
     "Second screen or mirror" : {
       "extractionState" : "manual",
       "localizations" : {
@@ -8188,6 +8260,78 @@
         }
       }
     },
+    "The second screen didn't start, and your PC can't share its main screen from its current graphics card. Check the PC." : {
+      "comment" : "On the connecting card and over the held picture, in Second screen mode after the second screen failed to start: Windows won't let the PC app capture its main screen from its graphics card either, so it can't mirror it.",
+      "extractionState" : "manual",
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "لم تبدأ الشاشة الثانية، ولا يمكن للكمبيوتر مشاركة شاشته الرئيسية باستخدام بطاقة الرسومات الحالية. تحقق من الكمبيوتر."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der zweite Bildschirm wurde nicht gestartet und der PC kann seinen Hauptbildschirm mit der aktuellen Grafikkarte nicht teilen. Überprüfe den PC."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La segunda pantalla no se inició y tu PC no puede compartir su pantalla principal con su tarjeta gráfica actual. Revisa el PC."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le second écran n'a pas démarré et le PC ne peut pas partager son écran principal avec sa carte graphique actuelle. Vérifiez le PC."
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "दूसरी स्क्रीन शुरू नहीं हुई और आपका PC मौजूदा ग्राफ़िक्स कार्ड से अपनी मुख्य स्क्रीन साझा नहीं कर सकता। PC जाँचें।"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "セカンドスクリーンが起動せず、現在のグラフィックカードではPCのメイン画面も共有できません。PCを確認してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "두 번째 화면이 시작되지 않았고 현재 그래픽 카드로는 PC의 기본 화면을 공유할 수 없습니다. PC를 확인하세요."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "A segunda tela não iniciou, e o PC não pode compartilhar a tela principal com a placa de vídeo atual. Verifique o PC."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Второй экран не запустился, а ПК не может передать основной экран с текущей видеокарты. Проверьте ПК."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "第二屏幕未能启动，电脑也无法使用当前显卡共享主屏幕。请检查电脑。"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "The second screen didn't start, and your PC can't share its main screen from its current graphics card. Check the PC."
+          }
+        }
+      }
+    },
     "Try again in %lld s" : {
       "comment" : "Button countdown after wrong codes; %lld is seconds",
       "extractionState" : "manual",
@@ -8540,6 +8684,78 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "不可用"
+          }
+        }
+      }
+    },
+    "Update EternalMonitor on %@ for faster, steadier streaming. Download it on the PC from eternalmonitor.dev." : {
+      "comment" : "Connect screen card under \"Your PC app is out of date\". The value is the PC's name. Keep eternalmonitor.dev as is",
+      "extractionState" : "manual",
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "حدّث EternalMonitor على %@ لبث أسرع وأكثر استقرارًا. نزّله على PC من eternalmonitor.dev."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Aktualisiere EternalMonitor auf %@ für schnelleres, stabileres Streaming. Lade es auf dem PC von eternalmonitor.dev herunter."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Update EternalMonitor on %@ for faster, steadier streaming. Download it on the PC from eternalmonitor.dev."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Actualiza EternalMonitor en %@ para una transmisión más rápida y estable. Descárgalo en el PC desde eternalmonitor.dev."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Mettez à jour EternalMonitor sur %@ pour une diffusion plus rapide et stable. Téléchargez-le sur le PC depuis eternalmonitor.dev."
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "तेज़ और स्थिर स्ट्रीमिंग के लिए %@ पर EternalMonitor अपडेट करें। इसे PC पर eternalmonitor.dev से डाउनलोड करें।"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "より速く安定したストリーミングのために、%@ の EternalMonitor をアップデートしてください。PC で eternalmonitor.dev からダウンロードできます。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "더 빠르고 안정적인 스트리밍을 위해 %@에서 EternalMonitor를 업데이트하세요. PC에서 eternalmonitor.dev를 통해 다운로드하세요."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Atualize o EternalMonitor em %@ para uma transmissão mais rápida e estável. Baixe-o no PC em eternalmonitor.dev."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Обновите EternalMonitor на %@ для более быстрой и стабильной трансляции. Скачайте его на PC с eternalmonitor.dev."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "更新 %@ 上的 EternalMonitor，让串流更快更稳定。在 PC 上从 eternalmonitor.dev 下载。"
           }
         }
       }
@@ -9039,6 +9255,366 @@
           "stringUnit" : {
             "state" : "translated",
             "value" : "你也可以在连接屏幕上输入电脑的地址。"
+          }
+        }
+      }
+    },
+    "Your PC app is out of date" : {
+      "comment" : "Title of the Connect screen card shown when the PC runs an EternalMonitor older than 0.3.4",
+      "extractionState" : "manual",
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "تطبيق PC لديك قديم"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Deine PC-App ist veraltet"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Your PC app is out of date"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "La app de tu PC está desactualizada"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "L’application sur votre PC n’est pas à jour"
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "आपके PC का ऐप पुराना है"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PC アプリが古くなっています"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PC 앱이 오래되었습니다"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "O app do seu PC está desatualizado"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Приложение на PC устарело"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PC 应用已过期"
+          }
+        }
+      }
+    },
+    "Your PC can't share its screen from its current graphics card. Check the PC." : {
+      "comment" : "On the connecting card and over the held picture: Windows won't let the PC app capture its screen from the graphics card it runs on (laptops with two graphics cards). The PC app's window says how to switch.",
+      "extractionState" : "manual",
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "لا يمكن للكمبيوتر مشاركة شاشته باستخدام بطاقة الرسومات الحالية. تحقق من الكمبيوتر."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der PC kann seinen Bildschirm mit der aktuellen Grafikkarte nicht teilen. Überprüfe den PC."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tu PC no puede compartir su pantalla con su tarjeta gráfica actual. Revisa el PC."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le PC ne peut pas partager son écran avec sa carte graphique actuelle. Vérifiez le PC."
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "आपका PC अपने मौजूदा ग्राफ़िक्स कार्ड से स्क्रीन साझा नहीं कर सकता। PC जाँचें।"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "現在のグラフィックカードではPCの画面を共有できません。PCを確認してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "현재 그래픽 카드로는 PC 화면을 공유할 수 없습니다. PC를 확인하세요."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "O PC não pode compartilhar a tela com a placa de vídeo atual. Verifique o PC."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ПК не может передать экран с текущей видеокарты. Проверьте ПК."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "电脑无法使用当前显卡共享屏幕。请检查电脑。"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Your PC can't share its screen from its current graphics card. Check the PC."
+          }
+        }
+      }
+    },
+    "Your PC has no active display. Turn on a screen to continue." : {
+      "comment" : "Over the held picture while no display is on at the PC: a closed laptop lid, or screens that are off or unplugged",
+      "extractionState" : "manual",
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "لا توجد شاشة نشطة على PC. شغّل شاشة للمتابعة."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dein PC hat keinen aktiven Bildschirm. Schalte einen Bildschirm ein, um fortzufahren."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Your PC has no active display. Turn on a screen to continue."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tu PC no tiene una pantalla activa. Enciende una pantalla para continuar."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Votre PC n’a pas d’écran actif. Allumez un écran pour continuer."
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "आपके PC पर कोई स्क्रीन चालू नहीं है। जारी रखने के लिए एक स्क्रीन चालू करें।"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PC に有効な画面がありません。続行するには画面をオンにしてください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PC에 활성 화면이 없습니다. 계속하려면 화면을 켜세요."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Seu PC não tem uma tela ativa. Ligue uma tela para continuar."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "На PC нет активного экрана. Включите экран, чтобы продолжить."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PC 没有活动的显示器。打开显示器后即可继续。"
+          }
+        }
+      }
+    },
+    "Your PC is locked. Unlock it to continue." : {
+      "comment" : "Over the held picture while the PC shows its lock screen or a permission prompt",
+      "extractionState" : "manual",
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PC مقفل. افتح قفله للمتابعة."
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Dein PC ist gesperrt. Entsperre ihn, um fortzufahren."
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Your PC is locked. Unlock it to continue."
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tu PC está bloqueado. Desbloquéalo para continuar."
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Votre PC est verrouillé. Déverrouillez-le pour continuer."
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "आपका PC लॉक है। जारी रखने के लिए उसे अनलॉक करें।"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PC がロックされています。続行するにはロックを解除してください。"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PC가 잠겨 있습니다. 계속하려면 잠금을 해제하세요."
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Seu PC está bloqueado. Desbloqueie-o para continuar."
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PC заблокирован. Разблокируйте его, чтобы продолжить."
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PC 已锁定。解锁后即可继续。"
+          }
+        }
+      }
+    },
+    "Your PC is restarting the stream…" : {
+      "comment" : "Over the held picture while the PC restarts its stream and keeps the session",
+      "extractionState" : "manual",
+      "localizations" : {
+        "ar" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "يعيد الكمبيوتر بدء البث…"
+          }
+        },
+        "de" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Der PC startet den Stream neu…"
+          }
+        },
+        "es" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Tu PC está reiniciando la transmisión…"
+          }
+        },
+        "fr" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Le PC redémarre le flux…"
+          }
+        },
+        "hi" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "आपका PC स्ट्रीम फिर से शुरू कर रहा है…"
+          }
+        },
+        "ja" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PCがストリームを再起動しています…"
+          }
+        },
+        "ko" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "PC에서 스트림을 다시 시작하는 중…"
+          }
+        },
+        "pt-BR" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "O PC está reiniciando a transmissão…"
+          }
+        },
+        "ru" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "ПК перезапускает трансляцию…"
+          }
+        },
+        "zh-Hans" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "电脑正在重启串流…"
+          }
+        },
+        "en" : {
+          "stringUnit" : {
+            "state" : "translated",
+            "value" : "Your PC is restarting the stream…"
           }
         }
       }

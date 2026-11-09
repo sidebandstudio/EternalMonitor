@@ -103,6 +103,10 @@ impl Link for UdpLink {
             return Err(invalid("UDP destination"));
         };
         check_length(datagram.len())?;
+        #[cfg(feature = "test-hooks")]
+        if let Some(error) = super::probe::fail(addr, datagram) {
+            return Err(error);
+        }
         self.socket.send_to(datagram, addr).await?;
         #[cfg(feature = "test-hooks")]
         super::probe::sent(addr);
@@ -398,10 +402,66 @@ pub fn tunnel_congestion_drops() -> u64 {
     TUNNEL_CONGESTION.load(Ordering::Relaxed)
 }
 
+/// What this host saw end a tunnel first. Neither side used to say: a
+/// tunnel that closed on both sides at once looked the same whoever closed
+/// it. It is the first end seen here, not necessarily what started it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CloseCause {
+    /// The other end (the iPad, or Apple's device service) ended the stream.
+    PeerEof,
+    /// Reading failed, e.g. a reset.
+    ReadFailed(io::ErrorKind),
+    /// The other end sent a length no datagram has.
+    BadLength,
+    /// Writing failed.
+    WriteFailed(io::ErrorKind),
+    /// This host let go of it: its device worker stopped, or the link was
+    /// dropped.
+    Host,
+}
+
+impl CloseCause {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PeerEof => "peer_eof",
+            Self::ReadFailed(io::ErrorKind::ConnectionReset) => "peer_reset",
+            Self::ReadFailed(_) => "read_error",
+            Self::BadLength => "bad_length",
+            Self::WriteFailed(_) => "write_error",
+            Self::Host => "host",
+        }
+    }
+
+    fn of_read(error: &io::Error) -> Self {
+        match error.kind() {
+            io::ErrorKind::UnexpectedEof => Self::PeerEof,
+            io::ErrorKind::InvalidData => Self::BadLength,
+            kind => Self::ReadFailed(kind),
+        }
+    }
+}
+
+/// How a closed tunnel ended, for its close line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CloseReport {
+    pub cause: CloseCause,
+    /// From the preamble to the close.
+    pub open: Duration,
+    /// From the last datagram read (or the preamble) to the close.
+    pub quiet: Duration,
+}
+
+struct Lifetime {
+    opened: Instant,
+    last_read: Instant,
+    closed: Option<(CloseCause, Instant)>,
+}
+
 struct WriterState {
     queue: Mutex<Outbound>,
     ready: Notify,
     closed: watch::Sender<bool>,
+    lifetime: Mutex<Lifetime>,
     /// Control datagrams fully written to the stream, in queue order.
     controls_written: watch::Sender<u64>,
     force_idr: Arc<AtomicBool>,
@@ -420,6 +480,15 @@ impl WriterState {
             .audio_packets_dropped
             .fetch_add(dropped, Ordering::Relaxed);
         audio.map(|audio| (audio, false))
+    }
+
+    /// Closes the tunnel. Only the first cause counts.
+    fn close(&self, cause: CloseCause) {
+        self.lifetime
+            .lock()
+            .closed
+            .get_or_insert((cause, Instant::now()));
+        let _ = self.closed.send(true);
     }
 
     fn wrote(&self, control: bool) {
@@ -486,37 +555,48 @@ impl FramedLink {
         let (mut reader, writer) = tokio::io::split(stream);
         let (inbound_tx, inbound_rx) = mpsc::channel(128);
         let (closed, mut read_closed) = watch::channel(false);
+        let opened = Instant::now();
         let state = Arc::new(WriterState {
             queue: Mutex::new(Outbound::default()),
             ready: Notify::new(),
             closed,
+            lifetime: Mutex::new(Lifetime {
+                opened,
+                last_read: opened,
+                closed: None,
+            }),
             controls_written: watch::channel(0).0,
             force_idr,
             stats: Arc::new(FramedStats::default()),
         });
         let read_state = Arc::clone(&state);
         let reading = tokio::spawn(async move {
-            loop {
+            let cause = loop {
                 let packet = tokio::select! {
                     biased;
-                    _ = read_closed.changed() => break,
+                    _ = read_closed.changed() => break CloseCause::Host,
                     packet = read_datagram(&mut reader) => packet,
                 };
-                let Ok(bytes) = packet else {
-                    break;
+                let bytes = match packet {
+                    Ok(bytes) => bytes,
+                    Err(error) => break CloseCause::of_read(&error),
                 };
+                read_state.lifetime.lock().last_read = Instant::now();
                 tokio::select! {
                     biased;
-                    _ = read_closed.changed() => break,
-                    sent = inbound_tx.send((peer, bytes)) => if sent.is_err() { break; },
+                    _ = read_closed.changed() => break CloseCause::Host,
+                    sent = inbound_tx.send((peer, bytes)) => if sent.is_err() { break CloseCause::Host; },
                 }
-            }
-            let _ = read_state.closed.send(true);
+            };
+            read_state.close(cause);
         });
         let write_state = Arc::clone(&state);
         let writing = tokio::spawn(async move {
-            let _ = write_loop(writer, &write_state).await;
-            let _ = write_state.closed.send(true);
+            let cause = match write_loop(writer, &write_state).await {
+                Ok(()) => CloseCause::Host,
+                Err(error) => CloseCause::WriteFailed(error.kind()),
+            };
+            write_state.close(cause);
         });
         Self {
             peer,
@@ -541,7 +621,19 @@ impl FramedLink {
     }
 
     pub fn close_guard(&self) -> CloseGuard {
-        CloseGuard(self.state.closed.clone())
+        CloseGuard(Arc::clone(&self.state))
+    }
+
+    /// What this host saw end the tunnel first, how long it was open and
+    /// how long the other end had been quiet. `None` while it is open.
+    pub fn close_report(&self) -> Option<CloseReport> {
+        let lifetime = self.state.lifetime.lock();
+        let (cause, at) = lifetime.closed?;
+        Some(CloseReport {
+            cause,
+            open: at.saturating_duration_since(lifetime.opened),
+            quiet: at.saturating_duration_since(lifetime.last_read),
+        })
     }
 
     /// Waits until every control datagram queued so far has been written to
@@ -581,10 +673,10 @@ impl FramedLink {
 
 /// A device worker owns this guard after handing the link to the transport.
 /// Removing the device or stopping its supervisor closes both tunnel halves.
-pub struct CloseGuard(watch::Sender<bool>);
+pub struct CloseGuard(Arc<WriterState>);
 impl Drop for CloseGuard {
     fn drop(&mut self) {
-        let _ = self.0.send(true);
+        self.0.close(CloseCause::Host);
     }
 }
 
@@ -643,7 +735,7 @@ impl Link for FramedLink {
 
 impl Drop for FramedLink {
     fn drop(&mut self) {
-        let _ = self.state.closed.send(true);
+        self.state.close(CloseCause::Host);
         for task in &self.tasks {
             task.abort();
         }
@@ -1027,7 +1119,7 @@ mod tests {
             .is_err());
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn silent_listener_peer_times_out_and_dropping_the_link_closes_io() {
         let (server, _silent) = tokio::io::duplex(32);
         let failed =
@@ -1049,11 +1141,94 @@ mod tests {
         );
     }
 
+    /// A tunnel says which end this host saw close it first, which is not
+    /// necessarily the end that started the close. In the field some closed
+    /// on both sides 9.5-9.8 s after they opened, and neither side said why.
+    #[tokio::test]
+    async fn a_closed_tunnel_reports_the_first_end_seen() {
+        let force_idr = || Arc::new(AtomicBool::new(false));
+        let open = || async {
+            let (host, mut ipad) = tokio::io::duplex(1024);
+            let link = FramedLink::connect(host, PeerId::usb(7), force_idr())
+                .await
+                .unwrap();
+            read_preamble(&mut ipad).await.unwrap();
+            (link, ipad)
+        };
+        let closed = |link: &FramedLink| {
+            let mut closed = link.closed_signal();
+            async move {
+                tokio::time::timeout(Duration::from_secs(1), closed.wait_for(|closed| *closed))
+                    .await
+                    .unwrap()
+                    .unwrap();
+            }
+        };
+
+        let (link, ipad) = open().await;
+        assert_eq!(link.close_report(), None);
+        drop(ipad);
+        closed(&link).await;
+        assert_eq!(link.close_report().unwrap().cause, CloseCause::PeerEof);
+
+        let (link, mut ipad) = open().await;
+        ipad.write_all(&[0, 0]).await.unwrap();
+        closed(&link).await;
+        assert_eq!(link.close_report().unwrap().cause, CloseCause::BadLength);
+
+        let (link, _ipad) = open().await;
+        drop(link.close_guard());
+        closed(&link).await;
+        assert_eq!(link.close_report().unwrap().cause, CloseCause::Host);
+        // A later end changes nothing: the first cause stands.
+        link.state.close(CloseCause::PeerEof);
+        assert_eq!(link.close_report().unwrap().cause, CloseCause::Host);
+
+        assert_eq!(
+            CloseCause::ReadFailed(io::ErrorKind::ConnectionReset).as_str(),
+            "peer_reset"
+        );
+        assert_eq!(
+            CloseCause::ReadFailed(io::ErrorKind::ConnectionAborted).as_str(),
+            "read_error"
+        );
+    }
+
+    /// Nothing in the link times a tunnel out: one whose iPad pings every
+    /// 2 s stays open for a minute, and when it closes it says how long it
+    /// was open and how long the iPad had been quiet.
+    #[tokio::test(start_paused = true)]
+    async fn a_tunnel_stays_open_until_an_end_closes_it_and_reports_its_timings() {
+        let (host, mut ipad) = tokio::io::duplex(64 * 1024);
+        let mut link = FramedLink::connect(host, PeerId::usb(7), Arc::new(AtomicBool::new(false)))
+            .await
+            .unwrap();
+        read_preamble(&mut ipad).await.unwrap();
+        let mut inbound = link.take_inbound().unwrap();
+        let start = Instant::now();
+        let ping = encode_control(1, 1, &ControlMessage::Ping(Ping { t1_us: 1 }));
+        while start.elapsed() < Duration::from_secs(60) {
+            write_datagram(&mut ipad, &ping).await.unwrap();
+            assert!(inbound.recv().await.is_some());
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            assert!(!link.is_closed(), "closed {:?} in", start.elapsed());
+        }
+        tokio::time::sleep(Duration::from_millis(1_500)).await;
+        drop(ipad);
+        tokio::time::timeout(Duration::from_secs(1), inbound.recv())
+            .await
+            .unwrap();
+        let report = link.close_report().unwrap();
+        assert_eq!(report.cause, CloseCause::PeerEof);
+        assert_eq!(report.open, Duration::from_millis(61_500));
+        assert_eq!(report.quiet, Duration::from_millis(3_500));
+    }
+
     /// The frame being written is finished however many newer frames
     /// overflow behind it. Cutting it short sent the iPad a partial keyframe
     /// over a lossless cable: lost fragments in its report, and another
     /// keyframe request.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn bounded_writer_finishes_the_frame_in_flight_and_recovers_with_a_keyframe() {
         let (host, mut client) = tokio::io::duplex(64);
         let force_idr = Arc::new(AtomicBool::new(false));
@@ -1105,7 +1280,7 @@ mod tests {
     /// A link that overflows again right after a keyframe waits before it
     /// asks for the next one, and still asks once the wait is over, even if
     /// no other frame comes.
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn overflow_right_after_a_keyframe_defers_the_next_request() {
         let (host, mut client) = tokio::io::duplex(64);
         let force_idr = Arc::new(AtomicBool::new(false));

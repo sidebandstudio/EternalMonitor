@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use crate::control::{CaptureTarget, SharedControl};
 use crate::transport::link::LinkId;
-use crate::transport::session::{EndReason, SessionEnd};
+use crate::transport::session::{EndReason, SessionEnd, StageFailure, StreamStop};
 use tracing::info;
 
 static SYSTEM_REPORT: OnceLock<String> = OnceLock::new();
@@ -34,6 +34,7 @@ pub fn log_system_report() {
 
 extern "C" {
     fn eternal_install_ffmpeg_logger(sink: unsafe extern "C" fn(i32, *const libc::c_char));
+    fn eternal_ffmpeg_verbose(wanted: libc::c_int);
 }
 
 /// Install once, before encoder threads start. The C shim owns the platform's va_list ABI.
@@ -45,6 +46,53 @@ pub fn install_ffmpeg_logging() {
 thread_local! {
     /// Set while this thread opens an encoder that is one of several to try.
     static PROBING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// FFmpeg's lines from this thread while it watches them (see
+    /// [`FfmpegWatch`]), verbose ones included.
+    static WATCHED: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Threads watching FFmpeg's verbose lines. The shim forwards them while
+/// any watches; FFmpeg's own level never changes after it is installed.
+static WATCHERS: std::sync::Mutex<usize> = std::sync::Mutex::new(0);
+
+/// Keeps FFmpeg's lines from this thread, its verbose ones included, from
+/// [`FfmpegWatch::start`] to [`FfmpegWatch::finish`]. Warnings and errors
+/// are logged as always; verbose lines are only kept, never logged. Lines
+/// from other threads meanwhile are not kept, and their verbose lines are
+/// dropped as before.
+pub struct FfmpegWatch(());
+
+impl FfmpegWatch {
+    pub fn start() -> Self {
+        install_ffmpeg_logging();
+        WATCHED.with(|watched| *watched.borrow_mut() = Some(Vec::new()));
+        let mut watchers = WATCHERS.lock().unwrap_or_else(|e| e.into_inner());
+        *watchers += 1;
+        if *watchers == 1 {
+            unsafe { eternal_ffmpeg_verbose(1) };
+        }
+        Self(())
+    }
+
+    /// The lines this thread logged since the watch started.
+    pub fn finish(self) -> Vec<String> {
+        let lines = WATCHED
+            .with(|watched| watched.borrow_mut().take())
+            .unwrap_or_default();
+        drop(self);
+        lines
+    }
+}
+
+impl Drop for FfmpegWatch {
+    fn drop(&mut self) {
+        WATCHED.with(|watched| watched.borrow_mut().take());
+        let mut watchers = WATCHERS.lock().unwrap_or_else(|e| e.into_inner());
+        *watchers = watchers.saturating_sub(1);
+        if *watchers == 0 {
+            unsafe { eternal_ffmpeg_verbose(0) };
+        }
+    }
 }
 
 /// Runs `open`, an encoder open with another encoder to try if it fails,
@@ -72,6 +120,15 @@ unsafe extern "C" fn ffmpeg_message(level: i32, message: *const libc::c_char) {
         let message = unsafe { CStr::from_ptr(message) }.to_string_lossy();
         let message = message.trim();
         if message.is_empty() {
+            return;
+        }
+        WATCHED.with(|watched| {
+            if let Some(lines) = watched.borrow_mut().as_mut() {
+                lines.push(message.to_string());
+            }
+        });
+        // Only a watching thread wants verbose lines (see `FfmpegWatch`).
+        if level > ffmpeg_next::ffi::AV_LOG_WARNING {
             return;
         }
         // `ffmpeg_level` keeps FFmpeg's own level either way.
@@ -126,6 +183,7 @@ fn log_stream_summary(shared: &SharedControl) {
         target_fps = shared.effective_fps(), max_dgram = shared.max_dgram.load(Relaxed),
         input = ?*shared.encoder_input.lock(), hevc = shared.hevc_enabled.load(Relaxed),
         retransmits = sample.transport_retransmits, usb_drops = sample.usb_frames_dropped,
+        pointer_sent = sample.pointer_states_sent, pointer_shapes = sample.pointer_shapes_sent,
         usb_state = %sample.usb_link_state, usb_devices = sample.usb_devices,
         capture_heartbeat_age_ms = now_ms.saturating_sub(shared.hb_capture_frame_ms.load(Relaxed)),
         encode_heartbeat_age_ms = now_ms.saturating_sub(shared.hb_encode_frame_ms.load(Relaxed)),
@@ -247,6 +305,13 @@ static SESSION_FALLBACK: parking_lot::Mutex<SessionFallback> =
 
 /// `session_id` started: fallbacks logged from now on are its own.
 pub fn note_session_start(session_id: u32, shared: &SharedControl) {
+    // The slot is the process's, so a test that starts a session would
+    // replace another test's.
+    #[cfg(test)]
+    assert!(
+        tests::FALLBACK_SLOT.is_locked(),
+        "a test that starts a session holds diagnostics::tests::FALLBACK_SLOT"
+    );
     *SESSION_FALLBACK.lock() = SessionFallback {
         session_id: Some(session_id),
         mode: Some(Arc::clone(&shared.capture_target)),
@@ -254,7 +319,11 @@ pub fn note_session_start(session_id: u32, shared: &SharedControl) {
     };
 }
 
-fn note_fallback(reason: &str) {
+/// Notes `reason` for the live session's summary, as a
+/// `second_screen_fallback` log field does. Also called directly for a
+/// Second screen that is held by design rather than failed, so the field
+/// (which the daily check counts as a failure) isn't logged for it.
+pub(crate) fn note_fallback(reason: &str) {
     let (session_id, mode) = {
         let slot = SESSION_FALLBACK.lock();
         match (slot.session_id, &slot.mode) {
@@ -285,7 +354,9 @@ fn take_fallback(session_id: u32) -> Option<&'static str> {
 }
 
 /// A `second_screen_fallback` reason as the summary names it. `remembered`
-/// is a failure saved by an earlier app run.
+/// is a failure saved by an earlier app run. The backend's check of the
+/// summary lists each token (`copy_session_summaries`), so a new reason goes
+/// as `other` until it lists that one too.
 fn fallback_token(reason: &str) -> &'static str {
     match reason {
         "attach_timeout" => "attach_timeout",
@@ -294,6 +365,8 @@ fn fallback_token(reason: &str) -> &'static str {
         "no_frames" => "no_frames",
         "duplication_failed" => "duplication_failed",
         "remembered" => "remembered",
+        "vdd_only" => "vdd_only",
+        "panel_lost" => "panel_lost",
         _ => "other",
     }
 }
@@ -331,30 +404,77 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FallbackWatch {
 /// Logs the summary of a session, or of a HELLO2 the host turned down. The
 /// upload sends it as category `summary` (`crate::telemetry`).
 pub fn log_session_end(end: &SessionEnd, shared: &SharedControl) {
+    info!("{}", summary_line(end, shared));
+}
+
+/// The summary of `end`, with what the PC knows at the end, for
+/// [`log_session_end`] and [`log_session_end_now`] alike.
+fn summary_line(end: &SessionEnd, shared: &SharedControl) -> String {
     let second_screen = *shared.capture_target.lock() == CaptureTarget::VirtualExtended;
     // `mode=` is the mode at the end; the fallback was counted in Second
     // screen mode, perhaps before a switch to Mirror.
     let fallback = end.session_id.and_then(take_fallback);
-    info!(
-        "{}",
-        session_summary(end, second_screen, fallback, host_facts())
-    );
+    let refused = *shared.capture_block.lock()
+        == Some(crate::capture::recovery::CaptureBlock::UnsupportedOnThisGpu);
+    session_summary(end, second_screen, fallback, refused, host_facts())
 }
 
-/// The app is quitting: the summary of the stream it stops.
+/// The app is quitting: the summary of the stream it stops. Its iPad is
+/// told the PC ended the session, or, when a restart or an update hands over
+/// to a new copy, to connect again.
 pub fn log_session_end_at_quit(shared: &SharedControl) {
-    let end = shared.session.lock().shut_down(std::time::Instant::now());
-    if let Some(end) = end {
+    stop_session(shared, quit_stop(shared));
+}
+
+/// Why the app quits: for good, or for a restart or an update that hands
+/// over to a new copy.
+pub fn quit_stop(shared: &SharedControl) -> StreamStop {
+    if shared.handoff.holder().is_some() {
+        StreamStop::Handoff
+    } else {
+        StreamStop::Quit
+    }
+}
+
+/// The stream stops for good: ends the session, which the transport tells
+/// why on its way out, stops the stream, and logs the summary.
+pub fn stop_session(shared: &SharedControl, why: StreamStop) {
+    if let Some(end) = end_stream(shared, why) {
         log_session_end(&end, shared);
     }
 }
 
+/// [`stop_session`] without the summary, which the caller writes. The
+/// goodbye and `running` change under one session lock, so a transport
+/// starting meanwhile never takes the goodbye for a stale one
+/// (`Session::transport_resumed`).
+pub fn end_stream(shared: &SharedControl, why: StreamStop) -> Option<SessionEnd> {
+    let mut session = shared.session.lock();
+    let end = session.shut_down(std::time::Instant::now(), why);
+    shared.stop();
+    end
+}
+
+/// [`log_session_end`] for a PC about to go down: the line goes straight to
+/// the session log and the upload outbox on disk, so it survives the
+/// process ending a moment later, and the next launch uploads it.
+pub fn log_session_end_now(end: &SessionEnd, shared: &SharedControl) {
+    let line = crate::startup::info_line(&summary_line(end, shared));
+    let written = crate::logging::append_now(&line).and(crate::telemetry::queue_now(&line, "info"));
+    if let Err(error) = written {
+        tracing::warn!(%error, "Could not save the session summary before the PC went down");
+    }
+}
+
 /// The `session_summary v=1` line (b-session-summary contract): enumerated
-/// tokens, bounded numbers and the facts above, nothing else.
+/// tokens, bounded numbers and the facts above, nothing else. `gpu_refused`:
+/// Windows refuses the screen from the graphics card EternalMonitor runs on,
+/// so a session that gets no picture failed in capture, not on the network.
 pub fn session_summary(
     end: &SessionEnd,
     second_screen: bool,
     fallback: Option<&'static str>,
+    gpu_refused: bool,
     host: &HostFacts,
 ) -> String {
     use eternal_wire::v2::control::{ByeReason, HelloStatus};
@@ -379,18 +499,36 @@ pub fn session_summary(
         _ if streamed => "streamed",
         EndReason::Goodbye(ByeReason::UserDisconnect) => "user_ended",
         EndReason::Goodbye(ByeReason::Error) | EndReason::Liveness => "no_picture",
-        EndReason::Goodbye(_) | EndReason::Superseded | EndReason::Shutdown => "app_ended",
+        EndReason::Goodbye(_)
+        | EndReason::Superseded
+        | EndReason::Shutdown
+        | EndReason::Stopped => "app_ended",
         EndReason::Revoked => "pairing",
-        EndReason::LinkLost => "error",
+        EndReason::LinkLost | EndReason::Failed(_) => "error",
     };
     let failure = match end.reason {
         EndReason::Refused(status) if pairing(status) => "none",
         EndReason::Refused(_) => "other",
         EndReason::LinkLost if matches!(end.link, LinkId::Usb { .. }) => "usb_lost",
         EndReason::LinkLost => "other",
+        EndReason::Liveness | EndReason::Goodbye(ByeReason::Error) if !streamed && gpu_refused => {
+            "capture_failed"
+        }
         EndReason::Liveness | EndReason::Goodbye(ByeReason::Error) if !streamed => "no_video",
         EndReason::Liveness => "signal_lost",
+        // The iPad gave up on video that went out: none of it arrived, or
+        // no frame of it completed.
+        EndReason::Goodbye(ByeReason::Error) if !end.frames_received => {
+            if end.frags_received {
+                "no_frame"
+            } else {
+                "no_video"
+            }
+        }
         EndReason::Goodbye(ByeReason::Error) => "other",
+        EndReason::Failed(StageFailure::Capture) => "capture_failed",
+        EndReason::Failed(StageFailure::Encoder) => "encoder_failed",
+        EndReason::Failed(StageFailure::Other) => "other",
         _ => "none",
     };
     let end_token = match end.reason {
@@ -398,7 +536,10 @@ pub fn session_summary(
         EndReason::Liveness => "liveness",
         EndReason::Superseded => "superseded",
         EndReason::Shutdown => "shutdown",
-        EndReason::Refused(_) | EndReason::LinkLost | EndReason::Revoked => "error",
+        EndReason::Stopped => "user",
+        EndReason::Refused(_) | EndReason::LinkLost | EndReason::Revoked | EndReason::Failed(_) => {
+            "error"
+        }
     };
     let session_id = end.session_id.map_or("-".to_string(), |id| id.to_string());
     let transport = match end.link {
@@ -590,7 +731,7 @@ pub(crate) mod tests {
                 r" stage=(started|hello_sent|accepted|video_sent|first_frame|steady)",
                 r" outcome=(streamed|no_reply|no_picture|pairing|user_ended|app_ended|error)",
                 r" failure=(none|no_reply|no_video|no_frame|vdd_enable_failed|vdd_attach_timeout|vdd_not_attached|capture_failed|encoder_failed|usb_lost|signal_lost|other)",
-                r" fallback=(none|attach_timeout|enable_failed|no_driver|no_frames|duplication_failed|remembered|other)",
+                r" fallback=(none|attach_timeout|enable_failed|no_driver|no_frames|duplication_failed|remembered|vdd_only|panel_lost|other)",
                 r" end=(goodbye|liveness|superseded|shutdown|timeout|user|background|error)",
                 r" ttff_ms=(0|[1-9][0-9]{0,5}|-) duration_ms=(0|[1-9][0-9]{0,9})",
                 r" os=(win:[0-9]{1,6}\.[0-9]{1,6}|ipados:[0-9]{1,3}\.[0-9]{1,3}(\.[0-9]{1,3})?) hw=(pc|iPad[0-9]{1,2},[0-9]{1,2})",
@@ -671,6 +812,7 @@ pub(crate) mod tests {
             reason,
             first_video: first_video_ms.map(Duration::from_millis),
             frames_received: first_video_ms.is_some(),
+            frags_received: first_video_ms.is_some(),
             duration: Duration::from_millis(duration_ms),
         }
     }
@@ -694,6 +836,7 @@ pub(crate) mod tests {
             ),
             true,
             Some("attach_timeout"),
+            false,
             &pc(),
         );
         assert_eq!(
@@ -743,6 +886,24 @@ pub(crate) mod tests {
                 end(Goodbye(ByeReason::Error), Some(500), 30_000),
                 ["steady", "streamed", "other", "goodbye"],
             ),
+            // The iPad gave up on video that went out: none of it arrived,
+            // or no frame of it completed.
+            (
+                SessionEnd {
+                    frames_received: false,
+                    frags_received: false,
+                    ..end(Goodbye(ByeReason::Error), Some(300), 10_000)
+                },
+                ["video_sent", "streamed", "no_video", "goodbye"],
+            ),
+            (
+                SessionEnd {
+                    frames_received: false,
+                    frags_received: true,
+                    ..end(Goodbye(ByeReason::Error), Some(300), 10_000)
+                },
+                ["video_sent", "streamed", "no_frame", "goodbye"],
+            ),
             (
                 end(Liveness, None, 3_000),
                 ["accepted", "no_picture", "no_video", "liveness"],
@@ -766,6 +927,27 @@ pub(crate) mod tests {
             (
                 end(Shutdown, None, 20),
                 ["accepted", "app_ended", "none", "shutdown"],
+            ),
+            // Stop on the PC and the storm brake are not a clean quit.
+            (
+                end(Stopped, Some(250), 20_000),
+                ["steady", "streamed", "none", "user"],
+            ),
+            (
+                end(Stopped, None, 20),
+                ["accepted", "app_ended", "none", "user"],
+            ),
+            (
+                end(Failed(StageFailure::Capture), Some(250), 20_000),
+                ["steady", "streamed", "capture_failed", "error"],
+            ),
+            (
+                end(Failed(StageFailure::Encoder), None, 20),
+                ["accepted", "error", "encoder_failed", "error"],
+            ),
+            (
+                end(Failed(StageFailure::Other), Some(250), 9_000),
+                ["first_frame", "streamed", "other", "error"],
             ),
             (usb, ["first_frame", "streamed", "usb_lost", "error"]),
             (
@@ -798,7 +980,7 @@ pub(crate) mod tests {
             ),
         ];
         for (end, expected) in cases {
-            let line = session_summary(&end, false, None, &pc());
+            let line = session_summary(&end, false, None, false, &pc());
             assert_eq!(tokens(&line), expected, "{end:?}");
             assert_contract(&line);
         }
@@ -806,6 +988,7 @@ pub(crate) mod tests {
             &end(Refused(HelloStatus::Busy), None, 0),
             true,
             Some("no_frames"),
+            false,
             &pc(),
         );
         assert!(
@@ -814,6 +997,47 @@ pub(crate) mod tests {
                 && refused.contains(" ttff_ms=- "),
             "{refused}"
         );
+    }
+
+    /// A hybrid laptop whose screen Windows won't share from the card
+    /// EternalMonitor runs on: the iPad gave up with no picture. That is a
+    /// capture failure, which the backend's check lists, not lost video. A
+    /// session that got its picture, or that the user ended, keeps its own
+    /// tokens.
+    #[test]
+    fn no_picture_from_a_refused_graphics_card_is_a_capture_failure() {
+        use EndReason::{Goodbye, Liveness};
+        for (end, expected) in [
+            (
+                end(Goodbye(ByeReason::Error), None, 10_000),
+                ["accepted", "no_picture", "capture_failed", "goodbye"],
+            ),
+            (
+                end(Liveness, None, 10_000),
+                ["accepted", "no_picture", "capture_failed", "liveness"],
+            ),
+            (
+                end(Goodbye(ByeReason::UserDisconnect), None, 4_000),
+                ["accepted", "user_ended", "none", "goodbye"],
+            ),
+            (
+                end(Liveness, Some(400), 60_000),
+                ["steady", "streamed", "signal_lost", "liveness"],
+            ),
+        ] {
+            let line = session_summary(&end, false, None, true, &pc());
+            assert_eq!(tokens(&line), expected, "{end:?}");
+            assert_contract(&line);
+        }
+        // Without the refusal, the same end is lost video, as before.
+        let line = session_summary(
+            &end(Goodbye(ByeReason::Error), None, 10_000),
+            false,
+            None,
+            false,
+            &pc(),
+        );
+        assert_eq!(tokens(&line)[2], "no_video");
     }
 
     #[test]
@@ -825,7 +1049,7 @@ pub(crate) mod tests {
             duration: Duration::from_secs(40 * 86_400),
             ..end(EndReason::Liveness, None, 0)
         };
-        let line = session_summary(&long, false, None, &pc());
+        let line = session_summary(&long, false, None, false, &pc());
         assert!(line.contains(" nonce=00000000ffffffff "), "{line}");
         assert!(
             line.contains(" ttff_ms=600000 duration_ms=2592000000 "),
@@ -837,7 +1061,13 @@ pub(crate) mod tests {
             gpu: gpu_token(&[]),
             hybrid: None,
         };
-        let line = session_summary(&end(EndReason::Shutdown, None, 0), false, None, &unknown);
+        let line = session_summary(
+            &end(EndReason::Shutdown, None, 0),
+            false,
+            None,
+            false,
+            &unknown,
+        );
         assert!(line.ends_with(" os=win:0.0 hw=pc gpu=- hybrid=-"), "{line}");
         assert_contract(&line);
     }
@@ -883,6 +1113,8 @@ pub(crate) mod tests {
             ("no_frames", "no_frames"),
             ("duplication_failed", "duplication_failed"),
             ("remembered", "remembered"),
+            ("vdd_only", "vdd_only"),
+            ("panel_lost", "panel_lost"),
             ("C:\\Users\\someone", "other"),
         ] {
             assert_eq!(fallback_token(reason), token);
@@ -891,6 +1123,7 @@ pub(crate) mod tests {
         let shared = SharedControl::new(9876, 15_000_000);
         *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
         let subscriber = tracing_subscriber::registry().with(FallbackWatch);
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(subscriber, || {
             tracing::info!(second_screen_fallback = "remembered", "before the session");
             note_session_start(1, &shared);
@@ -908,6 +1141,54 @@ pub(crate) mod tests {
             note_session_start(3, &shared);
             tracing::warn!(second_screen_fallback = %"something new", "unknown");
             assert_eq!(take_fallback(3), Some("other"));
+        });
+    }
+
+    /// The Windows 10 Second screen hold names `no_driver` in the session
+    /// summary without logging a `second_screen_fallback` field, which the
+    /// daily check counts as a failure. A failed start without a driver
+    /// still logs the field.
+    #[test]
+    fn a_windows_10_hold_is_summarised_as_no_driver_without_a_fallback_line() {
+        use tracing_subscriber::prelude::*;
+        struct Fields(std::sync::Arc<parking_lot::Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Fields {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                let names = event
+                    .metadata()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().to_string());
+                self.0.lock().extend(names);
+            }
+        }
+        let _slot = FALLBACK_SLOT.lock();
+        let shared = SharedControl::new(9876, 15_000_000);
+        *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
+        let fields = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(FallbackWatch)
+            .with(Fields(std::sync::Arc::clone(&fields)));
+        crate::logging::prepare_log_capture();
+        let has_field = || {
+            fields
+                .lock()
+                .iter()
+                .any(|name| name == "second_screen_fallback")
+        };
+        tracing::subscriber::with_default(subscriber, || {
+            note_session_start(1, &shared);
+            crate::capture::second_screen::log_windows_hold();
+            assert!(!has_field(), "{:?}", fields.lock());
+            assert_eq!(take_fallback(1), Some("no_driver"));
+            note_session_start(2, &shared);
+            tracing::info!(second_screen_fallback = "no_driver", "no driver here");
+            assert!(has_field());
+            assert_eq!(take_fallback(2), Some("no_driver"));
         });
     }
 
@@ -930,6 +1211,7 @@ pub(crate) mod tests {
             session_id: Some(id),
             ..end(EndReason::Goodbye(ByeReason::UserDisconnect), None, 1_000)
         };
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(subscriber, || {
             *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
             note_session_start(1, &shared);
@@ -988,6 +1270,49 @@ pub(crate) mod tests {
                 "second_screen none",
             ]
         );
+    }
+
+    /// The hybrid laptop's two fallbacks along the whole path: the session's
+    /// summary names each (the backend's check lists both), passes that
+    /// check, and uploads as written, in its own category.
+    #[test]
+    fn a_lone_display_or_lost_panel_reaches_the_uploaded_summary() {
+        use tracing_subscriber::prelude::*;
+        let _slot = FALLBACK_SLOT.lock();
+        let summaries = std::sync::Arc::new(parking_lot::Mutex::new(Vec::<String>::new()));
+        let subscriber = tracing_subscriber::registry()
+            .with(FallbackWatch)
+            .with(SummaryCapture(summaries.clone()));
+        let shared = SharedControl::new(9876, 15_000_000);
+        *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
+        crate::logging::prepare_log_capture();
+        tracing::subscriber::with_default(subscriber, || {
+            for (id, reason) in [(1, "vdd_only"), (2, "panel_lost")] {
+                note_session_start(id, &shared);
+                tracing::warn!(second_screen_fallback = reason, "fell back");
+                let ended = SessionEnd {
+                    session_id: Some(id),
+                    ..end(
+                        EndReason::Goodbye(ByeReason::UserDisconnect),
+                        Some(400),
+                        60_000,
+                    )
+                };
+                log_session_end(&ended, &shared);
+            }
+        });
+        let lines = summaries.lock().clone();
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        for (line, token) in lines.iter().zip(["vdd_only", "panel_lost"]) {
+            assert_contract(line);
+            assert!(line.contains(&format!(" fallback={token} ")), "{line}");
+            let logged = format!("2026-11-07T01:02:03.123456Z  INFO {line}");
+            assert_eq!(
+                crate::telemetry::session_summary(&logged),
+                Some(line.as_str())
+            );
+            assert_eq!(crate::telemetry::uploaded(&logged), *line);
+        }
     }
 
     #[test]

@@ -381,7 +381,7 @@ impl Sim {
             let control = shared.clone();
             let transport = tokio::spawn(async move {
                 let _audio = audio_tx;
-                transport::start_sender(nal_rx, audio_rx, port, control, supervisor_tx).await
+                transport::start_sender(nal_rx, audio_rx, port, control, supervisor_tx, 1).await
             });
             // The transport binds before its first wait.
             for _ in 0..10 {
@@ -776,4 +776,254 @@ fn another_ipad_takes_the_slot_of_a_silent_one() {
         assert!(gap < Duration::from_millis(100), "{gap:?}");
         sim.stop().await;
     });
+}
+
+/// The same iPad over the cable: the tunnel the host's USB worker opened to
+/// the test's listener, read and written as the app's link does. Its pings
+/// wait for their pong without moving the clock, so the host hears them
+/// when they are sent.
+struct UsbIpad {
+    stream: std::net::TcpStream,
+    buffer: Vec<u8>,
+    msg_seq: u32,
+    nonce: u32,
+    session_id: Option<u32>,
+    received: Vec<(Duration, Heard)>,
+    pongs: usize,
+    /// When the host's end of the tunnel closed, if it did.
+    closed: Option<Duration>,
+    next_report: Duration,
+    next_ping: Duration,
+}
+
+impl UsbIpad {
+    async fn accept(listener: &std::net::TcpListener) -> Self {
+        let mut accepted = None;
+        settle("the host's USB tunnel", || {
+            accepted = listener.accept().ok();
+            accepted.is_some()
+        })
+        .await;
+        let (stream, _) = accepted.unwrap();
+        stream.set_nonblocking(true).unwrap();
+        stream.set_nodelay(true).unwrap();
+        let mut ipad = Self {
+            stream,
+            buffer: Vec::new(),
+            msg_seq: 0,
+            nonce: 100,
+            session_id: None,
+            received: Vec::new(),
+            pongs: 0,
+            closed: None,
+            next_report: Duration::MAX,
+            next_ping: Duration::MAX,
+        };
+        let preamble = eternal_host::transport::link::PREAMBLE;
+        settle("the EMLINK preamble", || {
+            ipad.fill(Duration::ZERO);
+            ipad.buffer.len() >= preamble.len() || ipad.closed.is_some()
+        })
+        .await;
+        assert_eq!(&ipad.buffer[..preamble.len()], preamble);
+        ipad.buffer.drain(..preamble.len());
+        ipad
+    }
+
+    fn fill(&mut self, now: Duration) {
+        use std::io::Read;
+        let mut bytes = [0; 64 * 1024];
+        loop {
+            match self.stream.read(&mut bytes) {
+                Ok(0) => {
+                    self.closed.get_or_insert(now);
+                    return;
+                }
+                Ok(len) => self.buffer.extend_from_slice(&bytes[..len]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => return,
+                Err(_) => {
+                    self.closed.get_or_insert(now);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn drain(&mut self, now: Duration) {
+        self.fill(now);
+        while self.buffer.len() >= 2 {
+            let len = usize::from(u16::from_le_bytes([self.buffer[0], self.buffer[1]]));
+            if self.buffer.len() < 2 + len {
+                break;
+            }
+            let packet: Vec<u8> = self.buffer.drain(..2 + len).skip(2).collect();
+            if matches!(parse_control(&packet), Ok((_, ControlMessage::Pong(_)))) {
+                self.pongs += 1;
+            }
+            let heard = heard(&packet);
+            if let (None, Heard::Ack(HelloStatus::Ok, id)) = (self.session_id, heard) {
+                self.session_id = Some(id);
+                self.next_report = now + Duration::from_millis(500);
+                self.next_ping = now + Duration::from_secs(2);
+            }
+            self.received.push((now, heard));
+        }
+    }
+
+    fn send(&mut self, message: &ControlMessage) {
+        use std::io::Write;
+        self.msg_seq += 1;
+        let bytes = encode_control(self.session_id.unwrap_or(0), self.msg_seq, message);
+        let mut framed = (bytes.len() as u16).to_le_bytes().to_vec();
+        framed.extend_from_slice(&bytes);
+        self.stream.write_all(&framed).unwrap();
+    }
+
+    /// HELLO2 as the iPad that streamed over Wi-Fi, and its ACK.
+    async fn hello(&mut self, device_id: u64, now: Duration) -> u32 {
+        self.nonce += 1;
+        self.session_id = None;
+        self.send(&ControlMessage::Hello2(Hello2 {
+            proto_min: 2,
+            proto_max: 2,
+            client_nonce: self.nonce,
+            listen_port: 0,
+            decoder_caps: CAP_DECODE_H264,
+            feature_caps: FEATURE_WANTS_INPUT,
+            screen_px_w: 1280,
+            screen_px_h: 720,
+            screen_pt_w: 1280,
+            screen_pt_h: 720,
+            refresh_hz: 60,
+            device_name: "Stall test iPad".into(),
+            device_id,
+            preferred_fps: 0,
+            auth_token: [0; 16],
+            pairing_code: 0,
+        }));
+        settle("the ACK over USB", || {
+            self.drain(now);
+            self.session_id.is_some() || self.closed.is_some()
+        })
+        .await;
+        self.session_id.expect("an ACK over USB")
+    }
+
+    async fn step(&mut self, now: Duration) {
+        self.drain(now);
+        let Some(id) = self.session_id else {
+            return;
+        };
+        if self.closed.is_some() {
+            return;
+        }
+        if now >= self.next_report {
+            self.next_report += Duration::from_millis(500);
+            let frames = self
+                .received
+                .iter()
+                .filter(|(_, heard)| *heard == Heard::Media(id))
+                .count() as u32;
+            self.send(&ControlMessage::ReceiverReport(ReceiverReport {
+                stream_epoch: 1,
+                highest_seq: frames,
+                frames_complete: frames,
+                ..ReceiverReport::default()
+            }));
+        }
+        if now >= self.next_ping {
+            self.next_ping += Duration::from_secs(2);
+            let pongs = self.pongs;
+            self.send(&ControlMessage::Ping(Ping { t1_us: 1 }));
+            // A session that ended answers with a goodbye instead.
+            settle("a pong over USB", || {
+                self.drain(now);
+                self.pongs > pongs || self.closed.is_some() || !byes(&self.received).is_empty()
+            })
+            .await;
+        }
+    }
+}
+
+/// The iPad moves from Wi-Fi to the cable: it says goodbye on Wi-Fi
+/// (`superseded`) and sends HELLO2 over USB, in either order. In the field
+/// some of these tunnels closed on both sides 9.5-9.8 s later, with no
+/// reason on either side. Nothing in the host times that: for 30 s the
+/// session and the tunnel stay up and video flows over the cable, and
+/// neither link hears a goodbye. A deadline left from the Wi-Fi session or
+/// the takeover wait (1 s), the liveness hold (10 s) or the tunnel would
+/// show here.
+#[test]
+fn a_usb_takeover_from_wifi_keeps_its_tunnel_and_session() {
+    for bye_first in [true, false] {
+        run(async {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            std::env::set_var(
+                "ETERNAL_USB_DIRECT",
+                listener.local_addr().unwrap().to_string(),
+            );
+            let mut sim = Sim::start().await;
+            let wifi = sim.add_ipad(77).await;
+            sim.ipads[wifi].hello();
+            sim.run_until(secs(2.0)).await;
+            let (Some(wifi_id), None) = sim.session() else {
+                panic!("no session: {:?}", sim.session())
+            };
+            assert!(sim.ipads[wifi].video_after(wifi_id, secs(1.5)));
+            let mut usb = UsbIpad::accept(&listener).await;
+
+            let took_over = sim.start.elapsed();
+            let bye = ControlMessage::Bye(ByeReason::Superseded);
+            if bye_first {
+                sim.ipads[wifi].send_now(wifi_id, &bye).await;
+            }
+            let usb_id = usb.hello(77, took_over).await;
+            if !bye_first {
+                // The Wi-Fi goodbye arrives late, on a session already gone.
+                sim.ipads[wifi].send_now(wifi_id, &bye).await;
+            }
+            let wifi = sim.ipads.remove(wifi);
+            assert_ne!(usb_id, wifi_id);
+
+            let end = took_over + secs(30.0);
+            let mut next = took_over;
+            while next < end {
+                next += Duration::from_millis(50);
+                sim.run_until(next).await;
+                usb.step(sim.start.elapsed()).await;
+            }
+
+            eprintln!(
+                "USB_TAKEOVER_SIM bye_first={bye_first} took_over={took_over:?} closed={:?} \
+                 session={:?} usb_byes={:?}",
+                usb.closed,
+                sim.session(),
+                byes(&usb.received)
+            );
+            assert_eq!(usb.closed, None, "the host closed the tunnel");
+            assert_eq!(
+                sim.session(),
+                (Some(usb_id), Some((wifi_id, EndReason::Superseded)))
+            );
+            assert!(byes(&usb.received).is_empty(), "{:?}", byes(&usb.received));
+            assert!(
+                byes(&wifi.received()).is_empty(),
+                "{:?}",
+                byes(&wifi.received())
+            );
+            let last_video = usb
+                .received
+                .iter()
+                .filter(|(_, heard)| *heard == Heard::Media(usb_id))
+                .map(|(at, _)| *at)
+                .max();
+            assert!(
+                last_video.is_some_and(|at| at >= end - secs(0.5)),
+                "{last_video:?}"
+            );
+            sim.stop().await;
+            std::env::set_var("ETERNAL_USB_DIRECT", "127.0.0.1:0");
+        });
+    }
 }

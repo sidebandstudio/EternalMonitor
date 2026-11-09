@@ -1439,6 +1439,7 @@ mod tests {
             .with_writer(move || Sink(Arc::clone(&writer)))
             .finish();
         let mut store = key(None);
+        crate::logging::prepare_log_capture();
         let error = tracing::subscriber::with_default(subscriber, || {
             switch(
                 &mut store,
