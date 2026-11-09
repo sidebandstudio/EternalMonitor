@@ -25,7 +25,7 @@ fn placeholders(text: &str) -> Vec<&str> {
 /// English keys whose translations come in a separate pass. Until then
 /// every language shows them in English. A language that has one already
 /// is checked like any other key.
-const AWAITING_TRANSLATION: &[&str] = &["Dismiss", "Fix it", "Try again"];
+const AWAITING_TRANSLATION: &[&str] = &[];
 
 #[test]
 fn every_language_has_exactly_the_english_keys_and_placeholders() {
