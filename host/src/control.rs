@@ -90,8 +90,6 @@ pub struct SharedControl {
     /// The modes last written for the driver, and for which iPad; none when
     /// the driver's own modes apply.
     pub vdd_prepared: Arc<Mutex<Option<crate::capture::PreparedModes>>>,
-    /// Mode changes asked for on the second screen while it is on.
-    pub(crate) vdd_mode_changes: Arc<crate::capture::ModeChanges>,
     /// The second screen's size and the displays around it, as last seen.
     pub vdd_live: Arc<Mutex<crate::capture::VddLive>>,
     /// Second screen timing across pipeline restarts: the pending switch onto
@@ -236,7 +234,6 @@ impl SharedControl {
             vdd_output: Arc::new(Mutex::new(None)),
             vdd_resolutions: Arc::new(Mutex::new(Default::default())),
             vdd_prepared: Arc::new(Mutex::new(None)),
-            vdd_mode_changes: Arc::default(),
             vdd_live: Arc::default(),
             second_screen: Arc::new(Mutex::new(Default::default())),
             hb_capture_loop_ms: Arc::new(AtomicU64::new(0)),

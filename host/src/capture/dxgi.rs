@@ -260,6 +260,10 @@ pub fn run_capture_loop(
         height = tex_height,
         "Desktop duplication dimensions"
     );
+    if second_screen {
+        // The size the second screen is at, for the app; a resize updates it.
+        super::note_vdd_size(&shared, &chosen.device_name, (tex_width, tex_height));
+    }
     if tex_width == 0 || tex_height == 0 {
         return Err(format!(
             "Desktop duplication reported invalid dimensions {tex_width}x{tex_height}"

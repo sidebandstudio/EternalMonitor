@@ -362,6 +362,15 @@ impl ResolutionMemory {
     }
 }
 
+/// `sizes` for a log line: `1920x1080 1600x1200`.
+pub fn sizes_text(sizes: &[(u32, u32)]) -> String {
+    sizes
+        .iter()
+        .map(|(width, height)| format!("{width}x{height}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// The mode to set on the virtual display after it attached, when Windows
 /// picked another one. The driver offers the iPad's mode first, but Windows
 /// restores the mode it last saved for these displays: 800x600 when the
@@ -1900,6 +1909,15 @@ mod tests {
         assert!(!choices.set_in_windows(0, &mini, (1700, 1116)));
         assert!(!choices.set_in_windows(7, &[], (1700, 1116)));
         assert_eq!(choices, ResolutionChoices::default());
+    }
+
+    #[test]
+    fn offered_sizes_read_as_a_short_list_for_the_log() {
+        assert_eq!(
+            sizes_text(&[(1920, 1080), (1600, 1200)]),
+            "1920x1080 1600x1200"
+        );
+        assert_eq!(sizes_text(&[]), "");
     }
 
     /// Review r6: a size from Windows' display settings or the saved file
