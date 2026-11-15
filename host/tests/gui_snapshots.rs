@@ -813,22 +813,65 @@ fn a_sign_in_start_goes_to_the_taskbar(shared: &SharedControl, dir: &std::path::
     assert_eq!(restored.state().minimise_asks, 0, "restored by the user");
     assert_eq!(by_hand.state().minimise_asks, 0, "started by hand");
 
-    // An old iPad app's notice is on screen: it stays.
-    connect_app(shared, "Test iPad Pro", 10, 20, 3);
-    let mut with_notice = window(shared, Some(Box::new(|| false)), false);
-    run_together(&mut [&mut with_notice], 1000, |_, _| {});
-    assert_eq!(with_notice.state().minimise_asks, 0);
-    with_notice.get_by_label("Your iPad app is out of date");
-    disconnect_ipad(shared);
+    // A warning is on screen (another program holds the stream port): it
+    // stays.
+    {
+        use eternal_host::startup::port;
+        let holder = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let held = holder.local_addr().unwrap().port();
+        assert!(!port::check(held));
+        let mut with_warning = window(shared, Some(Box::new(|| false)), false);
+        run_together(&mut [&mut with_warning], 1000, |_, _| {});
+        assert_eq!(with_warning.state().minimise_asks, 0);
+        with_warning.get_by_label("Another program is using EternalMonitor's network port");
+        drop(holder);
+        assert!(port::check(held));
+    }
 
-    a_notice_in_the_grace_brings_the_window_back(shared);
+    // The feedback ask is on screen: it is no reason to stay.
+    feedback_ask_due(true);
+    let mut with_ask = window(shared, Some(Box::new(|| false)), false);
+    assert_eq!(with_ask.state().minimise_asks, 1);
+    user_minimises(&mut with_ask, false);
+    run_together(&mut [&mut with_ask], 300, |_, _| {});
+    with_ask.get_by_label("How's EternalMonitor working for you? :)");
+    feedback_ask_due(false);
+
+    a_warning_in_the_grace_brings_the_window_back(shared);
     std::fs::write(&update_state, known).unwrap();
 }
 
-/// For 30 s after going to the taskbar, a notice that appears brings the
-/// window back once, though nothing draws it; not once the user restored it.
-fn a_notice_in_the_grace_brings_the_window_back(shared: &SharedControl) {
+/// Settings with three long sessions and the ask never answered, so the
+/// feedback ask shows while no iPad is connected; or the fixture's.
+fn feedback_ask_due(due: bool) {
+    SettingsFile {
+        check_for_updates: false,
+        feedback_sessions: if due { 3 } else { 0 },
+        ..Default::default()
+    }
+    .save()
+    .unwrap();
+}
+
+/// For 30 s after going to the taskbar, a warning that appears brings the
+/// window back once, though nothing draws it; not once the user restored
+/// it, and the feedback ask never does.
+fn a_warning_in_the_grace_brings_the_window_back(shared: &SharedControl) {
     use eternal_host::startup::port;
+    // An iPad is connected at sign-in, so the ask is hidden; it leaves in
+    // the grace and the ask shows.
+    feedback_ask_due(true);
+    connect_ipad(shared);
+    let mut asked = window(shared, Some(Box::new(|| false)), false);
+    assert_eq!(asked.state().minimise_asks, 1);
+    follow(&mut asked);
+    run_together(&mut [&mut asked], 300, |_, _| {});
+    disconnect_ipad(shared);
+    run_together(&mut [&mut asked], 1000, |_, _| {});
+    assert_eq!(asked.state().restore_asks, 0, "the feedback ask");
+    assert!(asked.state().minimised);
+    feedback_ask_due(false);
+
     // Drawing is confirmed by now: both go to the taskbar at once.
     let mut minimised = window(shared, Some(Box::new(|| false)), false);
     let mut taken = window(shared, Some(Box::new(|| false)), false);

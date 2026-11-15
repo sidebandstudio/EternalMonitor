@@ -1,14 +1,15 @@
 //! A launch Windows started at sign-in ("Start with Windows"): the window
 //! goes to the taskbar once it is confirmed drawing, unless it shows the
-//! user something or the user takes it first. For [`GRACE`] after that, a
-//! notice that appears brings it back once; after that it is like any
-//! window the user minimised.
+//! user something it needs (first-run setup, the update popup, a warning or
+//! error) or the user takes it first. For [`GRACE`] after that, such a
+//! state that appears brings it back once; after that it is like any window
+//! the user minimised. The feedback ask and update news are not such states.
 
 use std::time::{Duration, Instant};
 
 use tracing::info;
 
-/// How long after going to the taskbar a new notice brings the window back.
+/// How long after going to the taskbar a new warning brings the window back.
 pub(super) const GRACE: Duration = Duration::from_secs(30);
 
 /// The window's own activation, just after its first frame (eframe shows it
@@ -95,7 +96,9 @@ impl SignIn {
         } else if restored {
             self.end("the window was restored");
         } else if focus_gained {
-            self.end("the window was activated");
+            // Windows may also activate a window late at sign-in, when
+            // another startup app's window closes; the field log tells.
+            self.end("the window was activated after its first second");
         }
     }
 
@@ -108,7 +111,7 @@ impl SignIn {
 
     /// Whether the window goes to the taskbar or comes back now. `drawing`:
     /// confirmed drawing. `needs_user`: first-run setup, the update popup or
-    /// a notice is on screen (or would be, while minimised).
+    /// a warning or error banner is on screen (or would be, while minimised).
     pub(super) fn decide(
         &mut self,
         now: Instant,
@@ -118,7 +121,7 @@ impl SignIn {
         match self.phase {
             Phase::Pending if !drawing => None,
             Phase::Pending if needs_user => {
-                self.end("it shows something for the user");
+                self.end("it shows setup, the update popup or a warning");
                 None
             }
             Phase::Pending => {
@@ -131,7 +134,7 @@ impl SignIn {
                 None
             }
             Phase::Grace(_) if needs_user => {
-                info!("Started at sign-in: a notice appeared, so the window comes back");
+                info!("Started at sign-in: a warning appeared, so the window comes back");
                 self.phase = Phase::Done;
                 Some(Command::Restore)
             }
@@ -140,8 +143,10 @@ impl SignIn {
     }
 
     fn end(&mut self, why: &str) {
-        if self.phase == Phase::Pending {
-            info!(why, "Started at sign-in: window stays on screen");
+        match self.phase {
+            Phase::Pending => info!(why, "Started at sign-in: window stays on screen"),
+            Phase::Grace(_) => info!(why, "Started at sign-in: the user took the window back"),
+            Phase::Done => {}
         }
         self.phase = Phase::Done;
     }

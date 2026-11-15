@@ -385,7 +385,7 @@ pub struct AnalyzerApp {
     /// Windows started this launch at sign-in, until the window is like any
     /// other ([`sign_in::SignIn`]).
     sign_in: Option<sign_in::SignIn>,
-    /// Where the notices are drawn while the window is minimised in
+    /// Where the warnings are drawn while the window is minimised in
     /// [`sign_in::GRACE`], to see whether it would show one.
     offscreen: Option<egui::Context>,
 }
@@ -1215,7 +1215,7 @@ impl eframe::App for AnalyzerApp {
 
 impl AnalyzerApp {
     /// A sign-in start, at every pass and while minimised: whether the user
-    /// took the window, and in the grace, whether a notice brings it back.
+    /// took the window, and in the grace, whether a warning brings it back.
     fn sign_in_logic(&mut self, ctx: &egui::Context) {
         let Some(sign_in) = self.sign_in.as_mut() else {
             return;
@@ -1224,8 +1224,8 @@ impl AnalyzerApp {
         let (focused, minimized) = ctx.input(|i| (i.viewport().focused, i.viewport().minimized));
         sign_in.observe(now, ctx.cumulative_frame_nr(), focused, minimized);
         if minimized == Some(true) && sign_in.in_grace() {
-            // Nothing draws a minimised window: draw its notices offscreen.
-            let needs_user = self.setup.is_some() || self.notice_offscreen(ctx);
+            // Nothing draws a minimised window: draw its warnings offscreen.
+            let needs_user = self.setup.is_some() || self.warning_offscreen(ctx);
             let command = self
                 .sign_in
                 .as_mut()
@@ -1252,7 +1252,7 @@ impl AnalyzerApp {
                     .any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
         });
         let needs_user =
-            self.setup.is_some() || self.update_popup_open || widgets::notice_shown(ctx);
+            self.setup.is_some() || self.update_popup_open || widgets::warning_shown(ctx);
         let Some(sign_in) = self.sign_in.as_mut() else {
             return;
         };
@@ -1263,9 +1263,9 @@ impl AnalyzerApp {
         sign_in_command(ctx, command);
     }
 
-    /// Whether the notices the Stream page starts with would show one now,
-    /// drawn where no one sees them. A [`widgets::banner`] is a notice.
-    fn notice_offscreen(&mut self, ctx: &egui::Context) -> bool {
+    /// Whether the banners the Stream page starts with would show a warning
+    /// or error now ([`widgets::warning_shown`]), drawn where no one sees them.
+    fn warning_offscreen(&mut self, ctx: &egui::Context) -> bool {
         let offscreen = self
             .offscreen
             .get_or_insert_with(|| {
@@ -1290,9 +1290,7 @@ impl AnalyzerApp {
             self.update_banner(ui, &snap, &client);
             self.restart_banner(ui);
             self.notices(ui, &snap, &client);
-            self.ipad_update_notice(ui, &client);
-            self.feedback_ask_card(ui, &client);
-            shown = widgets::notice_shown(ui.ctx());
+            shown = widgets::warning_shown(ui.ctx());
         });
         // Nothing is painted: its fonts' texture is never made.
         output.drop_without_applying_deltas();

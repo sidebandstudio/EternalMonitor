@@ -1408,3 +1408,36 @@ mod sign_in_start {
         assert!(sign_in.done());
     }
 }
+
+/// At a sign-in start, only a warning or error banner keeps the window up
+/// or brings it back; update news and the feedback ask do not.
+#[test]
+fn only_warning_and_error_banners_need_the_user() {
+    let ctx = egui::Context::default();
+    theme::install(&ctx, i18n::Lang::En);
+    let drawn = |color: Option<egui::Color32>| {
+        let mut shown = false;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 640.0),
+            )),
+            ..Default::default()
+        };
+        ctx.run_ui(input, |ui| {
+            if let Some(color) = color {
+                widgets::banner(ui, color, Icon::Warning, "Title", "Body", 0.0, |_| {});
+            }
+            shown = widgets::warning_shown(ui.ctx());
+        })
+        .drop_without_applying_deltas();
+        shown
+    };
+    // The fonts are in from the second pass.
+    assert!(!drawn(None));
+    assert!(!drawn(Some(ACCENT)), "update news, the feedback ask");
+    assert!(drawn(Some(WARNING)));
+    assert!(drawn(Some(DANGER)));
+    // Only for the pass that drew it.
+    assert!(!drawn(None));
+}

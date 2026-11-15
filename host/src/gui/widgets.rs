@@ -902,7 +902,9 @@ pub fn banner(
     actions_width: f32,
     actions: impl FnOnce(&mut Ui),
 ) {
-    note_notice(ui.ctx());
+    if color == WARNING || color == DANGER {
+        note_warning(ui.ctx());
+    }
     let shown = appear(ui, ui.id().with(("banner", title)), 0.28);
     ui.add_space((1.0 - shown) * 6.0);
     ui.scope(|ui| {
@@ -911,15 +913,17 @@ pub fn banner(
     });
 }
 
-/// Every banner is a notice for the user: remember that this pass drew one.
-fn note_notice(ctx: &egui::Context) {
+/// A warning or error banner (WARNING or DANGER): something stops the app
+/// working or staying current. Remember that this pass drew one.
+fn note_warning(ctx: &egui::Context) {
     let pass = ctx.cumulative_pass_nr();
-    ctx.data_mut(|d| d.insert_temp(egui::Id::new("notice-shown"), pass));
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("warning-shown"), pass));
 }
 
-/// Whether this pass drew a [`banner`] so far.
-pub fn notice_shown(ctx: &egui::Context) -> bool {
-    let pass = ctx.data(|d| d.get_temp::<u64>(egui::Id::new("notice-shown")));
+/// Whether this pass drew a warning or error [`banner`] so far. Accent
+/// banners (update news, the feedback ask) are not counted.
+pub fn warning_shown(ctx: &egui::Context) -> bool {
+    let pass = ctx.data(|d| d.get_temp::<u64>(egui::Id::new("warning-shown")));
     pass == Some(ctx.cumulative_pass_nr())
 }
 
