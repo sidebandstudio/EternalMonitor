@@ -1,6 +1,6 @@
-# Static checks for Setup on Windows 10, where Second screen needs Windows 11: a fresh install
-# skips the Virtual Display Driver and its tasks, and an upgrade keeps a driver an earlier
-# version installed, with its tasks, without repairing or verifying it. Windows 11 is
+# Static checks for Setup on Windows 10, where Windows adds the virtual display only on some
+# PCs: Setup installs the Virtual Display Driver and its tasks, repairs and checks it, as on
+# Windows 11, but a failed repair or check is logged instead of failing Setup. Windows 11 is
 # unchanged. Nothing is compiled or installed. The checks also run against broken copies of
 # the script, which they must reject.
 param([string]$IssPath)
@@ -18,38 +18,56 @@ function Get-Failures([string]$Text) {
     if ($Text -notmatch '(?m)^\s*FirstWindows11Build = 22000;') {
         $failures += 'The first Windows 11 build is not 22000'
     }
-    $runs = Get-Routine $Text 'function WindowsRunsVdd: Boolean;'
-    if ($runs -notmatch 'GetWindowsVersionEx\((\w+)\);' -or
-        $runs -notmatch "Result := $($Matches[1])\.Build >= FirstWindows11Build;") {
-        $failures += 'WindowsRunsVdd does not compare the Windows build with the first Windows 11 build'
+    $isWindows11 = Get-Routine $Text 'function IsWindows11: Boolean;'
+    if ($isWindows11 -notmatch 'GetWindowsVersionEx\((\w+)\);' -or
+        $isWindows11 -notmatch "Result := $($Matches[1])\.Build >= FirstWindows11Build;") {
+        $failures += 'IsWindows11 does not compare the Windows build with the first Windows 11 build'
     }
 
-    # Fresh install: a registered driver is kept on every Windows; with none, only Windows 11
-    # installs one.
-    $needs = Get-Routine $Text 'function NeedsVddInstall: Boolean;'
-    if ($needs -notmatch '(?s)Result := not ReadVddRegistration\(Directory, Version\);.*else if not WindowsRunsVdd then begin.*Result := False;') {
-        $failures += 'NeedsVddInstall installs the driver on Windows 10'
+    # Only a failed driver step depends on the Windows version: nothing is skipped on Windows 10.
+    $fail = Get-Routine $Text 'procedure FailVddStep(const Message: String);'
+    $rest = $Text
+    foreach ($routine in @($isWindows11, $fail) | Where-Object { $_ }) { $rest = $rest.Replace($routine, '') }
+    if (!$fail -or $rest -match '\bIsWindows11\b|GetWindowsVersion|WindowsRunsVdd') {
+        $failures += 'Setup reads the Windows version outside FailVddStep'
     }
-    if ($Text -notmatch '(?m)^Filename: "\{app\}\\driver\\vdd-setup-x64\.exe";.*Check: NeedsVddInstall;') {
+
+    # A fresh install installs the driver on every Windows; a registered one is kept.
+    $needs = Get-Routine $Text 'function NeedsVddInstall: Boolean;'
+    if ($needs -notmatch '(?s)\nbegin\s*Result := not ReadVddRegistration\(Directory, Version\);\s*if not Result then\s*Log\([^;]*\);\s*end;$') {
+        $failures += 'NeedsVddInstall does not install the driver wherever none is registered'
+    }
+    if ($Text -notmatch '(?m)^Filename: "\{app\}\\driver\\vdd-setup-x64\.exe";.*Check: NeedsVddInstall; AfterInstall: RecordVddOwnership') {
         $failures += 'The vendor setup does not run under NeedsVddInstall'
     }
 
-    # The tasks: wherever a driver is installed, and on Windows 11.
-    $wanted = Get-Routine $Text 'function VddTasksWanted: Boolean;'
-    if ($wanted -notmatch 'Result := VddInstallSucceeded and \(WindowsRunsVdd or ReadVddRegistration\(Directory, Version\)\);') {
-        $failures += 'VddTasksWanted does not keep the tasks for an installed driver only'
-    }
+    # The tasks: whenever the driver steps have not failed, as in 0.3.4.
     $tasks = $Text -split "\r?\n" | Where-Object { $_ -match '^Filename: "powershell\.exe";.*vdd-tasks-setup\.ps1' }
-    if (@($tasks).Count -ne 1 -or $tasks -notmatch 'Check: VddTasksWanted;') {
-        $failures += 'The driver tasks are set up without VddTasksWanted'
+    if (@($tasks).Count -ne 1 -or $tasks -notmatch 'Check: VddInstallSucceeded; BeforeInstall: RepairVddDriver; AfterInstall: VerifyVddDriver') {
+        $failures += 'The driver tasks are not set up under VddInstallSucceeded'
     }
 
-    # A driver kept on Windows 10 is neither repaired nor checked: no device changes, and no
-    # failed Setup over a driver Windows 10 doesn't use.
-    foreach ($routine in 'procedure RepairVddDriver;', 'procedure VerifyVddDriver;') {
+    # A failed step fails Setup on Windows 11 only. On Windows 10 it is logged and Setup goes on.
+    if ($fail -notmatch '(?s)\nbegin\s*if not IsWindows11 then begin\s*Log\([^;]*\);\s*exit;\s*end;\s*VddInstallFailed := True;\s*RaiseException\(Message\);\s*end;$') {
+        $failures += 'FailVddStep does not fail Setup on Windows 11 only'
+    }
+
+    # Repair and verify run on every Windows and report failures through FailVddStep.
+    $steps = [ordered]@{
+        'procedure RepairVddDriver;' = @('vdd-driver-repair\.ps1', 'FailVddStep\(Message\);')
+        'procedure VerifyVddDriver;' = @('vdd-driver-verify\.ps1', "then\s*FailVddStep\('")
+    }
+    foreach ($routine in $steps.Keys) {
+        $name = $routine.Split(' ')[1].TrimEnd(';')
         $body = Get-Routine $Text $routine
-        $first = [regex]::Match($body, '(?s)\nbegin\s*(?:\{[^}]*\}\s*)*(?<first>if not WindowsRunsVdd then(?: begin)?\s*(?:Log\([^;]*\);\s*)?exit;)')
-        if (!$first.Success) { $failures += "$($routine.Split(' ')[1].TrimEnd(';')) runs on Windows 10" }
+        $scriptName, $report = $steps[$routine]
+        $start = [regex]::Match($body, '(?s)\nbegin(?<before>.*?)\bExec\(')
+        if (!$start.Success -or $start.Groups['before'].Value -match '\bexit\s*;' -or $body -notmatch $scriptName) {
+            $failures += "$name does not run its script on every Windows"
+        }
+        if ($body -notmatch $report -or $body -match 'RaiseException|VddInstallFailed') {
+            $failures += "$name does not report its failure through FailVddStep"
+        }
     }
     $failures
 }
@@ -58,18 +76,25 @@ $failures = @(Get-Failures $iss)
 if ($failures) { throw "Windows 10 checks failed:`n  " + ($failures -join "`n  ") }
 
 # Each broken copy must fail.
+function Add-AfterBegin([string]$Text, [string]$Header, [string]$Line) {
+    [regex]::Replace($Text, '(?s)(\n' + [regex]::Escape($Header) + '.*?\nbegin\r?\n)', "`$1$Line`n")
+}
 $broken = [ordered]@{
     'Windows 10 build' = $iss.Replace('FirstWindows11Build = 22000;', 'FirstWindows11Build = 19041;')
     'build not read' = $iss.Replace('Result := Windows.Build >= FirstWindows11Build;', 'Result := True;')
-    'fresh install on Windows 10' = $iss.Replace("  else if not WindowsRunsVdd then begin`r`n", "  else if False then begin`r`n").Replace("  else if not WindowsRunsVdd then begin`n", "  else if False then begin`n")
+    'fresh install skipped on Windows 10' = $iss.Replace('Result := not ReadVddRegistration(Directory, Version);', 'Result := IsWindows11 and not ReadVddRegistration(Directory, Version);')
     'vendor setup unchecked' = $iss.Replace('Check: NeedsVddInstall;', 'Check: VddInstallSucceeded;')
-    'tasks without a driver' = $iss.Replace('(WindowsRunsVdd or ReadVddRegistration(Directory, Version))', '(True or ReadVddRegistration(Directory, Version))')
-    'tasks unchecked' = $iss.Replace('Check: VddTasksWanted;', 'Check: VddInstallSucceeded;')
-    'repair on Windows 10' = [regex]::Replace($iss, '(?s)(procedure RepairVddDriver;.*?\nbegin.*?)if not WindowsRunsVdd then begin', '$1if False then begin')
-    'verify on Windows 10' = [regex]::Replace($iss, '(?s)(procedure VerifyVddDriver;.*?\nbegin.*?)if not WindowsRunsVdd then', '$1if False then')
+    'tasks on Windows 11 only' = $iss.Replace('Check: VddInstallSucceeded; BeforeInstall: RepairVddDriver', 'Check: IsWindows11; BeforeInstall: RepairVddDriver')
+    'repair skipped on Windows 10' = Add-AfterBegin $iss 'procedure RepairVddDriver;' '  if not IsWindows11 then exit;'
+    'verify skipped on Windows 10' = Add-AfterBegin $iss 'procedure VerifyVddDriver;' '  if not IsWindows11 then exit;'
+    'repair skipped' = Add-AfterBegin $iss 'procedure RepairVddDriver;' '  exit;'
+    'failure fails Windows 10' = $iss.Replace('  if not IsWindows11 then begin', '  if False then begin')
+    'failure passes Windows 11' = [regex]::Replace($iss, '\r?\n  RaiseException\(Message\);', '')
+    'verify fails by itself' = $iss.Replace("FailVddStep('Windows did not finish", "RaiseException('Windows did not finish")
+    'repair fails by itself' = $iss.Replace('  FailVddStep(Message);', '  VddInstallFailed := True; RaiseException(Message);')
 }
 foreach ($case in $broken.Keys) {
     if ($broken[$case] -ceq $iss) { throw "The '$case' copy is the real script; update this test" }
     if (!@(Get-Failures $broken[$case])) { throw "The checks pass a broken script: $case" }
 }
-Write-Output "PASS: Windows 10 skips a fresh driver install and its tasks, keeps an installed driver unrepaired and unchecked; $($broken.Count) broken copies rejected"
+Write-Output "PASS: Windows 10 installs the driver and its tasks, repairs and checks it, and a failed step fails Setup on Windows 11 only; $($broken.Count) broken copies rejected"
