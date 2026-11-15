@@ -21,6 +21,7 @@ use crate::stats::PIPELINE_STATS;
 
 pub mod input;
 use input::{select_input, EncoderInput};
+mod software_rate;
 #[cfg(target_os = "macos")]
 mod vimage;
 
@@ -164,6 +165,10 @@ fn run_encode_loop(
     let mut last_keyframe_reopen: Option<Instant> = None;
     let mut pending_keyframe = false;
     let mut bitrate_pacer = BitratePacer::default();
+    // Capture runs at the stream's rate until a software encoder cannot
+    // keep up with it.
+    let mut software_rate = software_rate::SoftwareRate::default();
+    shared.cpu_fps_limit.store(0, Ordering::Relaxed);
 
     // Guarantee the very first frame of every pipeline is an IDR for all encoders, so the
     // iPad never sits in `waitingForSyncSample` after a connect or pipeline restart.
@@ -703,9 +708,10 @@ fn run_encode_loop(
         // Conversion finished synchronously. Recycle capture's buffer before
         // the codec or sender can block, including on the direct macOS path.
         drop(raw_frame.data);
+        let convert_time = convert_start.elapsed();
         PIPELINE_STATS
             .lock()
-            .record_convert(convert_start.elapsed().as_micros());
+            .record_convert(convert_time.as_micros());
         let pts = encoder.next_pts(raw_frame.timestamp, raw_frame.frame_number);
         encoder.frame.set_pts(Some(pts));
         let force_idr = take_keyframe_request(
@@ -743,10 +749,22 @@ fn run_encode_loop(
         }
 
         let mut keyframe_out = false;
+        // The frame's cost, for a software encoder's rate, once its packet
+        // is out. A picture given again is not a new one.
+        let mut costed = raw_frame.cached || given_again;
         while reset_refused.is_none() {
             match encoder.encoder.receive_packet(&mut encoder.packet) {
                 Ok(()) => {
                     let encode_us = encode_start.elapsed().as_micros();
+                    if !std::mem::replace(&mut costed, true) {
+                        software_rate.note_encoded(
+                            &encoder.opened_encoder,
+                            convert_time + encode_start.elapsed(),
+                            target_fps,
+                            Instant::now(),
+                            &shared.cpu_fps_limit,
+                        );
+                    }
                     let packet_bytes = encoder.packet.data().unwrap_or_default();
                     let packet_is_key = encoder.packet.is_key();
                     let (nal_data, is_keyframe) = if opened_is_hevc {
