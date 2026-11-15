@@ -1221,7 +1221,7 @@ pub(crate) mod tests {
             assert!(!has_field(), "{:?}", fields.lock());
             assert_eq!(take_fallback(1), Some("no_driver"));
             note_session_start(3, &shared);
-            crate::capture::second_screen::log_windows_hold(Windows::Failed);
+            crate::capture::second_screen::log_windows_hold(Windows::Failed("attach_timeout"));
             assert!(!has_field(), "{:?}", fields.lock());
             assert_eq!(take_fallback(3), Some("remembered"));
             note_session_start(2, &shared);

@@ -960,6 +960,67 @@ fn a_lost_built_in_screen_from_before_the_restart_only_says_it_is_paused() {
     }
 }
 
+/// Review r3 of #260: a cause found after a failed Windows 10 start (the
+/// driver tasks stop responding or go missing, or the device names a
+/// problem) removes every "needs Windows 11" text at once: the notice is
+/// the one 0.3.4 gave that failure, and neither the Stream page's note,
+/// Settings nor the iPad says Windows 11. Until then all four do.
+#[test]
+fn a_cause_found_after_a_windows_10_failure_removes_every_windows_11_text() {
+    use super::page_settings::display_description;
+    use super::page_stream::{screen_mode_text, WINDOWS_10_NOTE};
+    use crate::capture::second_screen::{
+        notice_failure, set_task_health, windows_10_start_failed, windows_notice,
+        windows_unsupported,
+    };
+    use crate::vdd::VddTaskHealth;
+    use crate::vdd_device::VddProblem;
+    for reason in ["attach_timeout", "enable_failed"] {
+        for (problem, health) in [
+            (None, VddTaskHealth::NotResponding),
+            (None, VddTaskHealth::TasksMissing),
+            (Some(VddProblem::NotExtended), VddTaskHealth::Ok),
+            (Some(VddProblem::NotInstalled), VddTaskHealth::Ok),
+            (Some(VddProblem::SignatureBlocked), VddTaskHealth::Ok),
+            (Some(VddProblem::DriverError(Some(43))), VddTaskHealth::Ok),
+        ] {
+            let case = format!("{reason} {problem:?} {health:?}");
+            let shared = crate::control::SharedControl::new(9876, 15_000_000);
+            windows_10_start_failed(&shared, reason);
+            let status = *shared.vdd_status.lock();
+            let texts = |health, problem| {
+                let notice =
+                    second_screen_notice(status, health, problem, notice_failure(&shared)).unwrap();
+                let unsupported = windows_unsupported(&shared);
+                (
+                    notice,
+                    screen_mode_text(CAPTURE_VIRTUAL_SENTINEL, None, status, true, unsupported),
+                    display_description(unsupported),
+                    windows_notice(&shared, std::time::Instant::now()),
+                )
+            };
+            let (notice, mode, settings, ipad) = texts(VddTaskHealth::Ok, None);
+            assert!(notice.body.starts_with(WINDOWS_10_NOTE), "{case}");
+            assert!(mode.contains("needs Windows 11"), "{case}: {mode}");
+            assert!(settings.contains("needs Windows 11"), "{case}");
+            assert!(ipad, "{case}");
+
+            *shared.vdd_problem.lock() = problem;
+            set_task_health(&shared, health);
+            let (notice, mode, settings, ipad) = texts(health, problem);
+            assert!(!notice.body.contains("Windows 11"), "{case}");
+            assert_eq!(
+                Some(notice),
+                second_screen_notice(status, health, problem, Some(reason)),
+                "{case}"
+            );
+            assert!(!mode.contains("Windows 11"), "{case}: {mode}");
+            assert!(!settings.contains("Windows 11"), "{case}");
+            assert!(!ipad, "{case}");
+        }
+    }
+}
+
 /// On Windows 10 without the driver Second screen isn't tried: the notice,
 /// the note beside the choice and Settings say it needs Windows 11, with no
 /// Try again, and the note goes from Windows 11's text only. After a start
