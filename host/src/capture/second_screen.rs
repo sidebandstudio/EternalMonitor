@@ -1846,7 +1846,7 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
                     device = %output.device_name,
                     "Virtual display still attached — setting this iPad's mode and capturing it"
                 );
-                let output = driver.settle(output, wanted);
+                let output = settle(shared, driver, output, wanted);
                 super::note_settled_for(shared, choice);
                 live_since(shared, &output, driver.now());
                 if note_attached_if_selected(shared, output.device_name.clone()) {
@@ -1958,7 +1958,7 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
             // This settle reads the saved choice: a pick before it is in.
             shared.second_screen.lock().settle_asked = false;
             let (wanted, choice) = super::wanted_vdd(shared);
-            let chosen = driver.settle(chosen, wanted);
+            let chosen = settle(shared, driver, chosen, wanted);
             super::note_settled_for(shared, choice);
             let (device, width, height) = (chosen.device_name.clone(), chosen.width, chosen.height);
             live_since(shared, &chosen, driver.now());
@@ -2040,6 +2040,19 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
             }
         }
     }
+}
+
+/// Every mode set of the second screen: the driver's settle, with the guard
+/// that keeps the size changes it causes from being taken for the user's.
+#[cfg(any(windows, test, debug_assertions))]
+fn settle(
+    shared: &SharedControl,
+    driver: &impl Driver,
+    output: OutputInfo,
+    wanted: Option<VddMode>,
+) -> OutputInfo {
+    let _host = super::HostModeSet::begin(shared);
+    driver.settle(output, wanted)
 }
 
 /// A size was picked in the app: the thread that turns the second screen
@@ -2436,6 +2449,10 @@ mod tests {
         wanted: RefCell<Vec<Option<VddMode>>>,
         /// Where a settle leaves the display; by default the mode asked for.
         settle_to: Option<(u32, u32)>,
+        /// The display's size, once a settle or the test set it.
+        size: Cell<Option<(u32, u32)>>,
+        /// The sizes settles set: only those that changed the display.
+        sets: RefCell<Vec<(u32, u32)>>,
     }
 
     impl<'a> FakeDriver<'a> {
@@ -2460,6 +2477,8 @@ mod tests {
                 calls: RefCell::new(Vec::new()),
                 wanted: RefCell::new(Vec::new()),
                 settle_to: None,
+                size: Cell::new(None),
+                sets: RefCell::new(Vec::new()),
             }
         }
 
@@ -2497,7 +2516,11 @@ mod tests {
                 .zip(self.attach_after)
                 .is_some_and(|(on, after)| self.elapsed.get() >= on + after);
             if attached {
-                outputs.push(output("virtual", false));
+                let mut display = output("virtual", false);
+                if let Some((width, height)) = self.size.get() {
+                    (display.width, display.height) = (width, height);
+                }
+                outputs.push(display);
             }
             outputs
         }
@@ -2525,7 +2548,11 @@ mod tests {
             self.sleep(self.settle_takes);
             self.calls.borrow_mut().push(Call::Settle);
             if let Some(size) = self.settle_to.or(wanted.map(|m| (m.width, m.height))) {
+                if size != (chosen.width, chosen.height) {
+                    self.sets.borrow_mut().push(size);
+                }
                 (chosen.width, chosen.height) = size;
+                self.size.set(Some(size));
             }
             chosen
         }
@@ -4495,28 +4522,138 @@ mod tests {
         assert!(!settle_queued(&shared));
     }
 
-    /// Review r8: after Windows moved the display, a click on the saved size
-    /// settles it again; keeping the size Windows set asks no settle.
+    /// Review r8, r9: after Windows moved the display, a click on the saved
+    /// size settles it again. Keeping the size Windows set asks for a settle
+    /// too, which sets nothing: the display is at it.
     #[test]
-    fn a_kept_windows_size_asks_no_settle() {
+    fn a_kept_windows_size_sets_nothing() {
         let on_sleep = |_| {};
         let (shared, driver) = streaming_for_ipad_1(&on_sleep);
+        driver.size.set(Some((1920, 1080)));
         crate::capture::note_vdd_change(&shared, "virtual", (1920, 1080), Instant::now());
         crate::capture::click_vdd_resolution(&shared, (2266, 1488));
         run(&shared, &driver, ATTACH_TIMEOUT, false);
-        assert_eq!(driver.calls()[3..], [Call::Settle]);
-        assert_eq!(driver.wanted.borrow().last(), Some(&Some(mode(2266, 1488))));
+        assert_eq!(driver.sets.borrow().last(), Some(&(2266, 1488)));
 
-        // At 800x600, outside the list: kept with a click, and no settle.
+        // At 800x600, outside the list: kept with a click; the settle that
+        // follows finds the display there and sets nothing.
+        driver.size.set(Some((800, 600)));
         crate::capture::note_vdd_change(&shared, "virtual", (800, 600), Instant::now());
+        let sets = driver.sets.borrow().len();
         crate::capture::click_vdd_resolution(&shared, (800, 600));
-        assert!(!settle_queued(&shared));
+        assert!(settle_queued(&shared));
+        run(&shared, &driver, ATTACH_TIMEOUT, false);
+        assert_eq!(driver.wanted.borrow().last(), Some(&Some(mode(800, 600))));
+        assert_eq!(driver.sets.borrow().len(), sets, "no mode set");
+        assert_eq!(driver.toggles.borrow().len(), 1, "no restart");
         assert_eq!(
             shared.vdd_resolutions.lock().choices.chosen(1),
             Some((800, 600))
         );
+    }
+
+    /// Review r9: Windows left the display at 800x600, outside the list; a
+    /// pick of 1510x992 is being set when the highlighted 800x600 is kept.
+    /// The keep is followed by a settle of its own, which sets 800x600 back.
+    #[test]
+    fn keeping_the_current_size_supersedes_a_settle_in_flight() {
+        let shared = second_screen_selected();
+        connect_ipad(&shared, 1, (1488, 2266));
+        prepare_for_connected(&shared);
+        let keep_at = Cell::new(None::<Duration>);
+        let on_sleep = |elapsed| {
+            if keep_at.get().is_some_and(|at| elapsed >= at) {
+                keep_at.set(None);
+                // Capture hasn't seen 1510x992 yet: 800x600 is highlighted.
+                let menu = crate::capture::vdd_resolution_menu(&shared).unwrap();
+                assert_eq!(
+                    menu.click((800, 600)),
+                    crate::capture::Click::Keep((800, 600))
+                );
+                crate::capture::click_vdd_resolution(&shared, (800, 600));
+            }
+        };
+        let mut driver = FakeDriver::new(secs(3.0), Some(secs(0.5)), &on_sleep);
+        driver.settle_takes = secs(2.0);
+        attach(&shared, &driver, ATTACH_TIMEOUT);
+        shared.second_screen.lock().attaching = false;
+        driver.size.set(Some((800, 600)));
+        crate::capture::note_vdd_change(&shared, "virtual", (800, 600), Instant::now());
+
+        crate::capture::click_vdd_resolution(&shared, (1510, 992));
+        keep_at.set(Some(driver.elapsed.get() + secs(1.0)));
         run(&shared, &driver, ATTACH_TIMEOUT, false);
-        assert_eq!(driver.calls().len(), 4);
+        assert_eq!(keep_at.get(), None, "kept while 1510x992 was set");
+        assert_eq!(driver.sets.borrow()[1..], [(1510, 992), (800, 600)]);
+        assert_eq!(
+            shared.vdd_resolutions.lock().choices.chosen(1),
+            Some((800, 600))
+        );
+        assert!(!settle_queued(&shared));
+    }
+
+    /// Review r9: a size change this host causes is never taken for the
+    /// user's: capture reporting it while the settle runs, between a refused
+    /// size and its fallback, or just after, saves nothing, also after a
+    /// long quiet session. A change after the quiet time is the user's.
+    #[test]
+    fn the_hosts_own_resize_is_never_taken_for_the_users() {
+        let shared = second_screen_selected();
+        connect_ipad(&shared, 1, (1488, 2266));
+        prepare_for_connected(&shared);
+        let report = |size| {
+            crate::capture::note_vdd_change(&shared, "virtual", size, Instant::now());
+        };
+        // While the settle runs: its own size; a newer pick; the size a
+        // refused pick falls back to.
+        let script = RefCell::new(Vec::<(Duration, Box<dyn Fn()>)>::new());
+        let on_sleep = |elapsed| {
+            let due: Vec<_> = {
+                let mut script = script.borrow_mut();
+                let (due, rest) = script.drain(..).partition(|(at, _)| elapsed >= *at);
+                *script = rest;
+                due
+            };
+            for (_, action) in due {
+                action();
+            }
+        };
+        let mut driver = FakeDriver::new(secs(3.0), Some(secs(0.5)), &on_sleep);
+        driver.settle_takes = secs(2.0);
+        attach(&shared, &driver, ATTACH_TIMEOUT);
+        shared.second_screen.lock().attaching = false;
+        // A long, quiet session: a change now would be the user's.
+        let long_ago = Instant::now() - Duration::from_secs(60);
+        shared.vdd_live.lock().attached((2266, 1488), long_ago);
+        shared.vdd_live.lock().listed(&driver.outputs(), long_ago);
+
+        crate::capture::click_vdd_resolution(&shared, (1510, 992));
+        let at = driver.elapsed.get();
+        script.borrow_mut().extend([
+            (
+                at + secs(0.5),
+                Box::new(|| report((1510, 992))) as Box<dyn Fn()>,
+            ),
+            (
+                at + secs(1.0),
+                Box::new(|| crate::capture::click_vdd_resolution(&shared, (914, 600))),
+            ),
+            (at + secs(1.5), Box::new(|| report((2266, 1488)))),
+        ]);
+        run(&shared, &driver, ATTACH_TIMEOUT, false);
+        assert!(script.borrow().is_empty());
+        let chosen = || shared.vdd_resolutions.lock().choices.chosen(1);
+        assert_eq!(chosen(), Some((914, 600)), "the newest pick stays");
+        assert_eq!(driver.wanted.borrow().last(), Some(&Some(mode(914, 600))));
+        // Just after.
+        report((1510, 992));
+        assert_eq!(chosen(), Some((914, 600)));
+
+        // The user changes it in Windows' settings after the quiet time.
+        let later = driver.now().max(Instant::now()) + secs(11.0);
+        shared.vdd_live.lock().listed(&driver.outputs(), later);
+        crate::capture::note_vdd_change(&shared, "virtual", (1700, 1116), later);
+        assert_eq!(chosen(), Some((1700, 1116)));
     }
 
     /// Review r1, r8: a size picked while the second screen comes up, after
