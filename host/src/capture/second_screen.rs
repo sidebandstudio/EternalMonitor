@@ -179,6 +179,21 @@ impl Windows {
     }
 }
 
+/// Whether a failed start on Windows 10 has no more specific cause than
+/// Windows 10 itself: the driver tasks work, and the device ran with no
+/// screen or couldn't say. Any other problem keeps its own notice and
+/// handling, as on Windows 11 (Extend, a reinstall, a restart).
+pub(crate) fn no_specific_cause(
+    problem: Option<crate::vdd_device::VddProblem>,
+    health: crate::vdd::VddTaskHealth,
+) -> bool {
+    health == crate::vdd::VddTaskHealth::Ok
+        && matches!(
+            problem,
+            None | Some(crate::vdd_device::VddProblem::NoDisplay)
+        )
+}
+
 /// How long quitting waits for the worker to exit after the last Enable.
 const QUIT_JOIN: Duration = Duration::from_secs(5);
 
@@ -343,7 +358,11 @@ impl State {
                 memory: std::mem::take(&mut self.memory),
                 mirror_refused: self.mirror_refused.take(),
                 facts: std::mem::take(&mut self.facts),
-                windows: self.windows,
+                // A failed start is tried afresh too.
+                windows: match self.windows {
+                    Windows::Failed => Windows::Tried,
+                    windows => windows,
+                },
                 #[cfg(debug_assertions)]
                 fake_desktop_away: self.fake_desktop_away.take(),
                 ..State::default()
@@ -667,10 +686,12 @@ impl State {
     /// failure was recorded as usual: the iPad gets the mirror, and both
     /// notices say Second screen needs Windows 11. Later connections mirror
     /// with them until the second screen is tried again, when it would have
-    /// been for that failure.
+    /// been for that failure. Not when `specific`: a cause other than
+    /// Windows 10 is known ([`no_specific_cause`]), and the failure keeps
+    /// what it has on Windows 11.
     #[cfg(any(windows, test, debug_assertions))]
-    fn windows_10_failed(&mut self, reason: &'static str, now: Instant) {
-        if self.windows != Windows::Tried {
+    fn windows_10_failed(&mut self, reason: &'static str, specific: bool, now: Instant) {
+        if self.windows != Windows::Tried || specific {
             return;
         }
         tracing::info!(
@@ -763,7 +784,7 @@ pub(crate) fn log_windows_hold(windows: Windows) {
         second_screen_hold = windows.summary(),
         reason = WINDOWS_10,
         driver = if windows == Windows::Failed {
-            "failed_this_run"
+            "start_failed"
         } else {
             "missing"
         },
@@ -797,8 +818,8 @@ pub(crate) fn note_windows(
             );
         } else if installed {
             tracing::info!(
-                "Windows is older than Windows 11 — Second screen is tried, and mirrors the \
-                 primary display for the rest of this app run if it can't start"
+                "Windows is older than Windows 11 — Second screen is tried, and after a start that \
+                 fails mirrors the primary display until it is tried again"
             );
         } else {
             tracing::info!(
@@ -857,10 +878,25 @@ pub(crate) fn windows_unsupported(shared: &SharedControl) -> bool {
 /// Windows 11: for [`WINDOWS_10_IPAD_NOTICE`] after a connection began
 /// mirroring for it.
 pub(crate) fn windows_notice(shared: &SharedControl, now: Instant) -> bool {
+    windows_notice_with(shared, now, crate::vdd::task_health())
+}
+
+/// [`windows_notice`] with the driver tasks' `health`. After a failed start,
+/// not while a more specific cause is known ([`no_specific_cause`]).
+pub(crate) fn windows_notice_with(
+    shared: &SharedControl,
+    now: Instant,
+    health: crate::vdd::VddTaskHealth,
+) -> bool {
     let status = *shared.vdd_status.lock();
+    let problem = *shared.vdd_problem.lock();
     let state = shared.second_screen.lock();
     matches!(status, VddStatus::Failed | VddStatus::TaskFailed)
-        && matches!(state.failure, Some(WINDOWS_10 | WINDOWS_10_FAILED))
+        && match state.failure {
+            Some(WINDOWS_10) => true,
+            Some(WINDOWS_10_FAILED) => no_specific_cause(problem, health),
+            _ => false,
+        }
         && state
             .windows_held_at
             .is_some_and(|at| now.saturating_duration_since(at) < WINDOWS_10_IPAD_NOTICE)
@@ -1984,15 +2020,14 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
         if report.is_ok_and(|device| device != DeviceState::Missing) {
             disable(shared, driver);
         }
-        let blocked = mirror_blocked_now(shared, |_, _| true);
+        let specific = windows_10_specific(shared);
         let now = driver.now();
         let mut status = shared.vdd_status.lock();
         *status = VddStatus::TaskFailed;
         let mut state = shared.second_screen.lock();
         state.failure = Some("enable_failed");
-        // The mirror shows nothing: no Windows 10 hold, as after a timeout.
-        if !blocked {
-            state.windows_10_failed("enable_failed", now);
+        if let Some(specific) = specific {
+            state.windows_10_failed("enable_failed", specific, now);
         }
         return;
     }
@@ -2094,7 +2129,8 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
             // half-enabled device lingers as a phantom monitor.
             disable(shared, driver);
             let blocked = mirror_blocked_now(shared, |_, _| true);
-            let copied = *shared.vdd_problem.lock() == Some(VddProblem::NotExtended);
+            let copied_problem = *shared.vdd_problem.lock();
+            let copied = copied_problem == Some(VddProblem::NotExtended);
             let now = driver.now();
             let mut status = shared.vdd_status.lock();
             *status = VddStatus::Failed;
@@ -2105,7 +2141,8 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
             state.remember("attach_timeout", now, false, blocked);
             // The mirror shows nothing: the next connection tries again.
             if !blocked {
-                state.windows_10_failed("attach_timeout", now);
+                let specific = !no_specific_cause(copied_problem, crate::vdd::task_health());
+                state.windows_10_failed("attach_timeout", specific, now);
             }
             if blocked && copied {
                 info!(
@@ -2118,6 +2155,22 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
             }
         }
     }
+}
+
+/// After a failed Enable on Windows 10 with the driver (and only there, so
+/// Windows 11 reads nothing more than before): whether a cause other than
+/// Windows 10 is known ([`no_specific_cause`]), or `None` when the Windows 10
+/// hold doesn't apply: elsewhere, or while the mirror is blocked, where the
+/// failure keeps 0.3.4's handling, as after a timeout.
+#[cfg(any(windows, test, debug_assertions))]
+fn windows_10_specific(shared: &SharedControl) -> Option<bool> {
+    if shared.second_screen.lock().windows != Windows::Tried
+        || mirror_blocked_now(shared, |_, _| true)
+    {
+        return None;
+    }
+    let problem = *shared.vdd_problem.lock();
+    Some(!no_specific_cause(problem, crate::vdd::task_health()))
 }
 
 /// The only Enable: never once quitting has begun, and quitting waits for

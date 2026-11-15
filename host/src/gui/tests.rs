@@ -995,6 +995,40 @@ fn windows_10_says_second_screen_needs_windows_11() {
         assert!(notice.retry && !notice.installer);
         add_later_retry(&mut notice, true);
         assert!(notice.body.ends_with("tries again by itself later."));
+        // With no monitor, or no cause known: still Windows 10.
+        let no_display = second_screen_notice(
+            status,
+            VddTaskHealth::Ok,
+            Some(crate::vdd_device::VddProblem::NoDisplay),
+            failed,
+        )
+        .unwrap();
+        assert!(no_display.body.starts_with(WINDOWS_10_NOTE));
+        // A more specific cause keeps the notice 0.3.4 gave it: Extend, a
+        // reinstall, a restart.
+        use crate::vdd_device::VddProblem;
+        let reason = if status == VddStatus::Failed {
+            "attach_timeout"
+        } else {
+            "enable_failed"
+        };
+        for (health, problem) in [
+            (VddTaskHealth::NotResponding, None),
+            (VddTaskHealth::TasksMissing, None),
+            (VddTaskHealth::Ok, Some(VddProblem::NotExtended)),
+            (VddTaskHealth::Ok, Some(VddProblem::NotInstalled)),
+            (VddTaskHealth::Ok, Some(VddProblem::SignatureBlocked)),
+            (VddTaskHealth::Ok, Some(VddProblem::DriverError(Some(43)))),
+            (VddTaskHealth::Ok, Some(VddProblem::DriverError(None))),
+        ] {
+            let notice = second_screen_notice(status, health, problem, failed);
+            assert_eq!(
+                notice,
+                second_screen_notice(status, health, problem, Some(reason)),
+                "{status:?} {health:?} {problem:?}"
+            );
+            assert!(!notice.unwrap().body.contains("Windows 11"));
+        }
     }
 
     for status in [

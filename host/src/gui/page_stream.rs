@@ -993,9 +993,11 @@ pub(super) fn second_screen_notice(
                 false,
             )
         }
-        // A start failed on Windows 10, where it works on some PCs at times.
+        // A start failed on Windows 10, where it works on some PCs at times,
+        // with no more specific cause: any other keeps its own notice below.
         (Failed | TaskFailed, _, _)
-            if failure == Some(crate::capture::second_screen::WINDOWS_10_FAILED) =>
+            if failure == Some(crate::capture::second_screen::WINDOWS_10_FAILED)
+                && crate::capture::second_screen::no_specific_cause(problem, health) =>
         {
             notice(
                 &format!("{WINDOWS_10_NOTE} Mirror my screen works as usual."),

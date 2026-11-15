@@ -960,8 +960,9 @@ mod tests {
     use super::super::{
         attach, driver_supports_windows, next_step, note_attached, note_connected, note_image,
         note_windows, notice_failure, remembered_failure, retries_later, set_facts, start_proving,
-        windows_notice, windows_unsupported, Driver, Failure, Step, TurnedOn, BLOCKED_EXTEND_RETRY,
-        PANEL_LOST_BEFORE, PROVE_TIMEOUT, WINDOWS_10, WINDOWS_10_FAILED, WINDOWS_10_IPAD_NOTICE,
+        windows_notice, windows_notice_with, windows_unsupported, Driver, Failure, Step, TurnedOn,
+        BLOCKED_EXTEND_RETRY, EXTEND_TIMEOUT, PANEL_LOST_BEFORE, PROVE_TIMEOUT, WINDOWS_10,
+        WINDOWS_10_FAILED, WINDOWS_10_IPAD_NOTICE,
     };
     use super::*;
     use crate::capture::tests::{connect_viewer, hybrid_laptop, refuse_moved_mirror, NVIDIA};
@@ -2702,10 +2703,13 @@ mod tests {
         EnableFails,
     }
 
-    /// [`NeverAttaches`], with its display starting as `start` says.
+    /// [`NeverAttaches`], with its display starting as `start` says. A
+    /// failure reports the device's problem, when `reports` names one, as
+    /// the Windows driver does.
     struct Windows10 {
         display: NeverAttaches,
         start: Start,
+        reports: Option<(SharedControl, VddProblem)>,
     }
 
     impl Windows10 {
@@ -2713,6 +2717,14 @@ mod tests {
             Self {
                 display: NeverAttaches::new(at),
                 start,
+                reports: None,
+            }
+        }
+
+        fn reporting(self, shared: &SharedControl, problem: VddProblem) -> Self {
+            Self {
+                reports: Some((shared.clone(), problem)),
+                ..self
             }
         }
 
@@ -2757,6 +2769,12 @@ mod tests {
         fn device(&self) -> Option<crate::vdd_device::DeviceState> {
             (self.start == Start::NoMonitor && self.on())
                 .then_some(crate::vdd_device::DeviceState::NoMonitor)
+        }
+
+        fn report(&self, _failure: Failure) {
+            if let Some((shared, problem)) = &self.reports {
+                *shared.vdd_problem.lock() = Some(*problem);
+            }
         }
 
         fn now(&self) -> Instant {
@@ -2818,7 +2836,13 @@ mod tests {
             let shared = second_screen_with(memory);
             note_windows(&shared, Some(19045), false, true);
             connect_viewer(&shared);
-            let driver = Windows10::new(start, how);
+            // No monitor is what Windows 10 does: no more specific cause.
+            let driver = match how {
+                Start::NoMonitor => {
+                    Windows10::new(start, how).reporting(&shared, VddProblem::NoDisplay)
+                }
+                _ => Windows10::new(start, how),
+            };
             let (fallback, log, ()) = summary_fallback(&shared, || {
                 note_connected(&shared, start);
                 assert_eq!(next_step(&shared, start), Step::Attach, "{how:?}");
@@ -2879,7 +2903,7 @@ mod tests {
             assert_eq!(fallback, Some("remembered"), "{how:?}");
             assert!(
                 log.contains("Second screen held: needs Windows 11")
-                    && log.contains("failed_this_run")
+                    && log.contains("start_failed")
                     && !log.contains("second_screen_fallback"),
                 "{how:?}: {log}"
             );
@@ -2937,7 +2961,9 @@ mod tests {
         attach(&shared, &driver, ATTACH_TIMEOUT);
         assert_eq!(*shared.vdd_status.lock(), VddStatus::Active);
         assert!(!windows_notice(&shared, driver.now()));
-        remove_folder(&path);
+        if exists(&path) {
+            remove_folder(&path);
+        }
     }
 
     /// Windows 10 with the driver, while Windows won't let EternalMonitor
@@ -2983,6 +3009,166 @@ mod tests {
         shared.retry_second_screen();
         let later = driver.now() + Duration::from_secs(60);
         assert_eq!(next_step(&shared, later), Step::Attach);
+    }
+
+    /// Review r2 of #260: Choosing another mode after a failed start on
+    /// Windows 10 ends the hold with the rest of the state: Settings and the
+    /// Stream page no longer say Second screen needs Windows 11, and choosing
+    /// Second screen again tries it at once, as in 0.3.4.
+    #[test]
+    fn on_windows_10_choosing_second_screen_again_tries_a_failed_start_at_once() {
+        let path = temp_file("windows-10-chosen-again");
+        let (memory, start) = app_run(&path, Duration::ZERO);
+        let shared = second_screen_with(memory);
+        note_windows(&shared, Some(19045), false, true);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        let driver = Windows10::new(start, Start::TimesOut);
+        attach(&shared, &driver, ATTACH_TIMEOUT);
+        assert!(windows_unsupported(&shared));
+        let now = driver.now() + secs(1);
+        *shared.capture_target.lock() = CaptureTarget::PrimaryAuto;
+        assert_eq!(next_step(&shared, now), Step::Nothing);
+        assert!(!windows_unsupported(&shared), "Settings no longer say so");
+        *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
+        *shared.vdd_status.lock() = VddStatus::WaitingForClient;
+        assert_eq!(next_step(&shared, now), Step::Attach, "chosen again");
+        assert!(!windows_notice(&shared, now));
+        let driver = Windows10::new(now, Start::Attaches);
+        attach(&shared, &driver, ATTACH_TIMEOUT);
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Active);
+        if exists(&path) {
+            remove_folder(&path);
+        }
+    }
+
+    /// Review r2 of #260: a failed start on Windows 10 whose device names a
+    /// more specific cause than Windows 10 keeps what it has on Windows 11:
+    /// no Windows 10 hold, no iPad notice, the failure 0.3.4 kept (and its
+    /// notice on the PC), and after Windows kept the desktop off the second
+    /// screen, the longer wait for Extend at the next try.
+    #[test]
+    fn on_windows_10_a_failed_start_with_a_known_cause_keeps_its_own_handling() {
+        const SHORT: Duration = Duration::from_secs(5);
+        for (how, problem, reason) in [
+            (Start::TimesOut, VddProblem::NotExtended, "attach_timeout"),
+            (
+                Start::TimesOut,
+                VddProblem::DriverError(None),
+                "attach_timeout",
+            ),
+            (
+                Start::EnableFails,
+                VddProblem::NotInstalled,
+                "enable_failed",
+            ),
+            (
+                Start::EnableFails,
+                VddProblem::SignatureBlocked,
+                "enable_failed",
+            ),
+            (
+                Start::EnableFails,
+                VddProblem::DriverError(Some(43)),
+                "enable_failed",
+            ),
+        ] {
+            let path = temp_file("windows-10-cause");
+            let (memory, start) = app_run(&path, Duration::ZERO);
+            let shared = second_screen_with(memory);
+            note_windows(&shared, Some(19045), false, true);
+            connect_viewer(&shared);
+            assert_eq!(next_step(&shared, start), Step::Attach);
+            let driver = Windows10::new(start, how).reporting(&shared, problem);
+            let (fallback, log, ()) = summary_fallback(&shared, || {
+                attach(&shared, &driver, SHORT);
+            });
+            assert_eq!(fallback, Some(reason), "{problem:?}: {log}");
+            assert!(!log.contains("Windows 10"), "{problem:?}: {log}");
+            assert_eq!(notice_failure(&shared), Some(reason), "{problem:?}");
+            assert_eq!(*shared.vdd_problem.lock(), Some(problem));
+            assert!(!windows_unsupported(&shared), "{problem:?}");
+            assert!(!windows_notice(&shared, driver.now()), "{problem:?}: iPad");
+            if problem == VddProblem::NotExtended {
+                // The next try, once the saved wait is over, gives the user
+                // time to choose Extend.
+                let later = driver.now() + hours(2);
+                reconnect(&shared, later);
+                assert_eq!(next_step(&shared, later), Step::Attach);
+                let driver = Windows10::new(later, Start::TimesOut);
+                attach(&shared, &driver, SHORT);
+                assert!(driver.now() - later >= EXTEND_TIMEOUT, "waits for Extend");
+            }
+            if exists(&path) {
+                remove_folder(&path);
+            }
+        }
+    }
+
+    /// Review r2 of #260: after a failed start on Windows 10 with no more
+    /// specific cause, the iPad says Second screen needs Windows 11 only
+    /// while nothing more specific is known: not once the driver tasks stop
+    /// responding or go missing, or the device names a problem.
+    #[test]
+    fn the_ipad_hears_windows_10_only_without_a_more_specific_cause() {
+        use crate::vdd::VddTaskHealth;
+        let path = temp_file("windows-10-ipad");
+        let (memory, start) = app_run(&path, Duration::ZERO);
+        let shared = second_screen_with(memory);
+        note_windows(&shared, Some(19045), false, true);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        let driver = Windows10::new(start, Start::TimesOut);
+        attach(&shared, &driver, ATTACH_TIMEOUT);
+        let now = driver.now();
+        assert_eq!(notice_failure(&shared), Some(WINDOWS_10_FAILED));
+        assert!(windows_notice_with(&shared, now, VddTaskHealth::Ok));
+        for health in [VddTaskHealth::NotResponding, VddTaskHealth::TasksMissing] {
+            assert!(!windows_notice_with(&shared, now, health), "{health:?}");
+        }
+        *shared.vdd_problem.lock() = Some(VddProblem::NoDisplay);
+        assert!(windows_notice_with(&shared, now, VddTaskHealth::Ok));
+        for problem in [
+            VddProblem::NotExtended,
+            VddProblem::NotInstalled,
+            VddProblem::SignatureBlocked,
+            VddProblem::DriverError(Some(43)),
+        ] {
+            *shared.vdd_problem.lock() = Some(problem);
+            assert!(
+                !windows_notice_with(&shared, now, VddTaskHealth::Ok),
+                "{problem:?}"
+            );
+        }
+        remove_folder(&path);
+    }
+
+    /// Review r2 of #260: on Windows 11 a failed Enable reads nothing more
+    /// than on the candidate: with a refused mirror on record and no fresh
+    /// display facts, it logs no mirror decision, and keeps the failure.
+    #[test]
+    fn on_windows_11_a_failed_enable_reads_no_mirror_state() {
+        let path = temp_file("windows-11-enable");
+        let (memory, start) = app_run(&path, Duration::ZERO);
+        let shared = second_screen_with(memory);
+        note_windows(&shared, Some(26200), false, true);
+        refuse_moved_mirror(&shared);
+        set_facts(&shared, None);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        let driver = Windows10::new(start, Start::EnableFails);
+        let (log, ()) = logs(|| attach(&shared, &driver, ATTACH_TIMEOUT));
+        assert!(
+            !log.contains("Windows refused the mirror before"),
+            "no mirror decision: {log}"
+        );
+        assert!(
+            log.contains("Virtual display could not be enabled"),
+            "{log}"
+        );
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::TaskFailed);
+        assert_eq!(notice_failure(&shared), Some("enable_failed"));
+        assert!(!windows_unsupported(&shared) && !windows_notice(&shared, driver.now()));
     }
 
     /// The manifest names this PC: Second screen sessions start in the
