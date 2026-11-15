@@ -4,8 +4,11 @@ import Foundation
 /// Bonjour's list of PCs, kept up to date until stopped. Tests pass a fake.
 @MainActor
 protocol PCBrowser: AnyObject {
-    /// Called with the whole list each time it changes.
+    /// Called with the whole list each time it changes, services still
+    /// resolving among them, without an address.
     var onHosts: (([DiscoveredHost]) -> Void)? { get set }
+    /// Called when Bonjour can't search, as with Local Network off.
+    var onSearchFailed: (() -> Void)? { get set }
     func start()
     func stop()
 }
@@ -14,25 +17,35 @@ protocol PCBrowser: AnyObject {
 @MainActor
 final class BonjourPCBrowser: PCBrowser {
     var onHosts: (([DiscoveredHost]) -> Void)?
+    var onSearchFailed: (() -> Void)?
     private let scanner = NetworkScanner()
     private var watch: AnyCancellable?
+    private var failure: AnyCancellable?
 
     init() {
         scanner.retriesWhenEmpty = false
         scanner.searchesUntilStopped = true
     }
 
+    /// The scanner's list each time it settles: one update replaces a PC's
+    /// entry in steps, and only the list it ends on counts. A service that
+    /// has no address yet is in it too, so the support log sees it listed.
+    static func listings(of scanner: NetworkScanner) -> AnyPublisher<[DiscoveredHost], Never> {
+        scanner.$hosts.map { _ in () }.merge(with: scanner.$status.map { _ in () })
+            .debounce(for: .milliseconds(100), scheduler: RunLoop.main)
+            .map { [weak scanner] in scanner?.claims ?? [] }
+            .eraseToAnyPublisher()
+    }
+
     func start() {
-        // One update replaces a PC's entry in steps; only the list it ends on counts.
-        watch = scanner.$hosts.debounce(for: .milliseconds(100), scheduler: RunLoop.main).sink { [weak self] _ in
-            guard let self else { return }
-            self.onHosts?(self.scanner.hosts)
-        }
+        watch = Self.listings(of: scanner).sink { [weak self] hosts in self?.onHosts?(hosts) }
+        failure = scanner.$searchProblem.compactMap { $0 }.sink { [weak self] _ in self?.onSearchFailed?() }
         scanner.startScan()
     }
 
     func stop() {
         watch = nil
+        failure = nil
         scanner.stopScan()
     }
 }
@@ -59,6 +72,16 @@ struct PCReturn {
     private var tried = Set<String>()
     /// When the card went up and the watch's time limit started.
     private(set) var armedAt: Date?
+    /// For the support log (`NoReplyFacts`): every `address:port` the PC
+    /// was listed at since the watch began; whether its service was listed
+    /// without an IPv4 address (only IPv6, or still resolving); whether a
+    /// service without one that may be the PC was (the PC's name unknown);
+    /// whether Bonjour gave a list at all, and whether a search failed.
+    private(set) var seenAt = Set<String>()
+    private var seenWithoutAddress = false
+    private var maybeSeenWithoutAddress = false
+    private var heardAny = false
+    private var searchFailed = false
 
     init(name: String?, host: String, port: UInt16) {
         self.name = name.flatMap { $0.isEmpty ? nil : $0 }
@@ -83,6 +106,12 @@ struct PCReturn {
     mutating func heard(_ hosts: [DiscoveredHost]) -> Bool {
         var current: [String: DiscoveredHost] = [:]
         for pc in hosts where matches(pc) { current[Self.key(pc)] = pc }
+        heardAny = true
+        for pc in current.values { seenAt.insert("\(pc.address ?? ""):\(pc.port)") }
+        for pc in hosts where pc.address == nil {
+            if let service { seenWithoutAddress = seenWithoutAddress || pc.name == service }
+            else { maybeSeenWithoutAddress = true }
+        }
         let new = Set(current.keys).subtracting(listed.keys)
         listed = current
         tried.formIntersection(current.keys)
@@ -113,5 +142,47 @@ struct PCReturn {
 
     func expired(at now: Date, limit: TimeInterval) -> Bool {
         armedAt.map { now.timeIntervalSince($0) >= limit } ?? false
+    }
+
+    /// Bonjour couldn't search: a PC never listed may still be there.
+    mutating func couldNotSearch() {
+        searchFailed = true
+    }
+
+    /// Whether Bonjour listed the PC since the watch began: `yes`, `no`, or
+    /// `unknown` when it gave no list, a search failed, or a service without
+    /// an address may have been the PC.
+    var listedFact: String {
+        if !seenAt.isEmpty || seenWithoutAddress { return "yes" }
+        return heardAny && !searchFailed && !maybeSeenWithoutAddress ? "no" : "unknown"
+    }
+
+    /// Whether a listing of the PC was at `host:port`: `unknown` when one
+    /// had no address, `-` when it wasn't listed.
+    func listedAtFact(host: String, port: UInt16) -> String {
+        guard listedFact == "yes" else { return "-" }
+        if seenAt.contains("\(host):\(port)") { return "yes" }
+        return seenWithoutAddress ? "unknown" : "no"
+    }
+}
+
+/// The support log's line when an attempt over Wi-Fi ends with "didn't
+/// answer" (`when=timeout`), and when the watch for that PC ends
+/// (`when=watch_end`). It tells apart a PC that is closed, asleep or off
+/// (not listed), one that runs but is blocked (listed at the address
+/// tried), one that moved (listed elsewhere), and an iPad on another
+/// network than that address (not on its subnet):
+/// `no_reply_facts when=timeout listed=yes|no|unknown listed_at_tried=yes|no|unknown|-
+/// same_subnet=yes|no|unknown path=wifi|wired|cellular|other|unknown`.
+/// `same_subnet` is known only over a direct Wi-Fi or Ethernet path.
+enum NoReplyFacts {
+    /// `watch` is the watch for the PC, nil if none ran; `path` is how
+    /// this iPad reaches `host:port` now, nil if no path was ready.
+    static func line(when: String, watch: PCReturn?, host: String, port: UInt16, path: MovedPC.Path?) -> String {
+        let listed = watch?.listedFact ?? "unknown"
+        let atTried = watch?.listedAtFact(host: host, port: port) ?? "-"
+        let subnet = path?.route.flatMap { MovedPC.onSubnet(host, over: $0) }.map { $0 ? "yes" : "no" }
+        return "no_reply_facts when=\(when) listed=\(listed) listed_at_tried=\(atTried) same_subnet=\(subnet ?? "unknown")"
+            + " path=\(path?.kind ?? "unknown")"
     }
 }

@@ -7,6 +7,7 @@ import XCTest
 @MainActor
 private final class FakePCBrowser: PCBrowser {
     var onHosts: (([DiscoveredHost]) -> Void)?
+    var onSearchFailed: (() -> Void)?
     /// What Bonjour has now.
     var current: [DiscoveredHost] = []
     private(set) var starts = 0
@@ -21,6 +22,8 @@ private final class FakePCBrowser: PCBrowser {
         current = hosts
         onHosts?(hosts)
     }
+    /// Bonjour can't search, as with Local Network off.
+    func fail() { onSearchFailed?() }
 }
 
 /// The iPad shows "didn't answer" because the PC app wasn't running yet.
@@ -105,6 +108,148 @@ final class PCReturnTests: XCTestCase {
         XCTAssertTrue(watch.expired(at: start.addingTimeInterval(190), limit: 180), "a second card keeps the first limit")
     }
 
+    // MARK: - What the support log records at a no-reply
+
+    private static let wifi = MovedPC.Path(kind: "wifi",
+        route: MovedPC.Route(interface: "en0", direct: true, address: "192.0.2.23", netmask: "255.255.255.0"))
+
+    private func facts(_ watch: PCReturn?, host: String = "192.0.2.20", path: MovedPC.Path? = PCReturnTests.wifi) -> String {
+        NoReplyFacts.line(when: "timeout", watch: watch, host: host, port: 9876, path: path)
+    }
+
+    func testTheFactsSayWhetherAndWhereThePCWasListed() {
+        var watch = PCReturn(name: "Test PC", host: "192.0.2.20", port: 9876)
+        _ = watch.heard([pc("EternalMonitor (Other PC)", "192.0.2.30", port: 9876)])
+        XCTAssertEqual(facts(watch), "no_reply_facts when=timeout listed=no listed_at_tried=- same_subnet=yes path=wifi")
+        _ = watch.heard([pc("EternalMonitor (Test PC)", "192.0.2.40", port: 9876)])
+        XCTAssertEqual(facts(watch), "no_reply_facts when=timeout listed=yes listed_at_tried=no same_subnet=yes path=wifi")
+        // It left: it was still listed during the watch.
+        _ = watch.heard([])
+        XCTAssertEqual(facts(watch), "no_reply_facts when=timeout listed=yes listed_at_tried=no same_subnet=yes path=wifi")
+        _ = watch.heard([pc("EternalMonitor (Test PC)", "192.0.2.20", port: 9876)])
+        XCTAssertEqual(facts(watch), "no_reply_facts when=timeout listed=yes listed_at_tried=yes same_subnet=yes path=wifi")
+
+        // At another port only, the address tried isn't where it was listed.
+        var moved = PCReturn(name: "Test PC", host: "192.0.2.20", port: 9876)
+        _ = moved.heard([pc("EternalMonitor (Test PC)", "192.0.2.20", port: 9900)])
+        XCTAssertEqual(facts(moved), "no_reply_facts when=timeout listed=yes listed_at_tried=no same_subnet=yes path=wifi")
+    }
+
+    /// No search ran, Bonjour gave no list yet, or it couldn't search.
+    func testTheFactsSayUnknownWithoutASearch() {
+        XCTAssertEqual(facts(nil), "no_reply_facts when=timeout listed=unknown listed_at_tried=- same_subnet=yes path=wifi")
+        var watch = PCReturn(name: "Test PC", host: "192.0.2.20", port: 9876)
+        XCTAssertEqual(facts(watch), "no_reply_facts when=timeout listed=unknown listed_at_tried=- same_subnet=yes path=wifi")
+        _ = watch.heard([])
+        watch.couldNotSearch()
+        XCTAssertEqual(facts(watch), "no_reply_facts when=timeout listed=unknown listed_at_tried=- same_subnet=yes path=wifi")
+        // A listing seen before the search failed still counts.
+        var seen = PCReturn(name: "Test PC", host: "192.0.2.20", port: 9876)
+        _ = seen.heard([pc("EternalMonitor (Test PC)", "192.0.2.20", port: 9876)])
+        seen.couldNotSearch()
+        XCTAssertEqual(facts(seen), "no_reply_facts when=timeout listed=yes listed_at_tried=yes same_subnet=yes path=wifi")
+    }
+
+    func testTheFactsSayWhetherTheAddressTriedIsOnThisIPadsNetwork() {
+        var watch = PCReturn(name: nil, host: "198.51.100.20", port: 9876)
+        _ = watch.heard([])
+        XCTAssertEqual(facts(watch, host: "198.51.100.20"),
+                       "no_reply_facts when=timeout listed=no listed_at_tried=- same_subnet=no path=wifi")
+        let wired = MovedPC.Path(kind: "wired",
+            route: MovedPC.Route(interface: "en1", direct: true, address: "198.51.100.5", netmask: "255.255.255.0"))
+        XCTAssertEqual(facts(watch, host: "198.51.100.20", path: wired),
+                       "no_reply_facts when=timeout listed=no listed_at_tried=- same_subnet=yes path=wired")
+        let cellular = MovedPC.Path(kind: "cellular",
+            route: MovedPC.Route(interface: "pdp_ip0", direct: false, address: "198.51.100.5",
+                                     netmask: "255.255.255.0"))
+        XCTAssertEqual(facts(watch, host: "198.51.100.20", path: cellular),
+                       "no_reply_facts when=timeout listed=no listed_at_tried=- same_subnet=unknown path=cellular")
+        // No path within the wait, or a name instead of an address.
+        XCTAssertEqual(facts(watch, host: "198.51.100.20", path: nil),
+                       "no_reply_facts when=timeout listed=no listed_at_tried=- same_subnet=unknown path=unknown")
+        XCTAssertEqual(facts(nil, host: "test-pc.local"),
+                       "no_reply_facts when=timeout listed=unknown listed_at_tried=- same_subnet=unknown path=wifi")
+    }
+
+    /// Only a direct Wi-Fi or Ethernet path's own address and mask tell:
+    /// a VPN's tunnel says nothing about the Wi-Fi network, even with the
+    /// address tried inside the Wi-Fi subnet.
+    func testTheFactsKnowTheSubnetOnlyOverADirectPath() {
+        let tunnel = MovedPC.Path(kind: "other",
+            route: MovedPC.Route(interface: "utun4", direct: false, address: "10.8.0.6", netmask: "255.255.255.0"))
+        XCTAssertEqual(facts(nil, path: tunnel),
+                       "no_reply_facts when=timeout listed=unknown listed_at_tried=- same_subnet=unknown path=other")
+        let namedDirect = MovedPC.Path(kind: "wifi",
+            route: MovedPC.Route(interface: "utun4", direct: true, address: "10.8.0.6", netmask: "255.255.255.0"))
+        XCTAssertEqual(facts(nil, path: namedDirect),
+                       "no_reply_facts when=timeout listed=unknown listed_at_tried=- same_subnet=unknown path=wifi")
+        for mask in ["255.255.255.255", "0.0.0.0", "not-a-mask"] {
+            let route = MovedPC.Path(kind: "wifi",
+                route: MovedPC.Route(interface: "en0", direct: true, address: "198.51.100.5", netmask: mask))
+            XCTAssertEqual(facts(nil, path: route),
+                           "no_reply_facts when=timeout listed=unknown listed_at_tried=- same_subnet=unknown path=wifi", mask)
+        }
+    }
+
+    /// A Wi-Fi path with no IPv4 address (an IPv6-only network, reached
+    /// by name) or no netmask for it still logs its kind; only the subnet
+    /// isn't known. The route stays nil for the other callers.
+    func testThePathKeepsItsKindWithoutAnIPv4Subnet() {
+        let mask: (String, String) -> String? = { _, _ in "255.255.255.0" }
+        let ipv6 = MovedPC.path(kind: "wifi", interface: "en0", direct: true, localIPv4: nil, netmask: mask)
+        XCTAssertEqual(ipv6, MovedPC.Path(kind: "wifi", route: nil))
+        XCTAssertEqual(facts(nil, host: "test-pc.local", path: ipv6),
+                       "no_reply_facts when=timeout listed=unknown listed_at_tried=- same_subnet=unknown path=wifi")
+        let noMask = MovedPC.path(kind: "wired", interface: "en1", direct: true, localIPv4: "192.0.2.23", netmask: { _, _ in nil })
+        XCTAssertEqual(noMask, MovedPC.Path(kind: "wired", route: nil))
+        XCTAssertEqual(facts(nil, path: noMask),
+                       "no_reply_facts when=timeout listed=unknown listed_at_tried=- same_subnet=unknown path=wired")
+        let noInterface = MovedPC.path(kind: "wifi", interface: nil, direct: true, localIPv4: "192.0.2.23", netmask: mask)
+        XCTAssertEqual(noInterface, MovedPC.Path(kind: "wifi", route: nil))
+        XCTAssertEqual(MovedPC.path(kind: "wifi", interface: "en0", direct: true, localIPv4: "192.0.2.23", netmask: mask),
+                       MovedPC.Path(kind: "wifi", route: MovedPC.Route(interface: "en0", direct: true, address: "192.0.2.23",
+                                                                       netmask: "255.255.255.0")))
+    }
+
+    /// The PC's service listed with no IPv4 address (only IPv6, or still
+    /// resolving) is listed; where isn't known.
+    func testTheFactsCountAListingWithoutAnAddress() {
+        var watch = PCReturn(name: "Test PC", host: "192.0.2.20", port: 9876)
+        _ = watch.heard([pc("EternalMonitor (Other PC)", nil, port: 9876)])
+        XCTAssertEqual(facts(watch), "no_reply_facts when=timeout listed=no listed_at_tried=- same_subnet=yes path=wifi",
+                       "another PC's service is no listing of this one")
+        _ = watch.heard([pc("EternalMonitor (Test PC)", nil, port: 9876)])
+        XCTAssertEqual(facts(watch), "no_reply_facts when=timeout listed=yes listed_at_tried=unknown same_subnet=yes path=wifi")
+        _ = watch.heard([pc("EternalMonitor (Test PC)", "192.0.2.40", port: 9876)])
+        XCTAssertEqual(facts(watch), "no_reply_facts when=timeout listed=yes listed_at_tried=unknown same_subnet=yes path=wifi")
+        _ = watch.heard([pc("EternalMonitor (Test PC)", "192.0.2.20", port: 9876)])
+        XCTAssertEqual(facts(watch), "no_reply_facts when=timeout listed=yes listed_at_tried=yes same_subnet=yes path=wifi")
+
+        // Without the PC's name, any service without an address may be it.
+        var unnamed = PCReturn(name: nil, host: "192.0.2.20", port: 9876)
+        _ = unnamed.heard([pc("EternalMonitor (Any)", nil, port: 9876)])
+        XCTAssertEqual(facts(unnamed), "no_reply_facts when=timeout listed=unknown listed_at_tried=- same_subnet=yes path=wifi")
+    }
+
+    /// The real scanner's list for the watch has a service still resolving,
+    /// before it has any address, so the watch sees the PC listed.
+    func testBonjoursListHasAServiceStillResolving() async throws {
+        let scanner = NetworkScanner()
+        defer { scanner.stopScan() }
+        var lists: [[DiscoveredHost]] = []
+        let feed = BonjourPCBrowser.listings(of: scanner).sink { lists.append($0) }
+        defer { feed.cancel() }
+        scanner.netServiceBrowser(NetServiceBrowser(), didFind: NetService(domain: "local.", type: "_eternaldisplay._udp.",
+                                                                          name: "EternalMonitor (Example PC)"), moreComing: false)
+        let deadline = Date().addingTimeInterval(5)
+        while lists.last?.isEmpty != false, Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertEqual(lists.last?.map(\.name), ["EternalMonitor (Example PC)"])
+        XCTAssertEqual(lists.last?.first?.address, nil)
+        var watch = PCReturn(name: "Example PC", host: "192.0.2.20", port: 9876)
+        _ = watch.heard(lists.last ?? [])
+        XCTAssertEqual(facts(watch), "no_reply_facts when=timeout listed=yes listed_at_tried=unknown same_subnet=yes path=wifi")
+    }
+
     // MARK: - Connecting
 
     private final class Setup {
@@ -125,6 +270,7 @@ final class PCReturnTests: XCTestCase {
         }
 
         var tries: Int { lines.filter { $0 == "pc_return result=tried" }.count }
+        func facts(_ when: String) -> [String] { lines.filter { $0.hasPrefix("no_reply_facts when=\(when) ") } }
         var attempts: Int { lines.filter { $0.hasPrefix("Starting connection attempt=") }.count }
         var listing: DiscoveredHost { DiscoveredHost(name: "EternalMonitor (Test PC)", address: "127.0.0.1", port: host.port) }
     }
@@ -158,7 +304,9 @@ final class PCReturnTests: XCTestCase {
                                                       pcReturnProbeSeconds: 0.5),
                                         pairingStore: pairings)
         manager.homeAddress = { _ in true }
-        manager.localRoute = { _, _ in MovedPC.Route(interface: "en0", direct: true, address: "127.0.0.1", netmask: "255.0.0.0") }
+        let route = MovedPC.Route(interface: "en0", direct: true, address: "127.0.0.1", netmask: "255.0.0.0")
+        manager.localRoute = { _, _ in route }
+        manager.logPath = { _, _ in MovedPC.Path(kind: "wifi", route: route) }
         manager.findPCs = { _ in [] }
         let browser = FakePCBrowser()
         manager.makePCBrowser = { browser }
@@ -391,6 +539,64 @@ final class PCReturnTests: XCTestCase {
         try await until("tried on return", seconds: 5) { setup.tries == 1 }
     }
 
+    /// The PC wasn't listed: the no-reply's line says so, as does the line
+    /// when the watch ends, each with the route to the address tried.
+    func testTheNoReplyRecordsThatThePCWasNotListed() async throws {
+        let setup = try await noReply()
+        defer { setup.manager.cancel() }
+        try await until("timeout facts", seconds: 5) { !setup.facts("timeout").isEmpty }
+        XCTAssertEqual(setup.facts("timeout"),
+                       ["no_reply_facts when=timeout listed=no listed_at_tried=- same_subnet=yes path=wifi"])
+        XCTAssertEqual(setup.facts("watch_end"), [])
+        setup.browser.list([setup.listing])
+        setup.manager.problem = nil
+        try await until("watch end facts", seconds: 5) { !setup.facts("watch_end").isEmpty }
+        XCTAssertEqual(setup.facts("watch_end"),
+                       ["no_reply_facts when=watch_end listed=yes listed_at_tried=yes same_subnet=yes path=wifi"])
+    }
+
+    func testTheNoReplyRecordsAListingAtTheAddressTried() async throws {
+        let setup = try paired()
+        defer { setup.manager.cancel() }
+        setup.browser.current = [setup.listing]
+        setup.manager.connect(host: "127.0.0.1", port: setup.host.port)
+        try await until("timeout facts", seconds: 15) { !setup.facts("timeout").isEmpty }
+        XCTAssertEqual(setup.facts("timeout"),
+                       ["no_reply_facts when=timeout listed=yes listed_at_tried=yes same_subnet=yes path=wifi"])
+    }
+
+    func testTheNoReplyRecordsAListingAtAnotherAddress() async throws {
+        let setup = try paired()
+        defer { setup.manager.cancel() }
+        // Not a home address here, so nothing is sent there.
+        setup.manager.homeAddress = { $0 == "127.0.0.1" }
+        setup.browser.current = [DiscoveredHost(name: "EternalMonitor (Test PC)", address: "192.0.2.40", port: setup.host.port)]
+        setup.manager.connect(host: "127.0.0.1", port: setup.host.port)
+        try await until("timeout facts", seconds: 15) { !setup.facts("timeout").isEmpty }
+        XCTAssertEqual(setup.facts("timeout"),
+                       ["no_reply_facts when=timeout listed=yes listed_at_tried=no same_subnet=yes path=wifi"])
+    }
+
+    /// Bonjour couldn't search (Local Network off): whether the PC is
+    /// listed isn't known. The path there is asked for the address tried.
+    func testTheNoReplyRecordsAFailedSearchAsUnknown() async throws {
+        let setup = try paired()
+        defer { setup.manager.cancel() }
+        final class Asked { var hosts: [String] = [] }
+        let asked = Asked()
+        setup.manager.logPath = { host, _ in
+            asked.hosts.append(host)
+            return MovedPC.Path(kind: "wifi", route: MovedPC.Route(interface: "en0", direct: true, address: "192.0.2.23",
+                                                                   netmask: "255.255.255.0"))
+        }
+        setup.manager.connect(host: "127.0.0.1", port: setup.host.port)
+        setup.browser.fail()
+        try await until("timeout facts", seconds: 15) { !setup.facts("timeout").isEmpty }
+        XCTAssertEqual(setup.facts("timeout"),
+                       ["no_reply_facts when=timeout listed=unknown listed_at_tried=- same_subnet=no path=wifi"])
+        XCTAssertEqual(asked.hosts, ["127.0.0.1"])
+    }
+
     /// An unpaired PC can't prove it is the same one: it isn't watched for.
     func testAnUnpairedPCIsNotWatchedFor() async throws {
         let setup = try paired()
@@ -401,6 +607,9 @@ final class PCReturnTests: XCTestCase {
         try await until("didn't answer", seconds: 15) { setup.manager.problem == .noReply(usb: false) }
         XCTAssertFalse(setup.manager.watchingForPC)
         XCTAssertEqual(setup.browser.starts, 0)
+        try await until("timeout facts", seconds: 5) { !setup.facts("timeout").isEmpty }
+        XCTAssertEqual(setup.facts("timeout"),
+                       ["no_reply_facts when=timeout listed=unknown listed_at_tried=- same_subnet=yes path=wifi"])
     }
 
     func testPickingAnotherPCEndsTheWatch() async throws {
