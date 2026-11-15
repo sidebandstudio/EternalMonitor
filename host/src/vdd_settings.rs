@@ -202,6 +202,24 @@ pub fn modes_to_try(requested: VddMode, modes: &[VddMode]) -> Vec<VddMode> {
     tries
 }
 
+/// The largest side of a second screen mode: the most H.264 encoders take
+/// (level 6.2 is 8192 wide).
+pub const LARGEST_SIDE: u32 = 8192;
+
+/// Whether a size from outside this host's list (Windows' display settings,
+/// or the saved file) can be a second screen mode: landscape, even sides for
+/// 4:2:0 encoders, no smaller than [`LADDER_FLOOR`] and no side over
+/// [`LARGEST_SIDE`]. No refresh rate is saved with it; the iPad's own is
+/// used.
+pub fn usable_size((width, height): (u32, u32)) -> bool {
+    width % 2 == 0
+        && height % 2 == 0
+        && width >= height
+        && width >= LADDER_FLOOR.0
+        && height >= LADDER_FLOOR.1
+        && width <= LARGEST_SIDE
+}
+
 /// In the app data folder: the second screen's size chosen for each iPad.
 pub const RESOLUTION_RECORD: &str = "vdd-resolutions.json";
 
@@ -225,12 +243,17 @@ pub struct Size {
 pub struct ResolutionChoices(std::collections::BTreeMap<u64, Size>);
 
 impl ResolutionChoices {
-    /// None chosen when the file is missing or unreadable.
+    /// None chosen when the file is missing or unreadable; an entry with a
+    /// size that can't be a mode ([`usable_size`]) is dropped, the rest kept.
     pub fn load(path: &Path) -> Self {
-        std::fs::read_to_string(path)
+        let mut choices: Self = std::fs::read_to_string(path)
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        choices
+            .0
+            .retain(|_, size| usable_size((size.width, size.height)));
+        choices
     }
 
     pub fn save(&self, path: &Path) -> io::Result<()> {
@@ -296,8 +319,8 @@ impl ResolutionChoices {
     /// was set to `size` in Windows' display settings: kept even when this
     /// host's list lacks it. Its own size forgets the choice.
     pub fn set_in_windows(&mut self, device: u64, modes: &[VddMode], size: (u32, u32)) -> bool {
-        let usable = (640..=16384).contains(&size.0) && (480..=16384).contains(&size.1);
         let offered = sizes(modes);
+        let usable = usable_size(size) || offered.first() == Some(&size);
         if device == 0 || !usable || offered.is_empty() || self.chosen(device) == Some(size) {
             return false;
         }
@@ -1877,6 +1900,49 @@ mod tests {
         assert!(!choices.set_in_windows(0, &mini, (1700, 1116)));
         assert!(!choices.set_in_windows(7, &[], (1700, 1116)));
         assert_eq!(choices, ResolutionChoices::default());
+    }
+
+    /// Review r6: a size from Windows' display settings or the saved file
+    /// becomes a mode only if an encoder can take it: even sides, landscape,
+    /// 800x600 to 8192 wide. An unreadable file still means none chosen.
+    #[test]
+    fn only_usable_sizes_are_kept_from_windows_or_the_file() {
+        for size in [(800, 600), (1366, 768), (2266, 1488), (8192, 4320)] {
+            assert!(usable_size(size), "{size:?}");
+        }
+        for size in [
+            (915, 601),
+            (916, 601),
+            (0, 0),
+            (798, 600),
+            (800, 598),
+            (8194, 4320),
+            (1488, 2266),
+        ] {
+            assert!(!usable_size(size), "{size:?}");
+        }
+        let mini = modes_for_client(1488, 2266, 60);
+        let mut choices = ResolutionChoices::default();
+        assert!(!choices.set_in_windows(7, &mini, (915, 601)));
+        assert!(!choices.set_in_windows(7, &mini, (9000, 5000)));
+        assert_eq!(choices, ResolutionChoices::default());
+
+        let dir = temp_dir("vdd-resolutions-usable-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(RESOLUTION_RECORD);
+        std::fs::write(
+            &path,
+            r#"{"7":{"width":0,"height":0,"windows":true},"8":{"width":1366,"height":768,"windows":true},"9":{"width":915,"height":601,"windows":true}}"#,
+        )
+        .unwrap();
+        let loaded = ResolutionChoices::load(&path);
+        assert_eq!(loaded.chosen(7), None, "0x0 dropped");
+        assert_eq!(loaded.chosen(9), None, "odd dropped");
+        assert_eq!(loaded.chosen(8), Some((1366, 768)), "the good one kept");
+        assert_eq!(loaded.modes_for(7, &mini), mini, "nothing advertised");
+        std::fs::write(&path, "{\"7\":").unwrap();
+        assert_eq!(ResolutionChoices::load(&path), ResolutionChoices::default());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The file the driver reads for a connected iPad: every offered mode,

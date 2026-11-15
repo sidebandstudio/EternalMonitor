@@ -847,12 +847,14 @@ pub fn click_vdd_resolution(shared: &SharedControl, clicked: (u32, u32)) {
                 info.screen_px.1,
                 info.refresh_hz,
             );
-            // The newest choice: a pick still waiting is not set after it.
-            shared.vdd_mode_changes.supersede();
-            let mut memory = shared.vdd_resolutions.lock();
-            if memory.choices.set_in_windows(info.device_id, &modes, size) {
-                log_choice(&memory, size, "app");
+            {
+                let mut memory = shared.vdd_resolutions.lock();
+                if memory.choices.set_in_windows(info.device_id, &modes, size) {
+                    log_choice(&memory, size, "app");
+                }
             }
+            // The display is at it already: this sets nothing.
+            request_reconcile(shared);
         }
     }
 }
@@ -861,7 +863,8 @@ pub fn click_vdd_resolution(shared: &SharedControl, clicked: (u32, u32)) {
 #[cfg(any(windows, test, debug_assertions))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reuse {
-    /// Capture it as it is: the same iPad, or modes this host didn't write.
+    /// Capture it as it is: the iPad it was last settled for, with the same
+    /// modes (refresh rates included), or modes this host didn't write.
     Keep,
     /// Another iPad with the same modes: set its mode, then capture it.
     Settle(Option<crate::vdd_settings::VddMode>),
@@ -870,32 +873,57 @@ pub(crate) enum Reuse {
     Restart,
 }
 
+/// The second screen was settled for the connected iPad, on the modes
+/// written for the driver: a reuse keeps it only for that iPad.
+#[cfg(any(windows, test, debug_assertions))]
+pub(crate) fn note_settled_for(shared: &SharedControl) {
+    let Some(device) = shared
+        .session
+        .lock()
+        .client_info()
+        .map(|info| info.device_id)
+    else {
+        return;
+    };
+    if let Some(prepared) = shared.vdd_prepared.lock().as_mut() {
+        prepared.device = device;
+    }
+}
+
 #[cfg(any(windows, test, debug_assertions))]
 pub(crate) fn reuse_vdd(shared: &SharedControl) -> Reuse {
     let Some(prepared) = shared.vdd_prepared.lock().clone() else {
         return Reuse::Keep;
     };
     match connected_vdd_modes(shared) {
-        Some((device, _)) if device == prepared.device => Reuse::Keep,
         Some((_, modes)) if modes != prepared.modes => Reuse::Restart,
+        Some((device, _)) if device == prepared.device => Reuse::Keep,
         Some(_) => Reuse::Settle(wanted_vdd_mode(shared)),
         None => Reuse::Keep,
     }
 }
 
-/// Tests: a mode change waiting for the test to run it.
+/// Tests: a reconcile waiting for the test to run it.
 #[cfg(test)]
 type HeldChange = Box<dyn FnOnce() + Send>;
 
-/// Mode changes asked for on a second screen that is on, set one at a time
-/// in the order asked. One that a newer request replaced before its turn is
-/// dropped, so the newest is always set last.
+/// Changes of the second screen's mode outside the settle at attach. There
+/// is one kind, a reconcile: it carries no size and no iPad, only the
+/// display generation it was asked for. When it runs, it does nothing if the
+/// generation changed, the app quits or hands over, or the display isn't the
+/// connected iPad's; otherwise it sets that iPad's saved choice if the
+/// display isn't at it. So the order of requests can't matter, and at most
+/// one needs to wait.
 #[derive(Default)]
 pub struct ModeChanges {
-    /// The newest request, and its size until it has been set.
-    newest: Mutex<(u64, Option<(u32, u32)>)>,
+    /// The second screen's generation: a new one at every attach, release
+    /// and quit.
+    generation: std::sync::atomic::AtomicU64,
+    /// The generation of the reconcile waiting to run, if one is.
+    waiting: Mutex<Option<u64>>,
+    /// One reconcile runs at a time.
     turn: Mutex<()>,
-    /// Tests: requests held for the test to run, in its own order.
+    /// Tests: reconciles held for the test to run.
     #[cfg(test)]
     held: Mutex<Option<Vec<HeldChange>>>,
     /// Tests: the modes set, in order.
@@ -904,74 +932,47 @@ pub struct ModeChanges {
 }
 
 impl ModeChanges {
-    pub fn request(&self, size: (u32, u32)) -> u64 {
-        let mut newest = self.newest.lock();
-        newest.0 += 1;
-        newest.1 = Some(size);
-        newest.0
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    /// A choice with no mode to set: the requests before it are dropped.
-    pub fn supersede(&self) {
-        let mut newest = self.newest.lock();
-        newest.0 += 1;
-        newest.1 = None;
-    }
-
-    /// Set `request` with `set`, after the requests before it, unless a
-    /// newer one came first: then None.
-    pub fn apply(&self, request: u64, set: impl FnOnce() -> bool) -> Option<bool> {
-        let _turn = self.turn.lock();
-        if self.newest.lock().0 != request {
-            return None;
-        }
-        let done = set();
-        let mut newest = self.newest.lock();
-        if newest.0 == request {
-            newest.1 = None;
-        }
-        Some(done)
-    }
-
-    /// Whether the second screen's change to `size` may be kept as the
-    /// iPad's choice: not while a newer request for another size waits.
-    pub fn settled(&self, size: (u32, u32)) -> bool {
-        self.newest.lock().1.is_none_or(|waiting| waiting == size)
+    /// The second screen attached, was released, or the app quits: a
+    /// reconcile asked for before does nothing.
+    pub fn new_generation(&self) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
-/// Set `mode` on the second screen `display`, off the calling thread, after
-/// the changes asked for before it (see [`ModeChanges`]). It restarts the
-/// quiet time in which a size change is not taken for the user's.
-pub(crate) fn request_vdd_mode(
-    shared: &SharedControl,
-    display: String,
-    mode: crate::vdd_settings::VddMode,
-) {
-    shared.vdd_live.lock().host_set(Instant::now());
+/// Ask for a reconcile of the second screen with the connected iPad's
+/// saved choice, off the calling thread. None is queued while one for the
+/// same display waits: that one reads the choice when it runs.
+pub(crate) fn request_reconcile(shared: &SharedControl) {
     let changes = shared.vdd_mode_changes.clone();
-    let request = changes.request((mode.width, mode.height));
-    #[cfg(test)]
-    let queue = changes.clone();
+    let generation = changes.generation();
+    {
+        let mut waiting = changes.waiting.lock();
+        if *waiting == Some(generation) {
+            return;
+        }
+        *waiting = Some(generation);
+    }
     let shared = shared.clone();
-    let apply = move || {
-        let set = changes.apply(request, || set_vdd_mode_now(&shared, &display, mode));
-        info!(%mode, ?set, "Set the second screen's resolution");
-    };
+    let run = move || reconcile(&shared, generation);
     // Tests, on every platform: held for the test to run, or run now. A
     // thread would leave a test's next step racing the change.
     #[cfg(test)]
     {
-        let apply: HeldChange = Box::new(apply);
-        let apply = match queue.held.lock().as_mut() {
+        let run: HeldChange = Box::new(run);
+        let run = match changes.held.lock().as_mut() {
             Some(held) => {
-                held.push(apply);
+                held.push(run);
                 None
             }
-            None => Some(apply),
+            None => Some(run),
         };
-        if let Some(apply) = apply {
-            apply();
+        if let Some(run) = run {
+            run();
         }
     }
     #[cfg(all(windows, not(test)))]
@@ -979,13 +980,67 @@ pub(crate) fn request_vdd_mode(
         // Windows takes a moment to change a mode.
         let spawned = std::thread::Builder::new()
             .name("second-screen-mode".into())
-            .spawn(apply);
+            .spawn(run);
         if let Err(error) = spawned {
+            changes.waiting.lock().take();
             warn!(%error, "Could not set the second screen's resolution now");
         }
     }
     #[cfg(all(not(windows), not(test)))]
-    apply();
+    run();
+}
+
+/// A reconcile asked for at `generation` (see [`ModeChanges`]).
+fn reconcile(shared: &SharedControl, generation: u64) {
+    let changes = &shared.vdd_mode_changes;
+    let _turn = changes.turn.lock();
+    {
+        // From here a newer request queues its own run, which reads the
+        // choice after this one.
+        let mut waiting = changes.waiting.lock();
+        if *waiting == Some(generation) {
+            *waiting = None;
+        }
+    }
+    if changes.generation() != generation
+        || second_screen::quitting(shared)
+        || shared.handoff.holder().is_some()
+    {
+        return;
+    }
+    let Some(display) = shared.vdd_output.lock().clone() else {
+        return;
+    };
+    let Some((device, modes)) = connected_vdd_modes(shared) else {
+        return;
+    };
+    // The display is the connected iPad's: settled for it, on this host's
+    // modes. Before another iPad's attach decides, it isn't.
+    let settled_for = shared.vdd_prepared.lock().as_ref().map(|p| p.device);
+    let Some(native) = modes
+        .first()
+        .copied()
+        .filter(|_| settled_for == Some(device))
+    else {
+        return;
+    };
+    let saved = shared
+        .vdd_resolutions
+        .lock()
+        .choices
+        .chosen(device)
+        .unwrap_or((native.width, native.height));
+    if shared.vdd_live.lock().size == Some(saved) {
+        return;
+    }
+    let mode = crate::vdd_settings::VddMode {
+        width: saved.0,
+        height: saved.1,
+        refresh_hz: native.refresh_hz,
+    };
+    shared.vdd_live.lock().host_set(Instant::now());
+    let set = set_vdd_mode_now(shared, &display, mode);
+    info!(%mode, set, "Set the second screen's resolution to the iPad's choice");
 }
 
 /// Set `mode` on the second screen `display` now. Tests keep a list.
@@ -1013,7 +1068,7 @@ fn set_vdd_mode_now(
 }
 
 /// The second screen's size chosen in the app for the connected iPad:
-/// remembered for it, and set now when its second screen is on.
+/// saved for it, then the second screen reconciled with it.
 pub fn choose_vdd_resolution(shared: &SharedControl, size: (u32, u32)) {
     let Some((device, modes)) = connected_vdd_modes(shared) else {
         return;
@@ -1024,13 +1079,7 @@ pub fn choose_vdd_resolution(shared: &SharedControl, size: (u32, u32)) {
             log_choice(&memory, size, "app");
         }
     }
-    let display = shared.vdd_output.lock().clone();
-    if let (Some(display), Some(mode)) = (
-        display,
-        crate::vdd_settings::requested_mode(&modes, Some(size)),
-    ) {
-        request_vdd_mode(shared, display, mode);
-    }
+    request_reconcile(shared);
 }
 
 /// How long after the second screen attached, the displays changed, or
@@ -1124,9 +1173,7 @@ fn note_vdd_change(shared: &SharedControl, display: &str, size: (u32, u32), now:
 /// outside this host's list, so its next second screen starts in it.
 #[cfg(any(windows, test))]
 fn note_vdd_mode(shared: &SharedControl, display: &str, size: (u32, u32)) {
-    if shared.vdd_output.lock().as_deref() != Some(display)
-        || shared.vdd_prepared.lock().is_none()
-        || !shared.vdd_mode_changes.settled(size)
+    if shared.vdd_output.lock().as_deref() != Some(display) || shared.vdd_prepared.lock().is_none()
     {
         return;
     }
@@ -2263,7 +2310,17 @@ mod tests {
     }
 
     /// An iPad with the id `device_id` and the panel `(w, h)` connects.
-    pub(super) fn connect_ipad(shared: &SharedControl, device_id: u64, (w, h): (u16, u16)) {
+    pub(super) fn connect_ipad(shared: &SharedControl, device_id: u64, panel: (u16, u16)) {
+        connect_ipad_at(shared, device_id, panel, 60);
+    }
+
+    /// [`connect_ipad`] with the panel's refresh rate.
+    pub(super) fn connect_ipad_at(
+        shared: &SharedControl,
+        device_id: u64,
+        (w, h): (u16, u16),
+        refresh_hz: u8,
+    ) {
         use crate::transport::link::PeerId;
         use crate::transport::session::ConfigSource;
         use eternal_wire::v2::control::{ControlMessage, Hello2, StreamConfig, CAP_DECODE_H264};
@@ -2295,7 +2352,7 @@ mod tests {
             screen_px_h: h,
             screen_pt_w: w / 2,
             screen_pt_h: h / 2,
-            refresh_hz: 60,
+            refresh_hz,
             device_name: "viewer".into(),
             device_id,
             preferred_fps: 0,
@@ -2324,103 +2381,17 @@ mod tests {
         }
     }
 
-    /// Review r1: changes asked for quickly in turn are set one at a time,
-    /// and one replaced before its turn is dropped, so the newest is set
-    /// last whichever thread runs first.
+    /// Review r1, r6: a size set in Windows' display settings is kept, also
+    /// outside the list, when a mode can be made of it.
     #[test]
-    fn second_screen_mode_changes_are_set_in_order_newest_last() {
-        use std::sync::mpsc;
-        let changes = Arc::new(super::ModeChanges::default());
-        let set = Arc::new(Mutex::new(Vec::new()));
-        let setter = |size: (u32, u32)| {
-            let set = set.clone();
-            move || {
-                set.lock().push(size);
-                true
-            }
-        };
-        // The second request's thread runs before the first's.
-        let first = changes.request((1510, 992));
-        let second = changes.request((2266, 1488));
-        assert_eq!(changes.apply(second, setter((2266, 1488))), Some(true));
-        assert_eq!(changes.apply(first, setter((1510, 992))), None);
-        assert_eq!(*set.lock(), [(2266, 1488)]);
-
-        // The first is being set when two more are asked for.
-        set.lock().clear();
-        let (started, setting) = mpsc::channel();
-        let (finish, finished) = mpsc::channel::<()>();
-        let first = changes.request((1510, 992));
-        let worker = {
-            let (changes, set) = (changes.clone(), set.clone());
-            std::thread::spawn(move || {
-                changes.apply(first, || {
-                    started.send(()).unwrap();
-                    finished.recv().unwrap();
-                    set.lock().push((1510, 992));
-                    true
-                })
-            })
-        };
-        setting.recv().unwrap();
-        let second = changes.request((1700, 1116));
-        let third = changes.request((2266, 1488));
-        // The display reaching the first size now is not the choice.
-        assert!(!changes.settled((1510, 992)));
-        let later: Vec<_> = [(second, (1700, 1116)), (third, (2266, 1488))]
-            .into_iter()
-            .map(|(request, size)| {
-                let (changes, set) = (changes.clone(), set.clone());
-                std::thread::spawn(move || {
-                    changes.apply(request, || {
-                        set.lock().push(size);
-                        true
-                    })
-                })
-            })
-            .collect();
-        finish.send(()).unwrap();
-        assert_eq!(worker.join().unwrap(), Some(true));
-        let results: Vec<_> = later.into_iter().map(|t| t.join().unwrap()).collect();
-        assert_eq!(results, [None, Some(true)]);
-        assert_eq!(*set.lock(), [(1510, 992), (2266, 1488)]);
-        assert!(changes.settled((2266, 1488)) && changes.settled((1510, 992)));
-    }
-
-    /// Review r1: the second screen reporting a size that a newer request
-    /// replaced is not taken for a choice; once the newest is set, a size
-    /// set in Windows' display settings is, also outside the list.
-    #[test]
-    fn the_resize_callback_keeps_only_settled_sizes() {
+    fn the_resize_callback_keeps_windows_sizes_it_can_use() {
         let shared = SharedControl::new(0, 1);
         connect_ipad(&shared, 7, (1488, 2266));
         prepare_for_connected(&shared);
         *shared.vdd_output.lock() = Some("virtual".into());
         let chosen = || shared.vdd_resolutions.lock().choices.chosen(7);
 
-        // 1510x992 was chosen in the app, then the panel's own while the
-        // first was being set.
-        let modes = super::connected_vdd_modes(&shared).unwrap().1;
-        let choose = |size: (u32, u32)| {
-            let request = shared.vdd_mode_changes.request(size);
-            assert!(shared
-                .vdd_resolutions
-                .lock()
-                .choices
-                .choose(7, &modes, size));
-            request
-        };
-        let older = choose((1510, 992));
-        let newest = choose((2266, 1488));
-        assert_eq!(chosen(), None);
-        super::note_vdd_mode(&shared, "virtual", (1510, 992));
-        assert_eq!(chosen(), None, "the older size reached the display late");
-        assert_eq!(shared.vdd_mode_changes.apply(older, || true), None);
-        assert_eq!(shared.vdd_mode_changes.apply(newest, || true), Some(true));
-        super::note_vdd_mode(&shared, "virtual", (2266, 1488));
-        assert_eq!(chosen(), None);
-
-        // Windows' display settings, with nothing waiting.
+        // Windows' display settings.
         super::note_vdd_mode(&shared, "virtual", (1700, 1116));
         assert_eq!(chosen(), Some((1700, 1116)));
         super::note_vdd_mode(&shared, "virtual", (800, 600));
@@ -2429,6 +2400,9 @@ mod tests {
             super::connected_vdd_modes(&shared).unwrap().1.last(),
             Some(&at(800, 600))
         );
+        // A size no encoder takes (odd sides): not a choice.
+        super::note_vdd_mode(&shared, "virtual", (915, 601));
+        assert_eq!(chosen(), Some((800, 600)));
         // Another display, or the driver's own modes: not a choice.
         super::note_vdd_mode(&shared, "other", (1510, 992));
         *shared.vdd_prepared.lock() = None;
@@ -2537,8 +2511,9 @@ mod tests {
         assert_eq!((chosen(), set()), (Some((1920, 1080)), vec![]));
     }
 
-    /// Review r5: a click on the size the display is at that the list lacks
-    /// is the newest choice: a pick still waiting to be set is dropped.
+    /// Review r5, r6: a click on the size the display is at that the list
+    /// lacks is the newest choice: the reconcile reads it when it runs, so a
+    /// pick still waiting is never set.
     #[test]
     fn a_keep_click_drops_an_older_waiting_pick() {
         let shared = streaming_second_screen();
@@ -2553,13 +2528,12 @@ mod tests {
         let menu = super::vdd_resolution_menu(&shared).unwrap();
         assert_eq!(menu.click((800, 600)), super::Click::Keep((800, 600)));
         super::click_vdd_resolution(&shared, (800, 600));
-        assert_eq!(run_held(&shared), 1);
+        assert_eq!(run_held(&shared), 1, "one reconcile for both clicks");
         assert_eq!(*shared.vdd_mode_changes.set.lock(), [], "the older pick");
         assert_eq!(
             shared.vdd_resolutions.lock().choices.chosen(7),
             Some((800, 600))
         );
-        assert!(shared.vdd_mode_changes.settled((800, 600)));
     }
 
     /// The second screen of iPad 7 (2266x1488) is on, in its own size,
@@ -2573,7 +2547,20 @@ mod tests {
         shared
     }
 
-    fn run_held(shared: &SharedControl) -> usize {
+    /// Run the first reconcile held, leaving the rest.
+    pub(super) fn run_first_held(shared: &SharedControl) {
+        let first = shared
+            .vdd_mode_changes
+            .held
+            .lock()
+            .as_mut()
+            .filter(|held| !held.is_empty())
+            .map(|held| held.remove(0))
+            .expect("a held reconcile");
+        first();
+    }
+
+    pub(super) fn run_held(shared: &SharedControl) -> usize {
         let held = shared
             .vdd_mode_changes
             .held
@@ -2640,11 +2627,12 @@ mod tests {
         super::click_vdd_resolution(&shared, (2266, 1488));
         assert_eq!(
             (chosen(&shared), set(&shared)),
-            (None, vec![at(2266, 1488)])
+            (None, vec![]),
+            "at it already"
         );
         super::click_vdd_resolution(&shared, (914, 600));
         assert_eq!(chosen(&shared), Some((914, 600)));
-        assert_eq!(set(&shared), [at(2266, 1488), at(914, 600)]);
+        assert_eq!(set(&shared), [at(914, 600)]);
 
         // A size kept from Windows' display settings is in the list: with
         // the display elsewhere, clicking it sets it.
