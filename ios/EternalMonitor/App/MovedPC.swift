@@ -65,15 +65,21 @@ enum MovedPC {
     }
 
     /// How the iPad reaches an address: the interface it sends from, whether
-    /// the path is Wi-Fi or wired Ethernet and nothing else, that
-    /// interface's IPv4 address and netmask, and the path's kind for the
-    /// support log: `wifi`, `wired`, `cellular` or `other` (a tunnel too).
+    /// the path is Wi-Fi or wired Ethernet and nothing else, and that
+    /// interface's IPv4 address and netmask.
     struct Route: Equatable {
         var interface: String
         var direct: Bool
         var address: String
         var netmask: String
-        var kind = "other"
+    }
+
+    /// The path to an address for the support log: its kind (`wifi`,
+    /// `wired`, `cellular`, or `other`, a tunnel too), known even when the
+    /// path has no IPv4 address or netmask, and the route when it has both.
+    struct Path: Equatable {
+        var kind: String
+        var route: Route?
     }
 
     /// Interfaces that are tunnels, whatever the path calls them.
@@ -109,8 +115,15 @@ enum MovedPC {
     }
 
     /// How this iPad reaches `host:port` now, from a UDP path to it that
-    /// sends nothing; nil if no path is ready within 2 s.
+    /// sends nothing; nil if no path is ready within 2 s, or it has no IPv4
+    /// address with a netmask.
     static func route(to host: String, port: UInt16) async -> Route? {
+        await path(to: host, port: port)?.route
+    }
+
+    /// The path to `host:port` now, as `route(to:port:)` finds it; nil if
+    /// no path is ready within 2 s.
+    static func path(to host: String, port: UInt16) async -> Path? {
         guard let remotePort = NWEndpoint.Port(rawValue: port) else { return nil }
         let connection = NWConnection(to: .hostPort(host: NWEndpoint.Host(host), port: remotePort), using: .udp)
         let queue = DispatchQueue(label: "com.eternal.moved-pc.route")
@@ -132,19 +145,30 @@ enum MovedPC {
             queue.asyncAfter(deadline: .now() + 2) { finish(nil) }
             connection.start(queue: queue)
         }
-        guard let path, case .hostPort(.ipv4(let local), _)? = path.localEndpoint,
-              var interface = path.availableInterfaces.first?.name else { return nil }
+        guard let path else { return nil }
+        var interface = path.availableInterfaces.first?.name
         var direct = (path.usesInterfaceType(.wifi) || path.usesInterfaceType(.wiredEthernet))
             && !path.usesInterfaceType(.other) && !path.usesInterfaceType(.cellular)
-        if path.usesInterfaceType(.loopback), let stand = E2E.loopbackRouteInterface {
+        if interface != nil, path.usesInterfaceType(.loopback), let stand = E2E.loopbackRouteInterface {
             interface = stand
             direct = true
         }
         let kind = path.usesInterfaceType(.other) ? "other" : path.usesInterfaceType(.wifi) ? "wifi"
             : path.usesInterfaceType(.wiredEthernet) ? "wired" : path.usesInterfaceType(.cellular) ? "cellular" : "other"
-        let address = local.rawValue.map { String($0) }.joined(separator: ".")
-        guard let netmask = netmask(interface: interface, address: address) else { return nil }
-        return Route(interface: interface, direct: direct, address: address, netmask: netmask, kind: kind)
+        var local: String?
+        if case .hostPort(.ipv4(let address), _)? = path.localEndpoint {
+            local = address.rawValue.map { String($0) }.joined(separator: ".")
+        }
+        return Self.path(kind: kind, interface: interface, direct: direct, localIPv4: local,
+                         netmask: { netmask(interface: $0, address: $1) })
+    }
+
+    /// A path of `kind`, with its route when it has an interface, an IPv4
+    /// address (`localIPv4`) and that address's netmask on the interface.
+    static func path(kind: String, interface: String?, direct: Bool, localIPv4: String?,
+                     netmask: (String, String) -> String?) -> Path {
+        guard let interface, let localIPv4, let mask = netmask(interface, localIPv4) else { return Path(kind: kind, route: nil) }
+        return Path(kind: kind, route: Route(interface: interface, direct: direct, address: localIPv4, netmask: mask))
     }
 
     /// The netmask of `address` on `interface`, from the interface list.

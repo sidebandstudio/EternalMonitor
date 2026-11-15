@@ -110,11 +110,11 @@ final class PCReturnTests: XCTestCase {
 
     // MARK: - What the support log records at a no-reply
 
-    private static let wifi = MovedPC.Route(interface: "en0", direct: true, address: "192.0.2.23",
-                                            netmask: "255.255.255.0", kind: "wifi")
+    private static let wifi = MovedPC.Path(kind: "wifi",
+        route: MovedPC.Route(interface: "en0", direct: true, address: "192.0.2.23", netmask: "255.255.255.0"))
 
-    private func facts(_ watch: PCReturn?, host: String = "192.0.2.20", route: MovedPC.Route? = PCReturnTests.wifi) -> String {
-        NoReplyFacts.line(when: "timeout", watch: watch, host: host, port: 9876, route: route)
+    private func facts(_ watch: PCReturn?, host: String = "192.0.2.20", path: MovedPC.Path? = PCReturnTests.wifi) -> String {
+        NoReplyFacts.line(when: "timeout", watch: watch, host: host, port: 9876, path: path)
     }
 
     func testTheFactsSayWhetherAndWhereThePCWasListed() {
@@ -155,15 +155,17 @@ final class PCReturnTests: XCTestCase {
         _ = watch.heard([])
         XCTAssertEqual(facts(watch, host: "198.51.100.20"),
                        "no_reply_facts when=timeout listed=no listed_at_tried=- same_subnet=no path=wifi")
-        let wired = MovedPC.Route(interface: "en1", direct: true, address: "198.51.100.5", netmask: "255.255.255.0", kind: "wired")
-        XCTAssertEqual(facts(watch, host: "198.51.100.20", route: wired),
+        let wired = MovedPC.Path(kind: "wired",
+            route: MovedPC.Route(interface: "en1", direct: true, address: "198.51.100.5", netmask: "255.255.255.0"))
+        XCTAssertEqual(facts(watch, host: "198.51.100.20", path: wired),
                        "no_reply_facts when=timeout listed=no listed_at_tried=- same_subnet=yes path=wired")
-        let cellular = MovedPC.Route(interface: "pdp_ip0", direct: false, address: "198.51.100.5",
-                                     netmask: "255.255.255.0", kind: "cellular")
-        XCTAssertEqual(facts(watch, host: "198.51.100.20", route: cellular),
+        let cellular = MovedPC.Path(kind: "cellular",
+            route: MovedPC.Route(interface: "pdp_ip0", direct: false, address: "198.51.100.5",
+                                     netmask: "255.255.255.0"))
+        XCTAssertEqual(facts(watch, host: "198.51.100.20", path: cellular),
                        "no_reply_facts when=timeout listed=no listed_at_tried=- same_subnet=unknown path=cellular")
         // No path within the wait, or a name instead of an address.
-        XCTAssertEqual(facts(watch, host: "198.51.100.20", route: nil),
+        XCTAssertEqual(facts(watch, host: "198.51.100.20", path: nil),
                        "no_reply_facts when=timeout listed=no listed_at_tried=- same_subnet=unknown path=unknown")
         XCTAssertEqual(facts(nil, host: "test-pc.local"),
                        "no_reply_facts when=timeout listed=unknown listed_at_tried=- same_subnet=unknown path=wifi")
@@ -173,17 +175,40 @@ final class PCReturnTests: XCTestCase {
     /// a VPN's tunnel says nothing about the Wi-Fi network, even with the
     /// address tried inside the Wi-Fi subnet.
     func testTheFactsKnowTheSubnetOnlyOverADirectPath() {
-        let tunnel = MovedPC.Route(interface: "utun4", direct: false, address: "10.8.0.6", netmask: "255.255.255.0", kind: "other")
-        XCTAssertEqual(facts(nil, route: tunnel),
+        let tunnel = MovedPC.Path(kind: "other",
+            route: MovedPC.Route(interface: "utun4", direct: false, address: "10.8.0.6", netmask: "255.255.255.0"))
+        XCTAssertEqual(facts(nil, path: tunnel),
                        "no_reply_facts when=timeout listed=unknown listed_at_tried=- same_subnet=unknown path=other")
-        let namedDirect = MovedPC.Route(interface: "utun4", direct: true, address: "10.8.0.6", netmask: "255.255.255.0", kind: "wifi")
-        XCTAssertEqual(facts(nil, route: namedDirect),
+        let namedDirect = MovedPC.Path(kind: "wifi",
+            route: MovedPC.Route(interface: "utun4", direct: true, address: "10.8.0.6", netmask: "255.255.255.0"))
+        XCTAssertEqual(facts(nil, path: namedDirect),
                        "no_reply_facts when=timeout listed=unknown listed_at_tried=- same_subnet=unknown path=wifi")
         for mask in ["255.255.255.255", "0.0.0.0", "not-a-mask"] {
-            let route = MovedPC.Route(interface: "en0", direct: true, address: "198.51.100.5", netmask: mask, kind: "wifi")
-            XCTAssertEqual(facts(nil, route: route),
+            let route = MovedPC.Path(kind: "wifi",
+                route: MovedPC.Route(interface: "en0", direct: true, address: "198.51.100.5", netmask: mask))
+            XCTAssertEqual(facts(nil, path: route),
                            "no_reply_facts when=timeout listed=unknown listed_at_tried=- same_subnet=unknown path=wifi", mask)
         }
+    }
+
+    /// A Wi-Fi path with no IPv4 address (an IPv6-only network, reached
+    /// by name) or no netmask for it still logs its kind; only the subnet
+    /// isn't known. The route stays nil for the other callers.
+    func testThePathKeepsItsKindWithoutAnIPv4Subnet() {
+        let mask: (String, String) -> String? = { _, _ in "255.255.255.0" }
+        let ipv6 = MovedPC.path(kind: "wifi", interface: "en0", direct: true, localIPv4: nil, netmask: mask)
+        XCTAssertEqual(ipv6, MovedPC.Path(kind: "wifi", route: nil))
+        XCTAssertEqual(facts(nil, host: "test-pc.local", path: ipv6),
+                       "no_reply_facts when=timeout listed=unknown listed_at_tried=- same_subnet=unknown path=wifi")
+        let noMask = MovedPC.path(kind: "wired", interface: "en1", direct: true, localIPv4: "192.0.2.23", netmask: { _, _ in nil })
+        XCTAssertEqual(noMask, MovedPC.Path(kind: "wired", route: nil))
+        XCTAssertEqual(facts(nil, path: noMask),
+                       "no_reply_facts when=timeout listed=unknown listed_at_tried=- same_subnet=unknown path=wired")
+        let noInterface = MovedPC.path(kind: "wifi", interface: nil, direct: true, localIPv4: "192.0.2.23", netmask: mask)
+        XCTAssertEqual(noInterface, MovedPC.Path(kind: "wifi", route: nil))
+        XCTAssertEqual(MovedPC.path(kind: "wifi", interface: "en0", direct: true, localIPv4: "192.0.2.23", netmask: mask),
+                       MovedPC.Path(kind: "wifi", route: MovedPC.Route(interface: "en0", direct: true, address: "192.0.2.23",
+                                                                       netmask: "255.255.255.0")))
     }
 
     /// The PC's service listed with no IPv4 address (only IPv6, or still
@@ -279,9 +304,9 @@ final class PCReturnTests: XCTestCase {
                                                       pcReturnProbeSeconds: 0.5),
                                         pairingStore: pairings)
         manager.homeAddress = { _ in true }
-        manager.localRoute = { _, _ in
-            MovedPC.Route(interface: "en0", direct: true, address: "127.0.0.1", netmask: "255.0.0.0", kind: "wifi")
-        }
+        let route = MovedPC.Route(interface: "en0", direct: true, address: "127.0.0.1", netmask: "255.0.0.0")
+        manager.localRoute = { _, _ in route }
+        manager.logPath = { _, _ in MovedPC.Path(kind: "wifi", route: route) }
         manager.findPCs = { _ in [] }
         let browser = FakePCBrowser()
         manager.makePCBrowser = { browser }
@@ -553,15 +578,16 @@ final class PCReturnTests: XCTestCase {
     }
 
     /// Bonjour couldn't search (Local Network off): whether the PC is
-    /// listed isn't known. The route there is asked for the address tried.
+    /// listed isn't known. The path there is asked for the address tried.
     func testTheNoReplyRecordsAFailedSearchAsUnknown() async throws {
         let setup = try paired()
         defer { setup.manager.cancel() }
         final class Asked { var hosts: [String] = [] }
         let asked = Asked()
-        setup.manager.localRoute = { host, _ in
+        setup.manager.logPath = { host, _ in
             asked.hosts.append(host)
-            return MovedPC.Route(interface: "en0", direct: true, address: "192.0.2.23", netmask: "255.255.255.0", kind: "wifi")
+            return MovedPC.Path(kind: "wifi", route: MovedPC.Route(interface: "en0", direct: true, address: "192.0.2.23",
+                                                                   netmask: "255.255.255.0"))
         }
         setup.manager.connect(host: "127.0.0.1", port: setup.host.port)
         setup.browser.fail()

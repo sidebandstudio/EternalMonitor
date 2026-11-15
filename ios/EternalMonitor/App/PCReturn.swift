@@ -176,13 +176,13 @@ struct PCReturn {
 /// same_subnet=yes|no|unknown path=wifi|wired|cellular|other|unknown`.
 /// `same_subnet` is known only over a direct Wi-Fi or Ethernet path.
 enum NoReplyFacts {
-    /// `watch` is the watch for the PC, nil if none ran; `route` is how
+    /// `watch` is the watch for the PC, nil if none ran; `path` is how
     /// this iPad reaches `host:port` now, nil if no path was ready.
-    static func line(when: String, watch: PCReturn?, host: String, port: UInt16, route: MovedPC.Route?) -> String {
+    static func line(when: String, watch: PCReturn?, host: String, port: UInt16, path: MovedPC.Path?) -> String {
         let listed = watch?.listedFact ?? "unknown"
         let atTried = watch?.listedAtFact(host: host, port: port) ?? "-"
-        let subnet = route.flatMap { MovedPC.onSubnet(host, over: $0) }.map { $0 ? "yes" : "no" }
+        let subnet = path?.route.flatMap { MovedPC.onSubnet(host, over: $0) }.map { $0 ? "yes" : "no" }
         return "no_reply_facts when=\(when) listed=\(listed) listed_at_tried=\(atTried) same_subnet=\(subnet ?? "unknown")"
-            + " path=\(route?.kind ?? "unknown")"
+            + " path=\(path?.kind ?? "unknown")"
     }
 }

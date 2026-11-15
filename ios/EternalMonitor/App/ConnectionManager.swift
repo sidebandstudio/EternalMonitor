@@ -306,6 +306,8 @@ final class ConnectionManager: ObservableObject {
     var homeAddress: (String) -> Bool = MovedPC.isHomeAddress
     /// How this iPad reaches an address. Tests replace it.
     var localRoute: (String, UInt16) async -> MovedPC.Route? = { await MovedPC.route(to: $0, port: $1) }
+    /// The same, with the path's kind, for the support log. Tests replace it.
+    var logPath: (String, UInt16) async -> MovedPC.Path? = { await MovedPC.path(to: $0, port: $1) }
     /// Where the iPad sends to reach a PC address it was given. Tests on
     /// loopback point the addresses a fake signs at other fakes.
     var dialAddress: (String, UInt16) -> (host: String, port: UInt16) = { ($0, $1) }
@@ -1861,13 +1863,13 @@ final class ConnectionManager: ObservableObject {
         if watchingForPC { watchingForPC = false }
     }
 
-    /// Logs `NoReplyFacts` for the attempt at `host:port` once the route
+    /// Logs `NoReplyFacts` for the attempt at `host:port` once the path
     /// there is known, within 2 s; nothing waits for it.
     private func recordNoReplyFacts(_ when: String, watch: PCReturn?, host: String, port: UInt16) {
-        let localRoute = localRoute
+        let logPath = logPath
         Task { @MainActor [weak self] in
-            let route = await localRoute(host, port)
-            self?.record(.info, "connection", NoReplyFacts.line(when: when, watch: watch, host: host, port: port, route: route))
+            let path = await logPath(host, port)
+            self?.record(.info, "connection", NoReplyFacts.line(when: when, watch: watch, host: host, port: port, path: path))
         }
     }
 
