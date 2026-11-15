@@ -47,26 +47,22 @@ function Get-Failures([string]$Text) {
         $failures += 'The driver tasks are not set up under VddInstallSucceeded'
     }
 
-    # A failed step fails Setup on Windows 11 only. On Windows 10 it is logged and Setup goes on.
+    # A failed step fails Setup on Windows 11 only (build 22000 and later): it sets the failure
+    # exit code and raises. On Windows 10 it is logged and Setup goes on.
     if ($fail -notmatch '(?s)\nbegin\s*if not IsWindows11 then begin\s*Log\([^;]*\);\s*exit;\s*end;\s*VddInstallFailed := True;\s*RaiseException\(Message\);\s*end;$') {
         $failures += 'FailVddStep does not fail Setup on Windows 11 only'
     }
 
-    # Repair and verify run on every Windows and report failures through FailVddStep.
+    # Repair and verify run their scripts on every Windows, with nothing before them, and hand
+    # every failure to FailVddStep: a script that can't start or exits non-zero (repair: any
+    # code but 0, with its message for 10 and 11).
     $steps = [ordered]@{
-        'procedure RepairVddDriver;' = @('vdd-driver-repair\.ps1', 'FailVddStep\(Message\);')
-        'procedure VerifyVddDriver;' = @('vdd-driver-verify\.ps1', "then\s*FailVddStep\('")
+        'procedure RepairVddDriver;' = '(?s)\nbegin\s*(?:\{[^}]*\}\s*)*if not Exec\([^;]*?vdd-driver-repair\.ps1[^;]*?, ewWaitUntilTerminated, ExitCode\) then\s*ExitCode := -1;\s*if ExitCode = 0 then\s*exit;\s*case ExitCode of\s*10: Message := [^\n]*\n\s*11: Message := [^\n]*\n\s*else\s*Message := [^\n]*\n\s*end;\s*FailVddStep\(Message\);\s*end;$'
+        'procedure VerifyVddDriver;' = '(?s)\nbegin\s*(?:\{[^}]*\}\s*)*if not Exec\([^;]*?vdd-driver-verify\.ps1[^;]*?, ewWaitUntilTerminated, ExitCode\) or \(ExitCode <> 0\) then\s*FailVddStep\(''[^\n]*\);\s*end;$'
     }
     foreach ($routine in $steps.Keys) {
-        $name = $routine.Split(' ')[1].TrimEnd(';')
-        $body = Get-Routine $Text $routine
-        $scriptName, $report = $steps[$routine]
-        $start = [regex]::Match($body, '(?s)\nbegin(?<before>.*?)\bExec\(')
-        if (!$start.Success -or $start.Groups['before'].Value -match '\bexit\s*;' -or $body -notmatch $scriptName) {
-            $failures += "$name does not run its script on every Windows"
-        }
-        if ($body -notmatch $report -or $body -match 'RaiseException|VddInstallFailed') {
-            $failures += "$name does not report its failure through FailVddStep"
+        if ((Get-Routine $Text $routine) -notmatch $steps[$routine]) {
+            $failures += "$($routine.Split(' ')[1].TrimEnd(';')) does not run its script on every Windows and hand each failure to FailVddStep"
         }
     }
     $failures
@@ -92,6 +88,14 @@ $broken = [ordered]@{
     'failure passes Windows 11' = [regex]::Replace($iss, '\r?\n  RaiseException\(Message\);', '')
     'verify fails by itself' = $iss.Replace("FailVddStep('Windows did not finish", "RaiseException('Windows did not finish")
     'repair fails by itself' = $iss.Replace('  FailVddStep(Message);', '  VddInstallFailed := True; RaiseException(Message);')
+    'cutoff off by one' = $iss.Replace('Result := Windows.Build >= FirstWindows11Build;', 'Result := Windows.Build > FirstWindows11Build;')
+    'failure only logged on Windows 11' = $iss.Replace('  if not IsWindows11 then begin', '  if True then begin')
+    'failure logged on Windows 11 and fails Windows 10' = $iss.Replace('  if not IsWindows11 then begin', '  if IsWindows11 then begin')
+    'failure exit code dropped' = [regex]::Replace($iss, '\r?\n  VddInstallFailed := True;', '')
+    'repair accepts failures' = $iss.Replace('  if ExitCode = 0 then', '  if ExitCode <> 0 then')
+    'repair that cannot start accepted' = $iss.Replace('    ExitCode := -1;', '    ExitCode := 0;')
+    'verify accepts failures' = $iss.Replace('or (ExitCode <> 0) then', 'or (ExitCode = 0) then')
+    'verify that cannot start accepted' = [regex]::Replace($iss, '(?s)(procedure VerifyVddDriver;.*?)if not Exec\(', '$1if Exec(')
 }
 foreach ($case in $broken.Keys) {
     if ($broken[$case] -ceq $iss) { throw "The '$case' copy is the real script; update this test" }
