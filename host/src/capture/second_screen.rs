@@ -1842,8 +1842,12 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
                     "Virtual display still attached — setting this iPad's mode and capturing it"
                 );
                 let output = driver.settle(output, wanted);
-                note_attached(shared, output.device_name.clone());
-                follow_choice(shared, driver, &output, wanted);
+                if note_attached_if_selected(shared, output.device_name.clone()) {
+                    follow_choice(shared, driver, &output, wanted);
+                } else if !quitting(shared) {
+                    // Another mode was chosen while the mode was set.
+                    disable(shared, driver);
+                }
                 return;
             }
             Reuse::Restart => {
@@ -4243,6 +4247,26 @@ mod tests {
         *shared.vdd_prepared.lock() = None;
         attach(&shared, &driver, ATTACH_TIMEOUT);
         assert_eq!(driver.calls(), []);
+
+        // Mirror chosen while the other iPad's mode was set: turned off.
+        let shared = second_screen_selected();
+        connect_ipad(&shared, 1, (1488, 2266));
+        prepare_for_connected(&shared);
+        note_attached(&shared, "virtual".into());
+        disconnect(&shared);
+        connect_ipad(&shared, 2, (1488, 2266));
+        let mirror = Once::at(secs(0.5));
+        let on_sleep = |elapsed| {
+            mirror.run(elapsed, || {
+                *shared.capture_target.lock() = CaptureTarget::PrimaryAuto;
+            })
+        };
+        let mut driver = FakeDriver::new(secs(3.0), Some(Duration::ZERO), &on_sleep);
+        driver.on_since.set(Some(Duration::ZERO));
+        driver.settle_takes = secs(2.0);
+        attach(&shared, &driver, ATTACH_TIMEOUT);
+        assert_eq!(driver.calls(), [Call::Settle, Call::Disable]);
+        assert_eq!(*shared.vdd_output.lock(), None);
     }
 
     /// Review r1: a size picked while the second screen comes up, after
