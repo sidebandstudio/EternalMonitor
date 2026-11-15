@@ -444,6 +444,7 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     // The second screen's size, remembered for this iPad, then its own again.
     let resolution = |value: &'static str| kittest::by().role(Role::ComboBox).value(value);
     let record = dir.join("EternalMonitor").join("vdd-resolutions.json");
+    shared.vdd_resolutions.lock().path = Some(record.clone());
     for (open, pick, chosen) in [
         ("2420 × 1668 (native)", "1814 × 1250", Some((1814, 1250))),
         ("1814 × 1250", "2420 × 1668 (native)", None),
@@ -454,7 +455,7 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
         harness.get_by_label(pick).click();
         harness.run_steps(4);
         harness.get(resolution(pick));
-        assert_eq!(shared.vdd_resolutions.lock().chosen(7), chosen);
+        assert_eq!(shared.vdd_resolutions.lock().choices.chosen(7), chosen);
         let saved = eternal_host::vdd_settings::ResolutionChoices::load(&record);
         assert_eq!(saved.chosen(7), chosen);
     }

@@ -583,12 +583,10 @@ const VDD_SETTINGS_PATH: &str = r"C:\VirtualDisplayDriver\vdd_settings.xml";
 const VDD_PIN_RECORD: &str = "vdd-pin.txt";
 
 /// What the host asked the driver for before an enable: the graphics card
-/// (or why none), and the mode the second screen should come up in (none
-/// when the user keeps the driver's modes).
+/// (or why none). The modes it wrote are in `SharedControl::vdd_prepared`.
 #[cfg(windows)]
 struct VddRequest {
     pin: Result<String, &'static str>,
-    mode: Option<crate::vdd_settings::VddMode>,
     /// The adapters' LUIDs before the Enable, to find the driver's own.
     before: Vec<u64>,
     /// The driver's start before the Enable, if it was running, and what
@@ -631,31 +629,22 @@ fn prepare_vdd_settings(shared: &SharedControl, outputs: &[OutputInfo]) -> VddRe
         .ok()
         .and_then(|exe| exe.parent().map(crate::vdd_settings::driver_owned))
         .unwrap_or(false);
-    let mut mode = None;
+    *shared.vdd_prepared.lock() = None;
     let applied = match &record {
         None => Err(std::io::Error::other("no app data folder")),
         Some(record) if crate::settings::SettingsFile::load().vdd_match_resolution => {
-            let client = shared.session.lock().client_info();
-            let modes = client
-                .as_ref()
-                .map_or_else(crate::vdd_settings::default_modes, |info| {
-                    crate::vdd_settings::modes_for_client(
-                        info.screen_px.0,
-                        info.screen_px.1,
-                        info.refresh_hz,
-                    )
-                });
-            let chosen = client
-                .as_ref()
-                .and_then(|info| shared.vdd_resolutions.lock().chosen(info.device_id));
+            let (device, modes) = connected_vdd_modes(shared)
+                .unwrap_or_else(|| (0, crate::vdd_settings::default_modes()));
             let written = crate::vdd_settings::write_with_pin(path, record, owned, &modes, gpu);
             match &written {
                 Ok(_) => {
-                    mode = crate::vdd_settings::requested_mode(&modes, chosen);
+                    *shared.vdd_prepared.lock() = Some(PreparedModes {
+                        device,
+                        modes: modes.clone(),
+                    });
                     info!(
                         ?modes,
-                        chosen = ?chosen.map(|(w, h)| format!("{w}x{h}")),
-                        requested = ?mode,
+                        requested = ?wanted_vdd_mode(shared),
                         "Wrote virtual display mode list for the connected client"
                     );
                 }
@@ -708,7 +697,6 @@ fn prepare_vdd_settings(shared: &SharedControl, outputs: &[OutputInfo]) -> VddRe
     );
     VddRequest {
         pin: crate::vdd_settings::pin_result(wanted, &applied),
-        mode,
         before,
         instance,
         settings,
@@ -741,14 +729,139 @@ pub(crate) fn running_driver_cursor() -> crate::vdd_settings::DriverCursor {
     cursor
 }
 
-/// The connected iPad's id and the second screen modes offered for it.
+/// The mode list written for the second screen before its Enable, and the
+/// iPad it was written for (0 when none was connected or it sent no id).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedModes {
+    pub device: u64,
+    pub modes: Vec<crate::vdd_settings::VddMode>,
+}
+
+/// The connected iPad's id and the second screen modes for it: its panel's,
+/// and a size set for it in Windows' display settings outside them.
 pub fn connected_vdd_modes(
     shared: &SharedControl,
 ) -> Option<(u64, Vec<crate::vdd_settings::VddMode>)> {
     let info = shared.session.lock().client_info()?;
     let modes =
         crate::vdd_settings::modes_for_client(info.screen_px.0, info.screen_px.1, info.refresh_hz);
+    let modes = shared
+        .vdd_resolutions
+        .lock()
+        .choices
+        .modes_for(info.device_id, &modes);
     Some((info.device_id, modes))
+}
+
+/// The mode the second screen should have now: the connected iPad's latest
+/// choice among the modes written for the driver, or the first of them.
+/// None when this host left the modes to the driver.
+#[cfg(any(windows, test, debug_assertions))]
+pub(crate) fn wanted_vdd_mode(shared: &SharedControl) -> Option<crate::vdd_settings::VddMode> {
+    let modes = shared.vdd_prepared.lock().as_ref()?.modes.clone();
+    let device = shared
+        .session
+        .lock()
+        .client_info()
+        .map(|info| info.device_id);
+    let chosen = device.and_then(|device| shared.vdd_resolutions.lock().choices.chosen(device));
+    crate::vdd_settings::requested_mode(&modes, chosen)
+}
+
+/// What a start does with a second screen still on from before.
+#[cfg(any(windows, test, debug_assertions))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Reuse {
+    /// Capture it as it is: the same iPad, or modes this host didn't write.
+    Keep,
+    /// Another iPad with the same modes: set its mode, then capture it.
+    Settle(Option<crate::vdd_settings::VddMode>),
+    /// Another iPad that needs other modes: the driver reads them when it
+    /// starts, so turn it off and on.
+    Restart,
+}
+
+#[cfg(any(windows, test, debug_assertions))]
+pub(crate) fn reuse_vdd(shared: &SharedControl) -> Reuse {
+    let Some(prepared) = shared.vdd_prepared.lock().clone() else {
+        return Reuse::Keep;
+    };
+    match connected_vdd_modes(shared) {
+        Some((device, _)) if device == prepared.device => Reuse::Keep,
+        Some((_, modes)) if modes != prepared.modes => Reuse::Restart,
+        Some(_) => Reuse::Settle(wanted_vdd_mode(shared)),
+        None => Reuse::Keep,
+    }
+}
+
+/// Mode changes asked for on a second screen that is on, set one at a time
+/// in the order asked. One that a newer request replaced before its turn is
+/// dropped, so the newest is always set last.
+#[derive(Default)]
+pub struct ModeChanges {
+    /// The newest request, and its size until it has been set.
+    newest: Mutex<(u64, Option<(u32, u32)>)>,
+    turn: Mutex<()>,
+}
+
+impl ModeChanges {
+    pub fn request(&self, size: (u32, u32)) -> u64 {
+        let mut newest = self.newest.lock();
+        newest.0 += 1;
+        newest.1 = Some(size);
+        newest.0
+    }
+
+    /// Set `request` with `set`, after the requests before it, unless a
+    /// newer one came first: then None.
+    pub fn apply(&self, request: u64, set: impl FnOnce() -> bool) -> Option<bool> {
+        let _turn = self.turn.lock();
+        if self.newest.lock().0 != request {
+            return None;
+        }
+        let done = set();
+        let mut newest = self.newest.lock();
+        if newest.0 == request {
+            newest.1 = None;
+        }
+        Some(done)
+    }
+
+    /// Whether the second screen's change to `size` may be kept as the
+    /// iPad's choice: not while a newer request for another size waits.
+    pub fn settled(&self, size: (u32, u32)) -> bool {
+        self.newest.lock().1.is_none_or(|waiting| waiting == size)
+    }
+}
+
+/// Set `mode` on the second screen `display`, off the calling thread, after
+/// the changes asked for before it (see [`ModeChanges`]).
+pub(crate) fn request_vdd_mode(
+    shared: &SharedControl,
+    display: String,
+    mode: crate::vdd_settings::VddMode,
+) {
+    let changes = shared.vdd_mode_changes.clone();
+    let request = changes.request((mode.width, mode.height));
+    #[cfg(windows)]
+    {
+        // Windows takes a moment to change a mode.
+        let spawned = std::thread::Builder::new()
+            .name("second-screen-mode".into())
+            .spawn(move || {
+                let set = changes.apply(request, || {
+                    crate::vdd_device::set_display_mode(&display, mode)
+                });
+                info!(%mode, ?set, "Set the second screen's resolution");
+            });
+        if let Err(error) = spawned {
+            warn!(%error, "Could not set the second screen's resolution now");
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (display, changes.apply(request, || false));
+    }
 }
 
 /// The second screen's size chosen in the app for the connected iPad:
@@ -757,56 +870,46 @@ pub fn choose_vdd_resolution(shared: &SharedControl, size: (u32, u32)) {
     let Some((device, modes)) = connected_vdd_modes(shared) else {
         return;
     };
-    remember_vdd_resolution(shared, device, &modes, size, "app");
-    #[cfg(windows)]
+    {
+        let mut memory = shared.vdd_resolutions.lock();
+        if memory.choices.choose(device, &modes, size) {
+            log_choice(&memory, size, "app");
+        }
+    }
     let display = shared.vdd_output.lock().clone();
-    #[cfg(windows)]
     if let (Some(display), Some(mode)) = (
         display,
         crate::vdd_settings::requested_mode(&modes, Some(size)),
     ) {
-        // Windows takes a moment to change a mode; not on the window's thread.
-        let spawned = std::thread::Builder::new()
-            .name("second-screen-mode".into())
-            .spawn(move || {
-                let set = crate::vdd_device::set_display_mode(&display, mode);
-                info!(%mode, set, "Set the second screen's resolution chosen in the app");
-            });
-        if let Err(error) = spawned {
-            warn!(%error, "Could not set the second screen's resolution now");
-        }
+        request_vdd_mode(shared, display, mode);
     }
 }
 
 /// The second screen streaming now changed size, in Windows' display
-/// settings or from the app: remember it for the connected iPad, when its
-/// mode list offers it, so its next second screen starts in it.
-#[cfg(windows)]
+/// settings or from the app: remember it for the connected iPad, also
+/// outside this host's list, so its next second screen starts in it.
+#[cfg(any(windows, test))]
 fn note_vdd_mode(shared: &SharedControl, display: &str, size: (u32, u32)) {
     if shared.vdd_output.lock().as_deref() != Some(display)
-        || !crate::settings::SettingsFile::load().vdd_match_resolution
+        || shared.vdd_prepared.lock().is_none()
+        || !shared.vdd_mode_changes.settled(size)
     {
         return;
     }
-    if let Some((device, modes)) = connected_vdd_modes(shared) {
-        remember_vdd_resolution(shared, device, &modes, size, "display");
+    let Some(info) = shared.session.lock().client_info() else {
+        return;
+    };
+    let modes =
+        crate::vdd_settings::modes_for_client(info.screen_px.0, info.screen_px.1, info.refresh_hz);
+    let mut memory = shared.vdd_resolutions.lock();
+    if memory.choices.set_in_windows(info.device_id, &modes, size) {
+        log_choice(&memory, size, "display");
     }
 }
 
-fn remember_vdd_resolution(
-    shared: &SharedControl,
-    device: u64,
-    modes: &[crate::vdd_settings::VddMode],
-    size: (u32, u32),
-    from: &'static str,
-) {
-    let mut choices = shared.vdd_resolutions.lock();
-    if !choices.choose(device, modes, size) {
-        return;
-    }
-    let saved = crate::settings::app_data_dir()
-        .ok_or_else(|| std::io::Error::other("no app data folder"))
-        .and_then(|dir| choices.save(&dir.join(crate::vdd_settings::RESOLUTION_RECORD)));
+/// Save a changed choice and say so.
+fn log_choice(memory: &crate::vdd_settings::ResolutionMemory, size: (u32, u32), from: &str) {
+    let saved = memory.save();
     info!(
         size = %format!("{}x{}", size.0, size.1),
         from,
@@ -835,18 +938,34 @@ fn settle_vdd_mode(
         );
         return chosen;
     };
-    let mut set = crate::vdd_device::set_display_mode(&chosen.device_name, mode);
+    // A saved size the driver no longer offers gives way to the iPad's own.
+    let modes = shared
+        .vdd_prepared
+        .lock()
+        .as_ref()
+        .map_or_else(Vec::new, |prepared| prepared.modes.clone());
+    let tries = crate::vdd_settings::modes_to_try(mode, &modes);
+    let mut set = false;
     let mut fallback = None;
+    for &attempt in &tries {
+        set = (attempt.width, attempt.height) == (chosen.width, chosen.height)
+            || crate::vdd_device::set_display_mode(&chosen.device_name, attempt);
+        if set {
+            fallback = (attempt != mode).then_some(attempt);
+            break;
+        }
+    }
     if !set {
-        // The driver does not offer the iPad's mode: take the sharpest that fits.
+        // The driver offers neither: take the sharpest that fits.
+        let last = *tries.last().expect("the requested mode");
         let offered = crate::vdd_device::offered_modes(&chosen.device_name);
-        if let Some((width, height)) = crate::vdd_settings::best_offered(mode, &offered)
+        if let Some((width, height)) = crate::vdd_settings::best_offered(last, &offered)
             .filter(|&size| size != (chosen.width, chosen.height))
         {
             let size = crate::vdd_settings::VddMode {
                 width,
                 height,
-                ..mode
+                ..last
             };
             set = crate::vdd_device::set_display_mode(&chosen.device_name, size);
             fallback = Some(size);
@@ -1906,6 +2025,11 @@ mod tests {
     }
 
     pub(super) fn connect_viewer(shared: &SharedControl) {
+        connect_ipad(shared, 0, (2420, 1668));
+    }
+
+    /// An iPad with the id `device_id` and the panel `(w, h)` connects.
+    pub(super) fn connect_ipad(shared: &SharedControl, device_id: u64, (w, h): (u16, u16)) {
         use crate::transport::link::PeerId;
         use crate::transport::session::ConfigSource;
         use eternal_wire::v2::control::{ControlMessage, Hello2, StreamConfig, CAP_DECODE_H264};
@@ -1933,13 +2057,13 @@ mod tests {
             listen_port: 50000,
             decoder_caps: CAP_DECODE_H264,
             feature_caps: 0,
-            screen_px_w: 2420,
-            screen_px_h: 1668,
-            screen_pt_w: 1210,
-            screen_pt_h: 834,
+            screen_px_w: w,
+            screen_px_h: h,
+            screen_pt_w: w / 2,
+            screen_pt_h: h / 2,
             refresh_hz: 60,
             device_name: "viewer".into(),
-            device_id: 0,
+            device_id,
             preferred_fps: 0,
             auth_token: [0; 16],
             pairing_code: 0,
@@ -1950,6 +2074,145 @@ mod tests {
             .lock()
             .handle_control(peer, 0, hello, &Config, Instant::now());
         assert!(shared.client_connected());
+    }
+
+    /// What `prepare_vdd_settings` writes for the connected iPad.
+    pub(super) fn prepare_for_connected(shared: &SharedControl) {
+        let (device, modes) = super::connected_vdd_modes(shared).expect("an iPad");
+        *shared.vdd_prepared.lock() = Some(super::PreparedModes { device, modes });
+    }
+
+    fn at(width: u32, height: u32) -> crate::vdd_settings::VddMode {
+        crate::vdd_settings::VddMode {
+            width,
+            height,
+            refresh_hz: 60,
+        }
+    }
+
+    /// Review r1: changes asked for quickly in turn are set one at a time,
+    /// and one replaced before its turn is dropped, so the newest is set
+    /// last whichever thread runs first.
+    #[test]
+    fn second_screen_mode_changes_are_set_in_order_newest_last() {
+        use std::sync::mpsc;
+        let changes = Arc::new(super::ModeChanges::default());
+        let set = Arc::new(Mutex::new(Vec::new()));
+        let setter = |size: (u32, u32)| {
+            let set = set.clone();
+            move || {
+                set.lock().push(size);
+                true
+            }
+        };
+        // The second request's thread runs before the first's.
+        let first = changes.request((1510, 992));
+        let second = changes.request((2266, 1488));
+        assert_eq!(changes.apply(second, setter((2266, 1488))), Some(true));
+        assert_eq!(changes.apply(first, setter((1510, 992))), None);
+        assert_eq!(*set.lock(), [(2266, 1488)]);
+
+        // The first is being set when two more are asked for.
+        set.lock().clear();
+        let (started, setting) = mpsc::channel();
+        let (finish, finished) = mpsc::channel::<()>();
+        let first = changes.request((1510, 992));
+        let worker = {
+            let (changes, set) = (changes.clone(), set.clone());
+            std::thread::spawn(move || {
+                changes.apply(first, || {
+                    started.send(()).unwrap();
+                    finished.recv().unwrap();
+                    set.lock().push((1510, 992));
+                    true
+                })
+            })
+        };
+        setting.recv().unwrap();
+        let second = changes.request((1700, 1116));
+        let third = changes.request((2266, 1488));
+        // The display reaching the first size now is not the choice.
+        assert!(!changes.settled((1510, 992)));
+        let later: Vec<_> = [(second, (1700, 1116)), (third, (2266, 1488))]
+            .into_iter()
+            .map(|(request, size)| {
+                let (changes, set) = (changes.clone(), set.clone());
+                std::thread::spawn(move || {
+                    changes.apply(request, || {
+                        set.lock().push(size);
+                        true
+                    })
+                })
+            })
+            .collect();
+        finish.send(()).unwrap();
+        assert_eq!(worker.join().unwrap(), Some(true));
+        let results: Vec<_> = later.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(results, [None, Some(true)]);
+        assert_eq!(*set.lock(), [(1510, 992), (2266, 1488)]);
+        assert!(changes.settled((2266, 1488)) && changes.settled((1510, 992)));
+    }
+
+    /// Review r1: the second screen reporting a size that a newer request
+    /// replaced is not taken for a choice; once the newest is set, a size
+    /// set in Windows' display settings is, also outside the list.
+    #[test]
+    fn the_resize_callback_keeps_only_settled_sizes() {
+        let shared = SharedControl::new(0, 1);
+        connect_ipad(&shared, 7, (1488, 2266));
+        prepare_for_connected(&shared);
+        *shared.vdd_output.lock() = Some("virtual".into());
+        let chosen = || shared.vdd_resolutions.lock().choices.chosen(7);
+
+        // 1510x992 was chosen in the app, then the panel's own while the
+        // first was being set.
+        let modes = super::connected_vdd_modes(&shared).unwrap().1;
+        let choose = |size| {
+            let request = shared.vdd_mode_changes.request(size);
+            assert!(shared
+                .vdd_resolutions
+                .lock()
+                .choices
+                .choose(7, &modes, size));
+            request
+        };
+        let older = choose((1510, 992));
+        let newest = choose((2266, 1488));
+        assert_eq!(chosen(), None);
+        super::note_vdd_mode(&shared, "virtual", (1510, 992));
+        assert_eq!(chosen(), None, "the older size reached the display late");
+        assert_eq!(shared.vdd_mode_changes.apply(older, || true), None);
+        assert_eq!(shared.vdd_mode_changes.apply(newest, || true), Some(true));
+        super::note_vdd_mode(&shared, "virtual", (2266, 1488));
+        assert_eq!(chosen(), None);
+
+        // Windows' display settings, with nothing waiting.
+        super::note_vdd_mode(&shared, "virtual", (1700, 1116));
+        assert_eq!(chosen(), Some((1700, 1116)));
+        super::note_vdd_mode(&shared, "virtual", (800, 600));
+        assert_eq!(chosen(), Some((800, 600)), "kept outside the list");
+        assert_eq!(
+            super::connected_vdd_modes(&shared).unwrap().1.last(),
+            Some(&at(800, 600))
+        );
+        // Another display, or the driver's own modes: not a choice.
+        super::note_vdd_mode(&shared, "other", (1510, 992));
+        *shared.vdd_prepared.lock() = None;
+        super::note_vdd_mode(&shared, "virtual", (1510, 992));
+        assert_eq!(chosen(), Some((800, 600)));
+    }
+
+    /// Review r1: the mode to settle a starting second screen on is read
+    /// when it attached, so a size picked meanwhile counts.
+    #[test]
+    fn the_wanted_mode_is_the_latest_choice() {
+        let shared = SharedControl::new(0, 1);
+        connect_ipad(&shared, 7, (1488, 2266));
+        assert_eq!(super::wanted_vdd_mode(&shared), None, "nothing written");
+        prepare_for_connected(&shared);
+        assert_eq!(super::wanted_vdd_mode(&shared), Some(at(2266, 1488)));
+        super::choose_vdd_resolution(&shared, (914, 600));
+        assert_eq!(super::wanted_vdd_mode(&shared), Some(at(914, 600)));
     }
 
     #[test]

@@ -351,7 +351,7 @@ impl AnalyzerApp {
             .as_ref()
             .map_or_else(Vec::new, |(_, modes)| crate::vdd_settings::sizes(modes));
         let current = connected.as_ref().and_then(|(device, modes)| {
-            let chosen = shared.vdd_resolutions.lock().chosen(*device);
+            let chosen = shared.vdd_resolutions.lock().choices.chosen(*device);
             crate::vdd_settings::requested_mode(modes, chosen).map(|m| (m.width, m.height))
         });
         let selected_text = current.map_or_else(
