@@ -346,14 +346,10 @@ impl AnalyzerApp {
     /// one at the same shape, or a common one in another shape.
     fn resolution_row(&mut self, ui: &mut Ui, matching: bool) {
         let shared = &self.control.shared;
-        let connected = crate::capture::connected_vdd_modes(shared);
-        let sizes = connected
-            .as_ref()
-            .map_or_else(Vec::new, |(_, modes)| crate::vdd_settings::sizes(modes));
-        let current = connected.as_ref().and_then(|(device, modes)| {
-            let chosen = shared.vdd_resolutions.lock().choices.chosen(*device);
-            crate::vdd_settings::requested_mode(modes, chosen).map(|m| (m.width, m.height))
-        });
+        let menu = crate::capture::vdd_resolution_menu(shared);
+        let connected = menu.is_some();
+        let (sizes, current) =
+            menu.map_or((Vec::new(), None), |menu| (menu.sizes, Some(menu.current)));
         let selected_text = current.map_or_else(
             || tr("Native").to_string(),
             |size| resolution_label(size, sizes.first() == Some(&size)),
@@ -362,12 +358,15 @@ impl AnalyzerApp {
         widgets::setting_row(
             ui,
             tr("Resolution"),
-            resolution_description(matching, connected.is_some()),
+            resolution_description(matching, connected),
             220.0,
             |ui| {
                 ui.add_enabled_ui(matching && !sizes.is_empty(), |ui| {
                     let combo =
                         widgets::combo(ui.id().with("vdd-resolution"), &selected_text, 200.0)
+                            // Ten sizes and one Windows set all in view,
+                            // where the window has the room.
+                            .height(460.0)
                             .show_ui(ui, |ui| {
                                 ui.set_min_width(200.0);
                                 for (index, &size) in sizes.iter().enumerate() {

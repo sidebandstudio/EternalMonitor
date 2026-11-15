@@ -1055,6 +1055,7 @@ pub fn note_detached(shared: &SharedControl) {
 /// adapter) proves itself again when it is back, as after
 /// [`note_detached`].
 pub(crate) fn observe_listing(shared: &SharedControl, outputs: &[super::OutputInfo]) {
+    shared.vdd_live.lock().listed(outputs, Instant::now());
     let shows = |(adapter, name): &ProofOutput| {
         outputs
             .iter()
@@ -1833,6 +1834,7 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
         match super::reuse_vdd(shared) {
             Reuse::Keep => {
                 info!(device = %output.device_name, "Virtual display still attached — capturing it");
+                live_since(shared, &output, driver.now());
                 note_attached(shared, output.device_name);
                 return;
             }
@@ -1842,6 +1844,7 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
                     "Virtual display still attached — setting this iPad's mode and capturing it"
                 );
                 let output = driver.settle(output, wanted);
+                live_since(shared, &output, driver.now());
                 if note_attached_if_selected(shared, output.device_name.clone()) {
                     follow_choice(shared, driver, &output, wanted);
                 } else if !quitting(shared) {
@@ -1951,6 +1954,7 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
             let wanted = super::wanted_vdd_mode(shared);
             let chosen = driver.settle(chosen, wanted);
             let (device, width, height) = (chosen.device_name.clone(), chosen.width, chosen.height);
+            live_since(shared, &chosen, driver.now());
             if note_attached_if_selected(shared, chosen.device_name.clone()) {
                 info!(
                     %device,
@@ -2029,6 +2033,15 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
             }
         }
     }
+}
+
+/// The second screen `output` is attached from `now`, at its size.
+#[cfg(any(windows, test, debug_assertions))]
+fn live_since(shared: &SharedControl, output: &OutputInfo, now: Instant) {
+    shared
+        .vdd_live
+        .lock()
+        .attached((output.width, output.height), now);
 }
 
 /// A size chosen while `settled` was being set to `wanted`, before the app
@@ -4291,6 +4304,8 @@ mod tests {
             attach(&shared, &driver, ATTACH_TIMEOUT);
             assert!(pick.done.get());
             assert_eq!(*shared.vdd_status.lock(), VddStatus::Active);
+            // The size it attached at, for the app.
+            assert_eq!(shared.vdd_live.lock().size, Some((1920, 1080)));
             let wanted = driver.wanted.borrow().clone();
             (driver.calls(), wanted)
         };

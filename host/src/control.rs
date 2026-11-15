@@ -92,6 +92,8 @@ pub struct SharedControl {
     pub vdd_prepared: Arc<Mutex<Option<crate::capture::PreparedModes>>>,
     /// Mode changes asked for on the second screen while it is on.
     pub(crate) vdd_mode_changes: Arc<crate::capture::ModeChanges>,
+    /// The second screen's size and the displays around it, as last seen.
+    pub vdd_live: Arc<Mutex<crate::capture::VddLive>>,
     /// Second screen timing across pipeline restarts: the pending switch onto
     /// it, the grace period after its viewer left, the last driver change.
     pub(crate) second_screen: Arc<Mutex<crate::capture::second_screen::State>>,
@@ -235,6 +237,7 @@ impl SharedControl {
             vdd_resolutions: Arc::new(Mutex::new(Default::default())),
             vdd_prepared: Arc::new(Mutex::new(None)),
             vdd_mode_changes: Arc::default(),
+            vdd_live: Arc::default(),
             second_screen: Arc::new(Mutex::new(Default::default())),
             hb_capture_loop_ms: Arc::new(AtomicU64::new(0)),
             hb_capture_frame_ms: Arc::new(AtomicU64::new(0)),

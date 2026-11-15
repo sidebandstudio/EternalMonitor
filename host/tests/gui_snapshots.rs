@@ -459,6 +459,35 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
         let saved = eternal_host::vdd_settings::ResolutionChoices::load(&record);
         assert_eq!(saved.chosen(7), chosen);
     }
+    // The open list: the iPad's nine sizes and one set in Windows' display
+    // settings, ten in all.
+    let modes = eternal_host::vdd_settings::modes_for_client(1668, 2420, 120);
+    assert!(shared
+        .vdd_resolutions
+        .lock()
+        .choices
+        .set_in_windows(7, &modes, (1366, 768)));
+    harness.run_steps(4);
+    harness.get(resolution("1366 × 768")).click();
+    harness.run_steps(4);
+    for size in [
+        "2420 × 1668 (native)",
+        "1814 × 1250",
+        "1614 × 1112",
+        "1210 × 834",
+        "970 × 668",
+        "870 × 600",
+        "1920 × 1080 (16:9)",
+        "1920 × 1200 (16:10)",
+        "2048 × 1536 (4:3)",
+    ] {
+        harness.get_by_label(size);
+    }
+    snapshot(&mut harness, &shared, "settings-resolution-open");
+    harness.get_by_label("2420 × 1668 (native)").click();
+    harness.run_steps(4);
+    harness.get(resolution("2420 × 1668 (native)"));
+    assert_eq!(shared.vdd_resolutions.lock().choices.chosen(7), None);
 
     // General sits below the fold of the Settings page.
     harness

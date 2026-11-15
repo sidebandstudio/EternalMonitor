@@ -269,6 +269,9 @@ fn apply_style(style: &mut egui::Style) {
     spacing.button_padding = egui::vec2(12.0, 6.0);
     spacing.interact_size = egui::vec2(32.0, 32.0);
     spacing.combo_height = 320.0;
+    // A popup is sized to at most this on the frame it opens, and keeps
+    // that size: egui's 400 cut the Resolution list's tenth size.
+    spacing.default_area_size = egui::vec2(600.0, 600.0);
     spacing.menu_margin = Margin::same(6);
     spacing.window_margin = Margin::same(20);
     spacing.scroll = egui::style::ScrollStyle {
