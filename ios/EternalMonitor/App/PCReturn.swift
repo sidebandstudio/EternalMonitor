@@ -1,11 +1,11 @@
 import Combine
 import Foundation
-import Network
 
 /// Bonjour's list of PCs, kept up to date until stopped. Tests pass a fake.
 @MainActor
 protocol PCBrowser: AnyObject {
-    /// Called with the whole list each time it changes.
+    /// Called with the whole list each time it changes, services still
+    /// resolving among them, without an address.
     var onHosts: (([DiscoveredHost]) -> Void)? { get set }
     /// Called when Bonjour can't search, as with Local Network off.
     var onSearchFailed: (() -> Void)? { get set }
@@ -27,12 +27,18 @@ final class BonjourPCBrowser: PCBrowser {
         scanner.searchesUntilStopped = true
     }
 
+    /// The scanner's list each time it settles: one update replaces a PC's
+    /// entry in steps, and only the list it ends on counts. A service that
+    /// has no address yet is in it too, so the support log sees it listed.
+    static func listings(of scanner: NetworkScanner) -> AnyPublisher<[DiscoveredHost], Never> {
+        scanner.$hosts.map { _ in () }.merge(with: scanner.$status.map { _ in () })
+            .debounce(for: .milliseconds(100), scheduler: RunLoop.main)
+            .map { [weak scanner] in scanner?.claims ?? [] }
+            .eraseToAnyPublisher()
+    }
+
     func start() {
-        // One update replaces a PC's entry in steps; only the list it ends on counts.
-        watch = scanner.$hosts.debounce(for: .milliseconds(100), scheduler: RunLoop.main).sink { [weak self] _ in
-            guard let self else { return }
-            self.onHosts?(self.scanner.hosts)
-        }
+        watch = Self.listings(of: scanner).sink { [weak self] hosts in self?.onHosts?(hosts) }
         failure = scanner.$searchProblem.compactMap { $0 }.sink { [weak self] _ in self?.onSearchFailed?() }
         scanner.startScan()
     }
@@ -67,9 +73,13 @@ struct PCReturn {
     /// When the card went up and the watch's time limit started.
     private(set) var armedAt: Date?
     /// For the support log (`NoReplyFacts`): every `address:port` the PC
-    /// was listed at since the watch began, whether Bonjour gave a list at
-    /// all, and whether a search failed.
+    /// was listed at since the watch began; whether its service was listed
+    /// without an IPv4 address (only IPv6, or still resolving); whether a
+    /// service without one that may be the PC was (the PC's name unknown);
+    /// whether Bonjour gave a list at all, and whether a search failed.
     private(set) var seenAt = Set<String>()
+    private var seenWithoutAddress = false
+    private var maybeSeenWithoutAddress = false
     private var heardAny = false
     private var searchFailed = false
 
@@ -98,6 +108,10 @@ struct PCReturn {
         for pc in hosts where matches(pc) { current[Self.key(pc)] = pc }
         heardAny = true
         for pc in current.values { seenAt.insert("\(pc.address ?? ""):\(pc.port)") }
+        for pc in hosts where pc.address == nil {
+            if let service { seenWithoutAddress = seenWithoutAddress || pc.name == service }
+            else { maybeSeenWithoutAddress = true }
+        }
         let new = Set(current.keys).subtracting(listed.keys)
         listed = current
         tried.formIntersection(current.keys)
@@ -136,10 +150,19 @@ struct PCReturn {
     }
 
     /// Whether Bonjour listed the PC since the watch began: `yes`, `no`, or
-    /// `unknown` when it gave no list or a search failed.
+    /// `unknown` when it gave no list, a search failed, or a service without
+    /// an address may have been the PC.
     var listedFact: String {
-        if !seenAt.isEmpty { return "yes" }
-        return heardAny && !searchFailed ? "no" : "unknown"
+        if !seenAt.isEmpty || seenWithoutAddress { return "yes" }
+        return heardAny && !searchFailed && !maybeSeenWithoutAddress ? "no" : "unknown"
+    }
+
+    /// Whether a listing of the PC was at `host:port`: `unknown` when one
+    /// had no address, `-` when it wasn't listed.
+    func listedAtFact(host: String, port: UInt16) -> String {
+        guard listedFact == "yes" else { return "-" }
+        if seenAt.contains("\(host):\(port)") { return "yes" }
+        return seenWithoutAddress ? "unknown" : "no"
     }
 }
 
@@ -149,15 +172,16 @@ struct PCReturn {
 /// (not listed), one that runs but is blocked (listed at the address
 /// tried), one that moved (listed elsewhere), and an iPad on another
 /// network than that address (not on its subnet):
-/// `no_reply_facts when=timeout listed=yes|no|unknown listed_at_tried=yes|no|-
+/// `no_reply_facts when=timeout listed=yes|no|unknown listed_at_tried=yes|no|unknown|-
 /// same_subnet=yes|no|unknown path=wifi|wired|cellular|other|unknown`.
+/// `same_subnet` is known only over a direct Wi-Fi or Ethernet path.
 enum NoReplyFacts {
     /// `watch` is the watch for the PC, nil if none ran; `route` is how
     /// this iPad reaches `host:port` now, nil if no path was ready.
     static func line(when: String, watch: PCReturn?, host: String, port: UInt16, route: MovedPC.Route?) -> String {
         let listed = watch?.listedFact ?? "unknown"
-        let atTried = listed != "yes" ? "-" : watch?.seenAt.contains("\(host):\(port)") == true ? "yes" : "no"
-        let subnet = route.map { IPv4Address(host) == nil ? "unknown" : MovedPC.isLocal(host, over: $0) ? "yes" : "no" }
+        let atTried = watch?.listedAtFact(host: host, port: port) ?? "-"
+        let subnet = route.flatMap { MovedPC.onSubnet(host, over: $0) }.map { $0 ? "yes" : "no" }
         return "no_reply_facts when=\(when) listed=\(listed) listed_at_tried=\(atTried) same_subnet=\(subnet ?? "unknown")"
             + " path=\(route?.kind ?? "unknown")"
     }

@@ -83,13 +83,20 @@ enum MovedPC {
     /// Wi-Fi or Ethernet path, not a tunnel, with `host` in its subnet. A
     /// VPN that uses home network ranges fails here.
     static func isLocal(_ host: String, over route: Route) -> Bool {
+        onSubnet(host, over: route) == true
+    }
+
+    /// Whether `host` is in the subnet of `route`'s interface, or nil when
+    /// that can't be told: not a direct Wi-Fi or Ethernet path, a tunnel,
+    /// an unusable netmask, or `host` isn't an IPv4 address.
+    static func onSubnet(_ host: String, over route: Route) -> Bool? {
         let ipv4 = { (text: String) -> UInt32? in
             guard text.split(separator: ".").count == 4, let bytes = IPv4Address(text)?.rawValue, bytes.count == 4 else { return nil }
             return bytes.reduce(0) { $0 << 8 | UInt32($1) }
         }
         guard route.direct, !tunnels.contains(where: route.interface.hasPrefix),
               let address = ipv4(route.address), let mask = ipv4(route.netmask), let candidate = ipv4(host),
-              mask != 0, mask != .max else { return false }
+              mask != 0, mask != .max else { return nil }
         return address & mask == candidate & mask
     }
 

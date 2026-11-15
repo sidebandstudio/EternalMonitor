@@ -161,12 +161,68 @@ final class PCReturnTests: XCTestCase {
         let cellular = MovedPC.Route(interface: "pdp_ip0", direct: false, address: "198.51.100.5",
                                      netmask: "255.255.255.0", kind: "cellular")
         XCTAssertEqual(facts(watch, host: "198.51.100.20", route: cellular),
-                       "no_reply_facts when=timeout listed=no listed_at_tried=- same_subnet=no path=cellular")
+                       "no_reply_facts when=timeout listed=no listed_at_tried=- same_subnet=unknown path=cellular")
         // No path within the wait, or a name instead of an address.
         XCTAssertEqual(facts(watch, host: "198.51.100.20", route: nil),
                        "no_reply_facts when=timeout listed=no listed_at_tried=- same_subnet=unknown path=unknown")
         XCTAssertEqual(facts(nil, host: "test-pc.local"),
                        "no_reply_facts when=timeout listed=unknown listed_at_tried=- same_subnet=unknown path=wifi")
+    }
+
+    /// Only a direct Wi-Fi or Ethernet path's own address and mask tell:
+    /// a VPN's tunnel says nothing about the Wi-Fi network, even with the
+    /// address tried inside the Wi-Fi subnet.
+    func testTheFactsKnowTheSubnetOnlyOverADirectPath() {
+        let tunnel = MovedPC.Route(interface: "utun4", direct: false, address: "10.8.0.6", netmask: "255.255.255.0", kind: "other")
+        XCTAssertEqual(facts(nil, route: tunnel),
+                       "no_reply_facts when=timeout listed=unknown listed_at_tried=- same_subnet=unknown path=other")
+        let namedDirect = MovedPC.Route(interface: "utun4", direct: true, address: "10.8.0.6", netmask: "255.255.255.0", kind: "wifi")
+        XCTAssertEqual(facts(nil, route: namedDirect),
+                       "no_reply_facts when=timeout listed=unknown listed_at_tried=- same_subnet=unknown path=wifi")
+        for mask in ["255.255.255.255", "0.0.0.0", "not-a-mask"] {
+            let route = MovedPC.Route(interface: "en0", direct: true, address: "198.51.100.5", netmask: mask, kind: "wifi")
+            XCTAssertEqual(facts(nil, route: route),
+                           "no_reply_facts when=timeout listed=unknown listed_at_tried=- same_subnet=unknown path=wifi", mask)
+        }
+    }
+
+    /// The PC's service listed with no IPv4 address (only IPv6, or still
+    /// resolving) is listed; where isn't known.
+    func testTheFactsCountAListingWithoutAnAddress() {
+        var watch = PCReturn(name: "Test PC", host: "192.0.2.20", port: 9876)
+        _ = watch.heard([pc("EternalMonitor (Other PC)", nil, port: 9876)])
+        XCTAssertEqual(facts(watch), "no_reply_facts when=timeout listed=no listed_at_tried=- same_subnet=yes path=wifi",
+                       "another PC's service is no listing of this one")
+        _ = watch.heard([pc("EternalMonitor (Test PC)", nil, port: 9876)])
+        XCTAssertEqual(facts(watch), "no_reply_facts when=timeout listed=yes listed_at_tried=unknown same_subnet=yes path=wifi")
+        _ = watch.heard([pc("EternalMonitor (Test PC)", "192.0.2.40", port: 9876)])
+        XCTAssertEqual(facts(watch), "no_reply_facts when=timeout listed=yes listed_at_tried=unknown same_subnet=yes path=wifi")
+        _ = watch.heard([pc("EternalMonitor (Test PC)", "192.0.2.20", port: 9876)])
+        XCTAssertEqual(facts(watch), "no_reply_facts when=timeout listed=yes listed_at_tried=yes same_subnet=yes path=wifi")
+
+        // Without the PC's name, any service without an address may be it.
+        var unnamed = PCReturn(name: nil, host: "192.0.2.20", port: 9876)
+        _ = unnamed.heard([pc("EternalMonitor (Any)", nil, port: 9876)])
+        XCTAssertEqual(facts(unnamed), "no_reply_facts when=timeout listed=unknown listed_at_tried=- same_subnet=yes path=wifi")
+    }
+
+    /// The real scanner's list for the watch has a service still resolving,
+    /// before it has any address, so the watch sees the PC listed.
+    func testBonjoursListHasAServiceStillResolving() async throws {
+        let scanner = NetworkScanner()
+        defer { scanner.stopScan() }
+        var lists: [[DiscoveredHost]] = []
+        let feed = BonjourPCBrowser.listings(of: scanner).sink { lists.append($0) }
+        defer { feed.cancel() }
+        scanner.netServiceBrowser(NetServiceBrowser(), didFind: NetService(domain: "local.", type: "_eternaldisplay._udp.",
+                                                                          name: "EternalMonitor (Example PC)"), moreComing: false)
+        let deadline = Date().addingTimeInterval(5)
+        while lists.last?.isEmpty != false, Date() < deadline { try await Task.sleep(nanoseconds: 10_000_000) }
+        XCTAssertEqual(lists.last?.map(\.name), ["EternalMonitor (Example PC)"])
+        XCTAssertEqual(lists.last?.first?.address, nil)
+        var watch = PCReturn(name: "Example PC", host: "192.0.2.20", port: 9876)
+        _ = watch.heard(lists.last ?? [])
+        XCTAssertEqual(facts(watch), "no_reply_facts when=timeout listed=yes listed_at_tried=unknown same_subnet=yes path=wifi")
     }
 
     // MARK: - Connecting
