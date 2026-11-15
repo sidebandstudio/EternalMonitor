@@ -41,6 +41,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let restarted = eternal_host::relaunch::take_over_if_requested();
     let restart_wait = restarted.is_some().then(|| restart_started.elapsed());
     eternal_host::console::join_parent_console();
+    // "Start with Windows": the window goes to the taskbar once it draws.
+    let at_sign_in = eternal_host::autostart::started_at_sign_in(std::env::args_os().skip(1));
 
     // One host per installation; a second launch shows the first one and
     // exits. Checked after helper-mode dispatch and before anything a host
@@ -52,8 +54,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Some(None) => return Ok(()),
         None => {
             let Some(instance) = eternal_host::single_instance::acquire() else {
-                eprintln!("EternalMonitor is already running; showing its window");
-                eternal_host::single_instance::show_existing();
+                // Only a launch the user started brings the window up.
+                if !at_sign_in {
+                    eprintln!("EternalMonitor is already running; showing its window");
+                    eternal_host::single_instance::show_existing();
+                }
                 return Ok(());
             };
             instance
@@ -425,7 +430,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         info!("Termination signal received — shutting down cleanly");
-    } else if let Err(e) = gui::run_gui(gui_control.clone(), {
+    } else if let Err(e) = gui::run_gui(gui_control.clone(), at_sign_in, {
         let quit_once = std::sync::Arc::clone(&quit_once);
         Box::new(move || {
             let quit = quit_once.lock().take();

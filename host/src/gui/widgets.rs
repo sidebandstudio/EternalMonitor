@@ -902,12 +902,25 @@ pub fn banner(
     actions_width: f32,
     actions: impl FnOnce(&mut Ui),
 ) {
+    note_notice(ui.ctx());
     let shown = appear(ui, ui.id().with(("banner", title)), 0.28);
     ui.add_space((1.0 - shown) * 6.0);
     ui.scope(|ui| {
         ui.set_opacity(shown);
         banner_frame(ui, color, icon, title, body, actions_width, actions);
     });
+}
+
+/// Every banner is a notice for the user: remember that this pass drew one.
+fn note_notice(ctx: &egui::Context) {
+    let pass = ctx.cumulative_pass_nr();
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new("notice-shown"), pass));
+}
+
+/// Whether this pass drew a [`banner`] so far.
+pub fn notice_shown(ctx: &egui::Context) -> bool {
+    let pass = ctx.data(|d| d.get_temp::<u64>(egui::Id::new("notice-shown")));
+    pass == Some(ctx.cumulative_pass_nr())
 }
 
 fn banner_frame(

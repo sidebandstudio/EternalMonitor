@@ -5,6 +5,30 @@
 #[cfg(windows)]
 pub use windows_impl::{first_lan_ipv4, read_startup_registry, set_startup_registry};
 
+/// The argument the Run entry starts EternalMonitor with: Windows started it
+/// at sign-in, so its window opens minimised.
+pub const SIGN_IN_ARG: &str = "--autostart";
+
+/// Whether Windows started this launch at sign-in ("Start with Windows").
+/// `args` are the launch's arguments after the executable.
+pub fn started_at_sign_in<T: AsRef<std::ffi::OsStr>>(args: impl IntoIterator<Item = T>) -> bool {
+    args.into_iter().any(|arg| arg.as_ref() == SIGN_IN_ARG)
+}
+
+/// At launch: whether Start with Windows is on, which the Run entry decides
+/// over settings.json (`registry_on`), and, when it is, `write` the entry
+/// again for the current exe. After an installer upgrade or a move the old
+/// path would silently fail to launch at sign-in, and an entry written before
+/// 0.3.5 has no [`SIGN_IN_ARG`].
+pub fn refresh_at_launch(registry_on: bool, write: impl FnOnce() -> Result<(), String>) -> bool {
+    if registry_on {
+        if let Err(error) = write() {
+            tracing::warn!(error = %error, "Failed to refresh startup registry path on launch");
+        }
+    }
+    registry_on
+}
+
 /// Autostart is a Windows-only concept (HKCU Run key); the GUI hides the
 /// checkbox off-Windows and these stubs keep call sites compiling.
 #[cfg(not(windows))]
@@ -154,10 +178,13 @@ mod windows_impl {
 
     fn startup_command_bytes(value: &OsStr) -> Vec<u8> {
         // Run values are command lines. Quote the executable so Program Files
-        // and other paths with spaces remain a single executable argument.
+        // and other paths with spaces remain a single executable argument,
+        // then say the launch is Windows starting it at sign-in.
         std::iter::once(u16::from(b'"'))
             .chain(value.encode_wide())
-            .chain([u16::from(b'"'), 0])
+            .chain([u16::from(b'"'), u16::from(b' ')])
+            .chain(super::SIGN_IN_ARG.encode_utf16())
+            .chain([0])
             .flat_map(u16::to_le_bytes)
             .collect()
     }
@@ -198,10 +225,15 @@ mod windows_impl {
                 let mut count = 0;
                 let args = unsafe { CommandLineToArgvW(PCWSTR(wide.as_ptr()), &mut count) };
                 assert!(!args.is_null());
-                let executable = unsafe { (*args).to_string() };
+                let parsed: Vec<String> = (0..count as usize)
+                    .map(|i| unsafe { (*args.add(i)).to_string() }.unwrap())
+                    .collect();
                 unsafe { LocalFree(HLOCAL(args.cast())) };
-                assert_eq!(count, 1, "startup command must contain only the executable");
-                assert_eq!(executable.unwrap(), path);
+                assert_eq!(
+                    parsed,
+                    [path, super::super::SIGN_IN_ARG],
+                    "startup command must be the executable, then the sign-in argument"
+                );
             }
         }
 
@@ -214,5 +246,45 @@ mod windows_impl {
             let dword = u32::from_ne_bytes([192, 168, 1, 1]);
             assert_eq!(ipv4_from_inaddr(dword), Ipv4Addr::new(192, 168, 1, 1));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_sign_in_argument_means_windows_started_the_launch() {
+        assert!(started_at_sign_in([SIGN_IN_ARG]));
+        assert!(started_at_sign_in(["19876", SIGN_IN_ARG]));
+        // Started by hand: a shortcut, the Start menu or Setup's "launch now".
+        assert!(!started_at_sign_in(Vec::<String>::new()));
+        assert!(!started_at_sign_in(["19876"]));
+        assert!(!started_at_sign_in(["--relaunch-wait", "0123"]));
+        assert!(!started_at_sign_in(["--autostart=1", "autostart"]));
+        let os: Vec<std::ffi::OsString> = vec![SIGN_IN_ARG.into()];
+        assert!(started_at_sign_in(&os));
+    }
+
+    #[test]
+    fn an_entry_that_is_on_is_written_again_at_launch() {
+        // An entry from before the sign-in argument, at an old path.
+        let old = r#""C:\Program Files\EternalMonitor\old\EternalMonitor-host.exe""#;
+        let new =
+            format!(r#""C:\Program Files\EternalMonitor\EternalMonitor-host.exe" {SIGN_IN_ARG}"#);
+        let mut entry = Some(old.to_string());
+        let on = refresh_at_launch(entry.is_some(), || {
+            entry = Some(new.clone());
+            Ok(())
+        });
+        assert!(on);
+        assert_eq!(entry.as_deref(), Some(new.as_str()));
+
+        // Off: nothing is written, so Start with Windows stays off.
+        let on = refresh_at_launch(false, || panic!("an entry that is off is not written"));
+        assert!(!on);
+
+        // A failed write leaves the setting as the registry says.
+        assert!(refresh_at_launch(true, || Err("access denied".into())));
     }
 }

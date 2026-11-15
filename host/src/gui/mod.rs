@@ -379,6 +379,34 @@ pub struct AnalyzerApp {
     pending_language: Option<Lang>,
     /// First-run setup, while open.
     setup: Option<setup::Setup>,
+    /// Windows started this launch at sign-in, and the window has not yet
+    /// gone to the taskbar or been kept on screen ([`sign_in_start`]).
+    at_sign_in: bool,
+}
+
+/// What a window that Windows started at sign-in does in a UI pass.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SignInStart {
+    /// Not confirmed drawing yet: the graphics driver watch needs that proof
+    /// from a visible window.
+    Wait,
+    /// Go to the taskbar, once. Streaming and discovery keep running.
+    Minimise,
+    /// Stay on screen: the user is using the window, or it shows them
+    /// something (first-run setup, the update popup, a notice).
+    Stay,
+}
+
+fn sign_in_start(drawing: bool, user_acted: bool, needs_user: bool) -> SignInStart {
+    if user_acted {
+        SignInStart::Stay
+    } else if !drawing {
+        SignInStart::Wait
+    } else if needs_user {
+        SignInStart::Stay
+    } else {
+        SignInStart::Minimise
+    }
 }
 
 impl AnalyzerApp {
@@ -464,20 +492,11 @@ impl AnalyzerApp {
             .audio_enabled
             .store(persisted.stream_audio, Ordering::SeqCst);
 
-        let start_on_boot = if persisted.start_on_boot != read_startup_registry() {
-            // Persisted state disagrees with the registry — trust the registry as ground truth.
-            read_startup_registry()
-        } else {
-            persisted.start_on_boot
-        };
-
-        // If autostart is enabled, refresh the stored HKCU\Run path to the *current* exe location.
-        // After an installer upgrade or a move, the old path would silently fail to launch on boot.
-        if start_on_boot {
-            if let Err(error) = set_startup_registry(true) {
-                warn!(error = %error, "Failed to refresh startup registry path on launch");
-            }
-        }
+        // The registry is the ground truth; an entry that is on is written
+        // again for the current exe, with the sign-in argument.
+        let start_on_boot = crate::autostart::refresh_at_launch(read_startup_registry(), || {
+            set_startup_registry(true)
+        });
 
         let updates = {
             let ctx = cc.egui_ctx.clone();
@@ -547,7 +566,15 @@ impl AnalyzerApp {
             settings_language: persisted.language,
             pending_language: None,
             setup: crate::settings::fresh_install().then(setup::Setup::default),
+            at_sign_in: false,
         }
+    }
+
+    /// Windows started this launch at sign-in ("Start with Windows"): the
+    /// window goes to the taskbar once it is confirmed drawing.
+    pub fn started_at_sign_in(mut self, at_sign_in: bool) -> Self {
+        self.at_sign_in = at_sign_in;
+        self
     }
 
     fn persist_settings(&self) {
@@ -1190,6 +1217,36 @@ impl eframe::App for AnalyzerApp {
         self.draw_setup(&ctx, &snap);
         self.update_popup(&ctx, &client);
         self.draw_feedback_panel(&ctx, &client);
+        if self.at_sign_in {
+            self.finish_sign_in_start(&ctx);
+        }
+    }
+}
+
+impl AnalyzerApp {
+    /// After the pass drew everything: whether a window started at sign-in
+    /// goes to the taskbar now, stays on screen, or waits.
+    fn finish_sign_in_start(&mut self, ctx: &egui::Context) {
+        let user_acted = ctx.input(|i| {
+            i.pointer.any_pressed()
+                || i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
+        });
+        let needs_user =
+            self.setup.is_some() || self.update_popup_open || widgets::notice_shown(ctx);
+        match sign_in_start(renderer::drawing(), user_acted, needs_user) {
+            SignInStart::Wait => {}
+            SignInStart::Minimise => {
+                self.at_sign_in = false;
+                info!("Started at sign-in: window minimised to the taskbar");
+                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+            }
+            SignInStart::Stay => {
+                self.at_sign_in = false;
+                info!(user_acted, "Started at sign-in: window stays on screen");
+            }
+        }
     }
 }
 
@@ -1797,11 +1854,13 @@ pub fn quitting_from_outside() {
 }
 
 /// Launch the GUI window. Blocks the calling thread.
-/// Runs the window until it closes. `quit_while_stuck` is the app's quit
+/// Runs the window until it closes; `at_sign_in` when Windows started this
+/// launch at sign-in. `quit_while_stuck` is the app's quit
 /// path, for a Cancel in the graphics driver notice while the window's
 /// thread is stuck before its first frame; it ends the process.
 pub fn run_gui(
     control: GuiControl,
+    at_sign_in: bool,
     quit_while_stuck: Box<dyn FnOnce() + Send>,
 ) -> eframe::Result<()> {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon_256.png"))
@@ -1866,7 +1925,11 @@ pub fn run_gui(
     let result = eframe::run_native(
         "EternalMonitor",
         options,
-        Box::new(|cc| Ok(Box::new(AnalyzerApp::new(cc, control)))),
+        Box::new(move |cc| {
+            Ok(Box::new(
+                AnalyzerApp::new(cc, control).started_at_sign_in(at_sign_in),
+            ))
+        }),
     );
     #[cfg(windows)]
     let _ = watch.stop();

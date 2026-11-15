@@ -715,6 +715,11 @@ pub(super) fn frame_started(ctx: &egui::Context) {
     }
 }
 
+/// Whether the window is confirmed drawing ([`PresentTracker`]).
+pub(super) fn drawing() -> bool {
+    PRESENT.lock().is_ok_and(|tracker| tracker.confirmed)
+}
+
 /// When the window's thread last began a UI pass. None before the first.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub(super) fn last_pass() -> Option<Instant> {

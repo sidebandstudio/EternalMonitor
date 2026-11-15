@@ -1247,3 +1247,20 @@ fn troubleshooting_names_each_cards_choice_in_plain_words() {
     // A new choice made this run replaces the old one's story.
     assert_eq!(drawing_status_lines(&status, WindowDrawing::Dx12).len(), 1);
 }
+
+/// A window Windows started at sign-in goes to the taskbar once it is
+/// confirmed drawing, unless the user is using it or it shows them something.
+#[test]
+fn a_sign_in_start_minimises_only_a_drawing_window_with_nothing_to_show() {
+    use SignInStart::*;
+    // (drawing, user acted, needs the user)
+    assert_eq!(sign_in_start(false, false, false), Wait);
+    // Something to show before the proof: wait, it may be gone by then.
+    assert_eq!(sign_in_start(false, false, true), Wait);
+    assert_eq!(sign_in_start(true, false, false), Minimise);
+    // First-run setup, the update popup or a notice on screen.
+    assert_eq!(sign_in_start(true, false, true), Stay);
+    // A click or key press, before or after the proof.
+    assert_eq!(sign_in_start(false, true, false), Stay);
+    assert_eq!(sign_in_start(true, true, false), Stay);
+}

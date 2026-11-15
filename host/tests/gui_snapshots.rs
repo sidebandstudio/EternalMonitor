@@ -352,6 +352,7 @@ fn harness_with(
 #[test]
 fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     let (dir, shared) = fixture();
+    a_sign_in_start_goes_to_the_taskbar(&shared, &dir);
     connect_ipad(&shared);
     let mut harness = harness(&shared, egui::vec2(1040.0, 1180.0), 1.0);
 
@@ -615,6 +616,80 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     a_vpn_address_gets_a_home_network_hint(&shared);
     std::fs::remove_dir_all(dir).unwrap();
     results.unwrap();
+}
+
+/// A window Windows started at sign-in asks to be minimised, once, after it
+/// is confirmed drawing (about 3 s of frames and an answered screenshot),
+/// and stays on screen while it shows a notice. Runs first: before it, no
+/// window in this process was confirmed drawing.
+fn a_sign_in_start_goes_to_the_taskbar(shared: &SharedControl, dir: &std::path::Path) {
+    // No update is known, so no update notice shows.
+    let update_state = dir.join("EternalMonitor/update-state.json");
+    let known = std::fs::read(&update_state).unwrap();
+    std::fs::remove_file(&update_state).unwrap();
+
+    let window = |at_sign_in: bool| {
+        let control = GuiControl {
+            shared: shared.clone(),
+            supervisor_tx: std::sync::mpsc::channel().0,
+        };
+        Harness::builder()
+            .with_size(egui::vec2(1040.0, 900.0))
+            .with_theme(egui::Theme::Dark)
+            .wgpu()
+            .build_eframe(move |cc| MinimiseAsks {
+                app: AnalyzerApp::new(cc, control).started_at_sign_in(at_sign_in),
+                asks: 0,
+            })
+    };
+    // Runs `window` for `seconds` of real time; the minimise asks it made
+    // since it was built.
+    let run = |window: &mut Harness<'_, MinimiseAsks>, seconds: u64| {
+        let end = Instant::now() + Duration::from_secs(seconds);
+        while Instant::now() < end {
+            window.step();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        window.state().asks
+    };
+
+    // At sign-in with nothing to show: not before drawing is confirmed,
+    // then once.
+    let mut signed_in = window(true);
+    signed_in.get_by_label("Pairing");
+    assert_eq!(signed_in.state().asks, 0);
+    assert_eq!(run(&mut signed_in, 8), 1);
+
+    // Started by hand: the window stays.
+    let mut by_hand = window(false);
+    assert_eq!(run(&mut by_hand, 1), 0);
+
+    // An old iPad app's notice is on screen: it stays.
+    connect_app(shared, "Test iPad Pro", 10, 20, 3);
+    let mut with_notice = window(true);
+    assert_eq!(run(&mut with_notice, 1), 0);
+    with_notice.get_by_label("Your iPad app is out of date");
+    disconnect_ipad(shared);
+    std::fs::write(&update_state, known).unwrap();
+}
+
+/// The window, counting the minimise commands it sent in every pass.
+struct MinimiseAsks {
+    app: AnalyzerApp,
+    asks: usize,
+}
+
+impl eframe::App for MinimiseAsks {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        self.app.ui(ui, frame);
+        self.asks += ui.ctx().viewport(|viewport| {
+            viewport
+                .commands
+                .iter()
+                .filter(|command| **command == egui::ViewportCommand::Minimized(true))
+                .count()
+        });
+    }
 }
 
 /// Too many wrong codes pause code pairing. The Stream page says why and

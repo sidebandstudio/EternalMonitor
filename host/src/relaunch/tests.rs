@@ -501,4 +501,12 @@ fn a_copy_finds_its_request_and_keeps_the_users_arguments() {
     // The update helper reopens with the user's arguments only.
     let os: Vec<std::ffi::OsString> = vec!["9877".into(), WAIT_ARG.into(), nonce.into()];
     assert_eq!(own_args(os), vec![std::ffi::OsString::from("9877")]);
+    // A copy of a launch Windows started at sign-in opens its window.
+    let signed_in = args(&[crate::autostart::SIGN_IN_ARG]);
+    assert!(crate::autostart::started_at_sign_in(&signed_in));
+    assert_eq!(own_args(signed_in.clone()), args(&[]));
+    let copy = copy_args(signed_in, nonce, Reason::Plain);
+    assert!(!crate::autostart::started_at_sign_in(&copy));
+    let os: Vec<std::ffi::OsString> = vec![crate::autostart::SIGN_IN_ARG.into()];
+    assert!(own_args(os).is_empty());
 }
