@@ -776,14 +776,33 @@ pub struct ResolutionMenu {
     pub current: (u32, u32),
     /// The size saved for the iPad, which the next start asks for.
     pub saved: (u32, u32),
+    /// The size the second screen is at when the iPad's list lacks it,
+    /// listed last.
+    pub odd: Option<(u32, u32)>,
+}
+
+/// What a click on an entry of [`ResolutionMenu`] does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Click {
+    /// The saved size, which the display is at: nothing.
+    Nothing,
+    /// A size the list offers: saved and set, also the saved size while
+    /// the display is at another.
+    Choose((u32, u32)),
+    /// The size the display is at that the list lacks: kept as a size set
+    /// in Windows' display settings is, with no mode to set.
+    Keep((u32, u32)),
 }
 
 impl ResolutionMenu {
-    /// The size to choose when `clicked` is clicked: any size but the one
-    /// saved, also the size the second screen is at when the driver
-    /// refused the saved one.
-    pub fn submit(&self, clicked: (u32, u32)) -> Option<(u32, u32)> {
-        (clicked != self.saved).then_some(clicked)
+    pub fn click(&self, clicked: (u32, u32)) -> Click {
+        if clicked == self.saved && clicked == self.current {
+            Click::Nothing
+        } else if Some(clicked) == self.odd {
+            Click::Keep(clicked)
+        } else {
+            Click::Choose(clicked)
+        }
     }
 }
 
@@ -800,14 +819,39 @@ pub fn vdd_resolution_menu(shared: &SharedControl) -> Option<ResolutionMenu> {
     let live = on.then(|| shared.vdd_live.lock().size).flatten();
     let saved = (requested.width, requested.height);
     let current = live.unwrap_or(saved);
-    if !sizes.contains(&current) {
-        sizes.push(current);
-    }
+    let odd = (!sizes.contains(&current)).then_some(current);
+    sizes.extend(odd);
     Some(ResolutionMenu {
         sizes,
         current,
         saved,
+        odd,
     })
+}
+
+/// A click on `clicked` in the app's Resolution choice (see [`Click`]).
+pub fn click_vdd_resolution(shared: &SharedControl, clicked: (u32, u32)) {
+    let Some(menu) = vdd_resolution_menu(shared) else {
+        return;
+    };
+    match menu.click(clicked) {
+        Click::Nothing => {}
+        Click::Choose(size) => choose_vdd_resolution(shared, size),
+        Click::Keep(size) => {
+            let Some(info) = shared.session.lock().client_info() else {
+                return;
+            };
+            let modes = crate::vdd_settings::modes_for_client(
+                info.screen_px.0,
+                info.screen_px.1,
+                info.refresh_hz,
+            );
+            let mut memory = shared.vdd_resolutions.lock();
+            if memory.choices.set_in_windows(info.device_id, &modes, size) {
+                log_choice(&memory, size, "app");
+            }
+        }
+    }
 }
 
 /// What a start does with a second screen still on from before.
@@ -1040,10 +1084,13 @@ pub struct VddLive {
 }
 
 impl VddLive {
+    /// The second screen attached: a new episode, for this iPad.
     pub fn attached(&mut self, size: (u32, u32), now: Instant) {
         self.displays = None;
         self.changed_at = Some(now);
         self.size = Some(size);
+        self.restorations = 0;
+        self.restored_at = None;
     }
 
     /// Windows listed `outputs`, the displays the desktop is on.
@@ -2668,33 +2715,121 @@ mod tests {
         assert_eq!(chosen(&shared), None);
     }
 
-    /// Review r3: when the driver refused the saved size, picking the size
-    /// the display is at makes it the saved one; picking the saved size
-    /// again changes nothing.
+    /// Review r4: a click on each kind of entry. The saved size the display
+    /// is at does nothing; a size the list offers (the saved one included,
+    /// and a size kept from Windows' display settings) is saved and set; the
+    /// size the display is at that the list lacks is kept, with nothing set,
+    /// and never turns into the panel's own.
     #[test]
-    fn picking_the_size_the_display_is_at_replaces_a_refused_choice() {
-        let shared = streaming_second_screen();
-        let modes = super::connected_vdd_modes(&shared).unwrap().1;
+    fn a_click_on_each_kind_of_entry() {
+        use super::Click;
+        let menu = |shared: &SharedControl| super::vdd_resolution_menu(shared).unwrap();
+        let chosen = |shared: &SharedControl| shared.vdd_resolutions.lock().choices.chosen(7);
+        let set = |shared: &SharedControl| shared.vdd_mode_changes.set.lock().clone();
+        let base = crate::vdd_settings::modes_for_client(1488, 2266, 60);
+        // Streaming at `at_size`, with `saved` saved (the panel's own if none).
+        let start = |saved: Option<(u32, u32)>, at_size| {
+            let shared = streaming_second_screen();
+            *shared.vdd_mode_changes.held.lock() = None;
+            if let Some(saved) = saved {
+                assert!(shared
+                    .vdd_resolutions
+                    .lock()
+                    .choices
+                    .choose(7, &base, saved));
+            }
+            shared.vdd_live.lock().attached(at_size, Instant::now());
+            shared
+        };
+
+        // The saved size, which the display is at.
+        let shared = start(Some((1510, 992)), (1510, 992));
+        assert_eq!(menu(&shared).click((1510, 992)), Click::Nothing);
+        super::click_vdd_resolution(&shared, (1510, 992));
+        assert_eq!((chosen(&shared), set(&shared)), (Some((1510, 992)), vec![]));
+
+        // Given up: Windows left the display at 1920x1080; the saved size is
+        // the panel's own. Clicking it sets it.
+        let shared = start(None, (1920, 1080));
+        assert_eq!(
+            menu(&shared).click((2266, 1488)),
+            Click::Choose((2266, 1488))
+        );
+        super::click_vdd_resolution(&shared, (2266, 1488));
+        assert_eq!(
+            (chosen(&shared), set(&shared)),
+            (None, vec![at(2266, 1488)])
+        );
+
+        // The saved 1700x1116 was refused, the display is at its own size:
+        // clicking that saves it; another listed size is saved and set.
+        let shared = start(Some((1700, 1116)), (2266, 1488));
+        super::click_vdd_resolution(&shared, (2266, 1488));
+        assert_eq!(
+            (chosen(&shared), set(&shared)),
+            (None, vec![at(2266, 1488)])
+        );
+        super::click_vdd_resolution(&shared, (914, 600));
+        assert_eq!(chosen(&shared), Some((914, 600)));
+        assert_eq!(set(&shared), [at(2266, 1488), at(914, 600)]);
+
+        // A size kept from Windows' display settings is in the list: with
+        // the display elsewhere, clicking it sets it.
+        let shared = start(None, (2266, 1488));
         assert!(shared
             .vdd_resolutions
             .lock()
             .choices
-            .choose(7, &modes, (1700, 1116)));
-        // Settled on the panel's own: 1700x1116 was refused.
-        shared
-            .vdd_live
-            .lock()
-            .attached((2266, 1488), Instant::now());
-        let menu = super::vdd_resolution_menu(&shared).unwrap();
-        assert_eq!((menu.current, menu.saved), ((2266, 1488), (1700, 1116)));
-        assert_eq!(menu.submit((1700, 1116)), None, "the saved size");
-        assert_eq!(menu.submit((1510, 992)), Some((1510, 992)));
-        let picked = menu.submit((2266, 1488)).expect("the size it is at");
-        super::choose_vdd_resolution(&shared, picked);
-        assert_eq!(shared.vdd_resolutions.lock().choices.chosen(7), None);
-        let menu = super::vdd_resolution_menu(&shared).unwrap();
-        assert_eq!((menu.current, menu.saved), ((2266, 1488), (2266, 1488)));
-        assert_eq!(menu.submit((2266, 1488)), None);
+            .set_in_windows(7, &base, (800, 600)));
+        assert_eq!(menu(&shared).odd, None);
+        assert_eq!(menu(&shared).click((800, 600)), Click::Choose((800, 600)));
+        super::click_vdd_resolution(&shared, (800, 600));
+        assert_eq!(
+            (chosen(&shared), set(&shared)),
+            (Some((800, 600)), vec![at(800, 600)])
+        );
+
+        // Given up at a size the list lacks: clicking it keeps it as a size
+        // set in Windows' settings is, with nothing to set.
+        let shared = start(Some((1510, 992)), (800, 600));
+        assert_eq!(menu(&shared).odd, Some((800, 600)));
+        assert_eq!(menu(&shared).click((800, 600)), Click::Keep((800, 600)));
+        super::click_vdd_resolution(&shared, (800, 600));
+        assert_eq!((chosen(&shared), set(&shared)), (Some((800, 600)), vec![]));
+        let after = menu(&shared);
+        assert_eq!(
+            (after.saved, after.current, after.odd),
+            ((800, 600), (800, 600), None)
+        );
+        assert_eq!(after.click((800, 600)), Click::Nothing);
+        let next = super::connected_vdd_modes(&shared).unwrap().1;
+        assert_eq!(
+            crate::vdd_settings::sizes(&next).last(),
+            Some(&(800, 600)),
+            "the next start offers and asks for it"
+        );
+    }
+
+    /// Review r4: a new attach starts a new episode, so a session that
+    /// follows one which ran out of restorations gets its own.
+    #[test]
+    fn a_new_attach_starts_a_new_restoration_episode() {
+        use super::SizeChange::{GiveUp, Restore};
+        let start = Instant::now();
+        let t = |s| start + Duration::from_secs(s);
+        let laptop = [shown("panel", true), shown("virtual", false)];
+        let alone = [shown("virtual", true)];
+        let mut live = super::VddLive::default();
+        live.attached((2266, 1488), t(0));
+        live.listed(&laptop, t(1));
+        live.listed(&alone, t(2));
+        let ran_out: Vec<_> = [2, 3, 4].map(|s| live.size_changed(t(s), true)).into();
+        assert_eq!(ran_out, [Restore, Restore, GiveUp]);
+        // The iPad reconnects at 8 s; the panel drops out at 11 s.
+        live.attached((2266, 1488), t(8));
+        live.listed(&laptop, t(9));
+        live.listed(&alone, t(11));
+        assert_eq!(live.size_changed(t(11), true), Restore);
     }
 
     /// Review r2: while the second screen is on, the app shows the size it

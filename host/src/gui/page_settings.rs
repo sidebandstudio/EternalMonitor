@@ -381,9 +381,8 @@ impl AnalyzerApp {
                 });
             },
         );
-        // Also the size the display is at, when it isn't the saved one.
-        if let Some(size) = clicked.and_then(|size| menu?.submit(size)) {
-            crate::capture::choose_vdd_resolution(shared, size);
+        if let Some(size) = clicked {
+            crate::capture::click_vdd_resolution(shared, size);
         }
     }
 }
