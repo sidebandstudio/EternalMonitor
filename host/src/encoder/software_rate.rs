@@ -62,8 +62,12 @@ pub(crate) struct Step {
 #[derive(Debug)]
 pub(crate) struct SoftwareRate {
     published: Arc<AtomicU32>,
-    /// The encoder and session the measurements are of.
-    of: Option<(String, Option<u32>)>,
+    /// The encoder and the viewer's session the measurements are of.
+    encoder: Option<String>,
+    session: Option<Option<u32>>,
+    /// While an encoder opens in the background, the session that streams
+    /// meanwhile cannot reopen at a new rate: the limit stays as it is.
+    frozen: bool,
     /// The rate capture is held to, while it is below the stream's.
     limit: Option<u32>,
     /// Since when, the summed cost and the frames of the current window.
@@ -79,7 +83,9 @@ impl SoftwareRate {
         published.store(0, Ordering::Relaxed);
         Self {
             published,
-            of: None,
+            encoder: None,
+            session: None,
+            frozen: false,
             limit: None,
             window: None,
             headroom_since: None,
@@ -87,6 +93,22 @@ impl SoftwareRate {
             raised_at: None,
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's cost for each frame the encode loop on this thread notes.
+    pub(crate) static FRAME_COST: std::cell::Cell<Option<Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The cost a frame is noted with: as measured, or a test's.
+pub(crate) fn frame_cost(measured: Duration) -> Duration {
+    #[cfg(test)]
+    if let Some(cost) = FRAME_COST.with(std::cell::Cell::get) {
+        return cost;
+    }
+    measured
 }
 
 /// libx264 and libx265: every encoder that is not a graphics card's.
@@ -202,30 +224,44 @@ impl SoftwareRate {
         })
     }
 
-    /// Forgets the measurements and ends any limit.
+    /// Forgets the measurements and ends any limit, for the same encoder
+    /// and session.
     fn reset(&mut self) {
+        let (encoder, session) = (self.encoder.take(), self.session.take());
         *self = Self::new(Arc::clone(&self.published));
+        (self.encoder, self.session) = (encoder, session);
     }
 
-    /// After each frame the open session encoded from a new picture, in
-    /// `session` (the viewer's, if any): holds capture to the rate a
-    /// software encoder keeps up with. A hardware session, another encoder
-    /// or another session starts again without a limit.
+    /// Before each frame's open or reopen decision, with the viewer's
+    /// `session` and whether an encoder opens in the background. A new
+    /// session starts without a limit, so its first frame opens the session
+    /// once, at the stream's rate. While an encoder opens in the background
+    /// nothing changes: the session streaming meanwhile cannot reopen, and
+    /// one that opened with the pipeline was never limited.
+    pub(crate) fn before_frame(&mut self, session: Option<u32>, opening_behind: bool) {
+        self.frozen = opening_behind;
+        if !self.frozen && self.session != Some(session) {
+            self.reset();
+            self.session = Some(session);
+        }
+    }
+
+    /// After each frame the open session encoded from a new picture: holds
+    /// capture to the rate a software encoder keeps up with. A hardware
+    /// session or another encoder starts again without a limit.
     pub(crate) fn note_encoded(
         &mut self,
         encoder_name: &str,
-        session: Option<u32>,
         cost: Duration,
         ceiling: u32,
         now: Instant,
     ) {
-        if self
-            .of
-            .as_ref()
-            .is_none_or(|(encoder, of)| encoder != encoder_name || *of != session)
-        {
+        if self.frozen {
+            return;
+        }
+        if self.encoder.as_deref() != Some(encoder_name) {
             self.reset();
-            self.of = Some((encoder_name.to_string(), session));
+            self.encoder = Some(encoder_name.to_string());
         }
         if !is_software_encoder(encoder_name) {
             return;
@@ -358,13 +394,8 @@ mod tests {
                     let spent = cost(now.duration_since(epoch).as_secs_f64(), capture_fps);
                     encoder_free = now + spent;
                     if limiter {
-                        rate.note_encoded(
-                            encoder,
-                            Some(1),
-                            spent,
-                            shared.effective_fps(),
-                            encoder_free,
-                        );
+                        rate.before_frame(Some(1), false);
+                        rate.note_encoded(encoder, spent, shared.effective_fps(), encoder_free);
                     }
                 }
                 // Idle until the next capture.
@@ -535,7 +566,8 @@ mod tests {
         let end = *at + seconds * 1000 * MS;
         while *at < end {
             *at += cost;
-            rate.note_encoded(encoder, session, cost, ceiling, *at);
+            rate.before_frame(session, false);
+            rate.note_encoded(encoder, cost, ceiling, *at);
         }
     }
 
@@ -561,7 +593,9 @@ mod tests {
 
     /// A hardware session after a limited software one, another software
     /// encoder or another session: capture goes back to the stream's rate
-    /// at the first frame, before any measurement.
+    /// at the first frame, before any measurement. A new session (or none)
+    /// ends the limit before that frame's open decision, so its session
+    /// opens at the stream's rate.
     #[test]
     fn a_hardware_encoder_another_encoder_or_session_starts_without_a_limit() {
         let shared = shared_at(120);
@@ -580,7 +614,11 @@ mod tests {
             ("libx264", None),
         ] {
             let (mut rate, at) = limited(&shared);
-            rate.note_encoded(encoder, session, MS, 120, at + MS);
+            rate.before_frame(session, false);
+            if session != Some(1) {
+                assert_eq!(super::encode_fps(encoder, &shared), 120, "{session:?}");
+            }
+            rate.note_encoded(encoder, MS, 120, at + MS);
             assert_eq!(shared.cpu_fps_limit.load(Ordering::SeqCst), 0, "{encoder}");
             assert_eq!(shared.capture_fps(), 120, "{encoder} {session:?}");
         }
@@ -594,6 +632,35 @@ mod tests {
             10,
         );
         assert_eq!(shared.capture_fps(), 120);
+    }
+
+    /// While an encoder opens in the background the libx264 session that
+    /// streams meanwhile cannot reopen: no frame, however slow, and no new
+    /// session sets or ends a limit. The pipeline's first one streams at the
+    /// stream's rate, as before; one a limited session hands over to keeps
+    /// the rate it opened at.
+    #[test]
+    fn nothing_changes_the_limit_while_an_encoder_opens_in_the_background() {
+        let shared = shared_at(120);
+        let mut rate = SoftwareRate::new(Arc::clone(&shared.cpu_fps_limit));
+        let mut at = Instant::now();
+        for _ in 0..200 {
+            at += 20 * MS;
+            rate.before_frame(None, true);
+            rate.note_encoded("libx264", 20 * MS, 120, at);
+        }
+        assert_eq!(shared.capture_fps(), 120);
+        assert_eq!(super::encode_fps("libx264", &shared), 120);
+        // Once it opened, the measurements start.
+        busy(&mut rate, ("libx264", None, 120), 20 * MS, &mut at, 2);
+        assert_eq!(shared.capture_fps(), 45);
+        for session in [None, Some(3)] {
+            at += 20 * MS;
+            rate.before_frame(session, true);
+            rate.note_encoded("libx264", MS, 120, at);
+            assert_eq!(shared.capture_fps(), 45);
+            assert_eq!(super::encode_fps("libx264", &shared), 45);
+        }
     }
 
     /// An encoder so slow that a second holds only a few frames still
