@@ -9,9 +9,11 @@
 //!
 //! The iPad is told the stream's rate as before (`StreamConfig.fps` is the
 //! user's setting): it already takes a stream whose rate varies, as a still
-//! desktop's does, and the encoder's timestamps are capture's own.
+//! desktop's does. The software session itself reopens at the rate capture
+//! is held to (see [`encode_fps`]).
 
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tracing::info;
@@ -23,8 +25,9 @@ const STEPS: [u32; 5] = [120, 90, 60, 45, 30];
 pub(crate) const FLOOR_FPS: u32 = 30;
 /// The encoder's cost is averaged over this long before a rate changes.
 const WINDOW: Duration = Duration::from_secs(1);
-/// Fewer new pictures than this in a window say nothing about the encoder:
-/// a still desktop.
+/// Fewer new pictures than this in a window say nothing about the encoder,
+/// a still desktop, unless the encoder was busy most of the window (see
+/// [`HOLDS`]): then they were few because each took long.
 const MIN_FRAMES: u32 = 5;
 /// A rate holds while a frame's conversion and encoding take at most this
 /// share of its interval; capture and the transport need the rest.
@@ -54,8 +57,13 @@ pub(crate) struct Step {
     pub cost: Duration,
 }
 
+/// Holds capture to a software encoder's rate through `published`, the
+/// shared `cpu_fps_limit` (0 for none), which only this writes.
 #[derive(Debug)]
 pub(crate) struct SoftwareRate {
+    published: Arc<AtomicU32>,
+    /// The encoder and session the measurements are of.
+    of: Option<(String, Option<u32>)>,
     /// The rate capture is held to, while it is below the stream's.
     limit: Option<u32>,
     /// Since when, the summed cost and the frames of the current window.
@@ -65,9 +73,13 @@ pub(crate) struct SoftwareRate {
     raised_at: Option<Instant>,
 }
 
-impl Default for SoftwareRate {
-    fn default() -> Self {
+impl SoftwareRate {
+    /// No limit, published at once.
+    pub(crate) fn new(published: Arc<AtomicU32>) -> Self {
+        published.store(0, Ordering::Relaxed);
         Self {
+            published,
+            of: None,
             limit: None,
             window: None,
             headroom_since: None,
@@ -89,6 +101,20 @@ fn levels(ceiling: u32) -> impl Iterator<Item = u32> {
 
 fn holds(cost: Duration, fps: u32, share: f64) -> bool {
     cost.as_secs_f64() * f64::from(fps.max(1)) <= share
+}
+
+/// The rate the session for `encoder_name` opens at. x264's and x265's
+/// zero-latency rate control spends `bitrate / fps` on each frame whatever
+/// the timestamps say, so a software session encodes at the rate capture is
+/// held to: at 45 fps captured into a session opened at 120, it sent 389 of
+/// 1,000 kbps. With no limit this is the stream's rate, as before. Hardware
+/// sessions always open at the stream's rate.
+pub(crate) fn encode_fps(encoder_name: &str, shared: &crate::control::SharedControl) -> u32 {
+    if is_software_encoder(encoder_name) {
+        shared.capture_fps()
+    } else {
+        shared.effective_fps()
+    }
 }
 
 impl SoftwareRate {
@@ -116,7 +142,9 @@ impl SoftwareRate {
             return None;
         }
         let (_, sum, frames) = self.window.take().expect("filled above");
-        if frames < MIN_FRAMES {
+        // Few frames from an encoder busy all the window: each took long.
+        let busy = sum.as_secs_f64() >= HOLDS * elapsed.as_secs_f64();
+        if frames < MIN_FRAMES && !busy {
             self.headroom_since = None;
             return None;
         }
@@ -147,7 +175,10 @@ impl SoftwareRate {
                 cost,
             });
         }
-        self.limit?;
+        if self.limit.is_none() || frames < MIN_FRAMES {
+            self.headroom_since = None;
+            return None;
+        }
         let next = levels(ceiling)
             .filter(|&fps| fps > current)
             .min()
@@ -171,28 +202,41 @@ impl SoftwareRate {
         })
     }
 
-    /// After each frame the open session encoded from a new picture: holds
-    /// capture (`limit`, 0 for none) to the rate a software encoder keeps
-    /// up with. A hardware session ends any limit.
+    /// Forgets the measurements and ends any limit.
+    fn reset(&mut self) {
+        *self = Self::new(Arc::clone(&self.published));
+    }
+
+    /// After each frame the open session encoded from a new picture, in
+    /// `session` (the viewer's, if any): holds capture to the rate a
+    /// software encoder keeps up with. A hardware session, another encoder
+    /// or another session starts again without a limit.
     pub(crate) fn note_encoded(
         &mut self,
         encoder_name: &str,
+        session: Option<u32>,
         cost: Duration,
         ceiling: u32,
         now: Instant,
-        limit: &AtomicU32,
     ) {
+        if self
+            .of
+            .as_ref()
+            .is_none_or(|(encoder, of)| encoder != encoder_name || *of != session)
+        {
+            self.reset();
+            self.of = Some((encoder_name.to_string(), session));
+        }
         if !is_software_encoder(encoder_name) {
-            if self.limit.is_some() {
-                *self = Self::default();
-                limit.store(0, Ordering::Relaxed);
-            }
             return;
         }
-        let Some(step) = self.encoded(cost, ceiling, now) else {
+        let step = self.encoded(cost, ceiling, now);
+        // Also when a lower stream rate ended the limit without a step.
+        self.published
+            .store(self.limit.unwrap_or(0), Ordering::Relaxed);
+        let Some(step) = step else {
             return;
         };
-        limit.store(self.limit.unwrap_or(0), Ordering::Relaxed);
         let encode_us = step.cost.as_micros() as u64;
         if step.to < step.from {
             info!(
@@ -269,7 +313,7 @@ mod tests {
         let (producer, consumer) = frame_slot();
         let epoch = Instant::now();
         let end = epoch + Duration::from_secs_f64(seconds);
-        let mut rate = SoftwareRate::default();
+        let mut rate = SoftwareRate::new(Arc::clone(&shared.cpu_fps_limit));
         let mut run = Run::default();
         let mut next_capture = epoch;
         let mut encoder_free = epoch;
@@ -316,10 +360,10 @@ mod tests {
                     if limiter {
                         rate.note_encoded(
                             encoder,
+                            Some(1),
                             spent,
                             shared.effective_fps(),
                             encoder_free,
-                            &shared.cpu_fps_limit,
                         );
                     }
                 }
@@ -479,27 +523,97 @@ mod tests {
         }
     }
 
-    /// Back from libx264 to a hardware encoder that opened in the
-    /// background: capture goes back to the stream's rate.
-    #[test]
-    fn a_hardware_session_ends_the_limit() {
-        let shared = shared_at(120);
-        let mut rate = SoftwareRate::default();
-        let start = Instant::now();
-        for frame in 0..60u32 {
-            let at = start + frame * 25 * MS;
-            rate.note_encoded("libx264", 25 * MS, 120, at, &shared.cpu_fps_limit);
+    /// Frames of `cost` every `cost` (an encoder busy all the time) from
+    /// `at` for `seconds`, for `encoder` in `session` at `ceiling`.
+    fn busy(
+        rate: &mut SoftwareRate,
+        (encoder, session, ceiling): (&str, Option<u32>, u32),
+        cost: Duration,
+        at: &mut Instant,
+        seconds: u32,
+    ) {
+        let end = *at + seconds * 1000 * MS;
+        while *at < end {
+            *at += cost;
+            rate.note_encoded(encoder, session, cost, ceiling, *at);
         }
+    }
+
+    /// The review's sequence: held to 45, the user picks 30, then 120
+    /// again with cheap frames. Capture goes back to 120 with the
+    /// controller, instead of staying at 45.
+    #[test]
+    fn a_limit_a_lower_setting_ended_ends_in_capture_too() {
+        let shared = shared_at(120);
+        let mut rate = SoftwareRate::new(Arc::clone(&shared.cpu_fps_limit));
+        let mut at = Instant::now();
+        busy(&mut rate, ("libx264", Some(1), 120), 20 * MS, &mut at, 3);
+        assert_eq!(shared.capture_fps(), 45);
+        shared.target_fps.store(30, Ordering::SeqCst);
+        busy(&mut rate, ("libx264", Some(1), 30), MS, &mut at, 3);
         assert_eq!(shared.capture_fps(), 30);
-        rate.note_encoded("h264_qsv", MS, 120, start, &shared.cpu_fps_limit);
-        assert_eq!(shared.capture_fps(), 120);
+        shared.target_fps.store(120, Ordering::SeqCst);
+        busy(&mut rate, ("libx264", Some(1), 120), MS, &mut at, 3);
         assert_eq!(rate.rate(120), 120);
+        assert_eq!(shared.cpu_fps_limit.load(Ordering::SeqCst), 0);
+        assert_eq!(shared.capture_fps(), 120);
+    }
+
+    /// A hardware session after a limited software one, another software
+    /// encoder or another session: capture goes back to the stream's rate
+    /// at the first frame, before any measurement.
+    #[test]
+    fn a_hardware_encoder_another_encoder_or_session_starts_without_a_limit() {
+        let shared = shared_at(120);
+        let limited = |shared: &SharedControl| {
+            let mut rate = SoftwareRate::new(Arc::clone(&shared.cpu_fps_limit));
+            let mut at = Instant::now();
+            busy(&mut rate, ("libx264", Some(1), 120), 20 * MS, &mut at, 2);
+            assert_eq!(shared.capture_fps(), 45);
+            (rate, at)
+        };
+        for (encoder, session) in [
+            ("h264_nvenc", Some(1)),
+            ("h264_amf", Some(1)),
+            ("libx265", Some(1)),
+            ("libx264", Some(2)),
+            ("libx264", None),
+        ] {
+            let (mut rate, at) = limited(&shared);
+            rate.note_encoded(encoder, session, MS, 120, at + MS);
+            assert_eq!(shared.cpu_fps_limit.load(Ordering::SeqCst), 0, "{encoder}");
+            assert_eq!(shared.capture_fps(), 120, "{encoder} {session:?}");
+        }
+        // However long the hardware encoder takes.
+        let (mut rate, mut at) = limited(&shared);
+        busy(
+            &mut rate,
+            ("h264_nvenc", Some(1), 120),
+            50 * MS,
+            &mut at,
+            10,
+        );
+        assert_eq!(shared.capture_fps(), 120);
+    }
+
+    /// An encoder so slow that a second holds only a few frames still
+    /// limits capture: 500 ms and 100 ms a frame, busy all the time.
+    #[test]
+    fn an_encoder_too_slow_for_five_frames_a_second_still_limits_capture() {
+        for cost in [500 * MS, 100 * MS] {
+            let shared = shared_at(120);
+            let run = simulate(&shared, "libx264", 60.0, true, |_, _| cost);
+            let rates: Vec<u32> = run.rates.iter().map(|&(_, fps)| fps).collect();
+            assert_eq!(rates, [120, 30], "{cost:?}: {:?}", run.rates);
+            assert!(run.rate_at(2.1) == 30, "{cost:?}: {:?}", run.rates);
+            assert_eq!(shared.cpu_fps_limit.load(Ordering::SeqCst), 30);
+        }
     }
 
     /// A still desktop, whose few pictures are cheap, is no headroom.
     #[test]
-    fn a_still_desktop_does_not_raise_the_rate() {
-        let mut rate = SoftwareRate::default();
+    fn a_still_desktop_does_not_raise_or_lower_the_rate() {
+        let mut rate = SoftwareRate::new(Arc::default());
         let start = Instant::now();
         let mut at = start;
         for _ in 0..60 {
@@ -511,6 +625,13 @@ mod tests {
         for _ in 0..240 {
             at += 250 * MS;
             assert_eq!(rate.encoded(MS, 120, at), None);
+        }
+        assert_eq!(rate.rate(120), 45);
+        // Nor do fewer than five a second lower it while the encoder is
+        // mostly idle, though 40 ms is more than 90% of a 45 fps frame.
+        for _ in 0..150 {
+            at += 400 * MS;
+            assert_eq!(rate.encoded(40 * MS, 120, at), None);
         }
         assert_eq!(rate.rate(120), 45);
     }

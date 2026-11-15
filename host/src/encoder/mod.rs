@@ -167,8 +167,8 @@ fn run_encode_loop(
     let mut bitrate_pacer = BitratePacer::default();
     // Capture runs at the stream's rate until a software encoder cannot
     // keep up with it.
-    let mut software_rate = software_rate::SoftwareRate::default();
-    shared.cpu_fps_limit.store(0, Ordering::Relaxed);
+    let mut software_rate =
+        software_rate::SoftwareRate::new(std::sync::Arc::clone(&shared.cpu_fps_limit));
 
     // Guarantee the very first frame of every pipeline is an IDR for all encoders, so the
     // iPad never sits in `waitingForSyncSample` after a connect or pipeline restart.
@@ -240,7 +240,7 @@ fn run_encode_loop(
         }
 
         let desired_bitrate = shared.abr_current_bps.load(Ordering::SeqCst).max(500_000);
-        let target_fps = shared.effective_fps();
+        let stream_fps = shared.effective_fps();
 
         // HEVC negotiation, re-checked every frame so a settings toggle or a
         // new session takes effect at the next frame boundary: the user's
@@ -275,6 +275,8 @@ fn run_encode_loop(
             (Some(_), Some(state)) => state.opened_encoder.clone(),
             _ => desired_encoder,
         };
+        // A software session reopens at the rate capture is held to.
+        let target_fps = software_rate::encode_fps(&desired_encoder, &shared);
         forget_failed_reopen(
             &mut failed_reopen,
             &mut negotiated,
@@ -759,10 +761,10 @@ fn run_encode_loop(
                     if !std::mem::replace(&mut costed, true) {
                         software_rate.note_encoded(
                             &encoder.opened_encoder,
+                            session_id,
                             convert_time + encode_start.elapsed(),
-                            target_fps,
+                            stream_fps,
                             Instant::now(),
-                            &shared.cpu_fps_limit,
                         );
                     }
                     let packet_bytes = encoder.packet.data().unwrap_or_default();
@@ -3428,6 +3430,91 @@ mod tests {
             frame_number,
         );
         rows
+    }
+
+    /// kbit/s a real software session opened at `opened_fps` sends for 20 s
+    /// of moving pictures captured at `cadence`, at a 1 Mbit/s target.
+    fn software_kbps(encoder: &str, opened_fps: u32, cadence: u32) -> f64 {
+        let (width, height) = (320, 180);
+        let mut state = EncoderState::new(
+            encoder,
+            width,
+            height,
+            1_000_000,
+            opened_fps,
+            &mut EncoderInput::Yuv420,
+            Opening::First,
+            &mut || {},
+        )
+        .unwrap_or_else(|error| panic!("{encoder}: {error}"));
+        let frames = u64::from(cadence) * 20;
+        let start = Instant::now();
+        // Grain the test pattern leaves out, as on a real desktop: a plane
+        // twice the picture, read from a new place each frame.
+        let picture = (width * height * 4) as usize;
+        let mut noise = 0x2545_F491_4F6C_DD1Du64;
+        let grain: Vec<u8> = (0..picture * 2)
+            .map(|_| {
+                noise ^= noise << 13;
+                noise ^= noise >> 7;
+                noise ^= noise << 17;
+                (noise & 0x1f) as u8
+            })
+            .collect();
+        let mut bytes = 0;
+        for n in 1..=frames {
+            let mut rows = synthetic_capture(width, height, n);
+            let offset = (n as usize * 4099) % picture;
+            for (pixel, grain) in rows[..picture].iter_mut().zip(&grain[offset..]) {
+                *pixel = pixel.saturating_add(*grain);
+            }
+            state.convert(&rows, (width * 4) as usize).unwrap();
+            let captured = start + Duration::from_secs(n) / cadence;
+            let pts = state.next_pts(captured, n);
+            state.frame.set_pts(Some(pts));
+            state.send_frame(pts, captured, n).unwrap();
+            while state.encoder.receive_packet(&mut state.packet).is_ok() {
+                bytes += state.packet.size();
+            }
+        }
+        bytes as f64 * 8.0 / 20.0 / 1000.0
+    }
+
+    /// x264's and x265's zero-latency rate control gives each frame
+    /// `bitrate / fps` of the rate the session opened at, whatever the
+    /// timestamps say. A session the limit holds to 45 fps opens at 45 and
+    /// sends the bitrate it is given; one at the stream's 120, as before,
+    /// sent about 45/120 of it. With no limit, and for hardware, sessions
+    /// open at the stream's rate as before.
+    #[test]
+    fn a_software_session_held_to_45_fps_sends_its_whole_bitrate() {
+        ffmpeg_next::init().unwrap();
+        let shared = SharedControl::new(9876, 15_000_000);
+        shared.target_fps.store(120, Ordering::SeqCst);
+        assert_eq!(software_rate::encode_fps("libx264", &shared), 120);
+        shared.cpu_fps_limit.store(45, Ordering::SeqCst);
+        assert_eq!(software_rate::encode_fps("h264_nvenc", &shared), 120);
+        for encoder in ["libx264", "libx265"] {
+            if ffmpeg_next::encoder::find_by_name(encoder).is_none() {
+                eprintln!("{encoder} is not in this FFmpeg build");
+                continue;
+            }
+            let opened = software_rate::encode_fps(encoder, &shared);
+            assert_eq!(opened, 45);
+            let limited = software_kbps(encoder, opened, 45);
+            let unlimited = software_kbps(encoder, shared.effective_fps(), 45);
+            eprintln!(
+                "{encoder} at 45 fps: opened at 45 {limited:.0} kbps, at 120 {unlimited:.0} kbps"
+            );
+            assert!(
+                (900.0..=1100.0).contains(&limited),
+                "{encoder} opened at 45: {limited:.0} kbps of 1000"
+            );
+            assert!(
+                unlimited < 600.0,
+                "{encoder} opened at 120: {unlimited:.0} kbps"
+            );
+        }
     }
 
     /// A screen with an odd height (1680x945, from a report) or width
