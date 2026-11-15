@@ -320,10 +320,10 @@ pub fn note_session_start(session_id: u32, shared: &SharedControl) {
 }
 
 /// Notes `reason` for the live session's summary, as a
-/// `second_screen_fallback` log field does. Also called directly for a
-/// Second screen that is held by design rather than failed, so the field
-/// (which the daily check counts as a failure) isn't logged for it.
-pub(crate) fn note_fallback(reason: &str) {
+/// `second_screen_fallback` log field does, or a `second_screen_hold` field
+/// for a Second screen that is held by design rather than failed: the daily
+/// check counts the first as a failure, and doesn't read the second.
+fn note_fallback(reason: &str) {
     let (session_id, mode) = {
         let slot = SESSION_FALLBACK.lock();
         match (slot.session_id, &slot.mode) {
@@ -380,22 +380,19 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for FallbackWatch {
         struct Reason;
         impl tracing::field::Visit for Reason {
             fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
-                if field.name() == "second_screen_fallback" {
+                if FIELDS.contains(&field.name()) {
                     note_fallback(value);
                 }
             }
             fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
-                if field.name() == "second_screen_fallback" {
+                if FIELDS.contains(&field.name()) {
                     note_fallback(format!("{value:?}").trim_matches('"'));
                 }
             }
         }
-        if event
-            .metadata()
-            .fields()
-            .field("second_screen_fallback")
-            .is_some()
-        {
+        const FIELDS: [&str; 2] = ["second_screen_fallback", "second_screen_hold"];
+        let fields = event.metadata().fields();
+        if FIELDS.iter().any(|name| fields.field(name).is_some()) {
             event.record(&mut Reason);
         }
     }
@@ -763,6 +760,42 @@ pub(crate) mod tests {
 
     /// Held by tests that use the session's fallback slot.
     pub(crate) static FALLBACK_SLOT: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+    /// `act` within a session of `shared`, on this thread: the fallback the
+    /// session's summary names, what `act` logged, and what it returned.
+    pub(crate) fn summary_fallback<T>(
+        shared: &SharedControl,
+        act: impl FnOnce() -> T,
+    ) -> (Option<&'static str>, String, T) {
+        use tracing_subscriber::prelude::*;
+        #[derive(Clone, Default)]
+        struct Sink(std::sync::Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl std::io::Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let _slot = FALLBACK_SLOT.lock();
+        crate::logging::prepare_log_capture();
+        let sink = Sink::default();
+        let out = std::sync::Arc::clone(&sink.0);
+        let subscriber = tracing_subscriber::registry().with(FallbackWatch).with(
+            tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_writer(move || sink.clone()),
+        );
+        let (fallback, result) = tracing::subscriber::with_default(subscriber, || {
+            note_session_start(7, shared);
+            let result = act();
+            (take_fallback(7), result)
+        });
+        let log = String::from_utf8_lossy(&out.lock()).into_owned();
+        (fallback, log, result)
+    }
 
     /// Collects the `session_summary` lines logged.
     pub(crate) struct SummaryCapture(pub std::sync::Arc<parking_lot::Mutex<Vec<String>>>);
@@ -1145,11 +1178,13 @@ pub(crate) mod tests {
     }
 
     /// The Windows 10 Second screen hold names `no_driver` in the session
-    /// summary without logging a `second_screen_fallback` field, which the
-    /// daily check counts as a failure. A failed start without a driver
+    /// summary with no driver, and `remembered` after a start that failed in
+    /// this app run, without logging a `second_screen_fallback` field, which
+    /// the daily check counts as a failure. A failed start without a driver
     /// still logs the field.
     #[test]
-    fn a_windows_10_hold_is_summarised_as_no_driver_without_a_fallback_line() {
+    fn a_windows_10_hold_is_summarised_without_a_fallback_line() {
+        use crate::capture::second_screen::Windows;
         use tracing_subscriber::prelude::*;
         struct Fields(std::sync::Arc<parking_lot::Mutex<Vec<String>>>);
         impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Fields {
@@ -1182,9 +1217,13 @@ pub(crate) mod tests {
         };
         tracing::subscriber::with_default(subscriber, || {
             note_session_start(1, &shared);
-            crate::capture::second_screen::log_windows_hold();
+            crate::capture::second_screen::log_windows_hold(Windows::NoDriver);
             assert!(!has_field(), "{:?}", fields.lock());
             assert_eq!(take_fallback(1), Some("no_driver"));
+            note_session_start(3, &shared);
+            crate::capture::second_screen::log_windows_hold(Windows::Failed);
+            assert!(!has_field(), "{:?}", fields.lock());
+            assert_eq!(take_fallback(3), Some("remembered"));
             note_session_start(2, &shared);
             tracing::info!(second_screen_fallback = "no_driver", "no driver here");
             assert!(has_field());

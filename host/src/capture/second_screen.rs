@@ -114,14 +114,14 @@ pub(crate) const NO_MONITOR_WAIT: Duration = Duration::from_secs(10);
 #[cfg(any(windows, test, debug_assertions))]
 const DEVICE_READ_EVERY: Duration = Duration::from_secs(1);
 
-/// Why Second screen mirrors on this PC without trying: Windows is older
-/// than the display driver needs ([`driver_supports_windows`]). Not saved:
-/// each app run reads Windows again.
+/// Why Second screen mirrors on this PC without trying: Windows 10, with no
+/// display driver, or after a start failed in this app run ([`Windows`]).
+/// Not saved: each app run reads Windows again and tries again.
 pub(crate) const WINDOWS_10: &str = "windows_10";
 
 /// The first Windows 11 build. The display driver Setup installs is built
-/// for Windows 11's display driver framework: on Windows 10 it starts, but
-/// Windows never adds its screen.
+/// for Windows 11's display driver framework: on Windows 10 Windows adds its
+/// screen on some PCs and not on others, and on some only at times.
 #[cfg(any(windows, test))]
 const FIRST_WINDOWS_11_BUILD: u32 = 22000;
 
@@ -139,6 +139,38 @@ pub(crate) const WINDOWS_10_IPAD_NOTICE: Duration = Duration::from_secs(10);
 #[cfg(any(windows, test))]
 pub(crate) fn driver_supports_windows(build: Option<u32>, forced: bool) -> bool {
     forced || build.is_none_or(|build| build >= FIRST_WINDOWS_11_BUILD)
+}
+
+/// Second screen on this Windows, as [`note_windows`] read it at startup.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Windows {
+    /// Windows 11, an unknown build, or the tester's override.
+    #[default]
+    Supported,
+    /// Windows 10 with the display driver: tried, as on Windows 11.
+    Tried,
+    /// Windows 10 without the display driver: Second screen mirrors.
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))] // Read from Windows only.
+    NoDriver,
+    /// Windows 10, and a start failed in this app run: Second screen
+    /// mirrors until the app starts again.
+    Failed,
+}
+
+impl Windows {
+    /// Second screen mirrors without turning the driver on.
+    fn held(self) -> bool {
+        matches!(self, Self::NoDriver | Self::Failed)
+    }
+
+    /// A held connection's fallback in the session summary: no driver, or
+    /// the failure remembered, as 0.3.4 named a remembered failure.
+    fn summary(self) -> &'static str {
+        match self {
+            Self::Failed => "remembered",
+            _ => "no_driver",
+        }
+    }
 }
 
 /// How long quitting waits for the worker to exit after the last Enable.
@@ -263,9 +295,9 @@ pub(crate) struct State {
     /// The graphics cards and the screens' wiring, as last read off the
     /// transport loop: see [`facts`].
     facts: facts::Cache,
-    /// Windows is too old for the display driver: Second screen mirrors
-    /// without turning it on ([`note_windows`]).
-    windows_unsupported: bool,
+    /// Whether Second screen mirrors on this Windows without turning the
+    /// driver on ([`note_windows`]).
+    windows: Windows,
     /// When a connection last began mirroring for that, for the iPad's
     /// notice ([`windows_notice`]).
     windows_held_at: Option<Instant>,
@@ -305,7 +337,7 @@ impl State {
                 memory: std::mem::take(&mut self.memory),
                 mirror_refused: self.mirror_refused.take(),
                 facts: std::mem::take(&mut self.facts),
-                windows_unsupported: self.windows_unsupported,
+                windows: self.windows,
                 #[cfg(debug_assertions)]
                 fake_desktop_away: self.fake_desktop_away.take(),
                 ..State::default()
@@ -319,11 +351,11 @@ impl State {
         self.retry_if_back(status, connected, now, secure);
         match *status {
             // Before any saved failure: trying again can't help.
-            VddStatus::WaitingForClient if connected && self.windows_unsupported => {
+            VddStatus::WaitingForClient if connected && self.windows.held() => {
                 *status = VddStatus::Failed;
                 self.failure = Some(WINDOWS_10);
                 self.windows_held_at = Some(now);
-                log_windows_hold();
+                log_windows_hold(self.windows);
                 Step::Nothing
             }
             VddStatus::WaitingForClient if connected => {
@@ -426,7 +458,7 @@ impl State {
             memory: std::mem::take(&mut self.memory),
             mirror_refused: self.mirror_refused.take(),
             facts: std::mem::take(&mut self.facts),
-            windows_unsupported: self.windows_unsupported,
+            windows: self.windows,
             #[cfg(debug_assertions)]
             fake_desktop_away: self.fake_desktop_away.take(),
             ..State::default()
@@ -621,6 +653,25 @@ impl State {
         self.release_requested = false;
     }
 
+    /// On Windows 10, a start that failed with this `reason`: the iPad
+    /// gets the mirror and both notices say Second screen needs Windows 11,
+    /// and later connections mirror without trying again, for this app run.
+    #[cfg(any(windows, test, debug_assertions))]
+    fn windows_10_failed(&mut self, status: &mut VddStatus, reason: &'static str, now: Instant) {
+        if self.windows != Windows::Tried {
+            return;
+        }
+        tracing::info!(
+            reason,
+            "The second screen couldn't start on Windows 10 — Second screen mirrors the primary \
+             display for the rest of this app run"
+        );
+        self.windows = Windows::Failed;
+        *status = VddStatus::Failed;
+        self.failure = Some(WINDOWS_10);
+        self.windows_held_at = Some(now);
+    }
+
     #[cfg(any(windows, test, debug_assertions))]
     fn toggle_delay(&self, now: Instant) -> Duration {
         self.last_toggle.map_or(Duration::ZERO, |at| {
@@ -690,46 +741,85 @@ fn log_hold(hold: Hold) {
     );
 }
 
-/// The one log line for a connection that mirrors because Windows is too
-/// old for the display driver. It is expected, not a failure, so it has no
-/// `second_screen_fallback` field: the daily check counts those. The
-/// session summary still names it `no_driver`: there is no display driver
-/// for this Windows.
-pub(crate) fn log_windows_hold() {
-    crate::diagnostics::note_fallback("no_driver");
+/// The one log line for a connection that mirrors on Windows 10 without
+/// trying (see [`Windows`]). It is expected, not a new failure, so it has no
+/// `second_screen_fallback` field: the daily check counts those. Its
+/// `second_screen_hold` field names it in the session summary: `no_driver`
+/// with no driver, and `remembered` after a failed start
+/// ([`Windows::summary`]).
+pub(crate) fn log_windows_hold(windows: Windows) {
     tracing::info!(
+        second_screen_hold = windows.summary(),
         reason = WINDOWS_10,
+        driver = if windows == Windows::Failed {
+            "failed_this_run"
+        } else {
+            "missing"
+        },
         "Second screen held: needs Windows 11 — mirroring the primary display without turning \
          the display driver on"
     );
 }
 
-/// Records whether this Windows can run the display driver (see
-/// [`driver_supports_windows`]), at startup.
+/// Records, at startup, whether this Windows can run the display driver
+/// (see [`driver_supports_windows`]) and, below Windows 11, whether the
+/// driver is `installed`: Windows 10 tries it when it is.
 #[cfg(any(windows, test))]
-pub(crate) fn note_windows(shared: &SharedControl, build: Option<u32>, forced: bool) {
-    let supported = driver_supports_windows(build, forced);
+pub(crate) fn note_windows(
+    shared: &SharedControl,
+    build: Option<u32>,
+    forced: bool,
+    installed: bool,
+) {
+    let windows = if driver_supports_windows(build, forced) {
+        Windows::Supported
+    } else if installed {
+        Windows::Tried
+    } else {
+        Windows::NoDriver
+    };
     if !driver_supports_windows(build, false) {
         if forced {
             tracing::info!(
                 "Windows is older than Windows 11, but {WINDOWS_10_OVERRIDE} asks to try Second \
                  screen anyway"
             );
+        } else if installed {
+            tracing::info!(
+                "Windows is older than Windows 11 — Second screen is tried, and mirrors the \
+                 primary display for the rest of this app run if it can't start"
+            );
         } else {
             tracing::info!(
-                "Windows is older than Windows 11 — Second screen mirrors the primary display \
-                 without turning the display driver on"
+                "Windows is older than Windows 11 and has no virtual display driver — Second \
+                 screen mirrors the primary display"
             );
         }
     }
-    shared.second_screen.lock().windows_unsupported = !supported;
+    shared.second_screen.lock().windows = windows;
 }
 
-/// [`note_windows`] for this PC: its build, and the tester's override.
+/// [`note_windows`] for this PC: its build, the tester's override, and,
+/// below Windows 11, whether the driver's device is there. Only a confirmed
+/// absence counts as no driver; a read that isn't certain, or doesn't answer
+/// within 2 s, tries the driver as 0.3.4 did.
 #[cfg(windows)]
 pub fn check_windows(shared: &SharedControl) {
     let forced = std::env::var(WINDOWS_10_OVERRIDE).is_ok_and(|value| value.trim() == "1");
-    note_windows(shared, windows_build(), forced);
+    let build = windows_build();
+    let installed = driver_supports_windows(build, forced) || {
+        let (answer, answered) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("vdd-device-read".into())
+            .spawn(move || {
+                let _ = answer.send(crate::vdd_device::query_confirmed());
+            });
+        !matches!(
+            spawned.map(|_| answered.recv_timeout(Duration::from_secs(2))),
+            Ok(Ok(Some(DeviceState::Missing)))
+        )
+    };
+    note_windows(shared, build, forced, installed);
 }
 
 /// This PC's Windows build, as the registry names it. Windows 11 keeps
@@ -745,10 +835,11 @@ fn windows_build() -> Option<u32> {
     .ok()
 }
 
-/// Whether Second screen mirrors on this PC because Windows is too old for
-/// the display driver, for the Stream page and Settings.
+/// Whether Second screen mirrors on this Windows 10 PC without trying (no
+/// driver, or a start that failed in this app run), for the Stream page and
+/// Settings.
 pub(crate) fn windows_unsupported(shared: &SharedControl) -> bool {
-    shared.second_screen.lock().windows_unsupported
+    shared.second_screen.lock().windows.held()
 }
 
 /// Whether the heartbeat tells the iPad now that Second screen needs
@@ -804,8 +895,9 @@ pub(crate) fn note_connected(shared: &SharedControl, now: Instant) {
     // Nothing to try on this Windows, even when the mirror shows nothing.
     if *status == VddStatus::Failed && state.failure == Some(WINDOWS_10) {
         state.windows_held_at = Some(now);
+        let windows = state.windows;
         drop((state, status));
-        log_windows_hold();
+        log_windows_hold(windows);
         return;
     }
     // The mirror would show nothing: the second screen is the only picture.
@@ -1871,9 +1963,12 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
         if report.is_ok_and(|device| device != DeviceState::Missing) {
             disable(shared, driver);
         }
+        let now = driver.now();
         let mut status = shared.vdd_status.lock();
         *status = VddStatus::TaskFailed;
-        shared.second_screen.lock().failure = Some("enable_failed");
+        let mut state = shared.second_screen.lock();
+        state.failure = Some("enable_failed");
+        state.windows_10_failed(&mut status, "enable_failed", now);
         return;
     }
     let waiting_since = driver.now();
@@ -1983,6 +2078,10 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
             // version reads.
             state.failure = Some("attach_timeout");
             state.remember("attach_timeout", now, false, blocked);
+            // The mirror shows nothing: the next connection tries again.
+            if !blocked {
+                state.windows_10_failed(&mut status, "attach_timeout", now);
+            }
             if blocked && copied {
                 info!(
                     retry_in_s = BLOCKED_EXTEND_RETRY.as_secs(),
