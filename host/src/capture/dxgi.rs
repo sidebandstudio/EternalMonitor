@@ -958,6 +958,8 @@ pub fn run_capture_loop(
                     last_frame = Arc::new(frame_buffer(frame_bytes));
                     picture.resized();
                     start_picture.duplicated(Instant::now());
+                    // Set in Windows' display settings, or from the app.
+                    super::note_vdd_mode(&shared, &chosen.device_name, (new_w, new_h));
                     staging_texture = unsafe {
                         let mut tex = None;
                         device.CreateTexture2D(

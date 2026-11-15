@@ -441,6 +441,24 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     harness.run_steps(4);
     snapshot(&mut harness, &shared, "settings");
 
+    // The second screen's size, remembered for this iPad, then its own again.
+    let resolution = |value: &'static str| kittest::by().role(Role::ComboBox).value(value);
+    let record = dir.join("EternalMonitor").join("vdd-resolutions.json");
+    for (open, pick, chosen) in [
+        ("2420 × 1668 (native)", "1814 × 1250", Some((1814, 1250))),
+        ("1814 × 1250", "2420 × 1668 (native)", None),
+    ] {
+        harness.get(resolution(open)).click();
+        harness.run_steps(4);
+        harness.get_by_label("1920 × 1200 (16:10)");
+        harness.get_by_label(pick).click();
+        harness.run_steps(4);
+        harness.get(resolution(pick));
+        assert_eq!(shared.vdd_resolutions.lock().chosen(7), chosen);
+        let saved = eternal_host::vdd_settings::ResolutionChoices::load(&record);
+        assert_eq!(saved.chosen(7), chosen);
+    }
+
     // General sits below the fold of the Settings page.
     harness
         .get_by_label("Automatic update checks")

@@ -636,21 +636,28 @@ fn prepare_vdd_settings(shared: &SharedControl, outputs: &[OutputInfo]) -> VddRe
         None => Err(std::io::Error::other("no app data folder")),
         Some(record) if crate::settings::SettingsFile::load().vdd_match_resolution => {
             let client = shared.session.lock().client_info();
-            let modes = client.map_or_else(crate::vdd_settings::default_modes, |info| {
-                crate::vdd_settings::modes_for_client(
-                    info.screen_px.0,
-                    info.screen_px.1,
-                    info.refresh_hz,
-                )
-            });
+            let modes = client
+                .as_ref()
+                .map_or_else(crate::vdd_settings::default_modes, |info| {
+                    crate::vdd_settings::modes_for_client(
+                        info.screen_px.0,
+                        info.screen_px.1,
+                        info.refresh_hz,
+                    )
+                });
+            let chosen = client
+                .as_ref()
+                .and_then(|info| shared.vdd_resolutions.lock().chosen(info.device_id));
             let written = crate::vdd_settings::write_with_pin(path, record, owned, &modes, gpu);
             match &written {
                 Ok(_) => {
+                    mode = crate::vdd_settings::requested_mode(&modes, chosen);
                     info!(
                         ?modes,
+                        chosen = ?chosen.map(|(w, h)| format!("{w}x{h}")),
+                        requested = ?mode,
                         "Wrote virtual display mode list for the connected client"
                     );
-                    mode = modes.first().copied();
                 }
                 Err(error) => warn!(
                     %error,
@@ -732,6 +739,80 @@ pub(crate) fn running_driver_cursor() -> crate::vdd_settings::DriverCursor {
         "The running virtual display's pointer"
     );
     cursor
+}
+
+/// The connected iPad's id and the second screen modes offered for it.
+pub fn connected_vdd_modes(
+    shared: &SharedControl,
+) -> Option<(u64, Vec<crate::vdd_settings::VddMode>)> {
+    let info = shared.session.lock().client_info()?;
+    let modes =
+        crate::vdd_settings::modes_for_client(info.screen_px.0, info.screen_px.1, info.refresh_hz);
+    Some((info.device_id, modes))
+}
+
+/// The second screen's size chosen in the app for the connected iPad:
+/// remembered for it, and set now when its second screen is on.
+pub fn choose_vdd_resolution(shared: &SharedControl, size: (u32, u32)) {
+    let Some((device, modes)) = connected_vdd_modes(shared) else {
+        return;
+    };
+    remember_vdd_resolution(shared, device, &modes, size, "app");
+    #[cfg(windows)]
+    let display = shared.vdd_output.lock().clone();
+    #[cfg(windows)]
+    if let (Some(display), Some(mode)) = (
+        display,
+        crate::vdd_settings::requested_mode(&modes, Some(size)),
+    ) {
+        // Windows takes a moment to change a mode; not on the window's thread.
+        let spawned = std::thread::Builder::new()
+            .name("second-screen-mode".into())
+            .spawn(move || {
+                let set = crate::vdd_device::set_display_mode(&display, mode);
+                info!(%mode, set, "Set the second screen's resolution chosen in the app");
+            });
+        if let Err(error) = spawned {
+            warn!(%error, "Could not set the second screen's resolution now");
+        }
+    }
+}
+
+/// The second screen streaming now changed size, in Windows' display
+/// settings or from the app: remember it for the connected iPad, when its
+/// mode list offers it, so its next second screen starts in it.
+#[cfg(windows)]
+fn note_vdd_mode(shared: &SharedControl, display: &str, size: (u32, u32)) {
+    if shared.vdd_output.lock().as_deref() != Some(display)
+        || !crate::settings::SettingsFile::load().vdd_match_resolution
+    {
+        return;
+    }
+    if let Some((device, modes)) = connected_vdd_modes(shared) {
+        remember_vdd_resolution(shared, device, &modes, size, "display");
+    }
+}
+
+fn remember_vdd_resolution(
+    shared: &SharedControl,
+    device: u64,
+    modes: &[crate::vdd_settings::VddMode],
+    size: (u32, u32),
+    from: &'static str,
+) {
+    let mut choices = shared.vdd_resolutions.lock();
+    if !choices.choose(device, modes, size) {
+        return;
+    }
+    let saved = crate::settings::app_data_dir()
+        .ok_or_else(|| std::io::Error::other("no app data folder"))
+        .and_then(|dir| choices.save(&dir.join(crate::vdd_settings::RESOLUTION_RECORD)));
+    info!(
+        size = %format!("{}x{}", size.0, size.1),
+        from,
+        saved = ?saved.err(),
+        "Second screen resolution for this iPad"
+    );
 }
 
 /// Bring a freshly attached second screen to the mode asked for, when

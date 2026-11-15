@@ -34,42 +34,102 @@ impl std::fmt::Display for VddMode {
 }
 
 /// The modes to advertise for a client with the given native panel, best
-/// first. The iPad reports portrait-native pixels; the desktop wants
-/// landscape, so the long edge becomes the width. Odd dimensions are rounded
-/// down — 4:2:0 video encoders need even sizes.
+/// first: each of [`client_sizes`] at the panel's refresh rate and, for a
+/// panel that isn't 60 Hz, at 60 Hz too. The iPad reports portrait-native
+/// pixels; the desktop wants landscape, so the long edge becomes the width.
+/// Odd dimensions are rounded down — 4:2:0 video encoders need even sizes.
 pub fn modes_for_client(screen_px_w: u16, screen_px_h: u16, refresh_hz: u8) -> Vec<VddMode> {
-    let long = u32::from(screen_px_w.max(screen_px_h)) & !1;
-    let short = u32::from(screen_px_w.min(screen_px_h)) & !1;
     let refresh = match refresh_hz {
         0 => 60,
         hz => u32::from(hz),
     };
-
     let mut modes = Vec::new();
-    let mut push = |mode: VddMode| {
-        if mode.width >= 640 && mode.height >= 480 && !modes.contains(&mode) {
-            modes.push(mode);
+    for (width, height) in client_sizes(screen_px_w, screen_px_h) {
+        for refresh_hz in [refresh, 60] {
+            let mode = VddMode {
+                width,
+                height,
+                refresh_hz,
+            };
+            if !modes.contains(&mode) {
+                modes.push(mode);
+            }
+        }
+    }
+    if modes.is_empty() {
+        // Safety net the driver definitely supports.
+        modes.extend(default_modes());
+    }
+    modes
+}
+
+/// Smaller sizes at the panel's own shape, as fractions of it: everything
+/// on the second screen gets larger at the same Windows scale.
+const LADDER: [(u32, u32); 3] = [(3, 4), (2, 3), (1, 2)];
+
+/// Common sizes in other shapes (16:9, 16:10, 4:3), largest first. The
+/// largest of each shape that fits inside the panel is offered; the iPad
+/// shows it with bars. 1920x1080 is the driver's safety net.
+const STANDARD: [&[(u32, u32)]; 3] = [
+    &[(2560, 1440), (1920, 1080), (1600, 900), (1280, 720)],
+    &[
+        (2560, 1600),
+        (1920, 1200),
+        (1680, 1050),
+        (1440, 900),
+        (1280, 800),
+    ],
+    &[(2048, 1536), (1600, 1200), (1400, 1050), (1024, 768)],
+];
+
+/// The smallest added size: Windows 11 asks for a 720p display, and much
+/// of Windows doesn't fit a desktop narrower than 1024.
+const SMALLEST: (u32, u32) = (1024, 720);
+
+/// The sizes the second screen offers for a client's panel, in the order
+/// the app lists them: the panel's own size first, the default; then
+/// [`LADDER`] at the same shape, each within a pixel of it (the exact shape
+/// often has no smaller size with even sides); then [`STANDARD`] sizes no
+/// larger than the panel. Even sides, no duplicates, at most eight.
+pub fn client_sizes(screen_px_w: u16, screen_px_h: u16) -> Vec<(u32, u32)> {
+    let long = u32::from(screen_px_w.max(screen_px_h)) & !1;
+    let short = u32::from(screen_px_w.min(screen_px_h)) & !1;
+    if long < 640 || short < 480 {
+        return Vec::new();
+    }
+    let mut sizes = vec![(long, short)];
+    let mut push = |size: (u32, u32)| {
+        if size.0 >= SMALLEST.0 && size.1 >= SMALLEST.1 && !sizes.contains(&size) {
+            sizes.push(size);
         }
     };
-    push(VddMode {
-        width: long,
-        height: short,
-        refresh_hz: refresh,
-    });
-    if refresh != 60 {
-        push(VddMode {
-            width: long,
-            height: short,
-            refresh_hz: 60,
-        });
+    for (num, den) in LADDER {
+        // Of the even widths around the fraction, the one whose even height
+        // keeps the shape best.
+        let (long, short) = (u64::from(long), u64::from(short));
+        let low = (long * u64::from(num) / u64::from(den)) & !1;
+        let shaped = [low, low + 2].map(|width| (width, nearest_even(width * short, long)));
+        if let Some(&(width, height)) = shaped
+            .iter()
+            .min_by_key(|&&(width, height)| (u64::from(height) * long).abs_diff(width * short))
+        {
+            push((width as u32, height));
+        }
     }
-    // Safety net the driver definitely supports.
-    push(VddMode {
-        width: 1920,
-        height: 1080,
-        refresh_hz: 60,
-    });
-    modes
+    for shape in STANDARD {
+        if let Some(&size) = shape.iter().find(|&&(w, h)| w <= long && h <= short) {
+            push(size);
+        }
+    }
+    if 1920 <= long && 1080 <= short {
+        push((1920, 1080));
+    }
+    sizes
+}
+
+/// The even number nearest `num / den`.
+fn nearest_even(num: u64, den: u64) -> u32 {
+    ((num + den) / (2 * den) * 2) as u32
 }
 
 /// The modes to offer when the iPad's screen size is not known yet.
@@ -79,6 +139,82 @@ pub fn default_modes() -> Vec<VddMode> {
         height: 1080,
         refresh_hz: 60,
     }]
+}
+
+/// The sizes in `modes`, in order, once each.
+pub fn sizes(modes: &[VddMode]) -> Vec<(u32, u32)> {
+    let mut sizes = Vec::new();
+    for mode in modes {
+        if !sizes.contains(&(mode.width, mode.height)) {
+            sizes.push((mode.width, mode.height));
+        }
+    }
+    sizes
+}
+
+/// The mode to ask the second screen for among a client's `modes`: the
+/// size chosen for that iPad while the list still offers it, at the
+/// panel's refresh rate; otherwise the panel's own mode.
+pub fn requested_mode(modes: &[VddMode], chosen: Option<(u32, u32)>) -> Option<VddMode> {
+    chosen
+        .and_then(|size| modes.iter().find(|m| (m.width, m.height) == size))
+        .or(modes.first())
+        .copied()
+}
+
+/// In the app data folder: the second screen's size chosen for each iPad.
+pub const RESOLUTION_RECORD: &str = "vdd-resolutions.json";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Size {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// The second screen's size chosen for each iPad, by the id it sends when
+/// it connects, where that isn't the iPad's own size. Chosen in the app, or
+/// in Windows' display settings while the second screen streams.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ResolutionChoices(std::collections::BTreeMap<u64, Size>);
+
+impl ResolutionChoices {
+    /// None chosen when the file is missing or unreadable.
+    pub fn load(path: &Path) -> Self {
+        std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, path: &Path) -> io::Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        replace(
+            path,
+            &serde_json::to_string(self).map_err(io::Error::other)?,
+        )
+    }
+
+    pub fn chosen(&self, device: u64) -> Option<(u32, u32)> {
+        self.0.get(&device).map(|size| (size.width, size.height))
+    }
+
+    /// Remember `size` for the iPad `device`, whose modes are `modes`.
+    /// Its own size forgets the choice; a size the list doesn't offer, or
+    /// an iPad that sent no id, changes nothing. Whether anything changed.
+    pub fn choose(&mut self, device: u64, modes: &[VddMode], size: (u32, u32)) -> bool {
+        let offered = sizes(modes);
+        if device == 0 || !offered.contains(&size) {
+            return false;
+        }
+        if offered.first() == Some(&size) {
+            return self.0.remove(&device).is_some();
+        }
+        let (width, height) = size;
+        self.0.insert(device, Size { width, height }) != Some(Size { width, height })
+    }
 }
 
 /// The mode to set on the virtual display after it attached, when Windows
@@ -1317,14 +1453,266 @@ mod tests {
             },
             "a 60 Hz variant backs up high-refresh panels"
         );
-        assert_eq!(
-            modes[2],
-            VddMode {
+        assert!(
+            modes.contains(&VddMode {
                 width: 1920,
                 height: 1080,
                 refresh_hz: 60
-            }
+            }),
+            "the safety mode stays in the list"
         );
+    }
+
+    /// Native first; smaller sizes at the panel's shape; then the largest
+    /// 16:9, 16:10 and 4:3 sizes inside the panel, and 1920x1080.
+    #[test]
+    fn the_mode_list_offers_smaller_sizes_at_the_ipads_shape() {
+        type Sizes = &'static [(u32, u32)];
+        let cases: [((u16, u16), Sizes); 5] = [
+            // An 8.3-inch iPad, reported in portrait.
+            (
+                (1488, 2266),
+                &[
+                    (2266, 1488),
+                    (1700, 1116),
+                    (1510, 992),
+                    (1132, 744),
+                    (1920, 1080),
+                    (1920, 1200),
+                    (1600, 1200),
+                ],
+            ),
+            // 11-inch iPad Pro, reported in landscape.
+            (
+                (2388, 1668),
+                &[
+                    (2388, 1668),
+                    (1790, 1250),
+                    (1592, 1112),
+                    (1194, 834),
+                    (1920, 1080),
+                    (1920, 1200),
+                    (2048, 1536),
+                ],
+            ),
+            // 12.9-inch iPad Pro: 3/4 is 2048x1536, already 4:3.
+            (
+                (2048, 2732),
+                &[
+                    (2732, 2048),
+                    (2048, 1536),
+                    (1822, 1366),
+                    (1366, 1024),
+                    (2560, 1440),
+                    (2560, 1600),
+                    (1920, 1080),
+                ],
+            ),
+            // 11-inch iPad Pro M4, portrait.
+            (
+                (1668, 2420),
+                &[
+                    (2420, 1668),
+                    (1814, 1250),
+                    (1614, 1112),
+                    (1210, 834),
+                    (1920, 1080),
+                    (1920, 1200),
+                    (2048, 1536),
+                ],
+            ),
+            // A 4:3 iPad: half is 1024x768, the smallest kept.
+            (
+                (1536, 2048),
+                &[
+                    (2048, 1536),
+                    (1536, 1152),
+                    (1366, 1024),
+                    (1024, 768),
+                    (1920, 1080),
+                    (1920, 1200),
+                ],
+            ),
+        ];
+        for ((w, h), expected) in cases {
+            let sizes = client_sizes(w, h);
+            assert_eq!(sizes, expected, "{w}x{h}");
+            let (long, short) = sizes[0];
+            assert_eq!((long, short), (u32::from(w.max(h)), u32::from(w.min(h))));
+            assert!(sizes.len() <= 10, "{w}x{h}: short enough to read");
+            for (index, &(width, height)) in sizes.iter().enumerate() {
+                assert!(width % 2 == 0 && height % 2 == 0, "{width}x{height}: even");
+                assert!(width <= long && height <= short, "{width}x{height} fits");
+                assert!(width >= 1024 && height >= 720, "{width}x{height} is usable");
+                assert!(
+                    !sizes[..index].contains(&(width, height)),
+                    "{width}x{height} once"
+                );
+            }
+            // The ladder keeps the panel's shape to within a pixel of height.
+            for &(width, height) in &sizes[1..4] {
+                let exact = f64::from(width) * f64::from(short) / f64::from(long);
+                assert!(
+                    (f64::from(height) - exact).abs() <= 1.0,
+                    "{w}x{h}: {width}x{height} vs {exact}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn each_size_is_offered_at_the_panels_refresh_and_at_60() {
+        let modes = modes_for_client(1488, 2266, 120);
+        assert_eq!(modes.len(), 14);
+        assert_eq!(sizes(&modes), client_sizes(1488, 2266));
+        for (width, height) in client_sizes(1488, 2266) {
+            for refresh_hz in [120, 60] {
+                let mode = VddMode {
+                    width,
+                    height,
+                    refresh_hz,
+                };
+                assert!(modes.contains(&mode), "{mode}");
+            }
+        }
+        assert_eq!(modes_for_client(1488, 2266, 60).len(), 7, "no 60 Hz copies");
+        assert_eq!(modes[0].to_string(), "2266x1488@120");
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn a_resolution_chosen_for_an_ipad_is_saved_and_asked_for_on_its_next_connection() {
+        let dir = temp_dir("vdd-resolutions-test");
+        let path = dir.join(RESOLUTION_RECORD);
+        let mini = modes_for_client(1488, 2266, 120);
+        let pro = modes_for_client(1668, 2388, 120);
+        let mut choices = ResolutionChoices::load(&path);
+        assert_eq!(choices, ResolutionChoices::default(), "none chosen yet");
+        assert_eq!(requested_mode(&mini, choices.chosen(7)), Some(mini[0]));
+
+        assert!(choices.choose(7, &mini, (1510, 992)));
+        assert!(!choices.choose(7, &mini, (1510, 992)), "already chosen");
+        assert!(choices.choose(9, &pro, (1920, 1080)));
+        choices.save(&path).expect("save");
+
+        // The next start of the app, and the next connection of each iPad.
+        let loaded = ResolutionChoices::load(&path);
+        assert_eq!(loaded, choices);
+        let at = |width, height| VddMode {
+            width,
+            height,
+            refresh_hz: 120,
+        };
+        assert_eq!(requested_mode(&mini, loaded.chosen(7)), Some(at(1510, 992)));
+        assert_eq!(requested_mode(&pro, loaded.chosen(9)), Some(at(1920, 1080)));
+        // Another iPad keeps its own size.
+        assert_eq!(
+            requested_mode(&mini, loaded.chosen(8)),
+            Some(at(2266, 1488))
+        );
+        // The attached display is in the chosen mode: nothing to set.
+        assert_eq!(
+            mode_to_set(requested_mode(&mini, loaded.chosen(7)), (1510, 992)),
+            None
+        );
+        // Windows brought back 800x600: the chosen mode is set.
+        assert_eq!(
+            mode_to_set(requested_mode(&mini, loaded.chosen(7)), (800, 600)),
+            Some(at(1510, 992))
+        );
+
+        // Native forgets the choice.
+        let mut choices = loaded;
+        assert!(choices.choose(7, &mini, (2266, 1488)));
+        assert_eq!(choices.chosen(7), None);
+        assert!(!choices.choose(7, &mini, (2266, 1488)));
+
+        // Unreadable: none chosen.
+        std::fs::write(&path, "not json").unwrap();
+        assert_eq!(ResolutionChoices::load(&path), ResolutionChoices::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_saved_resolution_the_list_no_longer_offers_falls_back_to_native() {
+        let mini = modes_for_client(1488, 2266, 60);
+        let mut choices = ResolutionChoices::default();
+        assert!(choices.choose(7, &mini, (1700, 1116)));
+        // The same iPad id now reports another panel (a restored backup on
+        // another model): its list has no 1700x1116.
+        let pro = modes_for_client(1668, 2388, 60);
+        assert_eq!(requested_mode(&pro, choices.chosen(7)), Some(pro[0]));
+        // No list at all (size unknown): the driver's default.
+        assert_eq!(
+            requested_mode(&default_modes(), choices.chosen(7)),
+            Some(default_modes()[0])
+        );
+        assert_eq!(requested_mode(&[], choices.chosen(7)), None);
+    }
+
+    /// A size set in Windows' display settings while the second screen
+    /// streams is remembered like one chosen in the app, so the next
+    /// connection starts in it instead of setting the iPad's own back.
+    #[test]
+    fn a_resolution_changed_in_windows_settings_is_kept() {
+        let mini = modes_for_client(1488, 2266, 120);
+        let mut choices = ResolutionChoices::default();
+        assert!(choices.choose(7, &mini, (1700, 1116)), "chosen in the app");
+        assert!(choices.choose(7, &mini, (1920, 1080)), "changed in Windows");
+        let requested = requested_mode(&mini, choices.chosen(7));
+        assert_eq!(
+            mode_to_set(requested, (1920, 1080)),
+            None,
+            "left as Windows has it"
+        );
+        // A size this list doesn't offer (the driver's own, 800x600) is not
+        // a choice: the last one stands.
+        assert!(!choices.choose(7, &mini, (800, 600)));
+        assert!(!choices.choose(7, &mini, (2560, 1440)));
+        assert_eq!(choices.chosen(7), Some((1920, 1080)));
+        // An iPad that sent no id has nothing to remember it by.
+        assert!(!choices.choose(0, &mini, (1700, 1116)));
+        assert_eq!(choices.chosen(0), None);
+    }
+
+    /// The file the driver reads for a connected iPad: every offered mode,
+    /// and all it held before (one monitor, the refresh rate, the cursor
+    /// block, the pinned card).
+    #[test]
+    fn the_drivers_file_for_an_ipad_lists_its_sizes_and_keeps_the_rest() {
+        let dir = temp_dir("vdd-settings-modes-test");
+        let path = dir.join("vdd_settings.xml");
+        let record = dir.join("vdd-pin.txt");
+        let modes = modes_for_client(1488, 2266, 120);
+        let card = "NVIDIA GeForce RTX 4070 Ti";
+        let outcome = write_with_pin(&path, &record, true, &modes, Some(card)).expect("write");
+        assert_eq!(outcome, PinOutcome::Named);
+        let xml = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(xml, render(&modes, Some(card)));
+        assert!(xml.contains("<count>1</count>"));
+        assert!(xml.contains("<g_refresh_rate>120</g_refresh_rate>"));
+        assert_eq!(named_gpu(&xml), Ok(Some(card.to_string())));
+        assert_eq!(cursor_set_by(&xml), hardware(128, 128));
+        assert!(xml.contains(CURSOR));
+        // What 0.3.4 offered is still there.
+        for (width, height, refresh) in [(2266, 1488, 120), (2266, 1488, 60), (1920, 1080, 60)] {
+            assert!(xml.contains(&format!(
+                "<width>{width}</width>\n            <height>{height}</height>\n            \
+                 <refresh_rate>{refresh}</refresh_rate>"
+            )));
+        }
+        assert_eq!(xml.matches("<resolution>").count(), 14);
+        for (width, height) in client_sizes(1488, 2266) {
+            assert!(xml.contains(&format!(
+                "<width>{width}</width>\n            <height>{height}</height>"
+            )));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1383,6 +1771,10 @@ mod tests {
                 refresh_hz: 60
             }]
         );
+        // The largest panel a client can report.
+        let sizes = client_sizes(u16::MAX, u16::MAX);
+        assert_eq!(sizes[0], (65534, 65534));
+        assert_eq!(sizes[3], (32766, 32766));
     }
 
     #[test]

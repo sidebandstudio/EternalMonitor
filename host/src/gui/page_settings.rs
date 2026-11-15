@@ -54,6 +54,8 @@ impl AnalyzerApp {
                 self.set_vdd_match(vdd_match);
             }
             widgets::divider(ui);
+            self.resolution_row(ui, vdd_match);
+            widgets::divider(ui);
             let fps_env = self.overrides.target_fps.env();
             let mut fps = match fps_env {
                 Some(_) => self.overrides.target_fps.value,
@@ -336,6 +338,77 @@ pub(super) fn display_description(windows_10: bool) -> &'static str {
         "Mirror my screen shows your main screen. You can also mirror one particular monitor. Second screen needs Windows 11, so on this PC the iPad shows your main screen instead."
     } else {
         "Mirror my screen shows your main screen. Second screen adds the iPad as an extra screen while it is connected. You can also mirror one particular monitor."
+    }
+}
+
+impl AnalyzerApp {
+    /// The second screen's size for the connected iPad: its own, a smaller
+    /// one at the same shape, or a common one in another shape.
+    fn resolution_row(&mut self, ui: &mut Ui, matching: bool) {
+        let shared = &self.control.shared;
+        let connected = crate::capture::connected_vdd_modes(shared);
+        let sizes = connected
+            .as_ref()
+            .map_or_else(Vec::new, |(_, modes)| crate::vdd_settings::sizes(modes));
+        let current = connected.as_ref().and_then(|(device, modes)| {
+            let chosen = shared.vdd_resolutions.lock().chosen(*device);
+            crate::vdd_settings::requested_mode(modes, chosen).map(|m| (m.width, m.height))
+        });
+        let selected_text = current.map_or_else(
+            || tr("Native").to_string(),
+            |size| resolution_label(size, sizes.first() == Some(&size)),
+        );
+        let mut choice = current;
+        widgets::setting_row(
+            ui,
+            tr("Resolution"),
+            resolution_description(matching, connected.is_some()),
+            220.0,
+            |ui| {
+                ui.add_enabled_ui(matching && !sizes.is_empty(), |ui| {
+                    let combo =
+                        widgets::combo(ui.id().with("vdd-resolution"), &selected_text, 200.0)
+                            .show_ui(ui, |ui| {
+                                ui.set_min_width(200.0);
+                                for (index, &size) in sizes.iter().enumerate() {
+                                    let label = resolution_label(size, index == 0);
+                                    if ui.selectable_label(choice == Some(size), label).clicked() {
+                                        choice = Some(size);
+                                    }
+                                }
+                            });
+                    widgets::name_combo(ui, &combo.response, &selected_text);
+                });
+            },
+        );
+        if let Some(size) = choice.filter(|_| choice != current) {
+            crate::capture::choose_vdd_resolution(shared, size);
+        }
+    }
+}
+
+/// `2266 × 1488 (native)`, or a common shape's name after its size.
+fn resolution_label((width, height): (u32, u32), native: bool) -> String {
+    let size = format!("{width} × {height}");
+    if native {
+        return trf("{size} (native)", &[("size", &size)]);
+    }
+    let shape = [(16, 9, "16:9"), (16, 10, "16:10"), (4, 3, "4:3")]
+        .into_iter()
+        .find(|&(w, h, _)| width * h == height * w);
+    match shape {
+        Some((_, _, name)) => format!("{size} ({name})"),
+        None => size,
+    }
+}
+
+pub(super) fn resolution_description(matching: bool, connected: bool) -> &'static str {
+    if !matching {
+        "Used by Second screen. Turn on Match the iPad's resolution to choose one."
+    } else if !connected {
+        "Used by Second screen. Connect the iPad to choose its size. Each iPad keeps its own."
+    } else {
+        "Used by Second screen. A smaller size makes everything larger at the same Windows scale, and a little less sharp. Other shapes show with bars. Each iPad keeps its own, also when changed in Windows' display settings."
     }
 }
 
