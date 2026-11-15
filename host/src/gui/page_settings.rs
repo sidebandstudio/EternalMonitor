@@ -348,13 +348,14 @@ impl AnalyzerApp {
         let shared = &self.control.shared;
         let menu = crate::capture::vdd_resolution_menu(shared);
         let connected = menu.is_some();
-        let (sizes, current) =
-            menu.map_or((Vec::new(), None), |menu| (menu.sizes, Some(menu.current)));
+        let (sizes, current) = menu.as_ref().map_or((Vec::new(), None), |menu| {
+            (menu.sizes.clone(), Some(menu.current))
+        });
         let selected_text = current.map_or_else(
             || tr("Native").to_string(),
             |size| resolution_label(size, sizes.first() == Some(&size)),
         );
-        let mut choice = current;
+        let mut clicked = None;
         widgets::setting_row(
             ui,
             tr("Resolution"),
@@ -371,8 +372,8 @@ impl AnalyzerApp {
                                 ui.set_min_width(200.0);
                                 for (index, &size) in sizes.iter().enumerate() {
                                     let label = resolution_label(size, index == 0);
-                                    if ui.selectable_label(choice == Some(size), label).clicked() {
-                                        choice = Some(size);
+                                    if ui.selectable_label(current == Some(size), label).clicked() {
+                                        clicked = Some(size);
                                     }
                                 }
                             });
@@ -380,7 +381,8 @@ impl AnalyzerApp {
                 });
             },
         );
-        if let Some(size) = choice.filter(|_| choice != current) {
+        // Also the size the display is at, when it isn't the saved one.
+        if let Some(size) = clicked.and_then(|size| menu?.submit(size)) {
             crate::capture::choose_vdd_resolution(shared, size);
         }
     }

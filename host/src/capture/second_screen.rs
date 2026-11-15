@@ -2216,7 +2216,11 @@ impl Driver for WindowsDriver<'_> {
     }
 
     fn set_mode(&self, display: &str, mode: VddMode) {
-        super::request_vdd_mode(self.shared, display.to_string(), mode);
+        super::request_vdd_mode(
+            self.shared,
+            display.to_string(),
+            super::ModeRequest::Mode(mode),
+        );
     }
 
     fn device(&self) -> Option<DeviceState> {
