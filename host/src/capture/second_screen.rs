@@ -1838,9 +1838,11 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
                 info!(device = %output.device_name, "Virtual display still attached — capturing it");
                 live_since(shared, &output, driver.now());
                 note_attached(shared, output.device_name);
+                // A size chosen while the iPad was away.
+                super::request_reconcile(shared);
                 return;
             }
-            Reuse::Settle(wanted) => {
+            Reuse::Settle(wanted, choice) => {
                 info!(
                     device = %output.device_name,
                     "Virtual display still attached — setting this iPad's mode and capturing it"
@@ -1848,6 +1850,7 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
                 let output = driver.settle(output, wanted);
                 super::note_settled_for(shared);
                 live_since(shared, &output, driver.now());
+                shared.vdd_live.lock().applied = Some(choice);
                 if note_attached_if_selected(shared, output.device_name.clone()) {
                     // A size chosen while its mode was set.
                     super::request_reconcile(shared);
@@ -1955,11 +1958,12 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
             // Setting the mode can take seconds, and the user may choose
             // another mode meanwhile. A size picked while the display came
             // up counts too.
-            let wanted = super::wanted_vdd_mode(shared);
+            let (wanted, choice) = super::wanted_vdd(shared);
             let chosen = driver.settle(chosen, wanted);
             super::note_settled_for(shared);
             let (device, width, height) = (chosen.device_name.clone(), chosen.width, chosen.height);
             live_since(shared, &chosen, driver.now());
+            shared.vdd_live.lock().applied = Some(choice);
             if note_attached_if_selected(shared, chosen.device_name.clone()) {
                 info!(
                     %device,
@@ -2393,6 +2397,8 @@ mod tests {
         calls: RefCell<Vec<Call>>,
         /// The mode each settle was asked for.
         wanted: RefCell<Vec<Option<VddMode>>>,
+        /// Where a settle leaves the display; by default the mode asked for.
+        settle_to: Option<(u32, u32)>,
     }
 
     impl<'a> FakeDriver<'a> {
@@ -2416,6 +2422,7 @@ mod tests {
                 device_since_on: Vec::new(),
                 calls: RefCell::new(Vec::new()),
                 wanted: RefCell::new(Vec::new()),
+                settle_to: None,
             }
         }
 
@@ -2480,8 +2487,8 @@ mod tests {
             self.wanted.borrow_mut().push(wanted);
             self.sleep(self.settle_takes);
             self.calls.borrow_mut().push(Call::Settle);
-            if let Some(mode) = wanted {
-                (chosen.width, chosen.height) = (mode.width, mode.height);
+            if let Some(size) = self.settle_to.or(wanted.map(|m| (m.width, m.height))) {
+                (chosen.width, chosen.height) = size;
             }
             chosen
         }
@@ -4445,6 +4452,101 @@ mod tests {
         shared.vdd_live.lock().size = Some((1920, 1080));
         crate::capture::click_vdd_resolution(&shared, (1920, 1080));
         assert_eq!(run_held(&shared), 0);
+    }
+
+    /// Review r7, the reviewer's case: click 1510x992, set; click the panel's
+    /// own size before capture has seen the first change. Both are set.
+    #[test]
+    fn returning_to_a_size_before_capture_saw_the_change_sets_it() {
+        let on_sleep = |_| {};
+        let (shared, _driver) = streaming_for_ipad_1(&on_sleep);
+        crate::capture::click_vdd_resolution(&shared, (1510, 992));
+        run_held(&shared);
+        crate::capture::click_vdd_resolution(&shared, (2266, 1488));
+        run_held(&shared);
+        assert_eq!(
+            *shared.vdd_mode_changes.set.lock(),
+            [mode(1510, 992), mode(2266, 1488)]
+        );
+        assert_eq!(shared.vdd_resolutions.lock().choices.chosen(1), None);
+    }
+
+    /// Review r7, the reviewer's case: the same iPad back within the grace,
+    /// with a size clicked before its attach: the attach that keeps the
+    /// display asks for a reconcile, which sets it.
+    #[test]
+    fn a_click_before_the_same_ipads_attach_is_set() {
+        let on_sleep = |_| {};
+        let (shared, driver) = streaming_for_ipad_1(&on_sleep);
+        disconnect(&shared);
+        connect_ipad(&shared, 1, (1488, 2266));
+        crate::capture::click_vdd_resolution(&shared, (1510, 992));
+        attach(&shared, &driver, ATTACH_TIMEOUT);
+        run_held(&shared);
+        assert_eq!(*shared.vdd_mode_changes.set.lock(), [mode(1510, 992)]);
+        assert_eq!(
+            shared.vdd_resolutions.lock().choices.chosen(1),
+            Some((1510, 992))
+        );
+    }
+
+    /// Review r7: what a settle tried counts as applied. A user who never
+    /// picked gets no mode set after the attach, also when the settle fell
+    /// short; a saved size the driver refused is not tried again mid-stream.
+    #[test]
+    fn a_settle_that_fell_short_is_not_retried_mid_stream() {
+        let on_sleep = |_| {};
+        let modes = crate::vdd_settings::modes_for_client(1488, 2266, 60);
+        for saved in [None, Some((1700, 1116))] {
+            let shared = second_screen_selected();
+            connect_ipad(&shared, 1, (1488, 2266));
+            if let Some(saved) = saved {
+                assert!(shared
+                    .vdd_resolutions
+                    .lock()
+                    .choices
+                    .choose(1, &modes, saved));
+            }
+            prepare_for_connected(&shared);
+            let mut driver = FakeDriver::new(secs(3.0), Some(secs(0.5)), &on_sleep);
+            // The best offered size: neither native nor 1700x1116.
+            driver.settle_to = Some((1920, 1080));
+            attach(&shared, &driver, ATTACH_TIMEOUT);
+            assert_eq!(shared.vdd_live.lock().size, Some((1920, 1080)));
+            assert_eq!(*shared.vdd_mode_changes.set.lock(), [], "{saved:?}");
+        }
+    }
+
+    /// Review r7: after Windows moved the display (what is on it is then
+    /// unknown), a click on the user's own size sets it; a size kept from
+    /// Windows' display settings sets nothing.
+    #[test]
+    fn after_windows_moved_the_display_a_click_on_the_saved_size_sets_it() {
+        let on_sleep = |_| {};
+        let set = |shared: &SharedControl| shared.vdd_mode_changes.set.lock().clone();
+        let (shared, _driver) = streaming_for_ipad_1(&on_sleep);
+        crate::capture::click_vdd_resolution(&shared, (1510, 992));
+        run_held(&shared);
+        // Windows puts it at 1920x1080 right after: not the user's.
+        crate::capture::note_vdd_change(&shared, "virtual", (1920, 1080), Instant::now());
+        assert_eq!(shared.vdd_live.lock().applied, None, "unknown");
+        crate::capture::click_vdd_resolution(&shared, (1510, 992));
+        run_held(&shared);
+        assert_eq!(set(&shared), [mode(1510, 992), mode(1510, 992)]);
+
+        // At 800x600, outside the list, kept with a click: nothing set.
+        crate::capture::note_vdd_change(&shared, "virtual", (800, 600), Instant::now());
+        crate::capture::click_vdd_resolution(&shared, (800, 600));
+        assert_eq!(run_held(&shared), 1);
+        assert_eq!(set(&shared).len(), 2);
+        assert_eq!(
+            shared.vdd_resolutions.lock().choices.chosen(1),
+            Some((800, 600))
+        );
+        // A later reconcile (another attach's) sets nothing either.
+        crate::capture::request_reconcile(&shared);
+        run_held(&shared);
+        assert_eq!(set(&shared).len(), 2);
     }
 
     /// Review r1: a size picked while the second screen comes up, after
