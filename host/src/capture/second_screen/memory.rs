@@ -961,7 +961,7 @@ mod tests {
         attach, driver_supports_windows, next_step, note_attached, note_connected, note_image,
         note_windows, notice_failure, remembered_failure, retries_later, set_facts, start_proving,
         windows_notice, windows_unsupported, Driver, Failure, Step, TurnedOn, BLOCKED_EXTEND_RETRY,
-        PANEL_LOST_BEFORE, PROVE_TIMEOUT, WINDOWS_10, WINDOWS_10_IPAD_NOTICE,
+        PANEL_LOST_BEFORE, PROVE_TIMEOUT, WINDOWS_10, WINDOWS_10_FAILED, WINDOWS_10_IPAD_NOTICE,
     };
     use super::*;
     use crate::capture::tests::{connect_viewer, hybrid_laptop, refuse_moved_mirror, NVIDIA};
@@ -2800,17 +2800,18 @@ mod tests {
     /// Windows 10 with the driver, and a start that fails: no monitor (after
     /// #233's short wait), an attach timeout, or a failed Enable. The
     /// summary names what 0.3.4 named, and the connection mirrors with the
-    /// Windows 10 notices on the PC and the iPad. Later connections of this
-    /// app run mirror without an Enable or a wait, also after Try again or
-    /// choosing Second screen again, with a `remembered` summary and no new
-    /// failure. The next app run tries again, after 0.3.4's wait for a saved
-    /// failure: some Windows 10 PCs attach on one run and not another.
+    /// Windows 10 notices on the PC and the iPad. Later connections mirror at
+    /// once with them, without an Enable or a wait, and with a `remembered`
+    /// summary and no new fallback line, until 0.3.4 would have tried again:
+    /// once the wait for a saved failure is over, or, after a failed Enable,
+    /// which 0.3.4 saved for no later wait, at Try again. A display that then
+    /// attaches streams with no notice: some Windows 10 PCs attach at times.
     #[test]
-    fn on_windows_10_a_second_screen_that_cannot_start_mirrors_for_the_rest_of_the_app_run() {
-        for (how, reason) in [
-            (Start::NoMonitor, "attach_timeout"),
-            (Start::TimesOut, "attach_timeout"),
-            (Start::EnableFails, "enable_failed"),
+    fn on_windows_10_a_failed_start_mirrors_until_it_is_tried_again() {
+        for (how, reason, saved) in [
+            (Start::NoMonitor, "attach_timeout", true),
+            (Start::TimesOut, "attach_timeout", true),
+            (Start::EnableFails, "enable_failed", false),
         ] {
             let path = temp_file("windows-10-fails");
             let (memory, start) = app_run(&path, Duration::ZERO);
@@ -2841,8 +2842,14 @@ mod tests {
                 Start::TimesOut => assert!(waited >= ATTACH_TIMEOUT, "{waited:?}"),
                 _ => {}
             }
-            assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed, "{how:?}");
-            assert_eq!(notice_failure(&shared), Some(WINDOWS_10), "{how:?}");
+            let status = if saved {
+                VddStatus::Failed
+            } else {
+                VddStatus::TaskFailed
+            };
+            assert_eq!(*shared.vdd_status.lock(), status, "{how:?}: as in 0.3.4");
+            assert_eq!(saved_failure(&path), saved, "{how:?}: as in 0.3.4");
+            assert_eq!(notice_failure(&shared), Some(WINDOWS_10_FAILED), "{how:?}");
             assert!(windows_unsupported(&shared), "{how:?}");
             assert!(
                 windows_notice(&shared, failed),
@@ -2861,12 +2868,12 @@ mod tests {
                 "{how:?}: the mirror"
             );
 
-            // The next connection, after 0.3.4's wait for a saved failure
-            // would be over: no Enable, no wait.
-            let later = failed + hours(2);
+            // The next connection, within 0.3.4's first wait of an hour: the
+            // mirror at once, with the notices and no new fallback.
+            let soon = failed + Duration::from_secs(30 * 60);
             let (fallback, log, step) = summary_fallback(&shared, || {
-                reconnect(&shared, later);
-                next_step(&shared, later)
+                reconnect(&shared, soon);
+                next_step(&shared, soon)
             });
             assert_eq!(step, Step::Nothing, "{how:?}");
             assert_eq!(fallback, Some("remembered"), "{how:?}");
@@ -2876,51 +2883,66 @@ mod tests {
                     && !log.contains("second_screen_fallback"),
                 "{how:?}: {log}"
             );
-            assert!(windows_notice(&shared, later), "{how:?}");
-            shared.retry_second_screen();
-            assert_eq!(
-                next_step(&shared, later),
-                Step::Nothing,
-                "{how:?}: Try again"
-            );
-            *shared.capture_target.lock() = CaptureTarget::PrimaryAuto;
-            assert_eq!(next_step(&shared, later), Step::Nothing);
-            *shared.capture_target.lock() = CaptureTarget::VirtualExtended;
-            *shared.vdd_status.lock() = VddStatus::WaitingForClient;
-            assert_eq!(
-                next_step(&shared, later),
-                Step::Nothing,
-                "{how:?}: chosen again"
-            );
-            assert_eq!(
-                driver.display.enables.get(),
-                1,
-                "{how:?}: one Enable in all"
-            );
+            assert!(windows_notice(&shared, soon), "{how:?}");
+            assert_eq!(driver.display.enables.get(), 1, "{how:?}: no Enable");
 
-            // The next app run tries again, and a display that attaches then
-            // streams with no notice.
-            let (memory, next) = app_run(&path, hours(2));
-            let shared = second_screen_with(memory);
-            note_windows(&shared, Some(19045), false, true);
+            // Once 0.3.4 would try again, the second screen is tried, and
+            // streams.
+            let later = failed + hours(2);
+            reconnect(&shared, later);
+            if !saved {
+                assert_eq!(next_step(&shared, later), Step::Nothing, "{how:?}");
+                shared.retry_second_screen();
+            }
+            assert_eq!(next_step(&shared, later), Step::Attach, "{how:?}");
             assert!(!windows_unsupported(&shared), "{how:?}");
-            connect_viewer(&shared);
-            note_connected(&shared, next);
-            assert_eq!(next_step(&shared, next), Step::Attach, "{how:?}");
-            let driver = Windows10::new(next, Start::Attaches);
+            let driver = Windows10::new(later, Start::Attaches);
             attach(&shared, &driver, ATTACH_TIMEOUT);
             assert_eq!(*shared.vdd_status.lock(), VddStatus::Active, "{how:?}");
-            assert!(!windows_notice(&shared, driver.now()));
-            // An Enable that failed saves nothing, as in 0.3.4.
+            assert_eq!(notice_failure(&shared), None, "{how:?}");
+            assert!(!windows_unsupported(&shared) && !windows_notice(&shared, driver.now()));
             if exists(&path) {
                 remove_folder(&path);
             }
         }
     }
 
+    /// Whether `path` holds a saved failure.
+    fn saved_failure(path: &Path) -> bool {
+        exists(path) && !saved(path)["failure"].is_null()
+    }
+
+    /// Windows 10 with the driver: Try again, during the wait after a
+    /// failed start, tries the second screen at once, as in 0.3.4.
+    #[test]
+    fn on_windows_10_try_again_tries_a_failed_second_screen_at_once() {
+        let path = temp_file("windows-10-try-again");
+        let (memory, start) = app_run(&path, Duration::ZERO);
+        let shared = second_screen_with(memory);
+        note_windows(&shared, Some(19045), false, true);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        let driver = Windows10::new(start, Start::TimesOut);
+        attach(&shared, &driver, ATTACH_TIMEOUT);
+        assert_eq!(notice_failure(&shared), Some(WINDOWS_10_FAILED));
+        assert!(
+            retries_later(&shared),
+            "the notice says it tries again later"
+        );
+        shared.retry_second_screen();
+        assert!(!windows_unsupported(&shared), "Settings no longer say so");
+        let now = driver.now() + secs(1);
+        assert_eq!(next_step(&shared, now), Step::Attach);
+        let driver = Windows10::new(now, Start::Attaches);
+        attach(&shared, &driver, ATTACH_TIMEOUT);
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Active);
+        assert!(!windows_notice(&shared, driver.now()));
+        remove_folder(&path);
+    }
+
     /// Windows 10 with the driver, while Windows won't let EternalMonitor
-    /// mirror the screen: a start that fails is not held for the app run,
-    /// so the next connection tries the second screen again, as in 0.3.4.
+    /// mirror the screen: an attach timeout is not held, so the next
+    /// connection tries the second screen again, as in 0.3.4.
     #[test]
     fn on_windows_10_a_failure_while_the_mirror_is_blocked_is_tried_again() {
         let path = temp_file("windows-10-blocked");
@@ -2933,9 +2955,33 @@ mod tests {
         let driver = Windows10::new(start, Start::NoMonitor);
         attach(&shared, &driver, ATTACH_TIMEOUT);
         assert!(!windows_unsupported(&shared));
-        assert_ne!(notice_failure(&shared), Some(WINDOWS_10));
+        assert_ne!(notice_failure(&shared), Some(WINDOWS_10_FAILED));
         let later = driver.now() + Duration::from_secs(60);
         reconnect(&shared, later);
+        assert_eq!(next_step(&shared, later), Step::Attach);
+    }
+
+    /// Review r1 of #260: Windows 10 with the driver, while Windows won't
+    /// let EternalMonitor mirror the screen, and the Enable fails. No
+    /// Windows 10 hold: the failure stays the one 0.3.4 showed, with its
+    /// notice and Try again, which tries the second screen at once.
+    #[test]
+    fn on_windows_10_an_enable_failure_while_the_mirror_is_blocked_is_not_held() {
+        let path = temp_file("windows-10-blocked-enable");
+        let (memory, start) = app_run(&path, Duration::ZERO);
+        let shared = second_screen_with(memory);
+        note_windows(&shared, Some(19045), false, true);
+        refuse_moved_mirror(&shared);
+        connect_viewer(&shared);
+        assert_eq!(next_step(&shared, start), Step::Attach);
+        let driver = Windows10::new(start, Start::EnableFails);
+        attach(&shared, &driver, ATTACH_TIMEOUT);
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::TaskFailed);
+        assert_eq!(notice_failure(&shared), Some("enable_failed"));
+        assert!(!windows_unsupported(&shared));
+        assert!(!windows_notice(&shared, driver.now()));
+        shared.retry_second_screen();
+        let later = driver.now() + Duration::from_secs(60);
         assert_eq!(next_step(&shared, later), Step::Attach);
     }
 

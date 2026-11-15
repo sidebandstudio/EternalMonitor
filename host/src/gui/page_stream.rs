@@ -993,6 +993,16 @@ pub(super) fn second_screen_notice(
                 false,
             )
         }
+        // A start failed on Windows 10, where it works on some PCs at times.
+        (Failed | TaskFailed, _, _)
+            if failure == Some(crate::capture::second_screen::WINDOWS_10_FAILED) =>
+        {
+            notice(
+                &format!("{WINDOWS_10_NOTE} Mirror my screen works as usual."),
+                true,
+                false,
+            )
+        }
         // Windows left the device as not extended too, but Extend can't help.
         (Failed, _, _) if failure == Some("panel_lost") => notice(
             "Your laptop's built-in screen turned off when the second screen started, and Windows only turns it back on after a restart. Until then your desktop is on the iPad: save your work there, then restart the PC. On this PC the second screen can turn the built-in screen off again, so the iPad shows your main screen until you click Try again or choose Second screen again.",

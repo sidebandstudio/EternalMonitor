@@ -960,9 +960,10 @@ fn a_lost_built_in_screen_from_before_the_restart_only_says_it_is_paused() {
     }
 }
 
-/// On Windows 10 Second screen isn't tried: the notice, the note beside the
-/// choice and Settings say it needs Windows 11, with no Try again, and the
-/// note goes from Windows 11's text only.
+/// On Windows 10 without the driver Second screen isn't tried: the notice,
+/// the note beside the choice and Settings say it needs Windows 11, with no
+/// Try again, and the note goes from Windows 11's text only. After a start
+/// that failed with the driver, the notice says the same with Try again.
 #[test]
 fn windows_10_says_second_screen_needs_windows_11() {
     use super::page_settings::display_description;
@@ -982,6 +983,19 @@ fn windows_10_says_second_screen_needs_windows_11() {
         }
     }
     assert!(WINDOWS_10_NOTE.contains("needs Windows 11"));
+    // A start that failed on Windows 10 with the driver: the same words,
+    // with Try again, and that it tries again by itself after a saved one.
+    let failed = Some(crate::capture::second_screen::WINDOWS_10_FAILED);
+    for status in [VddStatus::Failed, VddStatus::TaskFailed] {
+        let mut notice = second_screen_notice(status, VddTaskHealth::Ok, None, failed).unwrap();
+        assert_eq!(
+            notice.body,
+            format!("{WINDOWS_10_NOTE} Mirror my screen works as usual.")
+        );
+        assert!(notice.retry && !notice.installer);
+        add_later_retry(&mut notice, true);
+        assert!(notice.body.ends_with("tries again by itself later."));
+    }
 
     for status in [
         VddStatus::WaitingForClient,
