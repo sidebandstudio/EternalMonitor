@@ -763,7 +763,6 @@ pub fn connected_vdd_modes(
 /// None when this host left the modes to the driver.
 /// Also the connected iPad's saved choice it comes from (none: the panel's
 /// own), which a settle records.
-#[cfg(any(windows, test, debug_assertions))]
 pub(crate) fn wanted_vdd(
     shared: &SharedControl,
 ) -> (Option<crate::vdd_settings::VddMode>, Option<(u32, u32)>) {
@@ -871,7 +870,6 @@ pub fn click_vdd_resolution(shared: &SharedControl, clicked: (u32, u32)) {
 }
 
 /// What a start does with a second screen still on from before.
-#[cfg(any(windows, test, debug_assertions))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Reuse {
     /// Capture it as it is: the iPad and saved choice it was last settled
@@ -910,7 +908,6 @@ pub(crate) fn note_settled_for(shared: &SharedControl, choice: Option<(u32, u32)
 /// list alone keeps the display. Kept for the iPad and saved choice it was
 /// last settled for (for the same iPad with no choice: kept, as before
 /// resolutions could be chosen); otherwise settled again.
-#[cfg(any(windows, test, debug_assertions))]
 pub(crate) fn reuse_vdd(shared: &SharedControl) -> Reuse {
     let Some(prepared) = shared.vdd_prepared.lock().clone() else {
         return Reuse::Keep;
@@ -1406,6 +1403,9 @@ pub(crate) fn reconcile_virtual_display(
                         Instant::now(),
                         Some(proof_output),
                     );
+                    // Kept from before: the connected iPad's modes and
+                    // choice are checked against it (see `reuse_vdd`).
+                    second_screen::note_kept_met(shared);
                     return Some(CaptureTarget::Output(output.device_name));
                 }
             }

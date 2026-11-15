@@ -358,8 +358,10 @@ impl ResolutionMemory {
     }
 }
 
-/// Writes the resolution record on a thread of its own, the latest content
-/// once, as the second screen record is written (#137). Flushed at quit.
+/// Writes the resolution record on a thread of its own, as the second screen
+/// record is written (#137). The newest content is kept until it is on disk:
+/// a write that fails is tried again after [`RECORD_RETRY`], and at quit.
+/// Newer content replaces older content not written yet.
 pub struct RecordSaver {
     state: parking_lot::Mutex<RecordSaving>,
     /// Wakes the writer: content to write.
@@ -369,11 +371,20 @@ pub struct RecordSaver {
     write: fn(&Path, &str) -> io::Result<()>,
 }
 
+/// The pause before a failed write of the resolution record is tried again.
+pub const RECORD_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
 #[derive(Default)]
 struct RecordSaving {
+    /// The newest content, until it is on disk, and its number.
     next: Option<(std::path::PathBuf, String)>,
+    version: u64,
     busy: bool,
     running: bool,
+    /// The last write failed: the writer waits [`RECORD_RETRY`].
+    failed: bool,
+    /// A quit waits for the content: failed writes are tried again at once.
+    flushing: bool,
 }
 
 impl std::fmt::Debug for RecordSaver {
@@ -411,6 +422,7 @@ impl RecordSaver {
         let start = {
             let mut state = self.state.lock();
             state.next = Some((path, text));
+            state.version += 1;
             !std::mem::replace(&mut state.running, true)
         };
         self.work.notify_one();
@@ -429,39 +441,74 @@ impl RecordSaver {
     fn run(&self) {
         let mut state = self.state.lock();
         loop {
-            let Some((path, text)) = state.next.take() else {
+            let Some((path, text)) = state.next.clone() else {
                 self.work.wait(&mut state);
                 continue;
             };
+            let version = state.version;
             state.busy = true;
             let written =
                 parking_lot::MutexGuard::unlocked(&mut state, || (self.write)(&path, &text));
             state.busy = false;
-            if let Err(error) = written {
-                tracing::warn!(%error, "Could not save the second screen resolution");
+            match written {
+                // Newer content waits its own turn.
+                Ok(()) if state.version == version => {
+                    state.next = None;
+                    state.failed = false;
+                }
+                Ok(()) => state.failed = false,
+                Err(error) => {
+                    if !state.failed {
+                        tracing::warn!(
+                            %error,
+                            "Could not save the second screen resolution — trying again"
+                        );
+                    }
+                    state.failed = true;
+                }
             }
             self.idle.notify_all();
+            if state.failed {
+                // A pause, cut short by newer content or a quit; short while a
+                // quit waits.
+                let pause = if state.flushing {
+                    std::time::Duration::from_millis(100)
+                } else {
+                    RECORD_RETRY
+                };
+                let _ = self
+                    .work
+                    .wait_until(&mut state, std::time::Instant::now() + pause);
+            }
         }
     }
 
-    /// Whether content is not written yet.
+    /// Whether the newest content is not on disk yet.
     pub fn pending(&self) -> bool {
         let state = self.state.lock();
         state.busy || state.next.is_some()
     }
 
-    /// Quitting: wait up to `timeout` for the content to be written. If the
-    /// writer never started, it is written here. Whether it was.
+    /// Quitting: try the newest content again now if a write failed, and
+    /// wait up to `timeout` for it to be on disk. If the writer never
+    /// started, it is written here. Whether the newest content is on disk.
     pub fn flush(&self, timeout: std::time::Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         let mut state = self.state.lock();
         if !state.running {
-            let Some((path, text)) = state.next.take() else {
+            let Some((path, text)) = state.next.clone() else {
                 return true;
             };
             drop(state);
-            return (self.write)(&path, &text).is_ok();
+            let written = (self.write)(&path, &text).is_ok();
+            if written {
+                self.state.lock().next = None;
+            }
+            return written;
         }
+        // Wakes a writer pausing after a failure.
+        state.flushing = true;
+        self.work.notify_all();
         while state.busy || state.next.is_some() {
             if self.idle.wait_until(&mut state, deadline).timed_out() {
                 return !state.busy && state.next.is_none();
@@ -2057,6 +2104,51 @@ mod tests {
         assert!(!saver.pending());
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    static FAILED_ONCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    fn fails_once(path: &Path, text: &str) -> io::Result<()> {
+        if FAILED_ONCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            return Err(io::Error::other("the disk said no"));
+        }
+        write_record(path, text)
+    }
+
+    fn always_fails(_: &Path, _: &str) -> io::Result<()> {
+        Err(io::Error::other("the disk said no"))
+    }
+
+    /// Review r11: a write that fails is kept and tried again: at quit, and
+    /// with newer content, which replaces it.
+    #[test]
+    fn a_failed_record_write_is_tried_again_until_the_newest_is_on_disk() {
+        let dir = temp_dir("vdd-resolutions-retry-test");
+        let path = dir.join(RESOLUTION_RECORD);
+        let saver = std::sync::Arc::new(RecordSaver::with_writer(fails_once));
+        saver.queue(path.clone(), "first".into());
+        let start = std::time::Instant::now();
+        while FAILED_ONCE.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(start.elapsed() < std::time::Duration::from_secs(10));
+            std::thread::yield_now();
+        }
+        assert!(saver.pending(), "kept after the failure");
+        saver.queue(path.clone(), "second".into());
+        assert!(saver.flush(std::time::Duration::from_secs(10)));
+        assert!(!saver.pending());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review r11: a write that keeps failing is reported at quit, not
+    /// taken for written.
+    #[test]
+    fn a_record_that_never_reaches_the_disk_is_reported_at_quit() {
+        let dir = temp_dir("vdd-resolutions-refused-test");
+        let saver = std::sync::Arc::new(RecordSaver::with_writer(always_fails));
+        saver.queue(dir.join(RESOLUTION_RECORD), "never".into());
+        assert!(!saver.flush(std::time::Duration::from_millis(300)));
+        assert!(saver.pending());
     }
 
     #[test]

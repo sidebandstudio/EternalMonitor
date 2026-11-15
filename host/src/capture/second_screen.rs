@@ -167,6 +167,10 @@ pub(crate) enum Step {
     Release,
     /// The display showed no picture: restart onto the mirror, turn it off.
     Fallback(&'static str),
+    /// A connection or a capture restart met the display kept from before,
+    /// and the reuse rules ([`super::reuse_vdd`]) would change it: the
+    /// worker applies them.
+    CheckKept,
 }
 
 /// The second screen being streamed, before its first image. It outlives the
@@ -228,6 +232,9 @@ pub(crate) struct State {
     last_toggle: Option<Instant>,
     /// A start is claimed: its Attach is queued or running.
     attaching: bool,
+    /// A connection, or a capture restart, met the display kept from an
+    /// earlier one: the next step checks it against the reuse rules.
+    kept_met: bool,
     /// A size was picked in the app since the display was last settled:
     /// the next start settles it again (see [`settle_again`]).
     settle_asked: bool,
@@ -364,6 +371,8 @@ impl State {
                 self.release_requested = false;
                 if std::mem::take(&mut self.switch_pending) {
                     Step::Switch
+                } else if std::mem::take(&mut self.kept_met) {
+                    Step::CheckKept
                 } else {
                     Step::Nothing
                 }
@@ -644,11 +653,27 @@ pub(crate) fn next_step(shared: &SharedControl, now: Instant) -> Step {
     });
     let secure =
         *shared.capture_block.lock() == Some(crate::capture::recovery::CaptureBlock::SecureDesktop);
-    let mut status = shared.vdd_status.lock();
-    shared
-        .second_screen
-        .lock()
-        .step(selected, &mut status, connected, now, blocked, secure)
+    let step = {
+        let mut status = shared.vdd_status.lock();
+        shared
+            .second_screen
+            .lock()
+            .step(selected, &mut status, connected, now, blocked, secure)
+    };
+    // The same iPad with nothing to change: nothing, as before resolutions
+    // could be chosen. The worker decides again when it runs.
+    if step == Step::CheckKept && super::reuse_vdd(shared) == super::Reuse::Keep {
+        return Step::Nothing;
+    }
+    step
+}
+
+/// A connection or a capture restart met the second screen kept from
+/// before: the next step checks it ([`Step::CheckKept`]).
+pub(crate) fn note_kept_met(shared: &SharedControl) {
+    if shared.vdd_output.lock().is_some() && *shared.vdd_status.lock() == VddStatus::Active {
+        shared.second_screen.lock().kept_met = true;
+    }
 }
 
 /// A new capture generation ends a second screen that already failed to
@@ -800,6 +825,8 @@ pub fn load_memory(shared: &SharedControl) {
 /// why the iPad gets the mirror, or tries again once the wait after a saved
 /// failure is over.
 pub(crate) fn note_connected(shared: &SharedControl, now: Instant) {
+    // A new iPad session meets the display kept since the last one.
+    note_kept_met(shared);
     if shared.second_screen.lock().mirror_refused.is_some() {
         facts_cache(shared).refresh(true);
     }
@@ -1431,6 +1458,9 @@ pub(crate) enum Command {
     /// A size was picked in the app: bring the display attached now to the
     /// saved choice. Only that: never a start, never a restart.
     Settle,
+    /// [`Step::CheckKept`]: apply the reuse rules to the display kept from
+    /// before, for the iPad connected now.
+    CheckKept,
 }
 
 /// The one thread that turns the virtual display on and off, and its queue.
@@ -1518,7 +1548,7 @@ fn without_driver(shared: &SharedControl, command: Command) {
             fail_start(shared, "no_driver");
         }
         Command::Release | Command::Fallback(_) => *shared.vdd_output.lock() = None,
-        Command::Settle => {}
+        Command::Settle | Command::CheckKept => {}
     }
 }
 
@@ -1590,8 +1620,9 @@ pub fn finish_saving(shared: &SharedControl) {
 /// Whether everything asked for was written.
 fn finish_saving_within(shared: &SharedControl, wait: Duration) -> bool {
     let resolutions = shared.vdd_resolutions.lock().saver.clone();
-    if !resolutions.flush(wait) {
-        warn!("Abandoned a pending save of the second screen resolution — quitting without it");
+    // A disk that keeps refusing it doesn't hold the quit long.
+    if !resolutions.flush(wait.min(crate::vdd_settings::RECORD_RETRY)) {
+        warn!("Could not save the second screen resolution — quitting without it");
     }
     let Some(saver) = shared.second_screen.lock().memory.saver() else {
         return true;
@@ -1663,6 +1694,7 @@ pub(crate) fn run(
         match command {
             Command::Attach => attach(shared, driver, attach_timeout),
             Command::Settle => settle_attached(shared, driver),
+            Command::CheckKept => check_kept(shared, driver, attach_timeout),
             Command::Release => release(shared, driver),
             Command::Fallback(reason) => {
                 driver.report(Failure::Unproven(reason));
@@ -2126,6 +2158,55 @@ fn settle_attached(shared: &SharedControl, driver: &impl Driver) {
         shared.vdd_live.lock().size = Some((settled.width, settled.height));
     }
     super::note_settled_for(shared, choice);
+}
+
+/// [`Command::CheckKept`]: the reuse rules for the display kept from before,
+/// for the iPad connected now. Kept: nothing. Another iPad or saved choice
+/// the loaded modes serve: its mode is set, which capture follows. A size
+/// the loaded modes lack: the driver is turned off and on, through a start.
+#[cfg(any(windows, test, debug_assertions))]
+fn check_kept(shared: &SharedControl, driver: &impl Driver, attach_timeout: Duration) {
+    let selected = *shared.capture_target.lock() == CaptureTarget::VirtualExtended;
+    if !selected
+        || quitting(shared)
+        || !shared.client_connected()
+        || *shared.vdd_status.lock() != VddStatus::Active
+    {
+        return;
+    }
+    let owned = shared.vdd_output.lock().clone();
+    let Some(output) = owned.and_then(|name| {
+        listed(shared, driver)
+            .into_iter()
+            .find(|output| !output.is_primary && output.device_name == name)
+    }) else {
+        return;
+    };
+    // The rules read the saved choice now: a pick before is in.
+    shared.second_screen.lock().settle_asked = false;
+    match super::reuse_vdd(shared) {
+        Reuse::Keep => {}
+        Reuse::Settle(wanted, choice) => {
+            info!(
+                device = %output.device_name,
+                "Virtual display kept from before — setting the connected iPad's mode"
+            );
+            if wanted.is_some_and(|mode| (mode.width, mode.height) != (output.width, output.height))
+            {
+                let settled = settle(shared, driver, output, wanted);
+                shared.vdd_live.lock().size = Some((settled.width, settled.height));
+            }
+            super::note_settled_for(shared, choice);
+        }
+        Reuse::Restart => {
+            {
+                let mut status = shared.vdd_status.lock();
+                *status = VddStatus::Attaching;
+                shared.second_screen.lock().attaching = true;
+            }
+            attach(shared, driver, attach_timeout);
+        }
+    }
 }
 
 /// Tests: whether a settle was asked for and has not run.
@@ -4826,6 +4907,134 @@ mod tests {
         shared.vdd_live.lock().listed(&driver.outputs(), later);
         crate::capture::note_vdd_change(&shared, "virtual", (1700, 1116), later);
         assert_eq!(chosen(), Some((1700, 1116)));
+    }
+
+    /// What the transport does with a step, then the worker's turn.
+    fn tick(shared: &SharedControl, driver: &FakeDriver) -> Step {
+        let step = next_step(shared, driver.now());
+        match step {
+            Step::Attach => send(shared, Command::Attach),
+            Step::CheckKept => send(shared, Command::CheckKept),
+            _ => {}
+        }
+        run(shared, driver, ATTACH_TIMEOUT, false);
+        step
+    }
+
+    /// iPad 1 leaves; `device` connects within the grace, as the transport
+    /// reports it, and the transport ticks.
+    fn reconnect(
+        shared: &SharedControl,
+        driver: &FakeDriver,
+        device: u64,
+        panel: (u16, u16),
+    ) -> Step {
+        disconnect(shared);
+        assert_eq!(tick(shared, driver), Step::Nothing, "the grace");
+        connect_ipad(shared, device, panel);
+        note_connected(shared, driver.now());
+        tick(shared, driver)
+    }
+
+    /// Review r11: a connection within the release grace goes through the
+    /// reuse rules on the real path (`note_connected`, the state machine,
+    /// the worker). iPad 1 streams at 1510x992 first.
+    #[test]
+    fn a_connection_within_the_grace_meets_the_reuse_rules() {
+        let on_sleep = |_| {};
+        let modes = crate::vdd_settings::modes_for_client(1488, 2266, 60);
+        let at_1510 = || {
+            let (shared, driver) = streaming_for_ipad_1(&on_sleep);
+            moved_on(&shared);
+            crate::capture::click_vdd_resolution(&shared, (1510, 992));
+            run(&shared, &driver, ATTACH_TIMEOUT, false);
+            assert_eq!(driver.size.get(), Some((1510, 992)));
+            (shared, driver)
+        };
+
+        // iPad 2 with another panel: the loaded modes lack its size, so the
+        // driver is turned off and on with its modes.
+        let (shared, driver) = at_1510();
+        let calls = driver.calls().len();
+        assert_eq!(
+            reconnect(&shared, &driver, 2, (1668, 2388)),
+            Step::CheckKept
+        );
+        assert_eq!(
+            driver.calls()[calls..],
+            [Call::Disable, Call::Prepare, Call::Enable, Call::Settle]
+        );
+        assert_eq!(driver.wanted.borrow().last(), Some(&Some(mode(2388, 1668))));
+
+        // iPad 2 with the same panel and its own choice: its mode is set,
+        // nothing turned off.
+        let (shared, driver) = at_1510();
+        assert!(shared
+            .vdd_resolutions
+            .lock()
+            .choices
+            .choose(2, &modes, (1132, 744)));
+        let calls = driver.calls().len();
+        assert_eq!(
+            reconnect(&shared, &driver, 2, (1488, 2266)),
+            Step::CheckKept
+        );
+        assert_eq!(driver.calls()[calls..], [Call::Settle]);
+        assert_eq!(driver.size.get(), Some((1132, 744)));
+        assert_eq!(driver.toggles.borrow().len(), 1);
+
+        // iPad 1 back with nothing changed: nothing queued, nothing done.
+        let (shared, driver) = at_1510();
+        let calls = driver.calls().len();
+        assert_eq!(reconnect(&shared, &driver, 1, (1488, 2266)), Step::Nothing);
+        assert!(shared.vdd_worker.queue.lock().commands.is_empty());
+        assert_eq!(driver.calls().len(), calls);
+        assert_eq!(driver.size.get(), Some((1510, 992)));
+
+        // iPad 1 back after its saved choice changed while it was away (the
+        // app can't pick for an iPad that isn't connected: the record
+        // changed, as from another copy of the app).
+        let (shared, driver) = at_1510();
+        disconnect(&shared);
+        assert_eq!(tick(&shared, &driver), Step::Nothing);
+        crate::capture::click_vdd_resolution(&shared, (914, 600));
+        assert_eq!(
+            shared.vdd_resolutions.lock().choices.chosen(1),
+            Some((1510, 992)),
+            "no click without the iPad"
+        );
+        assert!(shared
+            .vdd_resolutions
+            .lock()
+            .choices
+            .choose(1, &modes, (914, 600)));
+        connect_ipad(&shared, 1, (1488, 2266));
+        note_connected(&shared, driver.now());
+        assert_eq!(tick(&shared, &driver), Step::CheckKept);
+        assert_eq!(driver.size.get(), Some((914, 600)));
+        assert_eq!(driver.toggles.borrow().len(), 1);
+    }
+
+    /// Review r11: a capture restart that reuses the display kept from
+    /// before (a mode switch back, a settings change) goes through the
+    /// same check: nothing for the same iPad and choice.
+    #[test]
+    fn a_capture_restart_on_the_kept_display_meets_the_reuse_rules() {
+        let on_sleep = |_| {};
+        let (shared, driver) = streaming_for_ipad_1(&on_sleep);
+        moved_on(&shared);
+        note_kept_met(&shared);
+        assert_eq!(tick(&shared, &driver), Step::Nothing);
+        // The choice changed while the stream was on the mirror.
+        let modes = crate::vdd_settings::modes_for_client(1488, 2266, 60);
+        assert!(shared
+            .vdd_resolutions
+            .lock()
+            .choices
+            .choose(1, &modes, (1700, 1116)));
+        note_kept_met(&shared);
+        assert_eq!(tick(&shared, &driver), Step::CheckKept);
+        assert_eq!(driver.size.get(), Some((1700, 1116)));
     }
 
     /// Review r1, r8: a size picked while the second screen comes up, after
