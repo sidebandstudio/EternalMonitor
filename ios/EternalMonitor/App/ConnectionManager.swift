@@ -1706,6 +1706,7 @@ final class ConnectionManager: ObservableObject {
         pcReturn = PCReturn(name: name, host: host, port: port)
         let browser = makePCBrowser()
         browser.onHosts = { [weak self] hosts in self?.pcReturnHeard(hosts) }
+        browser.onSearchFailed = { [weak self] in self?.pcReturn?.couldNotSearch() }
         pcReturnBrowser = browser
         pcReturnPaused = !isForeground
         if isForeground { browser.start() }
@@ -1844,16 +1845,30 @@ final class ConnectionManager: ObservableObject {
     }
 
     private func endPCReturn() {
+        if let watch = pcReturn, watch.armedAt != nil {
+            recordNoReplyFacts("watch_end", watch: watch, host: watch.host, port: watch.port)
+        }
         pcReturnTry?.cancel()
         pcReturnTry = nil
         pcReturnLimit?.cancel()
         pcReturnLimit = nil
         pcReturnBrowser?.onHosts = nil
+        pcReturnBrowser?.onSearchFailed = nil
         pcReturnBrowser?.stop()
         pcReturnBrowser = nil
         pcReturnPaused = false
         pcReturn = nil
         if watchingForPC { watchingForPC = false }
+    }
+
+    /// Logs `NoReplyFacts` for the attempt at `host:port` once the route
+    /// there is known, within 2 s; nothing waits for it.
+    private func recordNoReplyFacts(_ when: String, watch: PCReturn?, host: String, port: UInt16) {
+        let localRoute = localRoute
+        Task { @MainActor [weak self] in
+            let route = await localRoute(host, port)
+            self?.record(.info, "connection", NoReplyFacts.line(when: when, watch: watch, host: host, port: port, route: route))
+        }
     }
 
     /// The session and how long the current attempt has taken, appended to
@@ -1895,6 +1910,9 @@ final class ConnectionManager: ObservableObject {
                     isUSB: isUSB, host: debug.host), at: isUSB ? nil : "\(debug.host):\(debug.port)")
                 self.problem = problem == .noReply(usb: false) && self.attemptMove != nil
                     ? .noReplyAtNewAddress(debug.host) : problem
+                if self.showsNoReplyOverWiFi {
+                    self.recordNoReplyFacts("timeout", watch: self.pcReturn, host: debug.host, port: debug.port)
+                }
                 // The app gave up, not the user: the PC's log tells them apart.
                 self.disconnect(.connectTimeout)
                 if handshakeDone && self.noPictureStreak.stopsReconnecting { self.stopAutomaticAttempts(isUSB: isUSB) }

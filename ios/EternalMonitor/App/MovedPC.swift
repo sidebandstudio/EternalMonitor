@@ -65,13 +65,15 @@ enum MovedPC {
     }
 
     /// How the iPad reaches an address: the interface it sends from, whether
-    /// the path is Wi-Fi or wired Ethernet and nothing else, and that
-    /// interface's IPv4 address and netmask.
+    /// the path is Wi-Fi or wired Ethernet and nothing else, that
+    /// interface's IPv4 address and netmask, and the path's kind for the
+    /// support log: `wifi`, `wired`, `cellular` or `other` (a tunnel too).
     struct Route: Equatable {
         var interface: String
         var direct: Bool
         var address: String
         var netmask: String
+        var kind = "other"
     }
 
     /// Interfaces that are tunnels, whatever the path calls them.
@@ -131,9 +133,11 @@ enum MovedPC {
             interface = stand
             direct = true
         }
+        let kind = path.usesInterfaceType(.other) ? "other" : path.usesInterfaceType(.wifi) ? "wifi"
+            : path.usesInterfaceType(.wiredEthernet) ? "wired" : path.usesInterfaceType(.cellular) ? "cellular" : "other"
         let address = local.rawValue.map { String($0) }.joined(separator: ".")
         guard let netmask = netmask(interface: interface, address: address) else { return nil }
-        return Route(interface: interface, direct: direct, address: address, netmask: netmask)
+        return Route(interface: interface, direct: direct, address: address, netmask: netmask, kind: kind)
     }
 
     /// The netmask of `address` on `interface`, from the interface list.
