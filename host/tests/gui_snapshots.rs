@@ -456,6 +456,9 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
         harness.run_steps(4);
         harness.get(resolution(pick));
         assert_eq!(shared.vdd_resolutions.lock().choices.chosen(7), chosen);
+        // Written on the saver's thread.
+        let saver = shared.vdd_resolutions.lock().saver.clone();
+        assert!(saver.flush(std::time::Duration::from_secs(10)));
         let saved = eternal_host::vdd_settings::ResolutionChoices::load(&record);
         assert_eq!(saved.chosen(7), chosen);
     }

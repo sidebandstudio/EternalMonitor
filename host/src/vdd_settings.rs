@@ -256,16 +256,6 @@ impl ResolutionChoices {
         choices
     }
 
-    pub fn save(&self, path: &Path) -> io::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        replace(
-            path,
-            &serde_json::to_string(self).map_err(io::Error::other)?,
-        )
-    }
-
     pub fn chosen(&self, device: u64) -> Option<(u32, u32)> {
         self.0.get(&device).map(|size| (size.width, size.height))
     }
@@ -340,11 +330,13 @@ impl ResolutionChoices {
     }
 }
 
-/// [`ResolutionChoices`] and the file they are kept in, if any.
+/// [`ResolutionChoices`], the file they are kept in, if any, and the
+/// writer that saves them there.
 #[derive(Debug, Default)]
 pub struct ResolutionMemory {
     pub choices: ResolutionChoices,
     pub path: Option<std::path::PathBuf>,
+    pub saver: std::sync::Arc<RecordSaver>,
 }
 
 impl ResolutionMemory {
@@ -352,13 +344,130 @@ impl ResolutionMemory {
         Self {
             choices: ResolutionChoices::load(&path),
             path: Some(path),
+            saver: Default::default(),
         }
     }
 
-    pub fn save(&self) -> io::Result<()> {
-        self.path
-            .as_deref()
-            .map_or(Ok(()), |path| self.choices.save(path))
+    /// Hand the choices to the writer: no disk access here, so the window's
+    /// and capture's threads, which call this holding the memory's lock,
+    /// never wait for the disk.
+    pub fn save(&self) {
+        if let (Some(path), Ok(text)) = (&self.path, serde_json::to_string(&self.choices)) {
+            self.saver.queue(path.clone(), text);
+        }
+    }
+}
+
+/// Writes the resolution record on a thread of its own, the latest content
+/// once, as the second screen record is written (#137). Flushed at quit.
+pub struct RecordSaver {
+    state: parking_lot::Mutex<RecordSaving>,
+    /// Wakes the writer: content to write.
+    work: parking_lot::Condvar,
+    /// Wakes [`RecordSaver::flush`]: content was written.
+    idle: parking_lot::Condvar,
+    write: fn(&Path, &str) -> io::Result<()>,
+}
+
+#[derive(Default)]
+struct RecordSaving {
+    next: Option<(std::path::PathBuf, String)>,
+    busy: bool,
+    running: bool,
+}
+
+impl std::fmt::Debug for RecordSaver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordSaver").finish_non_exhaustive()
+    }
+}
+
+impl Default for RecordSaver {
+    fn default() -> Self {
+        Self::with_writer(write_record)
+    }
+}
+
+fn write_record(path: &Path, text: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    replace(path, text)
+}
+
+impl RecordSaver {
+    pub(crate) fn with_writer(write: fn(&Path, &str) -> io::Result<()>) -> Self {
+        Self {
+            state: Default::default(),
+            work: Default::default(),
+            idle: Default::default(),
+            write,
+        }
+    }
+
+    /// Write `text` to `path` on the writer's thread, in place of content
+    /// still waiting. Returns at once.
+    pub fn queue(self: &std::sync::Arc<Self>, path: std::path::PathBuf, text: String) {
+        let start = {
+            let mut state = self.state.lock();
+            state.next = Some((path, text));
+            !std::mem::replace(&mut state.running, true)
+        };
+        self.work.notify_one();
+        if start {
+            let saver = std::sync::Arc::clone(self);
+            let spawned = std::thread::Builder::new()
+                .name("resolution-save".into())
+                .spawn(move || saver.run());
+            if let Err(error) = spawned {
+                self.state.lock().running = false;
+                tracing::warn!(%error, "Could not start saving the second screen resolution");
+            }
+        }
+    }
+
+    fn run(&self) {
+        let mut state = self.state.lock();
+        loop {
+            let Some((path, text)) = state.next.take() else {
+                self.work.wait(&mut state);
+                continue;
+            };
+            state.busy = true;
+            let written =
+                parking_lot::MutexGuard::unlocked(&mut state, || (self.write)(&path, &text));
+            state.busy = false;
+            if let Err(error) = written {
+                tracing::warn!(%error, "Could not save the second screen resolution");
+            }
+            self.idle.notify_all();
+        }
+    }
+
+    /// Whether content is not written yet.
+    pub fn pending(&self) -> bool {
+        let state = self.state.lock();
+        state.busy || state.next.is_some()
+    }
+
+    /// Quitting: wait up to `timeout` for the content to be written. If the
+    /// writer never started, it is written here. Whether it was.
+    pub fn flush(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut state = self.state.lock();
+        if !state.running {
+            let Some((path, text)) = state.next.take() else {
+                return true;
+            };
+            drop(state);
+            return (self.write)(&path, &text).is_ok();
+        }
+        while state.busy || state.next.is_some() {
+            if self.idle.wait_until(&mut state, deadline).timed_out() {
+                return !state.busy && state.next.is_none();
+            }
+        }
+        true
     }
 }
 
@@ -1786,7 +1895,8 @@ mod tests {
             "already chosen"
         );
         assert!(memory.choices.choose(9, &pro, (1920, 1080)));
-        memory.save().expect("save");
+        memory.save();
+        assert!(memory.saver.flush(std::time::Duration::from_secs(10)));
 
         // The next start of the app, and the next connection of each iPad.
         let loaded = ResolutionMemory::open(path.clone()).choices;
@@ -1823,7 +1933,9 @@ mod tests {
         // Unreadable: none chosen. No file: nothing saved.
         std::fs::write(&path, "not json").unwrap();
         assert_eq!(ResolutionChoices::load(&path), ResolutionChoices::default());
-        assert!(ResolutionMemory::default().save().is_ok());
+        let unsaved = ResolutionMemory::default();
+        unsaved.save();
+        assert!(!unsaved.saver.pending(), "no file: nothing to write");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1909,6 +2021,42 @@ mod tests {
         assert!(!choices.set_in_windows(0, &mini, (1700, 1116)));
         assert!(!choices.set_in_windows(7, &[], (1700, 1116)));
         assert_eq!(choices, ResolutionChoices::default());
+    }
+
+    static GATE: (std::sync::Mutex<bool>, std::sync::Condvar) =
+        (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+    /// A disk that writes only once the test lets it.
+    fn gated_write(path: &Path, text: &str) -> io::Result<()> {
+        let mut open = GATE.0.lock().unwrap();
+        while !*open {
+            open = GATE.1.wait(open).unwrap();
+        }
+        drop(open);
+        write_record(path, text)
+    }
+
+    /// Review r10: saving hands the content to the writer's thread and
+    /// returns; the latest content is the one written; a flush waits for it.
+    #[test]
+    fn the_record_is_written_off_the_calling_thread() {
+        let dir = temp_dir("vdd-resolutions-saver-test");
+        let path = dir.join(RESOLUTION_RECORD);
+        let saver = std::sync::Arc::new(RecordSaver::with_writer(gated_write));
+        let started = std::time::Instant::now();
+        saver.queue(path.clone(), "first".into());
+        saver.queue(path.clone(), "second".into());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(
+            saver.pending() && !path.exists(),
+            "nothing written by the caller"
+        );
+        *GATE.0.lock().unwrap() = true;
+        GATE.1.notify_all();
+        assert!(saver.flush(std::time::Duration::from_secs(10)));
+        assert!(!saver.pending());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

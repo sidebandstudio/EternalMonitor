@@ -1428,6 +1428,9 @@ pub(crate) enum Command {
     /// The display showed no picture, for this reason: log how Windows sees
     /// it while it is still on, then release it.
     Fallback(&'static str),
+    /// A size was picked in the app: bring the display attached now to the
+    /// saved choice. Only that: never a start, never a restart.
+    Settle,
 }
 
 /// The one thread that turns the virtual display on and off, and its queue.
@@ -1515,6 +1518,7 @@ fn without_driver(shared: &SharedControl, command: Command) {
             fail_start(shared, "no_driver");
         }
         Command::Release | Command::Fallback(_) => *shared.vdd_output.lock() = None,
+        Command::Settle => {}
     }
 }
 
@@ -1585,6 +1589,10 @@ pub fn finish_saving(shared: &SharedControl) {
 
 /// Whether everything asked for was written.
 fn finish_saving_within(shared: &SharedControl, wait: Duration) -> bool {
+    let resolutions = shared.vdd_resolutions.lock().saver.clone();
+    if !resolutions.flush(wait) {
+        warn!("Abandoned a pending save of the second screen resolution — quitting without it");
+    }
     let Some(saver) = shared.second_screen.lock().memory.saver() else {
         return true;
     };
@@ -1654,6 +1662,7 @@ pub(crate) fn run(
         };
         match command {
             Command::Attach => attach(shared, driver, attach_timeout),
+            Command::Settle => settle_attached(shared, driver),
             Command::Release => release(shared, driver),
             Command::Fallback(reason) => {
                 driver.report(Failure::Unproven(reason));
@@ -1832,8 +1841,7 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
             .cloned()
     }) {
         // It has the modes written for the iPad it was turned on for.
-        let asked = std::mem::take(&mut shared.second_screen.lock().settle_asked);
-        match super::reuse_vdd(shared, asked) {
+        match super::reuse_vdd(shared) {
             Reuse::Keep => {
                 info!(device = %output.device_name, "Virtual display still attached — capturing it");
                 live_since(shared, &output, driver.now());
@@ -2056,21 +2064,68 @@ fn settle(
 }
 
 /// A size was picked in the app: the thread that turns the second screen
-/// on settles it again with the saved choice. The display it owns gets a
-/// start of its own; one still coming up gets it when its attach is done.
+/// on brings the display attached now to the saved choice
+/// ([`Command::Settle`]). Not while it fails, falls back, is released or is
+/// still coming up: a start in progress takes the request when it is done.
 pub(crate) fn settle_again(shared: &SharedControl) {
     shared.second_screen.lock().settle_asked = true;
-    if shared.vdd_output.lock().is_some() {
-        queue_attach(shared);
+    if streaming_on_it(shared) {
+        queue_settle(shared);
     }
 }
 
-/// After an attach: a size picked while it ran gets a start of its own.
+/// The second screen is attached, this host's, streaming for the iPad
+/// connected now, and no start, failure, fallback or release is under way.
+fn streaming_on_it(shared: &SharedControl) -> bool {
+    let quitting = shared.vdd_worker.queue.lock().quitting;
+    let state = shared.second_screen.lock();
+    let calm = state.failure.is_none() && !state.release_requested && !state.attaching;
+    drop(state);
+    calm && !quitting
+        && *shared.capture_target.lock() == CaptureTarget::VirtualExtended
+        && shared.vdd_output.lock().is_some()
+        && *shared.vdd_status.lock() == VddStatus::Active
+        && shared.client_connected()
+}
+
+/// After an attach: a size picked while it ran gets its settle now.
 #[cfg(any(windows, test, debug_assertions))]
 fn settle_again_if_asked(shared: &SharedControl) {
     if shared.second_screen.lock().settle_asked {
-        queue_attach(shared);
+        queue_settle(shared);
     }
+}
+
+/// [`Command::Settle`]: bring the attached display to the saved choice.
+/// It never prepares, enables, claims or releases, and it does not touch
+/// the stream: a display at the wanted size is left as it is, and a size
+/// change is followed by capture as one made in Windows' settings is.
+#[cfg(any(windows, test, debug_assertions))]
+fn settle_attached(shared: &SharedControl, driver: &impl Driver) {
+    // A start claimed meanwhile takes the request when it is done.
+    if !streaming_on_it(shared) {
+        return;
+    }
+    if !std::mem::take(&mut shared.second_screen.lock().settle_asked) {
+        return;
+    }
+    let owned = shared.vdd_output.lock().clone();
+    let Some(output) = owned.and_then(|name| {
+        listed(shared, driver)
+            .into_iter()
+            .find(|output| !output.is_primary && output.device_name == name)
+    }) else {
+        return;
+    };
+    let (wanted, choice) = super::wanted_vdd(shared);
+    let Some(mode) = wanted else {
+        return;
+    };
+    if (output.width, output.height) != (mode.width, mode.height) {
+        let settled = settle(shared, driver, output, Some(mode));
+        shared.vdd_live.lock().size = Some((settled.width, settled.height));
+    }
+    super::note_settled_for(shared, choice);
 }
 
 /// Tests: whether a settle was asked for and has not run.
@@ -2082,19 +2137,19 @@ pub(crate) fn settle_queued(shared: &SharedControl) -> bool {
             .queue
             .lock()
             .commands
-            .contains(&Command::Attach)
+            .contains(&Command::Settle)
 }
 
-/// An Attach for the worker, unless one waits already.
-fn queue_attach(shared: &SharedControl) {
+/// A Settle for the worker, unless one waits already.
+fn queue_settle(shared: &SharedControl) {
     let queued = shared
         .vdd_worker
         .queue
         .lock()
         .commands
-        .contains(&Command::Attach);
+        .contains(&Command::Settle);
     if !queued {
-        send(shared, Command::Attach);
+        send(shared, Command::Settle);
     }
 }
 
@@ -4375,24 +4430,51 @@ mod tests {
         );
         assert!(driver.toggles.borrow().is_empty());
 
-        // The same iPad with another refresh rate, or another panel.
-        for (refresh, panel) in [(120, (1488, 2266)), (60, (1668, 2388))] {
+        // Review r10: the same iPad with another refresh rate (Low Power
+        // Mode), with no saved choice or with one: kept, as 0.3.4 keeps it,
+        // since the loaded modes have its sizes. Another panel: restarted.
+        let modes = crate::vdd_settings::modes_for_client(1488, 2266, 60);
+        for (before, after, saved, restarts) in [
+            (120, 60, None, false),
+            (60, 120, None, false),
+            (120, 60, Some((1510, 992)), false),
+            (60, 120, Some((1510, 992)), false),
+        ] {
             let shared = second_screen_selected();
-            connect_ipad(&shared, 1, (1488, 2266));
+            if let Some(saved) = saved {
+                assert!(shared
+                    .vdd_resolutions
+                    .lock()
+                    .choices
+                    .choose(1, &modes, saved));
+            }
+            connect_ipad_at(&shared, 1, (1488, 2266), before);
             prepare_for_connected(&shared);
             note_attached(&shared, "virtual".into());
             shared.second_screen.lock().attaching = false;
             disconnect(&shared);
-            connect_ipad_at(&shared, 1, panel, refresh);
+            connect_ipad_at(&shared, 1, (1488, 2266), after);
             let driver = FakeDriver::new(secs(3.0), Some(Duration::ZERO), &on_sleep);
             driver.on_since.set(Some(Duration::ZERO));
             attach(&shared, &driver, ATTACH_TIMEOUT);
-            assert_eq!(
-                driver.calls(),
-                [Call::Disable, Call::Prepare, Call::Enable, Call::Settle],
-                "{refresh} Hz, {panel:?}"
-            );
+            assert_eq!(driver.calls(), [], "{before} to {after} Hz, {saved:?}");
+            assert!(!restarts);
         }
+        let shared = second_screen_selected();
+        connect_ipad(&shared, 1, (1488, 2266));
+        prepare_for_connected(&shared);
+        note_attached(&shared, "virtual".into());
+        shared.second_screen.lock().attaching = false;
+        disconnect(&shared);
+        connect_ipad(&shared, 1, (1668, 2388));
+        let driver = FakeDriver::new(secs(3.0), Some(Duration::ZERO), &on_sleep);
+        driver.on_since.set(Some(Duration::ZERO));
+        attach(&shared, &driver, ATTACH_TIMEOUT);
+        assert_eq!(
+            driver.calls(),
+            [Call::Disable, Call::Prepare, Call::Enable, Call::Settle],
+            "another panel"
+        );
     }
 
     /// iPad 1 (2266x1488) streams on the second screen at its own size.
@@ -4522,34 +4604,124 @@ mod tests {
         assert!(!settle_queued(&shared));
     }
 
-    /// Review r8, r9: after Windows moved the display, a click on the saved
-    /// size settles it again. Keeping the size Windows set asks for a settle
-    /// too, which sets nothing: the display is at it.
+    /// The stream as it runs on the second screen: what a click must leave
+    /// alone, unless the driver had to be turned off and on.
+    fn stream_state(shared: &SharedControl) -> (bool, bool, bool, VddStatus) {
+        let state = shared.second_screen.lock();
+        let status = *shared.vdd_status.lock();
+        (
+            state.switch_pending,
+            state.proving.is_some(),
+            state.proven.is_some(),
+            status,
+        )
+    }
+
+    /// The stream has moved onto the second screen and it proved itself.
+    fn moved_on(shared: &SharedControl) {
+        let mut state = shared.second_screen.lock();
+        state.switch_pending = false;
+        state.proving = None;
+        state.proven = Some((1, ((0, 1), "virtual".to_string())));
+    }
+
+    /// Review r8, r9, r10: after Windows moved the display, a click on the
+    /// saved size sets it, and only that: no pipeline restart, the proof
+    /// kept. Keeping the size Windows set asks for a settle too, which finds
+    /// the display there and does nothing at all.
     #[test]
     fn a_kept_windows_size_sets_nothing() {
         let on_sleep = |_| {};
         let (shared, driver) = streaming_for_ipad_1(&on_sleep);
+        moved_on(&shared);
+        let streaming = stream_state(&shared);
         driver.size.set(Some((1920, 1080)));
         crate::capture::note_vdd_change(&shared, "virtual", (1920, 1080), Instant::now());
         crate::capture::click_vdd_resolution(&shared, (2266, 1488));
         run(&shared, &driver, ATTACH_TIMEOUT, false);
         assert_eq!(driver.sets.borrow().last(), Some(&(2266, 1488)));
+        assert_eq!(
+            stream_state(&shared),
+            streaming,
+            "no restart, the proof kept"
+        );
 
         // At 800x600, outside the list: kept with a click; the settle that
-        // follows finds the display there and sets nothing.
+        // follows finds the display there and does nothing.
         driver.size.set(Some((800, 600)));
         crate::capture::note_vdd_change(&shared, "virtual", (800, 600), Instant::now());
-        let sets = driver.sets.borrow().len();
+        let calls = driver.calls().len();
         crate::capture::click_vdd_resolution(&shared, (800, 600));
         assert!(settle_queued(&shared));
         run(&shared, &driver, ATTACH_TIMEOUT, false);
-        assert_eq!(driver.wanted.borrow().last(), Some(&Some(mode(800, 600))));
-        assert_eq!(driver.sets.borrow().len(), sets, "no mode set");
+        assert!(!settle_queued(&shared));
+        assert_eq!(driver.calls().len(), calls, "no mode set");
         assert_eq!(driver.toggles.borrow().len(), 1, "no restart");
+        assert_eq!(stream_state(&shared), streaming);
         assert_eq!(
             shared.vdd_resolutions.lock().choices.chosen(1),
             Some((800, 600))
         );
+    }
+
+    /// Review r10, the reviewer's case: the second screen showed no picture
+    /// and falls back; a click meanwhile, or while it is released, never
+    /// turns it on again: its request only settles a display that is
+    /// attached and streaming.
+    #[test]
+    fn a_click_never_turns_a_failed_or_released_second_screen_on() {
+        let on_sleep = |_| {};
+        // Falling back: no settle is queued, and one queued before does
+        // nothing once the failure is recorded.
+        let (shared, driver) = streaming_for_ipad_1(&on_sleep);
+        crate::capture::click_vdd_resolution(&shared, (1700, 1116));
+        assert!(shared
+            .vdd_worker
+            .queue
+            .lock()
+            .commands
+            .contains(&Command::Settle));
+        *shared.vdd_status.lock() = VddStatus::Failed;
+        shared.second_screen.lock().failure = Some("no_frames");
+        send(&shared, Command::Fallback("no_frames"));
+        crate::capture::click_vdd_resolution(&shared, (1510, 992));
+        assert_eq!(
+            shared.vdd_worker.queue.lock().commands.len(),
+            2,
+            "nothing more queued"
+        );
+        run(&shared, &driver, ATTACH_TIMEOUT, false);
+        assert_eq!(*shared.vdd_output.lock(), None);
+        assert_eq!(
+            driver.calls()[3..]
+                .iter()
+                .filter(|call| matches!(call, Call::Prepare | Call::Enable))
+                .count(),
+            0
+        );
+        // The settle queued before the failure runs after it: nothing.
+        let calls = driver.calls();
+        assert_eq!(
+            calls[3..],
+            [Call::Report(Failure::Unproven("no_frames")), Call::Disable]
+        );
+        send(&shared, Command::Settle);
+        run(&shared, &driver, ATTACH_TIMEOUT, false);
+        assert_eq!(driver.calls(), calls);
+
+        // Released after its viewer left: a click then queues nothing, and
+        // one queued just before runs after the release and does nothing.
+        let (shared, driver) = streaming_for_ipad_1(&on_sleep);
+        crate::capture::click_vdd_resolution(&shared, (1510, 992));
+        shared.second_screen.lock().release_requested = true;
+        disconnect(&shared);
+        crate::capture::click_vdd_resolution(&shared, (914, 600));
+        let mut queue = shared.vdd_worker.queue.lock();
+        queue.commands.push_front(Command::Release);
+        drop(queue);
+        run(&shared, &driver, ATTACH_TIMEOUT, false);
+        assert_eq!(*shared.vdd_output.lock(), None);
+        assert_eq!(driver.calls()[3..], [Call::Disable]);
     }
 
     /// Review r9: Windows left the display at 800x600, outside the list; a
