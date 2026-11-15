@@ -64,6 +64,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             instance
         }
     };
+    // From here, a launch the user starts asks this one to keep its window up.
+    let sign_in = at_sign_in.then(eternal_host::single_instance::show_requests);
 
     // Anchor the process-wide media clock before anything else runs.
     clock::init();
@@ -430,7 +432,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         info!("Termination signal received — shutting down cleanly");
-    } else if let Err(e) = gui::run_gui(gui_control.clone(), at_sign_in, {
+    } else if let Err(e) = gui::run_gui(gui_control.clone(), sign_in, {
         let quit_once = std::sync::Arc::clone(&quit_once);
         Box::new(move || {
             let quit = quit_once.lock().take();

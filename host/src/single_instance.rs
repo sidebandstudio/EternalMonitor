@@ -71,6 +71,52 @@ fn claim_install(wait: Option<Duration>) -> Option<Guard> {
     claim_named(&mutex_name(&canonical(&exe), &canonical(&app_data)), wait)
 }
 
+/// The event a later launch sets to ask this installation's running host to
+/// show its window: the mutex's name with `-show`.
+pub fn show_event_name(mutex_name: &str) -> String {
+    format!("{mutex_name}-show")
+}
+
+#[cfg(windows)]
+fn install_show_event() -> Option<windows::core::HSTRING> {
+    let exe = std::env::current_exe().ok()?;
+    let app_data = crate::settings::app_data_dir()?;
+    let mutex = mutex_name(&canonical(&exe), &canonical(&app_data));
+    Some(show_event_name(&mutex).as_str().into())
+}
+
+/// Show requests from later launches ([`show_existing`]), for a host that
+/// Windows started at sign-in: its window must not go to the taskbar once
+/// the user started EternalMonitor again. True once for each request.
+#[cfg(windows)]
+pub fn show_requests() -> Box<dyn FnMut() -> bool> {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, WAIT_OBJECT_0};
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+    struct Event(HANDLE);
+    impl Drop for Event {
+        fn drop(&mut self) {
+            unsafe {
+                let _ = CloseHandle(self.0);
+            }
+        }
+    }
+    // Auto-reset: each wait that sees it set clears it.
+    let event = install_show_event()
+        .and_then(|name| unsafe { CreateEventW(None, false, false, &name) }.ok())
+        .map(Event);
+    Box::new(move || {
+        event
+            .as_ref()
+            .is_some_and(|event| unsafe { WaitForSingleObject(event.0, 0) } == WAIT_OBJECT_0)
+    })
+}
+
+/// No second launches to hear outside Windows.
+#[cfg(not(windows))]
+pub fn show_requests() -> Box<dyn FnMut() -> bool> {
+    Box::new(|| false)
+}
+
 /// Windows' named mutex, as the check uses it. Tests fake it.
 pub trait NamedMutex {
     type Handle;
@@ -328,6 +374,17 @@ pub fn show_existing() {
         false.into()
     }
 
+    // A host Windows started at sign-in listens for this, so it keeps its
+    // window up instead of sending it to the taskbar.
+    if let Some(name) = install_show_event() {
+        use windows::Win32::System::Threading::{OpenEventW, SetEvent, EVENT_MODIFY_STATE};
+        if let Ok(event) = unsafe { OpenEventW(EVENT_MODIFY_STATE, false, &name) } {
+            unsafe {
+                let _ = SetEvent(event);
+                let _ = CloseHandle(event);
+            }
+        }
+    }
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
@@ -368,6 +425,22 @@ mod tests {
             name,
             mutex_name(Path::new(r"D:\other\EternalMonitor-host.exe"), data)
         );
+    }
+
+    /// A later launch's show request reaches only its own install's host,
+    /// under a name of its own beside the mutex.
+    #[test]
+    fn the_show_request_is_named_for_the_install() {
+        let data = Path::new(r"C:\Users\A\AppData\Roaming\EternalMonitor");
+        let installed = mutex_name(
+            Path::new(r"C:\Program Files\EternalMonitor\EternalMonitor-host.exe"),
+            data,
+        );
+        let other = mutex_name(Path::new(r"D:\other\EternalMonitor-host.exe"), data);
+        let event = show_event_name(&installed);
+        assert_eq!(event, format!("{installed}-show"));
+        assert_ne!(event, installed);
+        assert_ne!(event, show_event_name(&other));
     }
 
     /// Aliases of one install and settings folder reach one key.

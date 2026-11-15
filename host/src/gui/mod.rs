@@ -30,10 +30,13 @@ mod page_troubleshooting;
 mod port_notice;
 pub(crate) mod renderer;
 mod setup;
+mod sign_in;
 mod theme;
 mod update_banner;
 mod update_toast;
 mod widgets;
+
+pub use sign_in::ShowRequests;
 
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
@@ -379,34 +382,12 @@ pub struct AnalyzerApp {
     pending_language: Option<Lang>,
     /// First-run setup, while open.
     setup: Option<setup::Setup>,
-    /// Windows started this launch at sign-in, and the window has not yet
-    /// gone to the taskbar or been kept on screen ([`sign_in_start`]).
-    at_sign_in: bool,
-}
-
-/// What a window that Windows started at sign-in does in a UI pass.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SignInStart {
-    /// Not confirmed drawing yet: the graphics driver watch needs that proof
-    /// from a visible window.
-    Wait,
-    /// Go to the taskbar, once. Streaming and discovery keep running.
-    Minimise,
-    /// Stay on screen: the user is using the window, or it shows them
-    /// something (first-run setup, the update popup, a notice).
-    Stay,
-}
-
-fn sign_in_start(drawing: bool, user_acted: bool, needs_user: bool) -> SignInStart {
-    if user_acted {
-        SignInStart::Stay
-    } else if !drawing {
-        SignInStart::Wait
-    } else if needs_user {
-        SignInStart::Stay
-    } else {
-        SignInStart::Minimise
-    }
+    /// Windows started this launch at sign-in, until the window is like any
+    /// other ([`sign_in::SignIn`]).
+    sign_in: Option<sign_in::SignIn>,
+    /// Where the notices are drawn while the window is minimised in
+    /// [`sign_in::GRACE`], to see whether it would show one.
+    offscreen: Option<egui::Context>,
 }
 
 impl AnalyzerApp {
@@ -566,14 +547,16 @@ impl AnalyzerApp {
             settings_language: persisted.language,
             pending_language: None,
             setup: crate::settings::fresh_install().then(setup::Setup::default),
-            at_sign_in: false,
+            sign_in: None,
+            offscreen: None,
         }
     }
 
     /// Windows started this launch at sign-in ("Start with Windows"): the
     /// window goes to the taskbar once it is confirmed drawing.
-    pub fn started_at_sign_in(mut self, at_sign_in: bool) -> Self {
-        self.at_sign_in = at_sign_in;
+    /// `show_requests` hears later launches asking to show it.
+    pub fn started_at_sign_in(mut self, show_requests: ShowRequests) -> Self {
+        self.sign_in = Some(sign_in::SignIn::new(show_requests));
         self
     }
 
@@ -1138,25 +1121,10 @@ impl eframe::App for AnalyzerApp {
             }
         }
         // (A debounced write still pending at window close is flushed by on_exit.)
-        // Live numbers refresh five times a second. Input and animations
-        // repaint on their own, and a quieter window leaves the GPU to the
-        // encoder.
-        ctx.request_repaint_after(Duration::from_millis(200));
-
-        // Holds no lock: a second screen record writer that could not start
-        // is started here, once its wait is over.
-        crate::capture::second_screen::retry_saving(&self.control.shared);
+        // Work that must go on while the window is minimised is in `logic`.
         let snap = StatsSnapshot::take();
         let client = ClientSnapshot::take(&self.control);
         self.history.sample(&snap, Instant::now());
-        self.observe_session(&client);
-        // The new copy runs: this one leaves.
-        if self.restart.poll() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-        if self.restart.busy() {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
         // A refusal is shown while what refused it still hands over.
         let holder = self.control.shared.handoff.holder();
         if holder != Some(Handoff::Update) {
@@ -1164,12 +1132,6 @@ impl eframe::App for AnalyzerApp {
         }
         if holder != Some(Handoff::Restart) {
             self.update_refused = false;
-        }
-        // Capture recorded how a graphics card switch went: save that.
-        let gpu_switch = self.control.shared.gpu_switch.lock().clone();
-        if gpu_switch != self.saved_gpu_switch {
-            self.saved_gpu_switch = gpu_switch;
-            self.persist_settings();
         }
         if !snap.pipeline_running {
             // A stopped pipeline starts with the new settings anyway.
@@ -1200,6 +1162,7 @@ impl eframe::App for AnalyzerApp {
                                 ui.set_opacity(shown);
                                 ui.set_max_width(ui.available_width().min(980.0));
                                 ui.spacing_mut().item_spacing.y = 10.0;
+                                self.tick_updates(ui.ctx(), &snap, &client);
                                 self.update_banner(ui, &snap, &client);
                                 self.restart_banner(ui);
                                 match self.page {
@@ -1217,16 +1180,71 @@ impl eframe::App for AnalyzerApp {
         self.draw_setup(&ctx, &snap);
         self.update_popup(&ctx, &client);
         self.draw_feedback_panel(&ctx, &client);
-        if self.at_sign_in {
-            self.finish_sign_in_start(&ctx);
+        self.finish_sign_in_pass(&ctx);
+    }
+
+    /// eframe calls this before every UI pass and, while the window is
+    /// minimised and runs no UI pass, on its own: the work here goes on
+    /// whether or not the window is drawn.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Live numbers refresh five times a second. Input and animations
+        // repaint on their own, and a quieter window leaves the GPU to the
+        // encoder. Minimised, this keeps `logic` running.
+        ctx.request_repaint_after(Duration::from_millis(200));
+
+        // Holds no lock: a second screen record writer that could not start
+        // is started here, once its wait is over.
+        crate::capture::second_screen::retry_saving(&self.control.shared);
+        self.observe_session(&ClientSnapshot::take(&self.control));
+        // The new copy runs: this one leaves.
+        if self.restart.poll() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+        if self.restart.busy() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        // Capture recorded how a graphics card switch went: save that.
+        let gpu_switch = self.control.shared.gpu_switch.lock().clone();
+        if gpu_switch != self.saved_gpu_switch {
+            self.saved_gpu_switch = gpu_switch;
+            self.persist_settings();
+        }
+        self.sign_in_logic(ctx);
     }
 }
 
 impl AnalyzerApp {
+    /// A sign-in start, at every pass and while minimised: whether the user
+    /// took the window, and in the grace, whether a notice brings it back.
+    fn sign_in_logic(&mut self, ctx: &egui::Context) {
+        let Some(sign_in) = self.sign_in.as_mut() else {
+            return;
+        };
+        let now = Instant::now();
+        let (focused, minimized) = ctx.input(|i| (i.viewport().focused, i.viewport().minimized));
+        sign_in.observe(now, ctx.cumulative_frame_nr(), focused, minimized);
+        if minimized == Some(true) && sign_in.in_grace() {
+            // Nothing draws a minimised window: draw its notices offscreen.
+            let needs_user = self.setup.is_some() || self.notice_offscreen(ctx);
+            let command = self
+                .sign_in
+                .as_mut()
+                .and_then(|sign_in| sign_in.decide(now, true, needs_user));
+            sign_in_command(ctx, command);
+        }
+        if self.sign_in.as_ref().is_some_and(sign_in::SignIn::done) {
+            self.sign_in = None;
+            self.offscreen = None;
+        }
+    }
+
     /// After the pass drew everything: whether a window started at sign-in
-    /// goes to the taskbar now, stays on screen, or waits.
-    fn finish_sign_in_start(&mut self, ctx: &egui::Context) {
+    /// goes to the taskbar now, stays on screen, or comes back.
+    fn finish_sign_in_pass(&mut self, ctx: &egui::Context) {
+        if self.sign_in.is_none() {
+            return;
+        }
+        // Read only in a UI pass: `logic` alone sees the last pass's input.
         let user_acted = ctx.input(|i| {
             i.pointer.any_pressed()
                 || i.events
@@ -1235,18 +1253,62 @@ impl AnalyzerApp {
         });
         let needs_user =
             self.setup.is_some() || self.update_popup_open || widgets::notice_shown(ctx);
-        match sign_in_start(renderer::drawing(), user_acted, needs_user) {
-            SignInStart::Wait => {}
-            SignInStart::Minimise => {
-                self.at_sign_in = false;
-                info!("Started at sign-in: window minimised to the taskbar");
-                ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
-            }
-            SignInStart::Stay => {
-                self.at_sign_in = false;
-                info!(user_acted, "Started at sign-in: window stays on screen");
-            }
+        let Some(sign_in) = self.sign_in.as_mut() else {
+            return;
+        };
+        if user_acted {
+            sign_in.user_input();
         }
+        let command = sign_in.decide(Instant::now(), renderer::drawing(), needs_user);
+        sign_in_command(ctx, command);
+    }
+
+    /// Whether the notices the Stream page starts with would show one now,
+    /// drawn where no one sees them. A [`widgets::banner`] is a notice.
+    fn notice_offscreen(&mut self, ctx: &egui::Context) -> bool {
+        let offscreen = self
+            .offscreen
+            .get_or_insert_with(|| {
+                let offscreen = egui::Context::default();
+                offscreen.set_fonts(ctx.fonts(|fonts| fonts.definitions().clone()));
+                offscreen.set_theme(egui::Theme::Dark);
+                offscreen.set_style_of(egui::Theme::Dark, ctx.style_of(egui::Theme::Dark));
+                offscreen
+            })
+            .clone();
+        let snap = StatsSnapshot::take();
+        let client = ClientSnapshot::take(&self.control);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 640.0),
+            )),
+            ..Default::default()
+        };
+        let mut shown = false;
+        let output = offscreen.run_ui(input, |ui| {
+            self.update_banner(ui, &snap, &client);
+            self.restart_banner(ui);
+            self.notices(ui, &snap, &client);
+            self.ipad_update_notice(ui, &client);
+            self.feedback_ask_card(ui, &client);
+            shown = widgets::notice_shown(ui.ctx());
+        });
+        // Nothing is painted: its fonts' texture is never made.
+        output.drop_without_applying_deltas();
+        shown
+    }
+}
+
+fn sign_in_command(ctx: &egui::Context, command: Option<sign_in::Command>) {
+    match command {
+        Some(sign_in::Command::Minimise) => {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true))
+        }
+        Some(sign_in::Command::Restore) => {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false))
+        }
+        None => {}
     }
 }
 
@@ -1854,13 +1916,13 @@ pub fn quitting_from_outside() {
 }
 
 /// Launch the GUI window. Blocks the calling thread.
-/// Runs the window until it closes; `at_sign_in` when Windows started this
-/// launch at sign-in. `quit_while_stuck` is the app's quit
+/// Runs the window until it closes; `sign_in` when Windows started this
+/// launch at sign-in, with its show requests. `quit_while_stuck` is the app's quit
 /// path, for a Cancel in the graphics driver notice while the window's
 /// thread is stuck before its first frame; it ends the process.
 pub fn run_gui(
     control: GuiControl,
-    at_sign_in: bool,
+    sign_in: Option<ShowRequests>,
     quit_while_stuck: Box<dyn FnOnce() + Send>,
 ) -> eframe::Result<()> {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon_256.png"))
@@ -1926,9 +1988,11 @@ pub fn run_gui(
         "EternalMonitor",
         options,
         Box::new(move |cc| {
-            Ok(Box::new(
-                AnalyzerApp::new(cc, control).started_at_sign_in(at_sign_in),
-            ))
+            let app = AnalyzerApp::new(cc, control);
+            Ok(Box::new(match sign_in {
+                Some(show_requests) => app.started_at_sign_in(show_requests),
+                None => app,
+            }))
         }),
     );
     #[cfg(windows)]
