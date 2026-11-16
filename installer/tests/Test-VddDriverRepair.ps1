@@ -176,7 +176,7 @@ try {
     }
     $code = [regex]::Match($iss, '(?s)procedure RepairVddDriver;.*?\nend;').Value
     if ($code -notmatch 'vdd-driver-repair\.ps1' -or $code -notmatch "10: Message := 'Another app installed" -or
-        $code -notmatch '11: Message' -or $code -notmatch 'VddInstallFailed := True' -or $code -notmatch 'RaiseException') {
+        $code -notmatch '11: Message' -or $code -notmatch 'FailVddStep\(Message\);') {
         $failures += 'Setup does not report each repair failure'
     }
     if ($failures) { throw "Repair checks failed:`n  " + ($failures -join "`n  ") }

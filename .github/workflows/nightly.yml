@@ -13,10 +13,11 @@ name: Beta builds
 # retention rules.
 #
 # Only a run on main publishes. A manual run with dry_run, on any other
-# branch or for a pull request that changes this pipeline, builds and scans
-# the installer and uploads it as a run artifact. The build itself is
-# beta-installer.yml; a pull request runs its own code, so its build gets no
-# secrets (scripts/test_workflow_secrets.py).
+# branch or for a pull request that changes this pipeline or Setup, builds and
+# scans the installer and uploads it as a run artifact. A pull request builds
+# its own commit, so a change to Setup is compiled before it lands. The build
+# itself is beta-installer.yml; a pull request runs its own code, so its build
+# gets no secrets (scripts/test_workflow_secrets.py).
 on:
   schedule:
     - cron: "41 7 * * *"
@@ -31,6 +32,7 @@ on:
       - .github/workflows/nightly.yml
       - .github/workflows/beta-installer.yml
       - scripts/nightly.py
+      - installer/**
 
 permissions: {}
 
@@ -114,7 +116,9 @@ jobs:
     secrets: inherit
 
   # The same build for a pull request, which runs its own code: no secrets,
-  # so no diagnostics credentials and no signing, and no OIDC token.
+  # so no diagnostics credentials and no signing, and no OIDC token. It builds
+  # the pull request's own commit (merged with its base), not the nightly
+  # branch, so the installer it compiles has the pull request's changes.
   check:
     name: Windows installer (pull request, no secrets)
     needs: plan
@@ -123,9 +127,9 @@ jobs:
       contents: read
     uses: ./.github/workflows/beta-installer.yml
     with:
-      sha: ${{ needs.plan.outputs.sha }}
+      sha: ${{ github.sha }}
       version: ${{ needs.plan.outputs.version }}
-      revision: ${{ needs.plan.outputs.revision }}
+      revision: ${{ github.sha }}
 
   publish:
     name: Publish
