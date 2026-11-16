@@ -409,11 +409,11 @@ fn resolution_label((width, height): (u32, u32), native: bool) -> String {
 
 pub(super) fn resolution_description(matching: bool, connected: bool) -> &'static str {
     if !matching {
-        tr("Used by Second screen. Turn on Match the iPad's resolution to choose one.")
+        "Used by Second screen. Turn on Match the iPad's resolution to choose one."
     } else if !connected {
-        tr("Used by Second screen. Connect the iPad to choose its size. Each iPad keeps its own.")
+        "Used by Second screen. Connect the iPad to choose its size. Each iPad keeps its own."
     } else {
-        tr("Used by Second screen. A smaller size makes everything larger at the same Windows scale, and a little less sharp. Other shapes show with bars. Each iPad keeps the size picked here. One set in Windows lasts for that session.")
+        "Used by Second screen. A smaller size makes everything larger at the same Windows scale, and a little less sharp. Other shapes show with bars. Each iPad keeps the size picked here. One set in Windows lasts for that session."
     }
 }
 

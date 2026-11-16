@@ -25,14 +25,7 @@ fn placeholders(text: &str) -> Vec<&str> {
 /// English keys whose translations come in a separate pass. Until then
 /// every language shows them in English. A language that has one already
 /// is checked like any other key.
-const AWAITING_TRANSLATION: &[&str] = &[
-    "Native",
-    "Resolution",
-    "{size} (native)",
-    "Used by Second screen. Turn on Match the iPad's resolution to choose one.",
-    "Used by Second screen. Connect the iPad to choose its size. Each iPad keeps its own.",
-    "Used by Second screen. A smaller size makes everything larger at the same Windows scale, and a little less sharp. Other shapes show with bars. Each iPad keeps the size picked here. One set in Windows lasts for that session.",
-];
+const AWAITING_TRANSLATION: &[&str] = &["Native", "Resolution", "{size} (native)"];
 
 #[test]
 fn every_language_has_exactly_the_english_keys_and_placeholders() {

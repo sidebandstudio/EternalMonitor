@@ -90,7 +90,7 @@ pub struct SharedControl {
     /// The modes last written for the driver, and for which iPad; none when
     /// the driver's own modes apply.
     pub vdd_prepared: Arc<Mutex<Option<crate::capture::PreparedModes>>>,
-    /// The second screen's size and the displays around it, as last seen.
+    /// The second screen's size as last seen: the size the app shows.
     pub vdd_live: Arc<Mutex<crate::capture::VddLive>>,
     /// Second screen timing across pipeline restarts: the pending switch onto
     /// it, the grace period after its viewer left, the last driver change.

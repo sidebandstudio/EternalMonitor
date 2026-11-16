@@ -309,8 +309,8 @@ impl ResolutionMemory {
     }
 
     /// Hand the choices to the writer: no disk access here, so the window's
-    /// and capture's threads, which call this holding the memory's lock,
-    /// never wait for the disk.
+    /// thread, which calls this holding the memory's lock, never waits for
+    /// the disk.
     pub fn save(&self) {
         if let (Some(path), Ok(text)) = (&self.path, serde_json::to_string(&self.choices)) {
             self.saver.queue(path.clone(), text);

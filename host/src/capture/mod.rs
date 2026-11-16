@@ -846,9 +846,9 @@ pub(crate) enum Reuse {
     /// Capture it as it is: the iPad and saved choice it was last settled
     /// for, or modes this host didn't write.
     Keep,
-    /// Another iPad or choice the loaded modes serve: settle it again on its
-    /// mode (from the saved choice, also given), then capture it.
-    Settle(Option<crate::vdd_settings::VddMode>, Option<(u32, u32)>),
+    /// Another iPad or choice the loaded modes serve: settle it again on the
+    /// saved choice, read once the settle is claimed, then capture it.
+    Settle,
     /// The loaded modes lack a size this connection needs: the driver reads
     /// them when it starts, so turn it off and on.
     Restart,
@@ -898,7 +898,7 @@ pub(crate) fn reuse_vdd(shared: &SharedControl) -> Reuse {
     if device == prepared.device && choice == prepared.choice {
         Reuse::Keep
     } else {
-        Reuse::Settle(wanted, choice)
+        Reuse::Settle
     }
 }
 
@@ -912,7 +912,11 @@ pub fn choose_vdd_resolution(shared: &SharedControl, size: (u32, u32)) {
     {
         let mut memory = shared.vdd_resolutions.lock();
         if memory.choices.choose(device, &modes, size) {
-            log_choice(&memory, size, "app");
+            memory.save();
+            info!(
+                size = %format!("{}x{}", size.0, size.1),
+                "Second screen resolution for this iPad"
+            );
         }
     }
     second_screen::settle_again(shared);
@@ -934,16 +938,6 @@ fn note_vdd_size(shared: &SharedControl, display: &str, size: (u32, u32)) {
     if shared.vdd_output.lock().as_deref() == Some(display) {
         shared.vdd_live.lock().size = Some(size);
     }
-}
-
-/// Save a changed choice (on the writer's thread) and say so.
-fn log_choice(memory: &crate::vdd_settings::ResolutionMemory, size: (u32, u32), from: &str) {
-    memory.save();
-    info!(
-        size = %format!("{}x{}", size.0, size.1),
-        from,
-        "Second screen resolution for this iPad"
-    );
 }
 
 /// Bring a freshly attached second screen to the mode asked for, when

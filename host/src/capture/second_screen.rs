@@ -1902,7 +1902,7 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
                 settle_again_if_asked(shared);
                 return;
             }
-            Reuse::Settle(..) => {
+            Reuse::Settle => {
                 info!(
                     device = %output.device_name,
                     "Virtual display still attached — setting this iPad's mode and capturing it"
@@ -2205,7 +2205,7 @@ fn check_kept(shared: &SharedControl, driver: &impl Driver, attach_timeout: Dura
     match super::reuse_vdd(shared) {
         // A pick waiting keeps its request: its Settle runs next.
         Reuse::Keep => {}
-        Reuse::Settle(..) => {
+        Reuse::Settle => {
             // Still streaming as when it was queued, and any pick's request
             // taken, in one step; then the saved choice is read.
             if !claim_streaming(shared, |_, state| {
@@ -2263,9 +2263,10 @@ fn claim_streaming(
 }
 
 /// Under the status and state locks: a start about to set, turn off or turn
-/// on the display has no failure, fallback or release recorded since it was
-/// claimed (a proof that expired meanwhile: its fallback runs next). Only
-/// then `claim` runs, under the same locks.
+/// on the display has no failure recorded since it was claimed (a proof
+/// that expired meanwhile: its fallback runs next) and no release or
+/// fallback waiting in the queue. Only then `claim` runs, under the same
+/// locks.
 #[cfg(any(windows, test, debug_assertions))]
 fn claim_start(shared: &SharedControl, claim: impl FnOnce(&mut State)) -> bool {
     let status = shared.vdd_status.lock();
