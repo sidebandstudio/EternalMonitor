@@ -34,42 +34,130 @@ impl std::fmt::Display for VddMode {
 }
 
 /// The modes to advertise for a client with the given native panel, best
-/// first. The iPad reports portrait-native pixels; the desktop wants
-/// landscape, so the long edge becomes the width. Odd dimensions are rounded
-/// down — 4:2:0 video encoders need even sizes.
+/// first: each of [`client_sizes`] at the panel's refresh rate and, for a
+/// panel that isn't 60 Hz, at 60 Hz too. The iPad reports portrait-native
+/// pixels; the desktop wants landscape, so the long edge becomes the width.
+/// Odd dimensions are rounded down — 4:2:0 video encoders need even sizes.
 pub fn modes_for_client(screen_px_w: u16, screen_px_h: u16, refresh_hz: u8) -> Vec<VddMode> {
-    let long = u32::from(screen_px_w.max(screen_px_h)) & !1;
-    let short = u32::from(screen_px_w.min(screen_px_h)) & !1;
     let refresh = match refresh_hz {
         0 => 60,
         hz => u32::from(hz),
     };
-
     let mut modes = Vec::new();
-    let mut push = |mode: VddMode| {
-        if mode.width >= 640 && mode.height >= 480 && !modes.contains(&mode) {
-            modes.push(mode);
+    for (width, height) in client_sizes(screen_px_w, screen_px_h) {
+        for refresh_hz in [refresh, 60] {
+            let mode = VddMode {
+                width,
+                height,
+                refresh_hz,
+            };
+            if !modes.contains(&mode) {
+                modes.push(mode);
+            }
+        }
+    }
+    if modes.is_empty() {
+        // Safety net the driver definitely supports.
+        modes.extend(default_modes());
+    }
+    modes
+}
+
+/// Smaller sizes at the panel's own shape, as fractions of it. At 100%
+/// scale a smaller size makes everything on the second screen larger. Windows
+/// picks a default scale from the resolution and the reported screen size,
+/// and Microsoft documents a maximum default scale by vertical resolution
+/// (https://learn.microsoft.com/windows-hardware/design/component-guidelines/guidance-for-rounded-display-bezels#max-scale-factor).
+/// Which scales Windows Settings lists for this display is not checked here.
+/// A size smaller than the panel's own at its highest offered scale is what
+/// makes the picture larger than the panel's own size can.
+const LADDER: [(u32, u32); 4] = [(3, 4), (2, 3), (1, 2), (2, 5)];
+
+/// The smallest size at the panel's shape. The desktop is always landscape.
+const LADDER_FLOOR: (u32, u32) = (800, 600);
+
+/// Common sizes in other shapes (16:9, 16:10, 4:3), largest first. The
+/// largest of each shape that fits inside the panel is offered; the iPad
+/// shows it with bars. 1920x1080 is the driver's safety net.
+const STANDARD: [&[(u32, u32)]; 3] = [
+    &[(2560, 1440), (1920, 1080), (1600, 900), (1280, 720)],
+    &[
+        (2560, 1600),
+        (1920, 1200),
+        (1680, 1050),
+        (1440, 900),
+        (1280, 800),
+    ],
+    &[(2048, 1536), (1600, 1200), (1400, 1050), (1024, 768)],
+];
+
+/// The smallest size in another shape.
+const STANDARD_FLOOR: (u32, u32) = (1024, 720);
+
+/// At most this many sizes; sizes in other shapes give way first.
+const MOST_SIZES: usize = 10;
+
+/// The sizes the second screen offers for a client's panel, in the order
+/// the app lists them: the panel's own size first, the default; then
+/// [`LADDER`] at the same shape down to [`LADDER_FLOOR`], and the shape
+/// fitted to that floor unless the rung above is within about 10% of it,
+/// each within a pixel of the shape (the exact shape often has no smaller
+/// size with even sides); then [`STANDARD`] sizes no larger than the panel.
+/// Even sides, no duplicates, at most [`MOST_SIZES`].
+pub fn client_sizes(screen_px_w: u16, screen_px_h: u16) -> Vec<(u32, u32)> {
+    let long = u32::from(screen_px_w.max(screen_px_h)) & !1;
+    let short = u32::from(screen_px_w.min(screen_px_h)) & !1;
+    if long < 640 || short < 480 {
+        return Vec::new();
+    }
+    let mut sizes = vec![(long, short)];
+    let push = |sizes: &mut Vec<(u32, u32)>, size: (u32, u32), floor: (u32, u32)| {
+        let fits = size.0 >= floor.0 && size.1 >= floor.1 && size.0 <= long && size.1 <= short;
+        if fits && sizes.len() < MOST_SIZES && !sizes.contains(&size) {
+            sizes.push(size);
         }
     };
-    push(VddMode {
-        width: long,
-        height: short,
-        refresh_hz: refresh,
-    });
-    if refresh != 60 {
-        push(VddMode {
-            width: long,
-            height: short,
-            refresh_hz: 60,
-        });
+    let (wide, tall) = (u64::from(long), u64::from(short));
+    for (num, den) in LADDER {
+        let low = (wide * u64::from(num) / u64::from(den)) & !1;
+        push(&mut sizes, shaped([low, low + 2], wide, tall), LADDER_FLOOR);
     }
-    // Safety net the driver definitely supports.
-    push(VddMode {
-        width: 1920,
-        height: 1080,
-        refresh_hz: 60,
-    });
-    modes
+    // The shape fitted to the floor: 600 lines, or 800 wide when narrower
+    // than 4:3, with the height kept at the floor or above.
+    let (floor_w, floor_h) = (u64::from(LADDER_FLOOR.0), u64::from(LADDER_FLOOR.1));
+    let width = (floor_h * wide).div_ceil(tall).max(floor_w) & !1;
+    let fitted = (0..3)
+        .map(|step| shaped([width + 2 * step], wide, tall))
+        .find(|&(_, height)| u64::from(height) >= floor_h);
+    let above = sizes.last().copied();
+    if let (Some(fitted), Some(above)) = (fitted, above) {
+        if fitted.0 * 10 <= above.0 * 9 {
+            push(&mut sizes, fitted, LADDER_FLOOR);
+        }
+    }
+    for shape in STANDARD {
+        if let Some(&size) = shape.iter().find(|&&(w, h)| w <= long && h <= short) {
+            push(&mut sizes, size, STANDARD_FLOOR);
+        }
+    }
+    push(&mut sizes, (1920, 1080), STANDARD_FLOOR);
+    sizes
+}
+
+/// Of the even `widths`, the one whose nearest even height keeps the
+/// `wide` by `tall` shape best, with that height.
+fn shaped<const N: usize>(widths: [u64; N], wide: u64, tall: u64) -> (u32, u32) {
+    widths
+        .map(|width| (width, nearest_even(width * tall, wide)))
+        .into_iter()
+        .min_by_key(|&(width, height)| (u64::from(height) * wide).abs_diff(width * tall))
+        .map(|(width, height)| (width as u32, height))
+        .expect("at least one width")
+}
+
+/// The even number nearest `num / den`.
+fn nearest_even(num: u64, den: u64) -> u32 {
+    ((num + den) / (2 * den) * 2) as u32
 }
 
 /// The modes to offer when the iPad's screen size is not known yet.
@@ -79,6 +167,324 @@ pub fn default_modes() -> Vec<VddMode> {
         height: 1080,
         refresh_hz: 60,
     }]
+}
+
+/// The sizes in `modes`, in order, once each.
+pub fn sizes(modes: &[VddMode]) -> Vec<(u32, u32)> {
+    let mut sizes = Vec::new();
+    for mode in modes {
+        if !sizes.contains(&(mode.width, mode.height)) {
+            sizes.push((mode.width, mode.height));
+        }
+    }
+    sizes
+}
+
+/// The mode to ask the second screen for among a client's `modes`: the
+/// size chosen for that iPad while the list still offers it, at the
+/// panel's refresh rate; otherwise the panel's own mode.
+pub fn requested_mode(modes: &[VddMode], chosen: Option<(u32, u32)>) -> Option<VddMode> {
+    chosen
+        .and_then(|size| modes.iter().find(|m| (m.width, m.height) == size))
+        .or(modes.first())
+        .copied()
+}
+
+/// The modes to try in turn when `requested` is to be set on a display
+/// given `modes`: it, then the panel's own when the driver doesn't take it.
+pub fn modes_to_try(requested: VddMode, modes: &[VddMode]) -> Vec<VddMode> {
+    let mut tries = vec![requested];
+    if let Some(&native) = modes.first() {
+        if (native.width, native.height) != (requested.width, requested.height) {
+            tries.push(native);
+        }
+    }
+    tries
+}
+
+/// The largest side of a second screen mode: the most H.264 encoders take
+/// (level 6.2 is 8192 wide).
+pub const LARGEST_SIDE: u32 = 8192;
+
+/// Whether a size read from the saved file can be a second screen mode:
+/// landscape, even sides for 4:2:0 encoders, no smaller than
+/// [`LADDER_FLOOR`] and no side over [`LARGEST_SIDE`]. No refresh rate is
+/// saved with it; the iPad's own is used.
+fn usable_size((width, height): (u32, u32)) -> bool {
+    width % 2 == 0
+        && height % 2 == 0
+        && width >= height
+        && width >= LADDER_FLOOR.0
+        && height >= LADDER_FLOOR.1
+        && width <= LARGEST_SIDE
+}
+
+/// In the app data folder: the second screen's size chosen for each iPad.
+pub const RESOLUTION_RECORD: &str = "vdd-resolutions.json";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Size {
+    pub width: u32,
+    pub height: u32,
+}
+
+/// An entry as earlier builds of this change may have saved it: one marked
+/// `windows` was a size kept from Windows' display settings, outside the
+/// sizes offered, and is not a choice.
+#[derive(Deserialize)]
+struct SavedSize {
+    width: u32,
+    height: u32,
+    #[serde(default)]
+    windows: bool,
+}
+
+/// The second screen's size chosen in the app for each iPad, by the id it
+/// sends when it connects, where that isn't the iPad's own size. Always one
+/// of the sizes offered for that iPad when it was chosen; one its list no
+/// longer offers falls back to the iPad's own ([`requested_mode`]).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ResolutionChoices(std::collections::BTreeMap<u64, Size>);
+
+impl ResolutionChoices {
+    /// None chosen when the file is missing or unreadable. An entry with a
+    /// size that can't be a mode ([`usable_size`]), or one kept from
+    /// Windows' display settings by an earlier build, is dropped; the rest
+    /// are kept.
+    pub fn load(path: &Path) -> Self {
+        let saved: std::collections::BTreeMap<u64, SavedSize> = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| serde_json::from_str(&text).ok())
+            .unwrap_or_default();
+        Self(
+            saved
+                .into_iter()
+                .filter(|(_, size)| !size.windows && usable_size((size.width, size.height)))
+                .map(|(device, size)| {
+                    let (width, height) = (size.width, size.height);
+                    (device, Size { width, height })
+                })
+                .collect(),
+        )
+    }
+
+    pub fn chosen(&self, device: u64) -> Option<(u32, u32)> {
+        self.0.get(&device).map(|size| (size.width, size.height))
+    }
+
+    /// Chosen in the app for the iPad `device` among its `modes`. Its own
+    /// size forgets the choice; a size not listed, the size already chosen,
+    /// or an iPad that sent no id changes nothing. Whether anything changed.
+    pub fn choose(&mut self, device: u64, modes: &[VddMode], size: (u32, u32)) -> bool {
+        let offered = sizes(modes);
+        if device == 0 || !offered.contains(&size) || self.chosen(device) == Some(size) {
+            return false;
+        }
+        if offered.first() == Some(&size) {
+            return self.0.remove(&device).is_some();
+        }
+        let (width, height) = size;
+        self.0.insert(device, Size { width, height });
+        true
+    }
+}
+
+/// [`ResolutionChoices`], the file they are kept in, if any, and the
+/// writer that saves them there.
+#[derive(Debug, Default)]
+pub struct ResolutionMemory {
+    pub choices: ResolutionChoices,
+    pub path: Option<std::path::PathBuf>,
+    pub saver: std::sync::Arc<RecordSaver>,
+}
+
+impl ResolutionMemory {
+    pub fn open(path: std::path::PathBuf) -> Self {
+        Self {
+            choices: ResolutionChoices::load(&path),
+            path: Some(path),
+            saver: Default::default(),
+        }
+    }
+
+    /// Hand the choices to the writer: no disk access here, so the window's
+    /// thread, which calls this holding the memory's lock, never waits for
+    /// the disk.
+    pub fn save(&self) {
+        if let (Some(path), Ok(text)) = (&self.path, serde_json::to_string(&self.choices)) {
+            self.saver.queue(path.clone(), text);
+        }
+    }
+}
+
+/// Writes the resolution record on a thread of its own, as the second screen
+/// record is written (#137). The newest content is kept until it is on disk:
+/// a write that fails is tried again after [`RECORD_RETRY`], and at quit.
+/// Newer content replaces older content not written yet.
+pub struct RecordSaver {
+    state: parking_lot::Mutex<RecordSaving>,
+    /// Wakes the writer: content to write.
+    work: parking_lot::Condvar,
+    /// Wakes [`RecordSaver::flush`]: content was written.
+    idle: parking_lot::Condvar,
+    write: fn(&Path, &str) -> io::Result<()>,
+}
+
+/// The pause before a failed write of the resolution record is tried again.
+pub const RECORD_RETRY: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[derive(Default)]
+struct RecordSaving {
+    /// The newest content, until it is on disk, and its number.
+    next: Option<(std::path::PathBuf, String)>,
+    version: u64,
+    busy: bool,
+    running: bool,
+    /// The last write failed: the writer waits [`RECORD_RETRY`].
+    failed: bool,
+    /// A quit waits for the content: failed writes are tried again at once.
+    flushing: bool,
+}
+
+impl std::fmt::Debug for RecordSaver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordSaver").finish_non_exhaustive()
+    }
+}
+
+impl Default for RecordSaver {
+    fn default() -> Self {
+        Self::with_writer(write_record)
+    }
+}
+
+fn write_record(path: &Path, text: &str) -> io::Result<()> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    replace(path, text)
+}
+
+impl RecordSaver {
+    pub(crate) fn with_writer(write: fn(&Path, &str) -> io::Result<()>) -> Self {
+        Self {
+            state: Default::default(),
+            work: Default::default(),
+            idle: Default::default(),
+            write,
+        }
+    }
+
+    /// Write `text` to `path` on the writer's thread, in place of content
+    /// still waiting. Returns at once.
+    pub fn queue(self: &std::sync::Arc<Self>, path: std::path::PathBuf, text: String) {
+        let start = {
+            let mut state = self.state.lock();
+            state.next = Some((path, text));
+            state.version += 1;
+            !std::mem::replace(&mut state.running, true)
+        };
+        self.work.notify_one();
+        if start {
+            let saver = std::sync::Arc::clone(self);
+            let spawned = std::thread::Builder::new()
+                .name("resolution-save".into())
+                .spawn(move || saver.run());
+            if let Err(error) = spawned {
+                self.state.lock().running = false;
+                tracing::warn!(%error, "Could not start saving the second screen resolution");
+            }
+        }
+    }
+
+    fn run(&self) {
+        let mut state = self.state.lock();
+        loop {
+            let Some((path, text)) = state.next.clone() else {
+                self.work.wait(&mut state);
+                continue;
+            };
+            let version = state.version;
+            state.busy = true;
+            let written =
+                parking_lot::MutexGuard::unlocked(&mut state, || (self.write)(&path, &text));
+            state.busy = false;
+            match written {
+                // Newer content waits its own turn.
+                Ok(()) if state.version == version => {
+                    state.next = None;
+                    state.failed = false;
+                }
+                Ok(()) => state.failed = false,
+                Err(error) => {
+                    if !state.failed {
+                        tracing::warn!(
+                            %error,
+                            "Could not save the second screen resolution — trying again"
+                        );
+                    }
+                    state.failed = true;
+                }
+            }
+            self.idle.notify_all();
+            if state.failed {
+                // A pause, cut short by newer content or a quit; short while a
+                // quit waits.
+                let pause = if state.flushing {
+                    std::time::Duration::from_millis(100)
+                } else {
+                    RECORD_RETRY
+                };
+                let _ = self
+                    .work
+                    .wait_until(&mut state, std::time::Instant::now() + pause);
+            }
+        }
+    }
+
+    /// Whether the newest content is not on disk yet.
+    pub fn pending(&self) -> bool {
+        let state = self.state.lock();
+        state.busy || state.next.is_some()
+    }
+
+    /// Quitting: try the newest content again now if a write failed, and
+    /// wait up to `timeout` for it to be on disk. If the writer never
+    /// started, it is written here. Whether the newest content is on disk.
+    pub fn flush(&self, timeout: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        let mut state = self.state.lock();
+        if !state.running {
+            let Some((path, text)) = state.next.clone() else {
+                return true;
+            };
+            drop(state);
+            let written = (self.write)(&path, &text).is_ok();
+            if written {
+                self.state.lock().next = None;
+            }
+            return written;
+        }
+        // Wakes a writer pausing after a failure.
+        state.flushing = true;
+        self.work.notify_all();
+        while state.busy || state.next.is_some() {
+            if self.idle.wait_until(&mut state, deadline).timed_out() {
+                return !state.busy && state.next.is_none();
+            }
+        }
+        true
+    }
+}
+
+/// `sizes` for a log line: `1920x1080 1600x1200`.
+pub fn sizes_text(sizes: &[(u32, u32)]) -> String {
+    sizes
+        .iter()
+        .map(|(width, height)| format!("{width}x{height}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The mode to set on the virtual display after it attached, when Windows
@@ -1317,14 +1723,424 @@ mod tests {
             },
             "a 60 Hz variant backs up high-refresh panels"
         );
-        assert_eq!(
-            modes[2],
-            VddMode {
+        assert!(
+            modes.contains(&VddMode {
                 width: 1920,
                 height: 1080,
                 refresh_hz: 60
-            }
+            }),
+            "the safety mode stays in the list"
         );
+    }
+
+    /// Native first; smaller sizes at the panel's shape down to 800x600, and
+    /// the shape fitted to 600 lines; then the largest 16:9, 16:10 and 4:3
+    /// sizes inside the panel, and 1920x1080.
+    #[test]
+    fn the_mode_list_offers_smaller_sizes_at_the_ipads_shape() {
+        type Sizes = &'static [(u32, u32)];
+        // The panel, how many sizes have its shape, and the list.
+        let cases: [((u16, u16), usize, Sizes); 5] = [
+            // An 8.3-inch iPad, reported in portrait: 2/5 would be 594 lines.
+            (
+                (1488, 2266),
+                5,
+                &[
+                    (2266, 1488),
+                    (1700, 1116),
+                    (1510, 992),
+                    (1132, 744),
+                    (914, 600),
+                    (1920, 1080),
+                    (1920, 1200),
+                    (1600, 1200),
+                ],
+            ),
+            // 11-inch iPad Pro, reported in landscape.
+            (
+                (2388, 1668),
+                6,
+                &[
+                    (2388, 1668),
+                    (1790, 1250),
+                    (1592, 1112),
+                    (1194, 834),
+                    (956, 668),
+                    (858, 600),
+                    (1920, 1080),
+                    (1920, 1200),
+                    (2048, 1536),
+                ],
+            ),
+            // 12.9-inch iPad Pro: 3/4 is 2048x1536, already 4:3.
+            (
+                (2048, 2732),
+                6,
+                &[
+                    (2732, 2048),
+                    (2048, 1536),
+                    (1822, 1366),
+                    (1366, 1024),
+                    (1094, 820),
+                    (800, 600),
+                    (2560, 1440),
+                    (2560, 1600),
+                    (1920, 1080),
+                ],
+            ),
+            // 11-inch iPad Pro M4, portrait.
+            (
+                (1668, 2420),
+                6,
+                &[
+                    (2420, 1668),
+                    (1814, 1250),
+                    (1614, 1112),
+                    (1210, 834),
+                    (970, 668),
+                    (870, 600),
+                    (1920, 1080),
+                    (1920, 1200),
+                    (2048, 1536),
+                ],
+            ),
+            // A 4:3 iPad: 800x600 is within 10% of 818x614, so left out.
+            (
+                (1536, 2048),
+                5,
+                &[
+                    (2048, 1536),
+                    (1536, 1152),
+                    (1366, 1024),
+                    (1024, 768),
+                    (818, 614),
+                    (1920, 1080),
+                    (1920, 1200),
+                ],
+            ),
+        ];
+        for ((w, h), same_shape, expected) in cases {
+            let sizes = client_sizes(w, h);
+            assert_eq!(sizes, expected, "{w}x{h}");
+            let (long, short) = sizes[0];
+            assert_eq!((long, short), (u32::from(w.max(h)), u32::from(w.min(h))));
+            assert!(sizes.len() <= 10, "{w}x{h}: short enough to read");
+            for (index, &(width, height)) in sizes.iter().enumerate() {
+                assert!(width % 2 == 0 && height % 2 == 0, "{width}x{height}: even");
+                assert!(width <= long && height <= short, "{width}x{height} fits");
+                assert!(width >= 800 && height >= 600, "{width}x{height} is usable");
+                assert!(
+                    !sizes[..index].contains(&(width, height)),
+                    "{width}x{height} once"
+                );
+            }
+            // The same-shape sizes keep the panel's shape to within a pixel
+            // of height, and reach below 700 lines: larger than the panel's
+            // own size at twice the scale.
+            for &(width, height) in &sizes[1..same_shape] {
+                let exact = f64::from(width) * f64::from(short) / f64::from(long);
+                assert!(
+                    (f64::from(height) - exact).abs() <= 1.0,
+                    "{w}x{h}: {width}x{height} vs {exact}"
+                );
+            }
+            let smallest = sizes[same_shape - 1];
+            assert!(smallest.1 * 2 < short, "{w}x{h}: {smallest:?}");
+            assert!(smallest.1 <= 672, "{w}x{h}: {smallest:?}");
+            // Other shapes keep their own floor.
+            for &(width, height) in &sizes[same_shape..] {
+                assert!(width >= 1024 && height >= 720, "{width}x{height}");
+            }
+        }
+    }
+
+    #[test]
+    fn each_size_is_offered_at_the_panels_refresh_and_at_60() {
+        let modes = modes_for_client(1488, 2266, 120);
+        assert_eq!(modes.len(), 16);
+        assert_eq!(sizes(&modes), client_sizes(1488, 2266));
+        for (width, height) in client_sizes(1488, 2266) {
+            for refresh_hz in [120, 60] {
+                let mode = VddMode {
+                    width,
+                    height,
+                    refresh_hz,
+                };
+                assert!(modes.contains(&mode), "{mode}");
+            }
+        }
+        assert_eq!(modes_for_client(1488, 2266, 60).len(), 8, "no 60 Hz copies");
+        assert_eq!(modes[0].to_string(), "2266x1488@120");
+    }
+
+    fn temp_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn a_resolution_chosen_for_an_ipad_is_saved_and_asked_for_on_its_next_connection() {
+        let dir = temp_dir("vdd-resolutions-test");
+        let path = dir.join(RESOLUTION_RECORD);
+        let mini = modes_for_client(1488, 2266, 120);
+        let pro = modes_for_client(1668, 2388, 120);
+        let mut memory = ResolutionMemory::open(path.clone());
+        assert_eq!(
+            memory.choices,
+            ResolutionChoices::default(),
+            "none chosen yet"
+        );
+        assert_eq!(
+            requested_mode(&mini, memory.choices.chosen(7)),
+            Some(mini[0])
+        );
+
+        assert!(memory.choices.choose(7, &mini, (914, 600)));
+        assert!(
+            !memory.choices.choose(7, &mini, (914, 600)),
+            "already chosen"
+        );
+        assert!(memory.choices.choose(9, &pro, (1920, 1080)));
+        memory.save();
+        assert!(memory.saver.flush(std::time::Duration::from_secs(10)));
+
+        // The next start of the app, and the next connection of each iPad.
+        let loaded = ResolutionMemory::open(path.clone()).choices;
+        assert_eq!(loaded, memory.choices);
+        let at = |width, height| VddMode {
+            width,
+            height,
+            refresh_hz: 120,
+        };
+        assert_eq!(requested_mode(&mini, loaded.chosen(7)), Some(at(914, 600)));
+        assert_eq!(requested_mode(&pro, loaded.chosen(9)), Some(at(1920, 1080)));
+        // Another iPad keeps its own size.
+        assert_eq!(
+            requested_mode(&mini, loaded.chosen(8)),
+            Some(at(2266, 1488))
+        );
+        // The attached display is in the chosen mode: nothing to set.
+        assert_eq!(
+            mode_to_set(requested_mode(&mini, loaded.chosen(7)), (914, 600)),
+            None
+        );
+        // Windows brought back 800x600: the chosen mode is set.
+        assert_eq!(
+            mode_to_set(requested_mode(&mini, loaded.chosen(7)), (800, 600)),
+            Some(at(914, 600))
+        );
+
+        // Native forgets the choice.
+        let mut choices = loaded;
+        assert!(choices.choose(7, &mini, (2266, 1488)));
+        assert_eq!(choices.chosen(7), None);
+        assert!(!choices.choose(7, &mini, (2266, 1488)));
+
+        // Unreadable: none chosen. No file: nothing saved.
+        std::fs::write(&path, "not json").unwrap();
+        assert_eq!(ResolutionChoices::load(&path), ResolutionChoices::default());
+        let unsaved = ResolutionMemory::default();
+        unsaved.save();
+        assert!(!unsaved.saver.pending(), "no file: nothing to write");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A size chosen in the app that the list no longer offers gives way to
+    /// the panel's own; so does a saved size the driver won't take.
+    #[test]
+    fn a_saved_resolution_no_longer_offered_falls_back_to_native() {
+        let mini = modes_for_client(1488, 2266, 60);
+        let mut choices = ResolutionChoices::default();
+        assert!(choices.choose(7, &mini, (1700, 1116)));
+        // The same iPad id now reports another panel (a restored backup on
+        // another model): its list has no 1700x1116.
+        let pro = modes_for_client(1668, 2388, 60);
+        assert_eq!(requested_mode(&pro, choices.chosen(7)), Some(pro[0]));
+        // No list at all (size unknown): the driver's default.
+        assert_eq!(
+            requested_mode(&default_modes(), choices.chosen(7)),
+            Some(default_modes()[0])
+        );
+        assert_eq!(requested_mode(&[], choices.chosen(7)), None);
+        // Settling: the saved size, then the panel's own.
+        let saved = requested_mode(&mini, choices.chosen(7)).unwrap();
+        assert_eq!(modes_to_try(saved, &mini), [saved, mini[0]]);
+        assert_eq!(modes_to_try(mini[0], &mini), [mini[0]]);
+        assert_eq!(modes_to_try(saved, &[]), [saved]);
+    }
+
+    static GATE: (std::sync::Mutex<bool>, std::sync::Condvar) =
+        (std::sync::Mutex::new(false), std::sync::Condvar::new());
+
+    /// A disk that writes only once the test lets it.
+    fn gated_write(path: &Path, text: &str) -> io::Result<()> {
+        let mut open = GATE.0.lock().unwrap();
+        while !*open {
+            open = GATE.1.wait(open).unwrap();
+        }
+        drop(open);
+        write_record(path, text)
+    }
+
+    /// Review r10: saving hands the content to the writer's thread and
+    /// returns; the latest content is the one written; a flush waits for it.
+    #[test]
+    fn the_record_is_written_off_the_calling_thread() {
+        let dir = temp_dir("vdd-resolutions-saver-test");
+        let path = dir.join(RESOLUTION_RECORD);
+        let saver = std::sync::Arc::new(RecordSaver::with_writer(gated_write));
+        let started = std::time::Instant::now();
+        saver.queue(path.clone(), "first".into());
+        saver.queue(path.clone(), "second".into());
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(
+            saver.pending() && !path.exists(),
+            "nothing written by the caller"
+        );
+        *GATE.0.lock().unwrap() = true;
+        GATE.1.notify_all();
+        assert!(saver.flush(std::time::Duration::from_secs(10)));
+        assert!(!saver.pending());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    static FAILED_ONCE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+    fn fails_once(path: &Path, text: &str) -> io::Result<()> {
+        if FAILED_ONCE.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+            return Err(io::Error::other("the disk said no"));
+        }
+        write_record(path, text)
+    }
+
+    fn always_fails(_: &Path, _: &str) -> io::Result<()> {
+        Err(io::Error::other("the disk said no"))
+    }
+
+    /// Review r11: a write that fails is kept and tried again: at quit, and
+    /// with newer content, which replaces it.
+    #[test]
+    fn a_failed_record_write_is_tried_again_until_the_newest_is_on_disk() {
+        let dir = temp_dir("vdd-resolutions-retry-test");
+        let path = dir.join(RESOLUTION_RECORD);
+        let saver = std::sync::Arc::new(RecordSaver::with_writer(fails_once));
+        saver.queue(path.clone(), "first".into());
+        let start = std::time::Instant::now();
+        while FAILED_ONCE.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            assert!(start.elapsed() < std::time::Duration::from_secs(10));
+            std::thread::yield_now();
+        }
+        assert!(saver.pending(), "kept after the failure");
+        saver.queue(path.clone(), "second".into());
+        assert!(saver.flush(std::time::Duration::from_secs(10)));
+        assert!(!saver.pending());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "second");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review r11: a write that keeps failing is reported at quit, not
+    /// taken for written.
+    #[test]
+    fn a_record_that_never_reaches_the_disk_is_reported_at_quit() {
+        let dir = temp_dir("vdd-resolutions-refused-test");
+        let saver = std::sync::Arc::new(RecordSaver::with_writer(always_fails));
+        saver.queue(dir.join(RESOLUTION_RECORD), "never".into());
+        assert!(!saver.flush(std::time::Duration::from_millis(300)));
+        assert!(saver.pending());
+    }
+
+    #[test]
+    fn offered_sizes_read_as_a_short_list_for_the_log() {
+        assert_eq!(
+            sizes_text(&[(1920, 1080), (1600, 1200)]),
+            "1920x1080 1600x1200"
+        );
+        assert_eq!(sizes_text(&[]), "");
+    }
+
+    /// Review r6, r12: an entry of the saved file becomes a choice only if
+    /// an encoder can take its size (even sides, landscape, 800x600 to 8192
+    /// wide) and it was chosen in the app: one an earlier build kept from
+    /// Windows' display settings (`"windows": true`) is dropped, the rest of
+    /// the file kept. An unreadable file means none chosen.
+    #[test]
+    fn only_usable_app_choices_are_loaded() {
+        for size in [(800, 600), (1366, 768), (2266, 1488), (8192, 4320)] {
+            assert!(usable_size(size), "{size:?}");
+        }
+        for size in [
+            (915, 601),
+            (916, 601),
+            (0, 0),
+            (798, 600),
+            (800, 598),
+            (8194, 4320),
+            (1488, 2266),
+        ] {
+            assert!(!usable_size(size), "{size:?}");
+        }
+        let dir = temp_dir("vdd-resolutions-usable-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(RESOLUTION_RECORD);
+        std::fs::write(
+            &path,
+            r#"{"6":{"width":1510,"height":992},"7":{"width":0,"height":0},"8":{"width":800,"height":600,"windows":true},"9":{"width":915,"height":601},"10":{"width":1920,"height":1080,"windows":false}}"#,
+        )
+        .unwrap();
+        let loaded = ResolutionChoices::load(&path);
+        assert_eq!(loaded.chosen(6), Some((1510, 992)), "chosen in the app");
+        assert_eq!(loaded.chosen(7), None, "0x0 dropped");
+        assert_eq!(loaded.chosen(8), None, "a size kept from Windows dropped");
+        assert_eq!(loaded.chosen(9), None, "odd dropped");
+        assert_eq!(loaded.chosen(10), Some((1920, 1080)));
+        let mini = modes_for_client(1488, 2266, 60);
+        assert_eq!(requested_mode(&mini, loaded.chosen(8)), Some(mini[0]));
+        // Saved again, without the dropped entries.
+        let text = serde_json::to_string(&loaded).unwrap();
+        assert_eq!(
+            text,
+            r#"{"6":{"width":1510,"height":992},"10":{"width":1920,"height":1080}}"#
+        );
+        std::fs::write(&path, "{\"7\":").unwrap();
+        assert_eq!(ResolutionChoices::load(&path), ResolutionChoices::default());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The file the driver reads for a connected iPad: every offered mode,
+    /// and all it held before (one monitor, the refresh rate, the cursor
+    /// block, the pinned card).
+    #[test]
+    fn the_drivers_file_for_an_ipad_lists_its_sizes_and_keeps_the_rest() {
+        let dir = temp_dir("vdd-settings-modes-test");
+        let path = dir.join("vdd_settings.xml");
+        let record = dir.join("vdd-pin.txt");
+        let modes = modes_for_client(1488, 2266, 120);
+        let card = "NVIDIA GeForce RTX 4070 Ti";
+        let outcome = write_with_pin(&path, &record, true, &modes, Some(card)).expect("write");
+        assert_eq!(outcome, PinOutcome::Named);
+        let xml = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(xml, render(&modes, Some(card)));
+        assert!(xml.contains("<count>1</count>"));
+        assert!(xml.contains("<g_refresh_rate>120</g_refresh_rate>"));
+        assert_eq!(named_gpu(&xml), Ok(Some(card.to_string())));
+        assert_eq!(cursor_set_by(&xml), hardware(128, 128));
+        assert!(xml.contains(CURSOR));
+        // What 0.3.4 offered is still there.
+        for (width, height, refresh) in [(2266, 1488, 120), (2266, 1488, 60), (1920, 1080, 60)] {
+            assert!(xml.contains(&format!(
+                "<width>{width}</width>\n            <height>{height}</height>\n            \
+                 <refresh_rate>{refresh}</refresh_rate>"
+            )));
+        }
+        assert_eq!(xml.matches("<resolution>").count(), 16);
+        for (width, height) in client_sizes(1488, 2266) {
+            assert!(xml.contains(&format!(
+                "<width>{width}</width>\n            <height>{height}</height>"
+            )));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1383,6 +2199,10 @@ mod tests {
                 refresh_hz: 60
             }]
         );
+        // The largest panel a client can report.
+        let sizes = client_sizes(u16::MAX, u16::MAX);
+        assert_eq!(sizes[0], (65534, 65534));
+        assert_eq!(sizes[3], (32766, 32766));
     }
 
     #[test]

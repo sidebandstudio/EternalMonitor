@@ -960,9 +960,71 @@ fn a_lost_built_in_screen_from_before_the_restart_only_says_it_is_paused() {
     }
 }
 
-/// On Windows 10 Second screen isn't tried: the notice, the note beside the
-/// choice and Settings say it needs Windows 11, with no Try again, and the
-/// note goes from Windows 11's text only.
+/// Review r3 of #260: a cause found after a failed Windows 10 start (the
+/// driver tasks stop responding or go missing, or the device names a
+/// problem) removes every "needs Windows 11" text at once: the notice is
+/// the one 0.3.4 gave that failure, and neither the Stream page's note,
+/// Settings nor the iPad says Windows 11. Until then all four do.
+#[test]
+fn a_cause_found_after_a_windows_10_failure_removes_every_windows_11_text() {
+    use super::page_settings::display_description;
+    use super::page_stream::{screen_mode_text, WINDOWS_10_NOTE};
+    use crate::capture::second_screen::{
+        notice_failure, set_task_health, windows_10_start_failed, windows_notice,
+        windows_unsupported,
+    };
+    use crate::vdd::VddTaskHealth;
+    use crate::vdd_device::VddProblem;
+    for reason in ["attach_timeout", "enable_failed"] {
+        for (problem, health) in [
+            (None, VddTaskHealth::NotResponding),
+            (None, VddTaskHealth::TasksMissing),
+            (Some(VddProblem::NotExtended), VddTaskHealth::Ok),
+            (Some(VddProblem::NotInstalled), VddTaskHealth::Ok),
+            (Some(VddProblem::SignatureBlocked), VddTaskHealth::Ok),
+            (Some(VddProblem::DriverError(Some(43))), VddTaskHealth::Ok),
+        ] {
+            let case = format!("{reason} {problem:?} {health:?}");
+            let shared = crate::control::SharedControl::new(9876, 15_000_000);
+            windows_10_start_failed(&shared, reason);
+            let status = *shared.vdd_status.lock();
+            let texts = |health, problem| {
+                let notice =
+                    second_screen_notice(status, health, problem, notice_failure(&shared)).unwrap();
+                let unsupported = windows_unsupported(&shared);
+                (
+                    notice,
+                    screen_mode_text(CAPTURE_VIRTUAL_SENTINEL, None, status, true, unsupported),
+                    display_description(unsupported),
+                    windows_notice(&shared, std::time::Instant::now()),
+                )
+            };
+            let (notice, mode, settings, ipad) = texts(VddTaskHealth::Ok, None);
+            assert!(notice.body.starts_with(WINDOWS_10_NOTE), "{case}");
+            assert!(mode.contains("needs Windows 11"), "{case}: {mode}");
+            assert!(settings.contains("needs Windows 11"), "{case}");
+            assert!(ipad, "{case}");
+
+            *shared.vdd_problem.lock() = problem;
+            set_task_health(&shared, health);
+            let (notice, mode, settings, ipad) = texts(health, problem);
+            assert!(!notice.body.contains("Windows 11"), "{case}");
+            assert_eq!(
+                Some(notice),
+                second_screen_notice(status, health, problem, Some(reason)),
+                "{case}"
+            );
+            assert!(!mode.contains("Windows 11"), "{case}: {mode}");
+            assert!(!settings.contains("Windows 11"), "{case}");
+            assert!(!ipad, "{case}");
+        }
+    }
+}
+
+/// On Windows 10 without the driver Second screen isn't tried: the notice,
+/// the note beside the choice and Settings say it needs Windows 11, with no
+/// Try again, and the note goes from Windows 11's text only. After a start
+/// that failed with the driver, the notice says the same with Try again.
 #[test]
 fn windows_10_says_second_screen_needs_windows_11() {
     use super::page_settings::display_description;
@@ -982,6 +1044,53 @@ fn windows_10_says_second_screen_needs_windows_11() {
         }
     }
     assert!(WINDOWS_10_NOTE.contains("needs Windows 11"));
+    // A start that failed on Windows 10 with the driver: the same words,
+    // with Try again, and that it tries again by itself after a saved one.
+    let failed = Some(crate::capture::second_screen::WINDOWS_10_FAILED);
+    for status in [VddStatus::Failed, VddStatus::TaskFailed] {
+        let mut notice = second_screen_notice(status, VddTaskHealth::Ok, None, failed).unwrap();
+        assert_eq!(
+            notice.body,
+            format!("{WINDOWS_10_NOTE} Mirror my screen works as usual.")
+        );
+        assert!(notice.retry && !notice.installer);
+        add_later_retry(&mut notice, true);
+        assert!(notice.body.ends_with("tries again by itself later."));
+        // With no monitor, or no cause known: still Windows 10.
+        let no_display = second_screen_notice(
+            status,
+            VddTaskHealth::Ok,
+            Some(crate::vdd_device::VddProblem::NoDisplay),
+            failed,
+        )
+        .unwrap();
+        assert!(no_display.body.starts_with(WINDOWS_10_NOTE));
+        // A more specific cause keeps the notice 0.3.4 gave it: Extend, a
+        // reinstall, a restart.
+        use crate::vdd_device::VddProblem;
+        let reason = if status == VddStatus::Failed {
+            "attach_timeout"
+        } else {
+            "enable_failed"
+        };
+        for (health, problem) in [
+            (VddTaskHealth::NotResponding, None),
+            (VddTaskHealth::TasksMissing, None),
+            (VddTaskHealth::Ok, Some(VddProblem::NotExtended)),
+            (VddTaskHealth::Ok, Some(VddProblem::NotInstalled)),
+            (VddTaskHealth::Ok, Some(VddProblem::SignatureBlocked)),
+            (VddTaskHealth::Ok, Some(VddProblem::DriverError(Some(43)))),
+            (VddTaskHealth::Ok, Some(VddProblem::DriverError(None))),
+        ] {
+            let notice = second_screen_notice(status, health, problem, failed);
+            assert_eq!(
+                notice,
+                second_screen_notice(status, health, problem, Some(reason)),
+                "{status:?} {health:?} {problem:?}"
+            );
+            assert!(!notice.unwrap().body.contains("Windows 11"));
+        }
+    }
 
     for status in [
         VddStatus::WaitingForClient,

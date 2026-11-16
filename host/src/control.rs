@@ -87,6 +87,14 @@ pub struct SharedControl {
     pub(crate) vdd_worker: Arc<crate::capture::second_screen::Worker>,
     /// Output owned by the enabled driver, retained across pipeline restarts.
     pub(crate) vdd_output: Arc<Mutex<Option<String>>>,
+    /// The second screen's size chosen for each iPad, as saved in the app
+    /// data folder (`vdd_settings::RESOLUTION_RECORD`).
+    pub vdd_resolutions: Arc<Mutex<crate::vdd_settings::ResolutionMemory>>,
+    /// The modes last written for the driver, and for which iPad; none when
+    /// the driver's own modes apply.
+    pub vdd_prepared: Arc<Mutex<Option<crate::capture::PreparedModes>>>,
+    /// The second screen's size as last seen: the size the app shows.
+    pub vdd_live: Arc<Mutex<crate::capture::VddLive>>,
     /// Second screen timing across pipeline restarts: the pending switch onto
     /// it, the grace period after its viewer left, the last driver change.
     pub(crate) second_screen: Arc<Mutex<crate::capture::second_screen::State>>,
@@ -228,6 +236,9 @@ impl SharedControl {
             handoff: Default::default(),
             vdd_worker: Arc::new(Default::default()),
             vdd_output: Arc::new(Mutex::new(None)),
+            vdd_resolutions: Arc::new(Mutex::new(Default::default())),
+            vdd_prepared: Arc::new(Mutex::new(None)),
+            vdd_live: Arc::default(),
             second_screen: Arc::new(Mutex::new(Default::default())),
             hb_capture_loop_ms: Arc::new(AtomicU64::new(0)),
             hb_capture_frame_ms: Arc::new(AtomicU64::new(0)),
