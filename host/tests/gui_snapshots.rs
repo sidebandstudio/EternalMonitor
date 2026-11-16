@@ -197,8 +197,26 @@ fn connect_app(
     frags_repaired: u32,
     feature_caps: u16,
 ) {
+    connect_app_at(
+        shared,
+        device_name,
+        frags_lost,
+        frags_repaired,
+        feature_caps,
+        Instant::now(),
+    );
+}
+
+/// As [`connect_app`], connected at `now`.
+fn connect_app_at(
+    shared: &SharedControl,
+    device_name: &str,
+    frags_lost: u32,
+    frags_repaired: u32,
+    feature_caps: u16,
+    now: Instant,
+) {
     let peer = PeerId::usb(7);
-    let now = Instant::now();
     let mut session = shared.session.lock();
     let actions = session.handle_control(
         peer,
@@ -352,6 +370,8 @@ fn harness_with(
 #[test]
 fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     let (dir, shared) = fixture();
+    a_sign_in_start_goes_to_the_taskbar(&shared, &dir);
+    minimised_work_goes_on(&shared, &dir);
     connect_ipad(&shared);
     let mut harness = harness(&shared, egui::vec2(1040.0, 1180.0), 1.0);
 
@@ -615,6 +635,332 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     a_vpn_address_gets_a_home_network_hint(&shared);
     std::fs::remove_dir_all(dir).unwrap();
     results.unwrap();
+}
+
+/// The window as eframe runs it: `logic` at every pass, `ui` only while it
+/// is not minimised, and minimise and restore followed as a real window
+/// follows them.
+struct Window {
+    app: AnalyzerApp,
+    minimised: bool,
+    minimise_asks: usize,
+    restore_asks: usize,
+}
+
+impl eframe::App for Window {
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        self.app.logic(ctx, frame);
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
+        if !self.minimised {
+            self.app.ui(ui, frame);
+        }
+        for command in ui.ctx().viewport(|viewport| viewport.commands.clone()) {
+            match command {
+                egui::ViewportCommand::Minimized(true) => {
+                    self.minimise_asks += 1;
+                    self.minimised = true;
+                }
+                egui::ViewportCommand::Minimized(false) => {
+                    self.restore_asks += 1;
+                    self.minimised = false;
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// A [`Window`], minimised from its first frame when `minimised`.
+fn window(
+    shared: &SharedControl,
+    sign_in: Option<eternal_host::gui::ShowRequests>,
+    minimised: bool,
+) -> Harness<'static, Window> {
+    let control = GuiControl {
+        shared: shared.clone(),
+        supervisor_tx: std::sync::mpsc::channel().0,
+    };
+    let mut window = Harness::builder()
+        .with_size(egui::vec2(1040.0, 900.0))
+        .with_theme(egui::Theme::Dark)
+        .wgpu()
+        .build_eframe(move |cc| {
+            let app = AnalyzerApp::new(cc, control);
+            Window {
+                app: match sign_in {
+                    Some(show_requests) => app.started_at_sign_in(show_requests),
+                    None => app,
+                },
+                minimised,
+                minimise_asks: 0,
+                restore_asks: 0,
+            }
+        });
+    set_focus(&mut window, true);
+    follow(&mut window);
+    window
+}
+
+/// The next pass sees the window as minimised or not, as eframe reports it.
+fn follow(window: &mut Harness<'_, Window>) {
+    let minimised = window.state().minimised;
+    window
+        .input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .minimized = Some(minimised);
+}
+
+fn set_focus(window: &mut Harness<'_, Window>, focused: bool) {
+    window
+        .input_mut()
+        .viewports
+        .entry(egui::ViewportId::ROOT)
+        .or_default()
+        .focused = Some(focused);
+}
+
+/// The user minimises or restores the window from the taskbar.
+fn user_minimises(window: &mut Harness<'_, Window>, minimised: bool) {
+    window.state_mut().minimised = minimised;
+    follow(window);
+}
+
+/// Steps `windows` together for `millis` of real time; `at` runs first in
+/// each round, with the time since the start.
+fn run_together(
+    windows: &mut [&mut Harness<'_, Window>],
+    millis: u64,
+    mut at: impl FnMut(Duration, &mut [&mut Harness<'_, Window>]),
+) {
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_millis(millis) {
+        at(start.elapsed(), windows);
+        for window in windows.iter_mut() {
+            window.step();
+            follow(window);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// A window Windows started at sign-in goes to the taskbar, once, after it
+/// is confirmed drawing (about 3 s of frames and an answered screenshot),
+/// unless the user took it first: a later launch, focus the user gave, a
+/// restore. Runs first: before it, no window in this process was confirmed
+/// drawing.
+fn a_sign_in_start_goes_to_the_taskbar(shared: &SharedControl, dir: &std::path::Path) {
+    // No update is known, so no update notice shows.
+    let update_state = dir.join("EternalMonitor/update-state.json");
+    let known = std::fs::read(&update_state).unwrap();
+    std::fs::remove_file(&update_state).unwrap();
+
+    // Drawing is confirmed at the earliest 3 s after the first window's first
+    // frame, however slowly the windows below are built. Each user action
+    // is done as soon as its window allows, so all come before that.
+
+    // The user clicks another window, then this one's taskbar button. Built
+    // first: focus counts from 1 s after the window's first frame, and
+    // its first frame starts the 3 s.
+    let mut focused_again = window(shared, Some(Box::new(|| false)), false);
+    let built = Instant::now();
+    set_focus(&mut focused_again, false);
+    while built.elapsed() < Duration::from_millis(1100) {
+        focused_again.step();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    set_focus(&mut focused_again, true);
+    focused_again.step();
+    assert_eq!(
+        focused_again.state().minimise_asks,
+        0,
+        "drawing was confirmed before the user's focus: this setup took over 3 s"
+    );
+    // The user starts EternalMonitor from its shortcut as this one opens.
+    let mut started_again = window(shared, Some(Box::new(|| true)), false);
+    // The user minimises this one as it opens, then restores it.
+    let mut restored = window(shared, Some(Box::new(|| false)), true);
+    restored.step();
+    user_minimises(&mut restored, false);
+    restored.step();
+    let mut quiet = window(shared, Some(Box::new(|| false)), false);
+    let mut by_hand = window(shared, None, false);
+    quiet.get_by_label("Pairing");
+    let mut windows = [
+        &mut quiet,
+        &mut started_again,
+        &mut focused_again,
+        &mut restored,
+        &mut by_hand,
+    ];
+    // Until drawing is confirmed and well after.
+    run_together(&mut windows, 8000, |_, _| {});
+    assert_eq!(quiet.state().minimise_asks, 1, "nothing to show");
+    assert!(quiet.state().minimised);
+    assert_eq!(started_again.state().minimise_asks, 0, "started again");
+    assert_eq!(
+        focused_again.state().minimise_asks,
+        0,
+        "focused by the user"
+    );
+    assert_eq!(restored.state().minimise_asks, 0, "restored by the user");
+    assert_eq!(by_hand.state().minimise_asks, 0, "started by hand");
+
+    // A warning is on screen (another program holds the stream port): it
+    // stays.
+    {
+        use eternal_host::startup::port;
+        let holder = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+        let held = holder.local_addr().unwrap().port();
+        assert!(!port::check(held));
+        let mut with_warning = window(shared, Some(Box::new(|| false)), false);
+        run_together(&mut [&mut with_warning], 1000, |_, _| {});
+        assert_eq!(with_warning.state().minimise_asks, 0);
+        with_warning.get_by_label("Another program is using EternalMonitor's network port");
+        drop(holder);
+        assert!(port::check(held));
+    }
+
+    // The feedback ask is on screen: it is no reason to stay.
+    feedback_ask_due(true);
+    let mut with_ask = window(shared, Some(Box::new(|| false)), false);
+    assert_eq!(with_ask.state().minimise_asks, 1);
+    user_minimises(&mut with_ask, false);
+    run_together(&mut [&mut with_ask], 300, |_, _| {});
+    with_ask.get_by_label("How's EternalMonitor working for you? :)");
+    feedback_ask_due(false);
+
+    a_warning_in_the_grace_brings_the_window_back(shared);
+    std::fs::write(&update_state, known).unwrap();
+}
+
+/// Settings with three long sessions and the ask never answered, so the
+/// feedback ask shows while no iPad is connected; or the fixture's.
+fn feedback_ask_due(due: bool) {
+    SettingsFile {
+        check_for_updates: false,
+        feedback_sessions: if due { 3 } else { 0 },
+        ..Default::default()
+    }
+    .save()
+    .unwrap();
+}
+
+/// For 30 s after going to the taskbar, a warning that appears brings the
+/// window back once, though nothing draws it; not once the user restored
+/// it, and the feedback ask never does.
+fn a_warning_in_the_grace_brings_the_window_back(shared: &SharedControl) {
+    use eternal_host::startup::port;
+    // An iPad is connected at sign-in, so the ask is hidden; it leaves in
+    // the grace and the ask shows.
+    feedback_ask_due(true);
+    connect_ipad(shared);
+    let mut asked = window(shared, Some(Box::new(|| false)), false);
+    assert_eq!(asked.state().minimise_asks, 1);
+    follow(&mut asked);
+    run_together(&mut [&mut asked], 300, |_, _| {});
+    disconnect_ipad(shared);
+    run_together(&mut [&mut asked], 1000, |_, _| {});
+    assert_eq!(asked.state().restore_asks, 0, "the feedback ask");
+    assert!(asked.state().minimised);
+    feedback_ask_due(false);
+
+    // Drawing is confirmed by now: both go to the taskbar at once.
+    let mut minimised = window(shared, Some(Box::new(|| false)), false);
+    let mut taken = window(shared, Some(Box::new(|| false)), false);
+    assert_eq!(minimised.state().minimise_asks, 1);
+    assert_eq!(taken.state().minimise_asks, 1);
+    follow(&mut minimised);
+    follow(&mut taken);
+    run_together(&mut [&mut minimised, &mut taken], 500, |_, _| {});
+    // The user restores one and minimises it again.
+    user_minimises(&mut taken, false);
+    run_together(&mut [&mut taken], 300, |_, _| {});
+    user_minimises(&mut taken, true);
+    run_together(&mut [&mut minimised, &mut taken], 300, |_, _| {});
+    assert_eq!(minimised.state().restore_asks, 0);
+
+    // Another program takes the stream port, as the supervisor finds.
+    let holder = std::net::UdpSocket::bind("0.0.0.0:0").unwrap();
+    let held = holder.local_addr().unwrap().port();
+    assert!(!port::check(held));
+    run_together(&mut [&mut minimised, &mut taken], 1000, |_, _| {});
+    assert_eq!(minimised.state().restore_asks, 1);
+    assert!(!minimised.state().minimised);
+    minimised.get_by_label("Another program is using EternalMonitor's network port");
+    assert_eq!(taken.state().restore_asks, 0);
+    assert!(taken.state().minimised);
+    drop(holder);
+    assert!(port::check(held));
+}
+
+/// Minimised, the window runs no UI pass, but what must go on does.
+fn minimised_work_goes_on(shared: &SharedControl, dir: &std::path::Path) {
+    use eternal_host::gpu_preference::{Diagnosis, Preference, SwitchRecord};
+    let mut minimised = window(shared, None, true);
+    let run = |window: &mut Harness<'_, Window>| run_together(&mut [window], 500, |_, _| {});
+
+    // Capture records how a graphics card switch went: it is saved.
+    let mut record = SwitchRecord::new(
+        None,
+        None,
+        Preference::PowerSaving,
+        "AMD Radeon(TM) 780M Graphics",
+    );
+    record.checking = false;
+    record.failed = true;
+    *shared.gpu_switch.lock() = Some(record.clone());
+    run(&mut minimised);
+    assert_eq!(settings_file(dir).gpu_switch, Some(record));
+
+    // A streaming session reaches 5 minutes: it counts toward the
+    // feedback ask.
+    assert_eq!(settings_file(dir).feedback_sessions, 0);
+    let six_minutes_ago = Instant::now() - Duration::from_secs(6 * 60);
+    connect_app_at(
+        shared,
+        "Test iPad Pro",
+        10,
+        20,
+        3 | FEATURE_CHECKS_UPDATES,
+        six_minutes_ago,
+    );
+    run(&mut minimised);
+    assert_eq!(settings_file(dir).feedback_sessions, 1);
+    disconnect_ipad(shared);
+    assert!(minimised.state().minimised);
+
+    // A restart asked for just before minimising finishes: here it could
+    // not start a copy, so its hold on updates ends.
+    *shared.capture_block.lock() = Some(CaptureBlock::UnsupportedOnThisGpu);
+    *shared.gpu_diagnosis.lock() = Some(Diagnosis {
+        screen_gpu: "AMD Radeon(TM) 780M Graphics".into(),
+        app_gpu: "NVIDIA GeForce RTX 5060 Laptop GPU".into(),
+        preference: Some(Preference::PowerSaving),
+    });
+    let mut restarting = window(shared, None, false);
+    restarting
+        .get_by_role_and_label(Role::Button, "Restart EternalMonitor")
+        .click();
+    restarting.step();
+    user_minimises(&mut restarting, true);
+    run(&mut restarting);
+    assert_eq!(shared.handoff.holder(), None);
+
+    *shared.gpu_switch.lock() = None;
+    *shared.gpu_diagnosis.lock() = None;
+    *shared.capture_block.lock() = None;
+    run(&mut minimised);
+    // The fixture's settings, for the tests after this one.
+    SettingsFile {
+        check_for_updates: false,
+        ..Default::default()
+    }
+    .save()
+    .unwrap();
 }
 
 /// Too many wrong codes pause code pairing. The Stream page says why and

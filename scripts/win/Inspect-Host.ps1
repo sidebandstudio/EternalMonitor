@@ -112,8 +112,8 @@ if ($TestAutostart) {
     try {
         Set-StartupFlag $false
         Set-StartupFlag $true
-        if ($key.GetValue('EternalMonitor') -ne ('"' + $p.Path + '"')) {
-            throw 'Startup command must contain the quoted, current host executable'
+        if ($key.GetValue('EternalMonitor') -ne ('"' + $p.Path + '" --autostart')) {
+            throw 'Startup command must be the quoted, current host executable and --autostart'
         }
         Set-StartupFlag $false
         $autostart = @{ enabled_path_verified=$true; disabled_value_absent=$true }

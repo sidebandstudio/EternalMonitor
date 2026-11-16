@@ -1247,3 +1247,197 @@ fn troubleshooting_names_each_cards_choice_in_plain_words() {
     // A new choice made this run replaces the old one's story.
     assert_eq!(drawing_status_lines(&status, WindowDrawing::Dx12).len(), 1);
 }
+
+mod sign_in_start {
+    use super::super::sign_in::{Command, SignIn, GRACE};
+    use std::cell::Cell;
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
+
+    const FOCUSED: Option<bool> = Some(true);
+    const UNFOCUSED: Option<bool> = Some(false);
+    const MINIMISED: Option<bool> = Some(true);
+    const SHOWN: Option<bool> = Some(false);
+
+    /// A sign-in start and a later launch's show request it hears.
+    fn start() -> (SignIn, Rc<Cell<bool>>) {
+        let asked = Rc::new(Cell::new(false));
+        let requests = Rc::clone(&asked);
+        (SignIn::new(Box::new(move || requests.take())), asked)
+    }
+
+    /// The window as eframe shows it: hidden for its first frame, then
+    /// shown and activated.
+    fn first_frames(sign_in: &mut SignIn, t0: Instant) {
+        sign_in.observe(t0, 0, UNFOCUSED, SHOWN);
+        sign_in.observe(t0 + Duration::from_millis(20), 1, FOCUSED, SHOWN);
+    }
+
+    fn after(t0: Instant, millis: u64) -> Instant {
+        t0 + Duration::from_millis(millis)
+    }
+
+    /// Minimised at t0 + 4 s, as when drawing is confirmed with nothing to show.
+    fn minimised(t0: Instant) -> SignIn {
+        let (mut sign_in, _) = start();
+        first_frames(&mut sign_in, t0);
+        assert_eq!(sign_in.decide(after(t0, 3000), false, false), None);
+        assert_eq!(
+            sign_in.decide(after(t0, 4000), true, false),
+            Some(Command::Minimise)
+        );
+        sign_in.observe(after(t0, 4100), 200, UNFOCUSED, MINIMISED);
+        assert!(sign_in.in_grace());
+        sign_in
+    }
+
+    #[test]
+    fn it_minimises_once_drawing_with_nothing_to_show() {
+        let t0 = Instant::now();
+        let mut sign_in = minimised(t0);
+        assert_eq!(sign_in.decide(after(t0, 4200), true, false), None);
+        assert!(!sign_in.done());
+    }
+
+    #[test]
+    fn something_on_screen_at_the_decision_keeps_it_up() {
+        let t0 = Instant::now();
+        let (mut sign_in, _) = start();
+        first_frames(&mut sign_in, t0);
+        // Something before the proof waits: it may be gone by then.
+        assert_eq!(sign_in.decide(after(t0, 1000), false, true), None);
+        assert_eq!(sign_in.decide(after(t0, 4000), true, true), None);
+        assert!(sign_in.done());
+        assert_eq!(sign_in.decide(after(t0, 5000), true, false), None);
+    }
+
+    #[test]
+    fn a_notice_in_the_grace_brings_it_back_once() {
+        let t0 = Instant::now();
+        let mut sign_in = minimised(t0);
+        let edge = 4000 + GRACE.as_millis() as u64;
+        assert_eq!(
+            sign_in.decide(after(t0, edge - 1), true, true),
+            Some(Command::Restore)
+        );
+        assert!(sign_in.done());
+        assert_eq!(sign_in.decide(after(t0, edge - 1), true, true), None);
+    }
+
+    #[test]
+    fn after_the_grace_a_notice_brings_nothing_back() {
+        let t0 = Instant::now();
+        let mut sign_in = minimised(t0);
+        let edge = 4000 + GRACE.as_millis() as u64;
+        assert_eq!(sign_in.decide(after(t0, edge), true, false), None);
+        assert!(sign_in.done());
+        assert_eq!(sign_in.decide(after(t0, edge + 1), true, true), None);
+    }
+
+    #[test]
+    fn a_window_the_user_restored_in_the_grace_is_left_alone() {
+        let t0 = Instant::now();
+        let mut sign_in = minimised(t0);
+        sign_in.observe(after(t0, 9000), 201, FOCUSED, SHOWN);
+        assert!(sign_in.done());
+        assert_eq!(sign_in.decide(after(t0, 10000), true, true), None);
+        // Minimised again by the user: still nothing pops up.
+        sign_in.observe(after(t0, 11000), 300, UNFOCUSED, MINIMISED);
+        assert_eq!(sign_in.decide(after(t0, 12000), true, true), None);
+    }
+
+    #[test]
+    fn a_later_launch_keeps_the_window_up() {
+        let t0 = Instant::now();
+        let (mut sign_in, asked) = start();
+        first_frames(&mut sign_in, t0);
+        asked.set(true);
+        sign_in.observe(after(t0, 2000), 60, FOCUSED, SHOWN);
+        assert!(sign_in.done());
+        assert_eq!(sign_in.decide(after(t0, 4000), true, false), None);
+        // In the grace too: the later launch restores it, and it stays.
+        let (mut sign_in, asked) = start();
+        first_frames(&mut sign_in, t0);
+        assert_eq!(
+            sign_in.decide(after(t0, 4000), true, false),
+            Some(Command::Minimise)
+        );
+        sign_in.observe(after(t0, 4100), 200, UNFOCUSED, MINIMISED);
+        asked.set(true);
+        sign_in.observe(after(t0, 6000), 200, UNFOCUSED, MINIMISED);
+        assert!(sign_in.done());
+        assert_eq!(sign_in.decide(after(t0, 7000), true, true), None);
+    }
+
+    #[test]
+    fn focus_the_user_gives_keeps_the_window_up_but_its_own_activation_does_not() {
+        let t0 = Instant::now();
+        let (mut sign_in, _) = start();
+        first_frames(&mut sign_in, t0);
+        // Activated a little late, as eframe shows the window: not the user.
+        sign_in.observe(after(t0, 100), 3, UNFOCUSED, SHOWN);
+        sign_in.observe(after(t0, 300), 6, FOCUSED, SHOWN);
+        assert!(!sign_in.done());
+        // The user clicks another window, then this one's taskbar button.
+        sign_in.observe(after(t0, 2000), 50, UNFOCUSED, SHOWN);
+        sign_in.observe(after(t0, 2500), 60, FOCUSED, SHOWN);
+        assert!(sign_in.done());
+        assert_eq!(sign_in.decide(after(t0, 4000), true, false), None);
+    }
+
+    #[test]
+    fn a_restore_before_the_decision_keeps_the_window_up() {
+        let t0 = Instant::now();
+        let (mut sign_in, _) = start();
+        first_frames(&mut sign_in, t0);
+        // The user minimises it, then restores it from the taskbar.
+        sign_in.observe(after(t0, 1500), 40, UNFOCUSED, MINIMISED);
+        assert!(!sign_in.done());
+        sign_in.observe(after(t0, 2500), 41, FOCUSED, SHOWN);
+        assert!(sign_in.done());
+        assert_eq!(sign_in.decide(after(t0, 4000), true, false), None);
+    }
+
+    #[test]
+    fn a_click_or_key_press_keeps_the_window_up() {
+        let t0 = Instant::now();
+        let (mut sign_in, _) = start();
+        first_frames(&mut sign_in, t0);
+        sign_in.user_input();
+        assert_eq!(sign_in.decide(after(t0, 4000), true, false), None);
+        assert!(sign_in.done());
+    }
+}
+
+/// At a sign-in start, only a warning or error banner keeps the window up
+/// or brings it back; update news and the feedback ask do not.
+#[test]
+fn only_warning_and_error_banners_need_the_user() {
+    let ctx = egui::Context::default();
+    theme::install(&ctx, i18n::Lang::En);
+    let drawn = |color: Option<egui::Color32>| {
+        let mut shown = false;
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 640.0),
+            )),
+            ..Default::default()
+        };
+        ctx.run_ui(input, |ui| {
+            if let Some(color) = color {
+                widgets::banner(ui, color, Icon::Warning, "Title", "Body", 0.0, |_| {});
+            }
+            shown = widgets::warning_shown(ui.ctx());
+        })
+        .drop_without_applying_deltas();
+        shown
+    };
+    // The fonts are in from the second pass.
+    assert!(!drawn(None));
+    assert!(!drawn(Some(ACCENT)), "update news, the feedback ask");
+    assert!(drawn(Some(WARNING)));
+    assert!(drawn(Some(DANGER)));
+    // Only for the pass that drew it.
+    assert!(!drawn(None));
+}
