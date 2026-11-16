@@ -963,14 +963,8 @@ pub fn run_capture_loop(
                     picture.resized();
                     start_picture.duplicated(Instant::now());
                     if second_screen {
-                        // Lists the displays as they are now, for the check.
-                        super::listing::outputs(&shared);
-                        super::note_vdd_change(
-                            &shared,
-                            &chosen.device_name,
-                            (new_w, new_h),
-                            Instant::now(),
-                        );
+                        // The size the app shows; nothing else is done.
+                        super::note_vdd_size(&shared, &chosen.device_name, (new_w, new_h));
                     }
                     staging_texture = unsafe {
                         let mut tex = None;

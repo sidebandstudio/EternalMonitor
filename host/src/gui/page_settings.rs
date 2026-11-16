@@ -348,8 +348,8 @@ impl AnalyzerApp {
         let shared = &self.control.shared;
         let menu = crate::capture::vdd_resolution_menu(shared);
         let connected = menu.is_some();
-        let (sizes, current) = menu.as_ref().map_or((Vec::new(), None), |menu| {
-            (menu.sizes.clone(), Some(menu.current))
+        let (sizes, current, odd) = menu.as_ref().map_or((Vec::new(), None, None), |menu| {
+            (menu.sizes.clone(), Some(menu.current), menu.odd)
         });
         let selected_text = current.map_or_else(
             || tr("Native").to_string(),
@@ -365,14 +365,19 @@ impl AnalyzerApp {
                 ui.add_enabled_ui(matching && !sizes.is_empty(), |ui| {
                     let combo =
                         widgets::combo(ui.id().with("vdd-resolution"), &selected_text, 200.0)
-                            // Ten sizes and one Windows set all in view,
+                            // Ten sizes and the display's own all in view,
                             // where the window has the room.
                             .height(460.0)
                             .show_ui(ui, |ui| {
                                 ui.set_min_width(200.0);
                                 for (index, &size) in sizes.iter().enumerate() {
                                     let label = resolution_label(size, index == 0);
-                                    if ui.selectable_label(current == Some(size), label).clicked() {
+                                    // The size the display is at, outside the
+                                    // list: shown, not offered.
+                                    let entry = ui.add_enabled_ui(odd != Some(size), |ui| {
+                                        ui.selectable_label(current == Some(size), label)
+                                    });
+                                    if entry.inner.clicked() {
                                         clicked = Some(size);
                                     }
                                 }
@@ -408,7 +413,7 @@ pub(super) fn resolution_description(matching: bool, connected: bool) -> &'stati
     } else if !connected {
         "Used by Second screen. Connect the iPad to choose its size. Each iPad keeps its own."
     } else {
-        "Used by Second screen. A smaller size makes everything larger at the same Windows scale, and a little less sharp. Other shapes show with bars. Each iPad keeps its own, also when changed in Windows' display settings."
+        "Used by Second screen. A smaller size makes everything larger at the same Windows scale, and a little less sharp. Other shapes show with bars. Each iPad keeps the size picked here. One set in Windows lasts for that session."
     }
 }
 

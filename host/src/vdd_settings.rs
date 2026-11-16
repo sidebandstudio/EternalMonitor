@@ -206,12 +206,11 @@ pub fn modes_to_try(requested: VddMode, modes: &[VddMode]) -> Vec<VddMode> {
 /// (level 6.2 is 8192 wide).
 pub const LARGEST_SIDE: u32 = 8192;
 
-/// Whether a size from outside this host's list (Windows' display settings,
-/// or the saved file) can be a second screen mode: landscape, even sides for
-/// 4:2:0 encoders, no smaller than [`LADDER_FLOOR`] and no side over
-/// [`LARGEST_SIDE`]. No refresh rate is saved with it; the iPad's own is
-/// used.
-pub fn usable_size((width, height): (u32, u32)) -> bool {
+/// Whether a size read from the saved file can be a second screen mode:
+/// landscape, even sides for 4:2:0 encoders, no smaller than
+/// [`LADDER_FLOOR`] and no side over [`LARGEST_SIDE`]. No refresh rate is
+/// saved with it; the iPad's own is used.
+fn usable_size((width, height): (u32, u32)) -> bool {
     width % 2 == 0
         && height % 2 == 0
         && width >= height
@@ -227,64 +226,56 @@ pub const RESOLUTION_RECORD: &str = "vdd-resolutions.json";
 pub struct Size {
     pub width: u32,
     pub height: u32,
-    /// Set in Windows' display settings, perhaps from a list the driver had
-    /// before this host's. Such a size is offered for that iPad from then
-    /// on; one chosen in the app is asked for only while the list has it.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub windows: bool,
 }
 
-/// The second screen's size chosen for each iPad, by the id it sends when
-/// it connects, where that isn't the iPad's own size. The last choice
-/// counts, made in the app or in Windows' display settings while the second
-/// screen streams.
+/// An entry as earlier builds of this change may have saved it: one marked
+/// `windows` was a size kept from Windows' display settings, outside the
+/// sizes offered, and is not a choice.
+#[derive(Deserialize)]
+struct SavedSize {
+    width: u32,
+    height: u32,
+    #[serde(default)]
+    windows: bool,
+}
+
+/// The second screen's size chosen in the app for each iPad, by the id it
+/// sends when it connects, where that isn't the iPad's own size. Always one
+/// of the sizes offered for that iPad when it was chosen; one its list no
+/// longer offers falls back to the iPad's own ([`requested_mode`]).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct ResolutionChoices(std::collections::BTreeMap<u64, Size>);
 
 impl ResolutionChoices {
-    /// None chosen when the file is missing or unreadable; an entry with a
-    /// size that can't be a mode ([`usable_size`]) is dropped, the rest kept.
+    /// None chosen when the file is missing or unreadable. An entry with a
+    /// size that can't be a mode ([`usable_size`]), or one kept from
+    /// Windows' display settings by an earlier build, is dropped; the rest
+    /// are kept.
     pub fn load(path: &Path) -> Self {
-        let mut choices: Self = std::fs::read_to_string(path)
+        let saved: std::collections::BTreeMap<u64, SavedSize> = std::fs::read_to_string(path)
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default();
-        choices
-            .0
-            .retain(|_, size| usable_size((size.width, size.height)));
-        choices
+        Self(
+            saved
+                .into_iter()
+                .filter(|(_, size)| !size.windows && usable_size((size.width, size.height)))
+                .map(|(device, size)| {
+                    let (width, height) = (size.width, size.height);
+                    (device, Size { width, height })
+                })
+                .collect(),
+        )
     }
 
     pub fn chosen(&self, device: u64) -> Option<(u32, u32)> {
         self.0.get(&device).map(|size| (size.width, size.height))
     }
 
-    /// The modes for the iPad `device` whose panel gives `modes`: those,
-    /// and a size set for it in Windows' display settings that they lack,
-    /// at the same refresh rates.
-    pub fn modes_for(&self, device: u64, modes: &[VddMode]) -> Vec<VddMode> {
-        let mut list = modes.to_vec();
-        let extra = self.0.get(&device).filter(|size| size.windows);
-        if let (Some(extra), Some(first)) = (extra, modes.first()) {
-            for refresh_hz in [first.refresh_hz, 60] {
-                let mode = VddMode {
-                    width: extra.width,
-                    height: extra.height,
-                    refresh_hz,
-                };
-                if !list.contains(&mode) {
-                    list.push(mode);
-                }
-            }
-        }
-        list
-    }
-
-    /// Chosen in the app for the iPad `device` among its `modes` (from
-    /// [`Self::modes_for`]). Its own size forgets the choice; a size not
-    /// listed, the size already chosen, or an iPad that sent no id changes
-    /// nothing. Whether anything changed.
+    /// Chosen in the app for the iPad `device` among its `modes`. Its own
+    /// size forgets the choice; a size not listed, the size already chosen,
+    /// or an iPad that sent no id changes nothing. Whether anything changed.
     pub fn choose(&mut self, device: u64, modes: &[VddMode], size: (u32, u32)) -> bool {
         let offered = sizes(modes);
         if device == 0 || !offered.contains(&size) || self.chosen(device) == Some(size) {
@@ -294,38 +285,7 @@ impl ResolutionChoices {
             return self.0.remove(&device).is_some();
         }
         let (width, height) = size;
-        self.0.insert(
-            device,
-            Size {
-                width,
-                height,
-                windows: false,
-            },
-        );
-        true
-    }
-
-    /// The second screen of the iPad `device`, whose panel gives `modes`,
-    /// was set to `size` in Windows' display settings: kept even when this
-    /// host's list lacks it. Its own size forgets the choice.
-    pub fn set_in_windows(&mut self, device: u64, modes: &[VddMode], size: (u32, u32)) -> bool {
-        let offered = sizes(modes);
-        let usable = usable_size(size) || offered.first() == Some(&size);
-        if device == 0 || !usable || offered.is_empty() || self.chosen(device) == Some(size) {
-            return false;
-        }
-        if offered.first() == Some(&size) {
-            return self.0.remove(&device).is_some();
-        }
-        let (width, height) = size;
-        self.0.insert(
-            device,
-            Size {
-                width,
-                height,
-                windows: !offered.contains(&size),
-            },
-        );
+        self.0.insert(device, Size { width, height });
         true
     }
 }
@@ -1996,7 +1956,6 @@ mod tests {
         // The same iPad id now reports another panel (a restored backup on
         // another model): its list has no 1700x1116.
         let pro = modes_for_client(1668, 2388, 60);
-        assert_eq!(choices.modes_for(7, &pro), pro, "nothing added for it");
         assert_eq!(requested_mode(&pro, choices.chosen(7)), Some(pro[0]));
         // No list at all (size unknown): the driver's default.
         assert_eq!(
@@ -2009,65 +1968,6 @@ mod tests {
         assert_eq!(modes_to_try(saved, &mini), [saved, mini[0]]);
         assert_eq!(modes_to_try(mini[0], &mini), [mini[0]]);
         assert_eq!(modes_to_try(saved, &[]), [saved]);
-    }
-
-    /// Review r1: a size set in Windows' display settings, from a list the
-    /// driver had before this host's, is kept for that iPad: offered with
-    /// its modes from then on and asked for on its next connection, and
-    /// the app's list shows it. A size from the list is kept like an app
-    /// choice; the panel's own forgets the choice.
-    #[test]
-    fn a_resolution_set_in_windows_settings_is_kept_even_outside_the_list() {
-        let mini = modes_for_client(1488, 2266, 120);
-        let mut choices = ResolutionChoices::default();
-        assert!(choices.choose(7, &mini, (1700, 1116)), "chosen in the app");
-        assert!(
-            choices.set_in_windows(7, &mini, (800, 600)),
-            "changed in Windows"
-        );
-        assert_eq!(choices.chosen(7), Some((800, 600)));
-        let listed = choices.modes_for(7, &mini);
-        assert_eq!(listed.len(), mini.len() + 2);
-        assert_eq!(sizes(&listed).last(), Some(&(800, 600)), "the app lists it");
-        let at = |width, height, refresh_hz| VddMode {
-            width,
-            height,
-            refresh_hz,
-        };
-        assert!(listed.contains(&at(800, 600, 120)) && listed.contains(&at(800, 600, 60)));
-        let requested = requested_mode(&listed, choices.chosen(7));
-        assert_eq!(requested, Some(at(800, 600, 120)));
-        assert_eq!(
-            mode_to_set(requested, (800, 600)),
-            None,
-            "left as Windows has it"
-        );
-        // Picking it again in the app keeps it Windows' own.
-        assert!(!choices.choose(7, &listed, (800, 600)));
-        assert_eq!(choices.modes_for(7, &mini), listed);
-        // The record keeps where it came from.
-        let text = serde_json::to_string(&choices).unwrap();
-        assert_eq!(text, r#"{"7":{"width":800,"height":600,"windows":true}}"#);
-        assert_eq!(
-            serde_json::from_str::<ResolutionChoices>(&text).unwrap(),
-            choices
-        );
-
-        // A size from the list, set in Windows: nothing added.
-        assert!(choices.set_in_windows(7, &mini, (1920, 1080)));
-        assert_eq!(choices.modes_for(7, &mini), mini);
-        assert_eq!(choices.chosen(7), Some((1920, 1080)));
-        // The app's choice after that replaces it.
-        assert!(choices.choose(7, &mini, (1510, 992)));
-        assert_eq!(choices.chosen(7), Some((1510, 992)));
-        // Its own size forgets it; sizes no display has, or an iPad that
-        // sent no id, change nothing.
-        assert!(choices.set_in_windows(7, &mini, (2266, 1488)));
-        assert_eq!(choices.chosen(7), None);
-        assert!(!choices.set_in_windows(7, &mini, (320, 240)));
-        assert!(!choices.set_in_windows(0, &mini, (1700, 1116)));
-        assert!(!choices.set_in_windows(7, &[], (1700, 1116)));
-        assert_eq!(choices, ResolutionChoices::default());
     }
 
     static GATE: (std::sync::Mutex<bool>, std::sync::Condvar) =
@@ -2160,11 +2060,13 @@ mod tests {
         assert_eq!(sizes_text(&[]), "");
     }
 
-    /// Review r6: a size from Windows' display settings or the saved file
-    /// becomes a mode only if an encoder can take it: even sides, landscape,
-    /// 800x600 to 8192 wide. An unreadable file still means none chosen.
+    /// Review r6, r12: an entry of the saved file becomes a choice only if
+    /// an encoder can take its size (even sides, landscape, 800x600 to 8192
+    /// wide) and it was chosen in the app: one an earlier build kept from
+    /// Windows' display settings (`"windows": true`) is dropped, the rest of
+    /// the file kept. An unreadable file means none chosen.
     #[test]
-    fn only_usable_sizes_are_kept_from_windows_or_the_file() {
+    fn only_usable_app_choices_are_loaded() {
         for size in [(800, 600), (1366, 768), (2266, 1488), (8192, 4320)] {
             assert!(usable_size(size), "{size:?}");
         }
@@ -2179,25 +2081,28 @@ mod tests {
         ] {
             assert!(!usable_size(size), "{size:?}");
         }
-        let mini = modes_for_client(1488, 2266, 60);
-        let mut choices = ResolutionChoices::default();
-        assert!(!choices.set_in_windows(7, &mini, (915, 601)));
-        assert!(!choices.set_in_windows(7, &mini, (9000, 5000)));
-        assert_eq!(choices, ResolutionChoices::default());
-
         let dir = temp_dir("vdd-resolutions-usable-test");
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(RESOLUTION_RECORD);
         std::fs::write(
             &path,
-            r#"{"7":{"width":0,"height":0,"windows":true},"8":{"width":1366,"height":768,"windows":true},"9":{"width":915,"height":601,"windows":true}}"#,
+            r#"{"6":{"width":1510,"height":992},"7":{"width":0,"height":0},"8":{"width":800,"height":600,"windows":true},"9":{"width":915,"height":601},"10":{"width":1920,"height":1080,"windows":false}}"#,
         )
         .unwrap();
         let loaded = ResolutionChoices::load(&path);
+        assert_eq!(loaded.chosen(6), Some((1510, 992)), "chosen in the app");
         assert_eq!(loaded.chosen(7), None, "0x0 dropped");
+        assert_eq!(loaded.chosen(8), None, "a size kept from Windows dropped");
         assert_eq!(loaded.chosen(9), None, "odd dropped");
-        assert_eq!(loaded.chosen(8), Some((1366, 768)), "the good one kept");
-        assert_eq!(loaded.modes_for(7, &mini), mini, "nothing advertised");
+        assert_eq!(loaded.chosen(10), Some((1920, 1080)));
+        let mini = modes_for_client(1488, 2266, 60);
+        assert_eq!(requested_mode(&mini, loaded.chosen(8)), Some(mini[0]));
+        // Saved again, without the dropped entries.
+        let text = serde_json::to_string(&loaded).unwrap();
+        assert_eq!(
+            text,
+            r#"{"6":{"width":1510,"height":992},"10":{"width":1920,"height":1080}}"#
+        );
         std::fs::write(&path, "{\"7\":").unwrap();
         assert_eq!(ResolutionChoices::load(&path), ResolutionChoices::default());
         let _ = std::fs::remove_dir_all(&dir);

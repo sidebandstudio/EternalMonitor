@@ -462,20 +462,15 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
         let saved = eternal_host::vdd_settings::ResolutionChoices::load(&record);
         assert_eq!(saved.chosen(7), chosen);
     }
-    // The open list: the iPad's nine sizes and one set in Windows' display
-    // settings, ten in all.
-    let modes = eternal_host::vdd_settings::modes_for_client(1668, 2420, 120);
-    assert!(shared
-        .vdd_resolutions
-        .lock()
-        .choices
-        .set_in_windows(7, &modes, (1366, 768)));
+    // The open list: the iPad's nine sizes, 1814 × 1250 chosen.
+    harness.get(resolution("2420 × 1668 (native)")).click();
     harness.run_steps(4);
-    harness.get(resolution("1366 × 768")).click();
+    harness.get_by_label("1814 × 1250").click();
+    harness.run_steps(4);
+    harness.get(resolution("1814 × 1250")).click();
     harness.run_steps(4);
     for size in [
         "2420 × 1668 (native)",
-        "1814 × 1250",
         "1614 × 1112",
         "1210 × 834",
         "970 × 668",

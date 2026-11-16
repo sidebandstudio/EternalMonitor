@@ -742,19 +742,13 @@ pub struct PreparedModes {
     pub choice: Option<(u32, u32)>,
 }
 
-/// The connected iPad's id and the second screen modes for it: its panel's,
-/// and a size set for it in Windows' display settings outside them.
+/// The connected iPad's id and the second screen modes offered for it.
 pub fn connected_vdd_modes(
     shared: &SharedControl,
 ) -> Option<(u64, Vec<crate::vdd_settings::VddMode>)> {
     let info = shared.session.lock().client_info()?;
     let modes =
         crate::vdd_settings::modes_for_client(info.screen_px.0, info.screen_px.1, info.refresh_hz);
-    let modes = shared
-        .vdd_resolutions
-        .lock()
-        .choices
-        .modes_for(info.device_id, &modes);
     Some((info.device_id, modes))
 }
 
@@ -766,8 +760,7 @@ pub fn connected_vdd_modes(
 pub(crate) fn wanted_vdd(
     shared: &SharedControl,
 ) -> (Option<crate::vdd_settings::VddMode>, Option<(u32, u32)>) {
-    // The connected iPad's modes, with a size kept from Windows' settings,
-    // which the running driver offers; the written ones when none is.
+    // The connected iPad's modes; the written ones when none is connected.
     let prepared = shared.vdd_prepared.lock().as_ref().map(|p| p.modes.clone());
     let connected = connected_vdd_modes(shared);
     let device = connected.as_ref().map(|(device, _)| *device);
@@ -786,30 +779,27 @@ pub struct ResolutionMenu {
     pub current: (u32, u32),
     /// The size saved for the iPad, which the next start asks for.
     pub saved: (u32, u32),
-    /// The size the second screen is at when the iPad's list lacks it,
-    /// listed last.
+    /// The size the second screen is at when the iPad's list lacks it
+    /// (set in Windows' display settings, or a choice the driver refused):
+    /// listed last, shown, not offered.
     pub odd: Option<(u32, u32)>,
 }
 
 /// What a click on an entry of [`ResolutionMenu`] does.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Click {
-    /// The saved size, which the display is at: nothing.
+    /// The saved size, which the display is at, or the size the display is
+    /// at that the list lacks (shown, not offered): nothing.
     Nothing,
     /// A size the list offers: saved and set, also the saved size while
     /// the display is at another.
     Choose((u32, u32)),
-    /// The size the display is at that the list lacks: kept as a size set
-    /// in Windows' display settings is, with no mode to set.
-    Keep((u32, u32)),
 }
 
 impl ResolutionMenu {
     pub fn click(&self, clicked: (u32, u32)) -> Click {
-        if clicked == self.saved && clicked == self.current {
+        if (clicked == self.saved && clicked == self.current) || Some(clicked) == self.odd {
             Click::Nothing
-        } else if Some(clicked) == self.odd {
-            Click::Keep(clicked)
         } else {
             Click::Choose(clicked)
         }
@@ -847,25 +837,6 @@ pub fn click_vdd_resolution(shared: &SharedControl, clicked: (u32, u32)) {
     match menu.click(clicked) {
         Click::Nothing => {}
         Click::Choose(size) => choose_vdd_resolution(shared, size),
-        Click::Keep(size) => {
-            let Some(info) = shared.session.lock().client_info() else {
-                return;
-            };
-            let modes = crate::vdd_settings::modes_for_client(
-                info.screen_px.0,
-                info.screen_px.1,
-                info.refresh_hz,
-            );
-            {
-                let mut memory = shared.vdd_resolutions.lock();
-                if memory.choices.set_in_windows(info.device_id, &modes, size) {
-                    log_choice(&memory, size, "app");
-                }
-            }
-            // A settle in flight for an earlier pick is followed by one for
-            // this; with the display at it already, that sets nothing.
-            second_screen::settle_again(shared);
-        }
     }
 }
 
@@ -947,141 +918,21 @@ pub fn choose_vdd_resolution(shared: &SharedControl, size: (u32, u32)) {
     second_screen::settle_again(shared);
 }
 
-/// How long after the second screen attached, the displays changed, or
-/// this host set its mode, a change of its size is taken for Windows' own.
-/// Windows may list a display that came or went apart from the mode it then
-/// restores: on hybrid laptops the built-in panel drops out a few seconds
-/// after the driver starts.
-pub(crate) const DISPLAYS_SETTLE: Duration = Duration::from_secs(10);
-
-/// The second screen as last seen, to tell a size the user set in
-/// Windows' display settings from one Windows set along with a change of
-/// displays.
+/// The second screen as last seen: the size the app shows.
 #[derive(Debug, Default)]
 pub struct VddLive {
-    /// The displays last listed (their names, sorted, and the primary's),
-    /// and when that set changed, the second screen attached or this host
-    /// set its mode.
-    displays: Option<(Vec<String>, Option<String>)>,
-    changed_at: Option<Instant>,
     /// The second screen's size as last seen.
     pub size: Option<(u32, u32)>,
-    /// The second screen's thread is setting its mode ([`HostModeSet`]).
-    host_setting: u32,
 }
 
-impl VddLive {
-    pub fn attached(&mut self, size: (u32, u32), now: Instant) {
-        self.displays = None;
-        self.changed_at = Some(now);
-        self.size = Some(size);
-    }
-
-    /// Windows listed `outputs`, the displays the desktop is on.
-    pub fn listed(&mut self, outputs: &[OutputInfo], now: Instant) {
-        let mut names: Vec<String> = outputs.iter().map(|o| o.device_name.clone()).collect();
-        names.sort();
-        let primary = outputs
-            .iter()
-            .find(|o| o.is_primary)
-            .map(|o| o.device_name.clone());
-        let displays = Some((names, primary));
-        if self.displays.is_some() && self.displays != displays {
-            self.changed_at = Some(now);
-        }
-        self.displays = displays;
-    }
-
-    /// Whether a size change seen now can be the user's: this host isn't
-    /// setting the mode ([`HostModeSet`]), and the same displays
-    /// and primary since before it, for [`DISPLAYS_SETTLE`], with no mode
-    /// set by this host in that time.
-    pub fn by_user(&self, now: Instant) -> bool {
-        self.host_setting == 0
-            && self.displays.is_some()
-            && self
-                .changed_at
-                .is_none_or(|at| now.saturating_duration_since(at) >= DISPLAYS_SETTLE)
-    }
-}
-
-/// The second screen `display` is at `size`, as its duplication reports
-/// when capture starts on it: the size the app shows.
+/// The second screen `display` is at `size`, as capture saw it when its
+/// duplication started or after a resize: the size the app shows. A size
+/// changed in Windows' display settings is left as it is and not saved;
+/// the next settle uses the choice saved in the app.
 #[cfg(any(windows, test))]
 fn note_vdd_size(shared: &SharedControl, display: &str, size: (u32, u32)) {
     if shared.vdd_output.lock().as_deref() == Some(display) {
         shared.vdd_live.lock().size = Some(size);
-    }
-}
-
-/// Held by the second screen's thread around every mode set it makes (the
-/// settle, its fallback, a settle again): a size change seen meanwhile, and
-/// for [`DISPLAYS_SETTLE`] after, is never taken for the user's, whatever
-/// order capture sees it in.
-#[cfg(any(windows, test, debug_assertions))]
-pub(crate) struct HostModeSet<'a>(&'a SharedControl);
-
-#[cfg(any(windows, test, debug_assertions))]
-impl<'a> HostModeSet<'a> {
-    pub(crate) fn begin(shared: &'a SharedControl) -> Self {
-        shared.vdd_live.lock().host_setting += 1;
-        Self(shared)
-    }
-}
-
-#[cfg(any(windows, test, debug_assertions))]
-impl Drop for HostModeSet<'_> {
-    fn drop(&mut self) {
-        let mut live = self.0.vdd_live.lock();
-        live.host_setting -= 1;
-        live.changed_at = live.changed_at.max(Some(Instant::now()));
-    }
-}
-
-/// The second screen streaming now changed to `size`; the displays were
-/// listed just before. A change the user can have made in Windows' display
-/// settings is remembered for the connected iPad. One that came with a
-/// change of displays, or soon after the second screen attached or this
-/// host set its mode, is Windows' own or this host's: not remembered, and
-/// left as it is. The next start asks for the iPad's chosen size.
-#[cfg(any(windows, test))]
-fn note_vdd_change(shared: &SharedControl, display: &str, size: (u32, u32), now: Instant) {
-    if shared.vdd_output.lock().as_deref() != Some(display) {
-        return;
-    }
-    let by_user = {
-        let mut live = shared.vdd_live.lock();
-        live.size = Some(size);
-        live.by_user(now)
-    };
-    if by_user {
-        note_vdd_mode(shared, display, size);
-        return;
-    }
-    info!(
-        size = %format!("{}x{}", size.0, size.1),
-        "The second screen changed size along with the displays or this host's own change \
-         — not taken for a choice"
-    );
-}
-
-/// The second screen streaming now changed size, in Windows' display
-/// settings or from the app: remember it for the connected iPad, also
-/// outside this host's list, so its next second screen starts in it.
-#[cfg(any(windows, test))]
-fn note_vdd_mode(shared: &SharedControl, display: &str, size: (u32, u32)) {
-    if shared.vdd_output.lock().as_deref() != Some(display) || shared.vdd_prepared.lock().is_none()
-    {
-        return;
-    }
-    let Some(info) = shared.session.lock().client_info() else {
-        return;
-    };
-    let modes =
-        crate::vdd_settings::modes_for_client(info.screen_px.0, info.screen_px.1, info.refresh_hz);
-    let mut memory = shared.vdd_resolutions.lock();
-    if memory.choices.set_in_windows(info.device_id, &modes, size) {
-        log_choice(&memory, size, "display");
     }
 }
 
@@ -2293,175 +2144,6 @@ mod tests {
         }
     }
 
-    /// Review r1, r6: a size set in Windows' display settings is kept, also
-    /// outside the list, when a mode can be made of it.
-    #[test]
-    fn the_resize_callback_keeps_windows_sizes_it_can_use() {
-        let shared = SharedControl::new(0, 1);
-        connect_ipad(&shared, 7, (1488, 2266));
-        prepare_for_connected(&shared);
-        *shared.vdd_output.lock() = Some("virtual".into());
-        let chosen = || shared.vdd_resolutions.lock().choices.chosen(7);
-
-        // Windows' display settings.
-        super::note_vdd_mode(&shared, "virtual", (1700, 1116));
-        assert_eq!(chosen(), Some((1700, 1116)));
-        super::note_vdd_mode(&shared, "virtual", (800, 600));
-        assert_eq!(chosen(), Some((800, 600)), "kept outside the list");
-        assert_eq!(
-            super::connected_vdd_modes(&shared).unwrap().1.last(),
-            Some(&at(800, 600))
-        );
-        // A size no encoder takes (odd sides): not a choice.
-        super::note_vdd_mode(&shared, "virtual", (915, 601));
-        assert_eq!(chosen(), Some((800, 600)));
-        // Another display, or the driver's own modes: not a choice.
-        super::note_vdd_mode(&shared, "other", (1510, 992));
-        *shared.vdd_prepared.lock() = None;
-        super::note_vdd_mode(&shared, "virtual", (1510, 992));
-        assert_eq!(chosen(), Some((800, 600)));
-    }
-
-    fn shown(name: &str, primary: bool) -> super::OutputInfo {
-        super::OutputInfo {
-            adapter_index: 0,
-            output_index: 0,
-            device_name: name.to_string(),
-            width: 1920,
-            height: 1080,
-            left: 0,
-            top: 0,
-            is_primary: primary,
-            adapter_name: "Test GPU".to_string(),
-            adapter_id: (0, 1),
-        }
-    }
-
-    /// Review r2, r5, r8: a size change that comes with a display added or
-    /// removed, the primary changing, or soon after the second screen was
-    /// settled, is not the user's: nothing is saved and no settle is asked;
-    /// the display stays as Windows put it. With the same displays and no
-    /// settle for 10 s before it, it is the user's.
-    #[test]
-    fn a_size_change_with_a_change_of_displays_is_not_saved() {
-        let shared = streaming_second_screen();
-        let chosen = || shared.vdd_resolutions.lock().choices.chosen(7);
-        let set = || {
-            assert!(!second_screen::settle_queued(&shared), "no settle asked");
-            Vec::<()>::new()
-        };
-        let start = Instant::now();
-        let t = |s| start + Duration::from_secs(s);
-        let list = |outputs: &[super::OutputInfo], s| shared.vdd_live.lock().listed(outputs, t(s));
-        let laptop = [shown("panel", true), shown("virtual", false)];
-        let alone = [shown("virtual", true)];
-
-        // A hybrid laptop: the panel drops out 3 s after the second screen
-        // attached, and Windows restores 800x600 for the displays left.
-        shared.vdd_live.lock().attached((2266, 1488), t(0));
-        list(&laptop, 1);
-        list(&alone, 3);
-        super::note_vdd_change(&shared, "virtual", (800, 600), t(3));
-        assert_eq!((chosen(), set()), (None, vec![]), "not saved, not set back");
-        assert_eq!(shared.vdd_live.lock().size, Some((800, 600)));
-        // The same displays all along, but just after the attach.
-        shared.vdd_live.lock().attached((800, 600), t(10));
-        list(&alone, 11);
-        super::note_vdd_change(&shared, "virtual", (1700, 1116), t(15));
-        assert_eq!((chosen(), set()), (None, vec![]));
-
-        // The same displays for 10 s and more: the user's.
-        list(&alone, 30);
-        super::note_vdd_change(&shared, "virtual", (1700, 1116), t(30));
-        assert_eq!((chosen(), set()), (Some((1700, 1116)), vec![]));
-
-        // The primary changes with the size: not the user's.
-        let swapped = [shown("panel", false), shown("virtual", true)];
-        list(&laptop, 40);
-        list(&swapped, 60);
-        super::note_vdd_change(&shared, "virtual", (1510, 992), t(60));
-        assert_eq!((chosen(), set()), (Some((1700, 1116)), vec![]));
-
-        // A display added with no size change; a change 12 s later is the
-        // user's.
-        list(
-            &[
-                shown("panel", false),
-                shown("virtual", true),
-                shown("tv", false),
-            ],
-            80,
-        );
-        list(
-            &[
-                shown("tv", false),
-                shown("virtual", true),
-                shown("panel", false),
-            ],
-            92,
-        );
-        super::note_vdd_change(&shared, "virtual", (1132, 744), t(92));
-        assert_eq!(chosen(), Some((1132, 744)));
-
-        // The display was settled again (a pick in the app) at 100 s: a
-        // change 5 s later is not the user's, one 12 s after it is.
-        shared.vdd_live.lock().attached((1132, 744), t(100));
-        list(
-            &[
-                shown("tv", false),
-                shown("virtual", true),
-                shown("panel", false),
-            ],
-            101,
-        );
-        super::note_vdd_change(&shared, "virtual", (1920, 1080), t(105));
-        assert_eq!(chosen(), Some((1132, 744)));
-        list(
-            &[
-                shown("tv", false),
-                shown("virtual", true),
-                shown("panel", false),
-            ],
-            112,
-        );
-        super::note_vdd_change(&shared, "virtual", (1920, 1080), t(112));
-        assert_eq!(chosen(), Some((1920, 1080)));
-
-        // Not listed since the attach: it can't be told, so not kept.
-        shared.vdd_live.lock().attached((1920, 1080), t(200));
-        super::note_vdd_change(&shared, "virtual", (1510, 992), t(230));
-        assert_eq!((chosen(), set()), (Some((1920, 1080)), vec![]));
-    }
-
-    /// Review r9: while the second screen's thread holds the guard, and for
-    /// 10 s after it lets go, no size change is the user's, even after a
-    /// long quiet session.
-    #[test]
-    fn the_host_mode_set_guard_closes_attribution_until_the_quiet_time_after() {
-        let shared = SharedControl::new(0, 1);
-        let outputs = [shown("primary", true), shown("virtual", false)];
-        let long_ago = Instant::now() - Duration::from_secs(60);
-        shared.vdd_live.lock().attached((2266, 1488), long_ago);
-        shared.vdd_live.lock().listed(&outputs, long_ago);
-        assert!(shared.vdd_live.lock().by_user(Instant::now()));
-        let held = super::HostModeSet::begin(&shared);
-        assert!(!shared.vdd_live.lock().by_user(Instant::now()));
-        assert!(!shared
-            .vdd_live
-            .lock()
-            .by_user(Instant::now() + Duration::from_secs(60)));
-        drop(held);
-        let ended = Instant::now();
-        assert!(!shared
-            .vdd_live
-            .lock()
-            .by_user(ended + Duration::from_secs(5)));
-        assert!(shared
-            .vdd_live
-            .lock()
-            .by_user(ended + Duration::from_secs(11)));
-    }
-
     static GATE: (std::sync::Mutex<bool>, std::sync::Condvar) =
         (std::sync::Mutex::new(false), std::sync::Condvar::new());
 
@@ -2475,11 +2157,11 @@ mod tests {
         std::fs::write(path, text)
     }
 
-    /// Review r10: a choice saved from the window's thread (a click) or
-    /// capture's (a size set in Windows) returns without touching the disk,
-    /// and the memory's lock is free meanwhile; quitting writes the latest.
+    /// Review r10: a choice saved from the window's thread (a click) returns
+    /// without touching the disk, and the memory's lock is free meanwhile;
+    /// quitting writes the latest.
     #[test]
-    fn choices_are_saved_off_the_calling_threads_and_written_at_quit() {
+    fn choices_are_saved_off_the_calling_thread_and_written_at_quit() {
         let dir = std::env::temp_dir().join(format!("vdd-choice-save-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let path = dir.join(crate::vdd_settings::RESOLUTION_RECORD);
@@ -2491,7 +2173,7 @@ mod tests {
         }
         let started = Instant::now();
         super::choose_vdd_resolution(&shared, (1510, 992));
-        super::note_vdd_mode(&shared, "virtual", (1700, 1116));
+        super::choose_vdd_resolution(&shared, (1700, 1116));
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(!path.exists(), "nothing written on the calling thread");
         assert!(
@@ -2522,10 +2204,7 @@ mod tests {
     #[test]
     fn the_app_shows_the_size_duplication_starts_at() {
         let shared = streaming_second_screen();
-        shared
-            .vdd_live
-            .lock()
-            .attached((2266, 1488), Instant::now());
+        shared.vdd_live.lock().size = Some((2266, 1488));
         super::note_vdd_size(&shared, "virtual", (1510, 992));
         assert_eq!(
             super::vdd_resolution_menu(&shared).unwrap().current,
@@ -2538,12 +2217,12 @@ mod tests {
         );
     }
 
-    /// Review r4, r8: a click on each kind of entry. The saved size the
+    /// Review r4, r8, r12: a click on each kind of entry. The saved size the
     /// display is at does nothing; a size the list offers (the saved one
-    /// included, and a size kept from Windows' display settings) is saved and
-    /// asks the second screen's thread to settle again; the size the display
-    /// is at that the list lacks is kept and asks for a settle too, and never
-    /// turns into the panel's own.
+    /// included) is saved and asks the second screen's thread to settle
+    /// again; the size the display is at that the list lacks (set in
+    /// Windows' display settings) is shown but not offered: a click on it
+    /// does nothing and saves nothing.
     #[test]
     fn a_click_on_each_kind_of_entry() {
         use super::Click;
@@ -2561,7 +2240,7 @@ mod tests {
                     .choices
                     .choose(7, &base, saved));
             }
-            shared.vdd_live.lock().attached(at_size, Instant::now());
+            shared.vdd_live.lock().size = Some(at_size);
             shared
         };
 
@@ -2574,8 +2253,8 @@ mod tests {
             (Some((1510, 992)), false)
         );
 
-        // Windows left the display at 1920x1080; the saved size is the
-        // panel's own. Clicking it settles again.
+        // Windows Settings put the display at 1920x1080; the saved size is
+        // the panel's own. Clicking it settles again.
         let shared = start(None, (1920, 1080));
         assert_eq!(
             menu(&shared).click((2266, 1488)),
@@ -2592,39 +2271,24 @@ mod tests {
         super::click_vdd_resolution(&shared, (914, 600));
         assert_eq!(chosen(&shared), Some((914, 600)));
 
-        // A size kept from Windows' display settings is in the list: with
-        // the display elsewhere, clicking it settles again.
-        let shared = start(None, (2266, 1488));
-        assert!(shared
-            .vdd_resolutions
-            .lock()
-            .choices
-            .set_in_windows(7, &base, (800, 600)));
-        assert_eq!(menu(&shared).odd, None);
-        assert_eq!(menu(&shared).click((800, 600)), Click::Choose((800, 600)));
-        super::click_vdd_resolution(&shared, (800, 600));
-        assert_eq!((chosen(&shared), asked(&shared)), (Some((800, 600)), true));
-
-        // At a size the list lacks: clicking it keeps it as a size set in
-        // Windows' settings is, and asks for a settle, which finds the
-        // display at it.
+        // At a size the list lacks: shown, but a click on it does nothing.
         let shared = start(Some((1510, 992)), (800, 600));
         assert_eq!(menu(&shared).odd, Some((800, 600)));
-        assert_eq!(menu(&shared).click((800, 600)), Click::Keep((800, 600)));
+        assert_eq!(menu(&shared).click((800, 600)), Click::Nothing);
         super::click_vdd_resolution(&shared, (800, 600));
-        assert_eq!((chosen(&shared), asked(&shared)), (Some((800, 600)), true));
-        let after = menu(&shared);
         assert_eq!(
-            (after.saved, after.current, after.odd),
-            ((800, 600), (800, 600), None)
+            (chosen(&shared), asked(&shared)),
+            (Some((1510, 992)), false)
         );
-        assert_eq!(after.click((800, 600)), Click::Nothing);
-        let next = super::connected_vdd_modes(&shared).unwrap().1;
         assert_eq!(
-            crate::vdd_settings::sizes(&next).last(),
-            Some(&(800, 600)),
-            "the next start offers and asks for it"
+            super::connected_vdd_modes(&shared).unwrap().1,
+            base,
+            "not offered"
         );
+        // Any listed size settles to it.
+        assert_eq!(menu(&shared).click((1510, 992)), Click::Choose((1510, 992)));
+        super::click_vdd_resolution(&shared, (1510, 992));
+        assert!(asked(&shared));
     }
 
     /// Review r2: while the second screen is on, the app shows the size it
@@ -2655,10 +2319,7 @@ mod tests {
 
         // On, but settled on the panel's own: the driver refused 1700x1116.
         *shared.vdd_output.lock() = Some("virtual".into());
-        shared
-            .vdd_live
-            .lock()
-            .attached((2266, 1488), Instant::now());
+        shared.vdd_live.lock().size = Some((2266, 1488));
         assert_eq!(menu(), (sizes.clone(), (2266, 1488)));
         // At a size the list lacks: listed, and shown.
         shared.vdd_live.lock().size = Some((800, 600));
