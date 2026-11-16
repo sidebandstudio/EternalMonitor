@@ -758,12 +758,35 @@ fn a_sign_in_start_goes_to_the_taskbar(shared: &SharedControl, dir: &std::path::
     let known = std::fs::read(&update_state).unwrap();
     std::fs::remove_file(&update_state).unwrap();
 
-    let asked = std::rc::Rc::new(std::cell::Cell::new(false));
-    let requests = std::rc::Rc::clone(&asked);
-    let mut quiet = window(shared, Some(Box::new(|| false)), false);
-    let mut started_again = window(shared, Some(Box::new(move || requests.take())), false);
+    // Drawing is confirmed at the earliest 3 s after the first window's first
+    // frame, however slowly the windows below are built. Each user action
+    // is done as soon as its window allows, so all come before that.
+
+    // The user clicks another window, then this one's taskbar button. Built
+    // first: focus counts from 1 s after the window's first frame, and
+    // its first frame starts the 3 s.
     let mut focused_again = window(shared, Some(Box::new(|| false)), false);
-    let mut restored = window(shared, Some(Box::new(|| false)), false);
+    let built = Instant::now();
+    set_focus(&mut focused_again, false);
+    while built.elapsed() < Duration::from_millis(1100) {
+        focused_again.step();
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    set_focus(&mut focused_again, true);
+    focused_again.step();
+    assert_eq!(
+        focused_again.state().minimise_asks,
+        0,
+        "drawing was confirmed before the user's focus: this setup took over 3 s"
+    );
+    // The user starts EternalMonitor from its shortcut as this one opens.
+    let mut started_again = window(shared, Some(Box::new(|| true)), false);
+    // The user minimises this one as it opens, then restores it.
+    let mut restored = window(shared, Some(Box::new(|| false)), true);
+    restored.step();
+    user_minimises(&mut restored, false);
+    restored.step();
+    let mut quiet = window(shared, Some(Box::new(|| false)), false);
     let mut by_hand = window(shared, None, false);
     quiet.get_by_label("Pairing");
     let mut windows = [
@@ -773,35 +796,8 @@ fn a_sign_in_start_goes_to_the_taskbar(shared: &SharedControl, dir: &std::path::
         &mut restored,
         &mut by_hand,
     ];
-    let mut done = [false; 4];
-    run_together(&mut windows, 8000, |elapsed, windows| {
-        // Before drawing is confirmed (3 s at least).
-        let ms = elapsed.as_millis();
-        if ms >= 1000 && !done[0] {
-            done[0] = true;
-            // The user starts EternalMonitor from its shortcut.
-            asked.set(true);
-            // The user minimises this one from its title bar.
-            user_minimises(windows[3], true);
-        }
-        if ms >= 1500 && !done[1] {
-            done[1] = true;
-            // The user clicks another window...
-            set_focus(windows[2], false);
-        }
-        if ms >= 2000 && !done[2] {
-            done[2] = true;
-            // ...then this one's taskbar button; and restores the other.
-            set_focus(windows[2], true);
-            user_minimises(windows[3], false);
-        }
-        if !done[3] {
-            done[3] = true;
-            for window in windows.iter() {
-                assert_eq!(window.state().minimise_asks, 0);
-            }
-        }
-    });
+    // Until drawing is confirmed and well after.
+    run_together(&mut windows, 8000, |_, _| {});
     assert_eq!(quiet.state().minimise_asks, 1, "nothing to show");
     assert!(quiet.state().minimised);
     assert_eq!(started_again.state().minimise_asks, 0, "started again");
