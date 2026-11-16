@@ -1845,18 +1845,31 @@ impl NoMonitorWatch {
 }
 
 /// However [`attach`] ends, its claim ends with it: a start that did not
-/// finish leaves the status for the next tick to claim again.
+/// finish leaves the status for the next tick to claim again. A size picked
+/// while the claim held (see [`settle_again`]) is handed on in the same
+/// step: read under the lock that ends the claim, and settled once the
+/// display streams.
 #[cfg(any(windows, test, debug_assertions))]
 struct AttachExit<'a>(&'a SharedControl);
 
 #[cfg(any(windows, test, debug_assertions))]
 impl Drop for AttachExit<'_> {
     fn drop(&mut self) {
-        let mut status = self.0.vdd_status.lock();
-        if *status == VddStatus::Attaching {
-            *status = VddStatus::WaitingForClient;
+        let shared = self.0;
+        let asked = {
+            let mut status = shared.vdd_status.lock();
+            if *status == VddStatus::Attaching {
+                *status = VddStatus::WaitingForClient;
+            }
+            let mut state = shared.second_screen.lock();
+            state.attaching = false;
+            state.settle_asked
+        };
+        // Not streaming (a failed or cancelled start): the next start's
+        // settle reads the choice.
+        if asked && streaming_on_it(shared) {
+            queue_settle(shared);
         }
-        self.0.second_screen.lock().attaching = false;
     }
 }
 
@@ -1899,7 +1912,6 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
                 info!(device = %output.device_name, "Virtual display still attached — capturing it");
                 live_since(shared, &output);
                 note_attached(shared, output.device_name);
-                settle_again_if_asked(shared);
                 return;
             }
             Reuse::Settle => {
@@ -1913,9 +1925,9 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
                 let output = driver.settle(output, wanted);
                 super::note_settled_for(shared, choice);
                 live_since(shared, &output);
-                if note_attached_if_selected(shared, output.device_name.clone()) {
-                    settle_again_if_asked(shared);
-                } else if !quitting(shared) {
+                if !note_attached_if_selected(shared, output.device_name.clone())
+                    && !quitting(shared)
+                {
                     // Another mode was chosen while the mode was set.
                     disable(shared, driver);
                 }
@@ -2034,7 +2046,6 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
                     %device,
                     width, height, "Virtual display attached — capturing it"
                 );
-                settle_again_if_asked(shared);
             } else if quitting(shared) {
                 info!("Quitting while the virtual display started — the quit turns it off");
             } else {
@@ -2113,9 +2124,16 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
 /// on brings the display attached now to the saved choice
 /// ([`Command::Settle`]). Not while it fails, falls back, is released or is
 /// still coming up: a start in progress takes the request when it is done.
+/// The request and the start's claim are read under one lock, as
+/// [`AttachExit`] reads them: a click before the claim ends is handed on by
+/// the start, one after it is queued here, so exactly one side queues it.
 pub(crate) fn settle_again(shared: &SharedControl) {
-    shared.second_screen.lock().settle_asked = true;
-    if streaming_on_it(shared) {
+    let starting = {
+        let mut state = shared.second_screen.lock();
+        state.settle_asked = true;
+        state.attaching
+    };
+    if !starting && streaming_on_it(shared) {
         queue_settle(shared);
     }
 }
@@ -2132,14 +2150,6 @@ fn streaming_on_it(shared: &SharedControl) -> bool {
         && shared.vdd_output.lock().is_some()
         && *shared.vdd_status.lock() == VddStatus::Active
         && shared.client_connected()
-}
-
-/// After an attach: a size picked while it ran gets its settle now.
-#[cfg(any(windows, test, debug_assertions))]
-fn settle_again_if_asked(shared: &SharedControl) {
-    if shared.second_screen.lock().settle_asked {
-        queue_settle(shared);
-    }
 }
 
 /// [`Command::Settle`]: bring the attached display to the saved choice.
@@ -5105,6 +5115,57 @@ mod tests {
             "only the fallback's"
         );
         assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
+    }
+
+    /// The worker's queued Settle commands.
+    fn settles_queued(shared: &SharedControl) -> usize {
+        let queue = shared.vdd_worker.queue.lock();
+        queue
+            .commands
+            .iter()
+            .filter(|command| **command == Command::Settle)
+            .count()
+    }
+
+    /// Review r14: a click after the start's last look at the request and
+    /// before its claim ends. The start is attached and streaming, its claim
+    /// still held (the moment just before `AttachExit` runs). The click
+    /// queues nothing itself; ending the claim hands it on, so the newest
+    /// choice is set, once, with no further input.
+    #[test]
+    fn a_click_as_a_start_ends_is_handed_on_and_set_once() {
+        let on_sleep = |_| {};
+        let (shared, driver) = streaming_for_ipad_1(&on_sleep);
+        moved_on(&shared);
+        shared.second_screen.lock().attaching = true;
+        let claim = AttachExit(&shared);
+        crate::capture::click_vdd_resolution(&shared, (1700, 1116));
+        crate::capture::click_vdd_resolution(&shared, (1510, 992));
+        assert_eq!(settles_queued(&shared), 0, "the start hands it on");
+        drop(claim);
+        assert_eq!(settles_queued(&shared), 1);
+        let sets = driver.sets.borrow().len();
+        run(&shared, &driver, ATTACH_TIMEOUT, false);
+        assert_eq!(driver.sets.borrow()[sets..], [(1510, 992)]);
+        assert!(!settle_queued(&shared));
+    }
+
+    /// Review r14, the mirror image: a click just after the start's claim
+    /// ended is queued by the click, once, and set.
+    #[test]
+    fn a_click_just_after_a_start_ends_is_queued_by_the_click_once() {
+        let on_sleep = |_| {};
+        let (shared, driver) = streaming_for_ipad_1(&on_sleep);
+        moved_on(&shared);
+        shared.second_screen.lock().attaching = true;
+        drop(AttachExit(&shared));
+        assert_eq!(settles_queued(&shared), 0, "nothing was asked");
+        crate::capture::click_vdd_resolution(&shared, (1510, 992));
+        assert_eq!(settles_queued(&shared), 1);
+        let sets = driver.sets.borrow().len();
+        run(&shared, &driver, ATTACH_TIMEOUT, false);
+        assert_eq!(driver.sets.borrow()[sets..], [(1510, 992)]);
+        assert!(!settle_queued(&shared));
     }
 
     /// Review r13, finding 1: a fresh start whose release is sent while it
