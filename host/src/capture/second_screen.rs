@@ -5365,6 +5365,133 @@ mod tests {
         assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
     }
 
+    /// What #260's Windows 10 hold consists of, to show a command left it
+    /// as it was.
+    fn windows_10_hold(
+        shared: &SharedControl,
+    ) -> (VddStatus, Option<&'static str>, Windows, Option<Instant>) {
+        let status = *shared.vdd_status.lock();
+        let state = shared.second_screen.lock();
+        (status, state.failure, state.windows, state.windows_held_at)
+    }
+
+    /// With #260: while a Windows 10 hold is in place (a failed start in
+    /// its wait, or no driver), a click and a `CheckKept` (as if queued
+    /// before the hold) start, restart and settle nothing, and the hold,
+    /// its notices and its wait stay exactly as they were.
+    #[test]
+    fn a_click_and_a_kept_display_check_leave_a_windows_10_hold_alone() {
+        for driver_installed in [true, false] {
+            let shared = second_screen_selected();
+            note_windows(&shared, Some(19045), false, driver_installed);
+            connect_ipad(&shared, 1, (1488, 2266));
+            if driver_installed {
+                // A start whose display never attaches: held after it.
+                assert_eq!(next_step(&shared, Instant::now()), Step::Attach);
+                prepare_for_connected(&shared);
+                let on_sleep = |_| {};
+                let never = FakeDriver::new(secs(3.0), None, &on_sleep);
+                attach(&shared, &never, ATTACH_TIMEOUT);
+                assert!(matches!(
+                    shared.second_screen.lock().windows,
+                    Windows::Failed(_)
+                ));
+            }
+            note_connected(&shared, Instant::now());
+            assert_eq!(next_step(&shared, Instant::now()), Step::Nothing);
+            let held = windows_10_hold(&shared);
+            // The saved failure and its wait, as a whole.
+            let wait = |shared: &SharedControl| format!("{:?}", shared.second_screen.lock().memory);
+            let waiting = wait(&shared);
+            assert!(windows_unsupported(&shared), "held");
+            let notice = windows_notice(&shared, Instant::now());
+            let on_sleep = |_| {};
+            let driver = FakeDriver::new(secs(3.0), Some(secs(0.5)), &on_sleep);
+            crate::capture::click_vdd_resolution(&shared, (1510, 992));
+            assert_eq!(settles_queued(&shared), 0, "{driver_installed}");
+            note_kept_met(&shared);
+            send(&shared, Command::Settle);
+            send(&shared, Command::CheckKept);
+            run(&shared, &driver, ATTACH_TIMEOUT, false);
+            assert!(driver.calls().is_empty(), "{:?}", driver.calls());
+            assert_eq!(windows_10_hold(&shared), held, "{driver_installed}");
+            assert_eq!(wait(&shared), waiting, "the wait is untouched");
+            assert_eq!(windows_notice(&shared, Instant::now()), notice);
+            assert_eq!(next_step(&shared, Instant::now()), Step::Nothing);
+            // The click is saved for the try after the wait.
+            assert_eq!(
+                shared.vdd_resolutions.lock().choices.chosen(1),
+                Some((1510, 992))
+            );
+        }
+    }
+
+    /// With #260: on Windows 10 with the driver, a second screen that
+    /// attached streams, and a click settles it as on Windows 11, with no
+    /// hold and no notice.
+    #[test]
+    fn a_click_on_windows_10_with_the_display_streaming_settles_it() {
+        let shared = second_screen_selected();
+        note_windows(&shared, Some(19045), false, true);
+        connect_ipad(&shared, 1, (1488, 2266));
+        assert_eq!(next_step(&shared, Instant::now()), Step::Attach);
+        prepare_for_connected(&shared);
+        let on_sleep = |_| {};
+        let driver = FakeDriver::new(secs(3.0), Some(secs(0.5)), &on_sleep);
+        attach(&shared, &driver, ATTACH_TIMEOUT);
+        moved_on(&shared);
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::Active);
+        crate::capture::click_vdd_resolution(&shared, (1510, 992));
+        let (calls, sets) = (driver.calls().len(), driver.sets.borrow().len());
+        run(&shared, &driver, ATTACH_TIMEOUT, false);
+        assert_eq!(driver.calls()[calls..], [Call::Settle]);
+        assert_eq!(driver.sets.borrow()[sets..], [(1510, 992)]);
+        assert_eq!(windows_10_hold(&shared).2, Windows::Tried);
+        assert!(!windows_unsupported(&shared));
+        assert!(!windows_notice(&shared, Instant::now()));
+        assert_eq!(shared.second_screen.lock().failure, None);
+    }
+
+    /// With #260: a Windows 10 PC whose driver ignores the host's mode list
+    /// and stays at 1600x1200. The row shows that size, outside the iPad's
+    /// list, greyed out; a click on a listed size is a refused set that
+    /// leaves the display where it is. Neither is a failed second screen:
+    /// no Windows 10 hold, no notice, no fallback.
+    #[test]
+    fn a_refused_size_on_windows_10_is_not_a_failed_second_screen() {
+        let shared = second_screen_selected();
+        note_windows(&shared, Some(19045), false, true);
+        connect_ipad(&shared, 1, (1668, 2388));
+        assert_eq!(next_step(&shared, Instant::now()), Step::Attach);
+        prepare_for_connected(&shared);
+        let on_sleep = |_| {};
+        let mut driver = FakeDriver::new(secs(3.0), Some(secs(0.5)), &on_sleep);
+        driver.settle_to = Some((1600, 1200));
+        attach(&shared, &driver, ATTACH_TIMEOUT);
+        moved_on(&shared);
+        let menu = crate::capture::vdd_resolution_menu(&shared).unwrap();
+        assert_eq!(menu.current, (1600, 1200));
+        assert_eq!(menu.odd, Some((1600, 1200)), "shown, greyed out");
+        crate::capture::click_vdd_resolution(&shared, (1600, 1200));
+        assert_eq!(settles_queued(&shared), 0, "not offered");
+        crate::capture::click_vdd_resolution(&shared, (1920, 1200));
+        let calls = driver.calls().len();
+        run(&shared, &driver, ATTACH_TIMEOUT, false);
+        assert_eq!(driver.calls()[calls..], [Call::Settle], "no restart");
+        assert_eq!(driver.size.get(), Some((1600, 1200)), "refused");
+        assert_eq!(shared.vdd_live.lock().size, Some((1600, 1200)));
+        assert_eq!(
+            windows_10_hold(&shared),
+            (VddStatus::Active, None, Windows::Tried, None)
+        );
+        assert!(!windows_unsupported(&shared));
+        assert!(!windows_notice(&shared, Instant::now()));
+        assert!(!matches!(
+            next_step(&shared, Instant::now()),
+            Step::Fallback(_)
+        ));
+    }
+
     /// The worker's queued Settle commands.
     fn settles_queued(shared: &SharedControl) -> usize {
         let queue = shared.vdd_worker.queue.lock();
