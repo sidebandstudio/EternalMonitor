@@ -604,6 +604,9 @@ pub fn read_value() -> Result<Option<String>, String> {
 }
 
 #[cfg(windows)]
+pub(crate) use windows_impl::source_name;
+
+#[cfg(windows)]
 mod windows_impl {
     use std::os::windows::ffi::OsStrExt;
 
@@ -727,6 +730,22 @@ mod windows_impl {
         Some(adapters)
     }
 
+    pub(crate) fn source_name(path: &DISPLAYCONFIG_PATH_INFO) -> Option<String> {
+        let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
+            header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
+                r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
+                size: std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
+                adapterId: path.sourceInfo.adapterId,
+                id: path.sourceInfo.id,
+            },
+            ..Default::default()
+        };
+        if unsafe { DisplayConfigGetDeviceInfo(&mut source.header) } != 0 {
+            return None;
+        }
+        Some(text(&source.viewGdiDeviceName))
+    }
+
     /// Each active screen's GDI name and the adapter the display
     /// configuration says scans it out: the physical wiring, unlike DXGI,
     /// which lists screens under the adapter the process runs on. `None`
@@ -735,24 +754,7 @@ mod windows_impl {
         let paths = super::read_display_config(read_paths)?;
         let screens = paths
             .iter()
-            .filter_map(|path| {
-                let mut source = DISPLAYCONFIG_SOURCE_DEVICE_NAME {
-                    header: DISPLAYCONFIG_DEVICE_INFO_HEADER {
-                        r#type: DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME,
-                        size: std::mem::size_of::<DISPLAYCONFIG_SOURCE_DEVICE_NAME>() as u32,
-                        adapterId: path.sourceInfo.adapterId,
-                        id: path.sourceInfo.id,
-                    },
-                    ..Default::default()
-                };
-                if unsafe { DisplayConfigGetDeviceInfo(&mut source.header) } != 0 {
-                    return None;
-                }
-                Some((
-                    text(&source.viewGdiDeviceName),
-                    id(path.sourceInfo.adapterId),
-                ))
-            })
+            .filter_map(|path| Some((source_name(path)?, id(path.sourceInfo.adapterId))))
             .collect();
         Some(screens)
     }

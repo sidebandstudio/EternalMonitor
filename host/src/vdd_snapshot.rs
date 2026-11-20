@@ -18,6 +18,18 @@ const MAX_NAME: usize = 48;
 /// The virtual display's monitor reports the driver's EDID ID in its path.
 const VDD_MONITOR: &str = "MTT1337";
 
+/// A target on the active desktop and the GDI source DXGI opens for it.
+#[cfg(any(windows, test, debug_assertions))]
+#[derive(Clone)]
+pub(crate) struct ActivePath {
+    pub source: String,
+    pub virtual_display: bool,
+    pub position: (i32, i32),
+}
+
+#[cfg(windows)]
+pub(crate) use windows_impl::active_paths;
+
 /// A DXGI adapter.
 #[derive(Debug, Clone)]
 pub struct Adapter {
@@ -49,6 +61,9 @@ impl Target {
 }
 
 /// Whether a monitor device path is the virtual display's.
+/// The guard and capture both match the driver's stock EDID marker in the
+/// monitor path. This cannot distinguish a custom EDID or prove a PnP node.
+/// The same driver installed by another app is the device our tasks control.
 pub fn is_vdd_monitor(monitor_path: &str) -> bool {
     monitor_path.to_ascii_uppercase().contains(VDD_MONITOR)
 }
@@ -370,6 +385,46 @@ mod windows_impl {
         } else {
             String::new()
         }
+    }
+
+    pub(crate) fn active_paths() -> Option<Vec<super::ActivePath>> {
+        use windows::Win32::Devices::Display::{
+            DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, QDC_ONLY_ACTIVE_PATHS,
+        };
+        let (paths, modes) = display_config(QDC_ONLY_ACTIVE_PATHS)?;
+        paths
+            .iter()
+            .map(|path| {
+                let monitor = monitor_path(path);
+                if monitor.is_empty() || !path.targetInfo.targetAvailable.as_bool() {
+                    return None;
+                }
+                // In the virtual-mode layout the low half is the clone group
+                // and the high half is the source mode index.
+                let raw = unsafe { path.sourceInfo.Anonymous.modeInfoIdx };
+                let index = if path.flags
+                    & windows::Win32::Graphics::Gdi::DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE
+                    != 0
+                {
+                    raw >> 16
+                } else {
+                    raw
+                };
+                let mode = modes.get(index as usize)?;
+                if mode.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE
+                    || mode.id != path.sourceInfo.id
+                    || mode.adapterId != path.sourceInfo.adapterId
+                {
+                    return None;
+                }
+                let pos = unsafe { mode.Anonymous.sourceMode.position };
+                Some(super::ActivePath {
+                    source: crate::gpu_preference::source_name(path)?,
+                    virtual_display: super::is_vdd_monitor(&monitor),
+                    position: (pos.x, pos.y),
+                })
+            })
+            .collect()
     }
 
     /// Every active path, then each available target no active path uses.
