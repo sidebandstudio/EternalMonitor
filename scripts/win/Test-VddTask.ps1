@@ -101,34 +101,69 @@ if ($case.Code -ne 1 -or $case.Output -notmatch '0x80070002' -or $case.Output -m
 }
 Write-Output 'VDD task checks passed: waits for the other direction, earlier runs, hung Enable bound, queued instance, no -After, missing tasks'
 
-# Run the real Setup registration on the Windows CI runner. Use an inert
-# toggle so Setup's final direct disable cannot touch a display device.
-$names = 'EternalMonitor VDD Enable', 'EternalMonitor VDD Disable'
-foreach ($name in $names) {
-    if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
-        throw "Refusing to replace existing scheduled task '$name' in the test."
-    }
+# The mock cases above also run in a normal shell.
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$user = [Security.Principal.WindowsPrincipal]::new($identity)
+if (!$user.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Write-Output 'Skipping real VDD task registration checks: this shell is not elevated.'
+    exit 0
 }
-$fixture = Join-Path $env:TEMP ('em-vdd-task-setup-test-' + [guid]::NewGuid().ToString('N'))
+
+$id = [guid]::NewGuid().ToString('N')
+$prefix = "EternalMonitor VDD Test $id"
+$names = "$prefix Enable", "$prefix Disable"
+# A task surviving an interrupted test must not run a script a normal user can edit.
+$fixture = Join-Path $env:ProgramFiles "em-vdd-task-setup-test-$id"
+$created = @()
+New-Item -ItemType Directory -Path $fixture | Out-Null
 try {
-    New-Item -ItemType Directory -Path $fixture | Out-Null
     Copy-Item (Join-Path $PSScriptRoot '..\..\installer\scripts\vdd-tasks-setup.ps1') $fixture
     Set-Content -Path (Join-Path $fixture 'vdd-toggle.ps1') -Value 'param([string]$Action); exit 0'
-    & (Join-Path $fixture 'vdd-tasks-setup.ps1')
+
+    # Install older definitions with sleeping actions. Allow starts so this
+    # test also works on a laptop already on battery.
+    $action = New-ScheduledTaskAction -Execute "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe" `
+        -Argument '-NoProfile -NonInteractive -Command "Start-Sleep -Seconds 300"'
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $oldSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries
+    $service = New-Object -ComObject Schedule.Service
+    $service.Connect()
+    $folder = $service.GetFolder('\')
     foreach ($name in $names) {
-        $settings = (Get-ScheduledTask -TaskName $name).Settings
+        Register-ScheduledTask -TaskPath '\' -TaskName $name -Action $action -Principal $principal -Settings $oldSettings | Out-Null
+        $created += $name
+        Start-ScheduledTask -TaskPath '\' -TaskName $name
+    }
+    $deadline = (Get-Date).AddSeconds(30)
+    foreach ($name in $names) {
+        while ($folder.GetTask($name).State -ne 4) {
+            if ((Get-Date) -ge $deadline) { throw "The sleeping test task '$name' did not start." }
+            Start-Sleep -Milliseconds 100
+        }
+    }
+
+    $marker = Join-Path $fixture 'verified'
+    & (Join-Path $fixture 'vdd-tasks-setup.ps1') -TaskNamePrefix $prefix -ResultMarker $marker
+    foreach ($name in $names) {
+        $task = $folder.GetTask($name)
+        if ($task.State -in @(2, 4) -or $task.GetInstances(0).Count -ne 0) {
+            throw "An instance of '$name' survived task registration."
+        }
+        $settings = (Get-ScheduledTask -TaskPath '\' -TaskName $name).Settings
         if ($settings.DisallowStartIfOnBatteries -ne $false -or $settings.StopIfGoingOnBatteries -ne $false) {
             throw "'$name' must be allowed to start and keep running on battery."
         }
     }
-    Write-Output 'Setup registered both tasks with battery power allowed.'
+    if (!(Test-Path -LiteralPath $marker)) { throw 'Setup did not record verified task registration.' }
+    Write-Output 'Setup stopped both old task instances and registered both tasks with battery power allowed.'
 } finally {
-    foreach ($name in $names) {
-        if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
-            Unregister-ScheduledTask -TaskName $name -Confirm:$false
-        }
+    $cleanupErrors = @()
+    foreach ($name in $created) {
+        Stop-ScheduledTask -TaskPath '\' -TaskName $name -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskPath '\' -TaskName $name -Confirm:$false -ErrorAction SilentlyContinue -ErrorVariable +cleanupErrors
     }
     Remove-Item -LiteralPath $fixture -Recurse -Force -ErrorAction SilentlyContinue
+    if ($cleanupErrors) { throw "Could not remove the VDD test tasks: $cleanupErrors" }
 }
 # Some cases end their child with exit code 1 on purpose. Without this the
 # last one stays in $LASTEXITCODE, and a CI step that ends with it fails.

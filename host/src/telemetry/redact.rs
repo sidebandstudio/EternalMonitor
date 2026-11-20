@@ -177,7 +177,6 @@ const DIAGNOSTIC_KEYS: &[&str] = &[
     "bypass_rules",
     "lan",
     "verdict",
-    "power_source",
     // The virtual display snapshot.
     "driver",
     "tech",
@@ -936,6 +935,18 @@ impl Fields {
                 || description.is_some_and(|(_, field)| field == Some(key.as_str()))
             {
                 kept.push((equals + 1, end));
+            } else if key == "power_source" {
+                // The startup report ends this token with the details field's quote.
+                let start = equals + 1;
+                let token: String = chars
+                    .iter()
+                    .skip(start)
+                    .copied()
+                    .take_while(|c| !c.is_whitespace() && *c != '"')
+                    .collect();
+                if matches!(token.as_str(), "ac" | "battery" | "unknown") {
+                    kept.push((start, start + token.chars().count()));
+                }
             }
             if !NAME_FIELDS.contains(&key.as_str()) {
                 values.push((equals + 1, end));
@@ -1894,6 +1905,26 @@ mod tests {
                 // A path inside a diagnostic value still loses the name.
                 (r"reason=D:\no_frames\x", r"reason=D:\%USERNAME%\x"),
             ],
+        );
+    }
+
+    #[test]
+    fn power_source_only_exempts_the_known_token() {
+        let names = Names::new(None, None, Some("ExamplePC"));
+        assert_cases(
+            &names,
+            &[
+                ("power_source=ExamplePC", "power_source=%COMPUTERNAME%"),
+                (
+                    "power_source=battery ExamplePC",
+                    "power_source=battery %COMPUTERNAME%",
+                ),
+            ],
+        );
+        let names = Names::new(None, None, Some("battery-laptop"));
+        assert_cases(
+            &names,
+            &[("power_source=battery-laptop", "power_source=%COMPUTERNAME%")],
         );
     }
 

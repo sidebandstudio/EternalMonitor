@@ -41,10 +41,24 @@ function Get-Failures([string]$Text) {
         $failures += 'The vendor setup does not run under NeedsVddInstall'
     }
 
-    # The tasks: whenever the driver steps have not failed, as in 0.3.4.
+    # A driver failure must never skip task registration. Keep the existing
+    # repair/verify path gated by the failure state before registration.
     $tasks = $Text -split "\r?\n" | Where-Object { $_ -match '^Filename: "powershell\.exe";.*vdd-tasks-setup\.ps1' }
-    if (@($tasks).Count -ne 1 -or $tasks -notmatch 'Check: VddInstallSucceeded; BeforeInstall: RepairVddDriver; AfterInstall: VerifyVddDriver') {
-        $failures += 'The driver tasks are not set up under VddInstallSucceeded'
+    if (@($tasks).Count -ne 1 -or $tasks -match 'Check:|skipifsilent|postinstall' -or
+        $tasks -notmatch '-ResultMarker ""\{tmp\}\\vdd-tasks-verified""' -or
+        $tasks -notmatch 'BeforeInstall: PrepareVddTasks; AfterInstall: FinishVddTasks') {
+        $failures += 'Setup does not register and check the tasks on every driver-bundled install'
+    }
+    $prepare = Get-Routine $Text 'procedure PrepareVddTasks;'
+    if ($prepare -notmatch '(?s)begin\s*VddFailedBeforeTasks := VddInstallFailed;\s*if not VddFailedBeforeTasks then\s*RepairVddDriver;\s*end;') {
+        $failures += 'Setup does not repair the driver when the earlier driver step succeeded'
+    }
+    $finish = Get-Routine $Text 'procedure FinishVddTasks;'
+    if ($finish -notmatch '(?s)if not FileExists\(Marker\) then begin.*?ExecAndLogOutput\(.*?vdd-tasks-setup\.ps1.*?-ResultMarker.*?ewWaitUntilTerminated' -or
+        $finish -notmatch '(?s)if FileExists\(Marker\) then\s*Log\([^\n]*\)\s*else\s*Log\([^\n]*after two attempts' -or
+        $finish -notmatch '(?s)if not VddFailedBeforeTasks then\s*VerifyVddDriver;\s*end;' -or
+        $finish -match 'FailVddStep\(|VddInstallFailed\s*:=|RaiseException\(') {
+        $failures += 'Setup does not retry unverified registration once and log the result independently of the driver'
     }
 
     # A failed step fails Setup on Windows 11 only (build 22000 and later): it sets the failure
@@ -80,7 +94,10 @@ $broken = [ordered]@{
     'build not read' = $iss.Replace('Result := Windows.Build >= FirstWindows11Build;', 'Result := True;')
     'fresh install skipped on Windows 10' = $iss.Replace('Result := not ReadVddRegistration(Directory, Version);', 'Result := IsWindows11 and not ReadVddRegistration(Directory, Version);')
     'vendor setup unchecked' = $iss.Replace('Check: NeedsVddInstall;', 'Check: VddInstallSucceeded;')
-    'tasks on Windows 11 only' = $iss.Replace('Check: VddInstallSucceeded; BeforeInstall: RepairVddDriver', 'Check: IsWindows11; BeforeInstall: RepairVddDriver')
+    'tasks on Windows 11 only' = $iss.Replace('BeforeInstall: PrepareVddTasks;', 'Check: IsWindows11; BeforeInstall: PrepareVddTasks;')
+    'tasks skipped after a driver failure' = $iss.Replace('BeforeInstall: PrepareVddTasks;', 'Check: VddInstallSucceeded; BeforeInstall: PrepareVddTasks;')
+    'retry skipped' = $iss.Replace('if not FileExists(Marker) then begin', 'if False then begin')
+    'retry failure not logged' = $iss.Replace('could not be verified after two attempts', 'done')
     'repair skipped on Windows 10' = Add-AfterBegin $iss 'procedure RepairVddDriver;' '  if not IsWindows11 then exit;'
     'verify skipped on Windows 10' = Add-AfterBegin $iss 'procedure VerifyVddDriver;' '  if not IsWindows11 then exit;'
     'repair skipped' = Add-AfterBegin $iss 'procedure RepairVddDriver;' '  exit;'

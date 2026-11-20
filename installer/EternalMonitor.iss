@@ -220,10 +220,10 @@ Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Fil
 Filename: "{app}\driver\vdd-setup-x64.exe"; Parameters: "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART"; StatusMsg: "{cm:DriverStatus}"; Flags: waituntilterminated; Check: NeedsVddInstall; AfterInstall: RecordVddOwnership
 ; Register the enable/disable scheduled tasks and leave the virtual display OFF by default —
 ; EternalMonitor turns it on only while streaming to it, so there's no phantom monitor.
-; A preserved driver whose device was removed or broke is repaired first. On Windows 10 a
-; repair or check that fails is logged and Setup goes on (see FailVddStep).
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\vdd-tasks-setup.ps1"""; StatusMsg: "{cm:DisplayStatus}"; Flags: runhidden waituntilterminated; Check: VddInstallSucceeded; BeforeInstall: RepairVddDriver; AfterInstall: VerifyVddDriver
-; After the Disable above, and also when a failed driver step skipped it.
+; A preserved driver whose device was removed or broke is repaired first.
+; Even after a driver failure, replace the task definitions for future runs.
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\vdd-tasks-setup.ps1"" -ResultMarker ""{tmp}\vdd-tasks-verified"""; StatusMsg: "{cm:DisplayStatus}"; Flags: runhidden waituntilterminated logoutput; BeforeInstall: PrepareVddTasks; AfterInstall: FinishVddTasks
+; Check the screens after the display steps, including after a failure.
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\display-guard.ps1"" -Action check -Path ""{tmp}\display-layout.json"""; Flags: runhidden waituntilterminated logoutput
 #endif
 ; Launch the app at the end.
@@ -250,6 +250,9 @@ Type: files; Name: "{app}\driver\installed-by-eternalmonitor.txt"
 [Code]
 var
   VddInstallFailed: Boolean;
+#ifdef IncludeDriver
+  VddFailedBeforeTasks: Boolean;
+#endif
 
 function VddInstallSucceeded: Boolean;
 begin
@@ -377,6 +380,45 @@ begin
     Message := 'Setup could not repair the virtual display driver. Restart the PC and run this setup again. If it still fails, uninstall "Virtual Display Driver" in Windows Settings > Apps > Installed apps, then run this setup again.';
   end;
   FailVddStep(Message);
+end;
+
+procedure PrepareVddTasks;
+begin
+  VddFailedBeforeTasks := VddInstallFailed;
+  if not VddFailedBeforeTasks then
+    RepairVddDriver;
+end;
+
+procedure FinishVddTasks;
+var
+  Marker: String;
+  ExitCode: Integer;
+begin
+  { Inno logs the [Run] exit code but doesn't act on it. The script writes the
+    marker after reading back both tasks and before trying to disable the device. }
+  Marker := ExpandConstant('{tmp}\vdd-tasks-verified');
+  if not FileExists(Marker) then begin
+    Log('Virtual display task registration was not verified. Retrying.');
+    try
+      if ExecAndLogOutput(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+          '-NoProfile -ExecutionPolicy Bypass -File "' +
+          ExpandConstant('{app}\scripts\vdd-tasks-setup.ps1') + '" -ResultMarker "' + Marker + '"',
+          '', SW_SHOWNORMAL, ewWaitUntilTerminated, ExitCode, nil) then
+        Log('Virtual display task registration retry exited with code ' + IntToStr(ExitCode))
+      else
+        Log('Could not start the virtual display task registration retry: ' + IntToStr(ExitCode));
+    except
+      Log('Virtual display task registration retry failed: ' + GetExceptionMessage);
+    end;
+  end;
+  { Existing display failure messages are about the driver. A task-only
+    failure belongs in the Setup log until there is a message for it. }
+  if FileExists(Marker) then
+    Log('Both virtual display tasks were verified.')
+  else
+    Log('Virtual display task registration could not be verified after two attempts.');
+  if not VddFailedBeforeTasks then
+    VerifyVddDriver;
 end;
 
 procedure RecordVddOwnership;

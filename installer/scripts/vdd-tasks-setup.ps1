@@ -10,7 +10,13 @@
 # ROOT\DISPLAY\0000 fallback) breaks whenever the driver enumerates under a different id or
 # reports a different friendly name.
 
+param(
+    [ValidatePattern('^[A-Za-z0-9 -]+$')]
+    [string]$TaskNamePrefix = 'EternalMonitor VDD',
+    [string]$ResultMarker
+)
 $ErrorActionPreference = 'Stop'
+$names = "$TaskNamePrefix Enable", "$TaskNamePrefix Disable"
 
 $toggle = Join-Path $PSScriptRoot 'vdd-toggle.ps1'
 if (-not (Test-Path $toggle)) {
@@ -22,32 +28,50 @@ $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccou
 $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
 
-function Register-VddTask([string]$Name, [string]$ToggleAction) {
-    $argument = "-NoProfile -ExecutionPolicy Bypass -File `"$toggle`" -Action $ToggleAction"
-    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argument
-    Register-ScheduledTask -TaskName $Name -Action $action -Principal $principal -Settings $settings -Force | Out-Null
-}
-
-Register-VddTask 'EternalMonitor VDD Enable'  'enable'
-Register-VddTask 'EternalMonitor VDD Disable' 'disable'
-
-# Let a normal host process read/run the fixed SYSTEM tasks. Users receive no
-# permission to change the task action or its protected Program Files script.
 $service = New-Object -ComObject Schedule.Service
 $service.Connect()
 $folder = $service.GetFolder('\')
-foreach ($name in 'EternalMonitor VDD Enable', 'EternalMonitor VDD Disable') {
-    $folder.GetTask($name).SetSecurityDescriptor('D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;BU)', 0)
-}
 
-# Verify the tasks actually registered — fail the install loudly if not, instead of silently
-# leaving the host unable to control the virtual display at runtime.
-foreach ($name in 'EternalMonitor VDD Enable', 'EternalMonitor VDD Disable') {
-    if (-not (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue)) {
-        Write-Error "Failed to register scheduled task '$name'."
-        exit 1
+# Replacing the definitions does not establish that an old instance went away.
+# Stop all instances before replacing either definition.
+foreach ($name in $names) {
+    try {
+        $task = $folder.GetTask($name)
+        $task.Stop(0)
+        $deadline = (Get-Date).AddSeconds(5)
+        while ($folder.GetTask($name).State -in @(2, 4)) {
+            if ((Get-Date) -ge $deadline) { throw "Previous VDD task did not stop: $name" }
+            Start-Sleep -Milliseconds 50
+        }
+    } catch {
+        # ERROR_FILE_NOT_FOUND and SCHED_E_TASK_NOT_RUNNING are expected if
+        # the task is absent or its last instance has already finished.
+        if ($_.Exception.GetBaseException().HResult -notin @(-2147024894, -2147216629)) { throw }
     }
 }
+
+function Register-VddTask([string]$Name, [string]$ToggleAction) {
+    $argument = "-NoProfile -ExecutionPolicy Bypass -File `"$toggle`" -Action $ToggleAction"
+    $action = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $argument
+    Register-ScheduledTask -TaskPath '\' -TaskName $Name -Action $action -Principal $principal -Settings $settings -Force | Out-Null
+}
+
+Register-VddTask $names[0] 'enable'
+Register-VddTask $names[1] 'disable'
+
+# Let a normal host process read/run the fixed SYSTEM tasks. Users receive no
+# permission to change the task action or its protected Program Files script.
+foreach ($name in $names) {
+    $task = $folder.GetTask($name)
+    $task.SetSecurityDescriptor('D:(A;;FA;;;SY)(A;;FA;;;BA)(A;;GRGX;;;BU)', 0)
+    $actual = $task.Definition.Settings
+    if ($actual.DisallowStartIfOnBatteries -ne $false -or $actual.StopIfGoingOnBatteries -ne $false) {
+        throw "Scheduled task '$name' did not retain its battery settings."
+    }
+}
+
+# Setup checks this separately from the device toggle, which requires a working driver.
+if ($ResultMarker) { [IO.File]::WriteAllText($ResultMarker, 'verified') }
 
 # Off by default — the host turns it on only while streaming to it (and only once an iPad
 # connects). Resolve + disable via the same toggle script so the logic stays in one place.
