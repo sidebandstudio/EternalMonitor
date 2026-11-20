@@ -21,6 +21,7 @@ use crate::stats::PIPELINE_STATS;
 
 pub mod input;
 use input::{select_input, EncoderInput};
+mod software_rate;
 #[cfg(target_os = "macos")]
 mod vimage;
 
@@ -164,6 +165,10 @@ fn run_encode_loop(
     let mut last_keyframe_reopen: Option<Instant> = None;
     let mut pending_keyframe = false;
     let mut bitrate_pacer = BitratePacer::default();
+    // Capture runs at the stream's rate until a software encoder cannot
+    // keep up with it.
+    let mut software_rate =
+        software_rate::SoftwareRate::new(std::sync::Arc::clone(&shared.cpu_fps_limit));
 
     // Guarantee the very first frame of every pipeline is an IDR for all encoders, so the
     // iPad never sits in `waitingForSyncSample` after a connect or pipeline restart.
@@ -235,7 +240,7 @@ fn run_encode_loop(
         }
 
         let desired_bitrate = shared.abr_current_bps.load(Ordering::SeqCst).max(500_000);
-        let target_fps = shared.effective_fps();
+        let stream_fps = shared.effective_fps();
 
         // HEVC negotiation, re-checked every frame so a settings toggle or a
         // new session takes effect at the next frame boundary: the user's
@@ -270,6 +275,9 @@ fn run_encode_loop(
             (Some(_), Some(state)) => state.opened_encoder.clone(),
             _ => desired_encoder,
         };
+        // A software session reopens at the rate capture is held to.
+        software_rate.before_frame(session_id, background.is_some());
+        let target_fps = software_rate::encode_fps(&desired_encoder, &shared);
         forget_failed_reopen(
             &mut failed_reopen,
             &mut negotiated,
@@ -703,9 +711,10 @@ fn run_encode_loop(
         // Conversion finished synchronously. Recycle capture's buffer before
         // the codec or sender can block, including on the direct macOS path.
         drop(raw_frame.data);
+        let convert_time = convert_start.elapsed();
         PIPELINE_STATS
             .lock()
-            .record_convert(convert_start.elapsed().as_micros());
+            .record_convert(convert_time.as_micros());
         let pts = encoder.next_pts(raw_frame.timestamp, raw_frame.frame_number);
         encoder.frame.set_pts(Some(pts));
         let force_idr = take_keyframe_request(
@@ -743,10 +752,21 @@ fn run_encode_loop(
         }
 
         let mut keyframe_out = false;
+        // The frame's cost, for a software encoder's rate, once its packet
+        // is out. A picture given again is not a new one.
+        let mut costed = raw_frame.cached || given_again;
         while reset_refused.is_none() {
             match encoder.encoder.receive_packet(&mut encoder.packet) {
                 Ok(()) => {
                     let encode_us = encode_start.elapsed().as_micros();
+                    if !std::mem::replace(&mut costed, true) {
+                        software_rate.note_encoded(
+                            &encoder.opened_encoder,
+                            software_rate::frame_cost(convert_time + encode_start.elapsed()),
+                            stream_fps,
+                            Instant::now(),
+                        );
+                    }
                     let packet_bytes = encoder.packet.data().unwrap_or_default();
                     let packet_is_key = encoder.packet.is_key();
                     let (nal_data, is_keyframe) = if opened_is_hevc {
@@ -3410,6 +3430,237 @@ mod tests {
             frame_number,
         );
         rows
+    }
+
+    /// The encode loop with real libx264 and a cost of 20 ms a frame (the
+    /// field case at 120 fps): the loop's measurements hold capture to 45
+    /// fps and reopen the session at 45. A new viewer session after that
+    /// starts without the limit: its first frame reopens the session at
+    /// 120, and the frames after it reopen nothing.
+    #[test]
+    fn the_encode_loop_holds_a_slow_libx264_to_45_fps_and_a_new_session_to_120() {
+        use std::sync::{mpsc as std_mpsc, Arc};
+        ffmpeg_next::init().unwrap();
+        let lines = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
+        struct Sink(Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let text = || String::from_utf8_lossy(&lines.lock()).into_owned();
+        let opened_at = |text: &str| -> Vec<String> {
+            text.lines()
+                .filter(|line| line.contains("Encoder opened"))
+                .filter_map(|line| line.split(" fps=").nth(1))
+                .map(|rest| rest.split(' ').next().unwrap_or_default().to_string())
+                .collect()
+        };
+
+        let (producer, consumer) = crate::capture::frame_slot();
+        let (tx, mut rx) = mpsc::channel(NAL_CHANNEL_CAPACITY);
+        let shared = SharedControl::new(0, 8_000_000);
+        shared.running.store(true, Ordering::SeqCst);
+        shared.target_fps.store(120, Ordering::SeqCst);
+        *shared.encoder_override.lock() = Some("libx264".into());
+        let generation = crate::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
+        let stage = {
+            let shared = shared.clone();
+            let writer = Arc::clone(&lines);
+            std::thread::spawn(move || {
+                let subscriber = tracing_subscriber::fmt()
+                    .with_ansi(false)
+                    .with_writer(move || Sink(Arc::clone(&writer)))
+                    .finish();
+                crate::logging::prepare_log_capture();
+                software_rate::FRAME_COST.with(|cost| cost.set(Some(Duration::from_millis(20))));
+                tracing::subscriber::with_default(subscriber, || {
+                    run_encode_stage(
+                        consumer,
+                        tx,
+                        shared,
+                        GpuInfo::software_fallback(),
+                        generation,
+                    )
+                    .map_err(|e| e.to_string())
+                })
+            })
+        };
+        let (packets, encoded) = std_mpsc::channel();
+        let collector = std::thread::spawn(move || {
+            while rx.blocking_recv().is_some() {
+                if packets.send(()).is_err() {
+                    break;
+                }
+            }
+        });
+        let mut number = 0;
+        // One picture, and its packet.
+        let mut frame = || {
+            number += 1;
+            producer.publish(RawFrame {
+                frame_number: number,
+                timestamp: Instant::now(),
+                data: Arc::new(synthetic_capture(64, 48, number)),
+                width: 64,
+                height: 48,
+                cached: false,
+            });
+            encoded
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the frame is encoded");
+        };
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while shared.cpu_fps_limit.load(Ordering::SeqCst) != 45 {
+            assert!(Instant::now() < deadline, "no limit: {}", text());
+            frame();
+        }
+        assert_eq!(shared.capture_fps(), 45);
+        frame();
+        assert_eq!(opened_at(&text()), ["120", "45"], "{}", text());
+
+        // A new viewer.
+        let hello =
+            eternal_wire::v2::control::ControlMessage::Hello2(eternal_wire::v2::control::Hello2 {
+                proto_min: 2,
+                proto_max: 2,
+                client_nonce: 9,
+                listen_port: 50000,
+                decoder_caps: 1,
+                feature_caps: 0,
+                screen_px_w: 2420,
+                screen_px_h: 1668,
+                screen_pt_w: 1210,
+                screen_pt_h: 834,
+                refresh_hz: 120,
+                device_name: "Test iPad".into(),
+                device_id: 0,
+                preferred_fps: 0,
+                auth_token: [0; 16],
+                pairing_code: 0,
+            });
+        struct Config;
+        impl crate::transport::session::ConfigSource for Config {
+            fn stream_config(&self) -> eternal_wire::v2::control::StreamConfig {
+                Default::default()
+            }
+            fn host_name(&self) -> String {
+                "TEST".into()
+            }
+        }
+        shared.session.lock().handle_control(
+            crate::transport::link::PeerId::udp("10.0.0.5:50000".parse().unwrap()),
+            0,
+            hello,
+            &Config,
+            Instant::now(),
+        );
+        assert!(shared.client_connected());
+        frame();
+        assert_eq!(opened_at(&text()), ["120", "45", "120"], "{}", text());
+        for _ in 0..5 {
+            frame();
+        }
+        assert_eq!(
+            opened_at(&text()),
+            ["120", "45", "120"],
+            "the new session's frames reopen nothing: {}",
+            text()
+        );
+
+        producer.close();
+        stage.join().unwrap().unwrap();
+        collector.join().unwrap();
+    }
+
+    /// kbit/s a real software session opened at `opened_fps` sends for 20 s
+    /// of moving pictures captured at `cadence`, at a 1 Mbit/s target.
+    fn software_kbps(encoder: &str, opened_fps: u32, cadence: u32) -> f64 {
+        let (width, height) = (320, 180);
+        let mut state = EncoderState::new(
+            encoder,
+            width,
+            height,
+            1_000_000,
+            opened_fps,
+            &mut EncoderInput::Yuv420,
+            Opening::First,
+            &mut || {},
+        )
+        .unwrap_or_else(|error| panic!("{encoder}: {error}"));
+        let frames = u64::from(cadence) * 20;
+        let start = Instant::now();
+        // Grain the test pattern leaves out, as on a real desktop: a plane
+        // twice the picture, read from a new place each frame.
+        let picture = (width * height * 4) as usize;
+        let mut noise = 0x2545_F491_4F6C_DD1Du64;
+        let grain: Vec<u8> = (0..picture * 2)
+            .map(|_| {
+                noise ^= noise << 13;
+                noise ^= noise >> 7;
+                noise ^= noise << 17;
+                (noise & 0x1f) as u8
+            })
+            .collect();
+        let mut bytes = 0;
+        for n in 1..=frames {
+            let mut rows = synthetic_capture(width, height, n);
+            let offset = (n as usize * 4099) % picture;
+            for (pixel, grain) in rows[..picture].iter_mut().zip(&grain[offset..]) {
+                *pixel = pixel.saturating_add(*grain);
+            }
+            state.convert(&rows, (width * 4) as usize).unwrap();
+            let captured = start + Duration::from_secs(n) / cadence;
+            let pts = state.next_pts(captured, n);
+            state.frame.set_pts(Some(pts));
+            state.send_frame(pts, captured, n).unwrap();
+            while state.encoder.receive_packet(&mut state.packet).is_ok() {
+                bytes += state.packet.size();
+            }
+        }
+        bytes as f64 * 8.0 / 20.0 / 1000.0
+    }
+
+    /// x264's and x265's zero-latency rate control gives each frame
+    /// `bitrate / fps` of the rate the session opened at, whatever the
+    /// timestamps say. A session the limit holds to 45 fps opens at 45 and
+    /// sends the bitrate it is given; one at the stream's 120, as before,
+    /// sent about 45/120 of it. With no limit, and for hardware, sessions
+    /// open at the stream's rate as before.
+    #[test]
+    fn a_software_session_held_to_45_fps_sends_its_whole_bitrate() {
+        ffmpeg_next::init().unwrap();
+        let shared = SharedControl::new(9876, 15_000_000);
+        shared.target_fps.store(120, Ordering::SeqCst);
+        assert_eq!(software_rate::encode_fps("libx264", &shared), 120);
+        shared.cpu_fps_limit.store(45, Ordering::SeqCst);
+        assert_eq!(software_rate::encode_fps("h264_nvenc", &shared), 120);
+        for encoder in ["libx264", "libx265"] {
+            if ffmpeg_next::encoder::find_by_name(encoder).is_none() {
+                eprintln!("{encoder} is not in this FFmpeg build");
+                continue;
+            }
+            let opened = software_rate::encode_fps(encoder, &shared);
+            assert_eq!(opened, 45);
+            let limited = software_kbps(encoder, opened, 45);
+            let unlimited = software_kbps(encoder, shared.effective_fps(), 45);
+            eprintln!(
+                "{encoder} at 45 fps: opened at 45 {limited:.0} kbps, at 120 {unlimited:.0} kbps"
+            );
+            assert!(
+                (900.0..=1100.0).contains(&limited),
+                "{encoder} opened at 45: {limited:.0} kbps of 1000"
+            );
+            assert!(
+                unlimited < 600.0,
+                "{encoder} opened at 120: {unlimited:.0} kbps"
+            );
+        }
     }
 
     /// A screen with an odd height (1680x945, from a report) or width
