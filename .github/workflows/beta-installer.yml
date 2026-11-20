@@ -276,12 +276,27 @@ jobs:
         shell: pwsh
         run: |
           .\scripts\win\Test-SetupInstall.ps1 -Setup build\out\EternalMonitor-Setup.exe `
-              -LogDirectory "$env:RUNNER_TEMP\setup-smoke"
+              -LogDirectory build\setup-smoke
+
+      - name: Check the Setup smoke logs for secret values
+        if: always() && github.event_name == 'pull_request'
+        id: smoke-log-scan
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+        run: >-
+          python scripts/artifact_secrets.py scan
+          --secrets ETERNAL_DIAGNOSTICS_ENDPOINT,ETERNAL_DIAGNOSTICS_INGEST_KEY,GITHUB_TOKEN
+          --optional AZURE_CLIENT_ID,AZURE_TENANT_ID,AZURE_SUBSCRIPTION_ID
+          build/setup-smoke
 
       - name: Upload Setup smoke logs
-        if: always() && github.event_name == 'pull_request'
+        if: always() && github.event_name == 'pull_request' && steps.smoke-log-scan.outcome == 'success'
         uses: actions/upload-artifact@v4
         with:
           name: setup-smoke-logs
-          path: ${{ runner.temp }}/setup-smoke/*.log
+          path: build/setup-smoke
           if-no-files-found: ignore
