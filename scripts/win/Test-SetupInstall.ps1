@@ -27,7 +27,11 @@ function Invoke-InstallerPhase([string]$Phase, [string]$Exe, [string[]]$Flags) {
         (Start-Process -FilePath $using:Exe -ArgumentList $using:commandLine `
             -WorkingDirectory $using:LogDirectory -PassThru -Wait).ExitCode
     }
+    $retryJob = $null
     try {
+        if ($Phase -eq 'upgrade') {
+            $retryJob = Start-ThreadJob -FilePath (Join-Path $PSScriptRoot 'Block-SetupSmokeMarker.ps1') -ArgumentList $log
+        }
         if (!(Wait-Job $job -Timeout $limit)) {
             try {
                 $capture = @{Phase=$Phase; LogDirectory=$LogDirectory; SetupLog=$log; StartedAt=$startedAt}
@@ -56,8 +60,13 @@ function Invoke-InstallerPhase([string]$Phase, [string]$Exe, [string[]]$Flags) {
         if ($null -eq $code -or $code -ne 0) {
             throw "$Phase expected exit code 0, got '$code'. Setup code 20 means driver failure and 21 means unverified task registration. See $log."
         }
+        if ($retryJob) {
+            if (!(Wait-Job $retryJob -Timeout 2)) { throw 'Upgrade did not reach the deliberately blocked marker retry.' }
+            Receive-Job $retryJob
+        }
         Get-Content -LiteralPath $log -Raw
     } finally {
+        if ($retryJob) { Remove-Job $retryJob -Force }
         Remove-Job $job -Force
     }
 }
@@ -164,6 +173,11 @@ try {
     $upgradeLog = Invoke-InstallerPhase 'upgrade' $Setup $setupFlags
     Assert-VddTasks 'upgrade'
     Assert-TaskRegistrationLog 'upgrade' $upgradeLog
+    if ([regex]::Matches($upgradeLog, 'Virtual display task registration was not verified\. Retrying\.').Count -ne 1 -or
+        $upgradeLog -notmatch 'Virtual display task registration retry exited with code 0\b') {
+        throw 'Upgrade did not retry the deliberately blocked marker write exactly once and succeed.'
+    }
+    Write-Host 'Upgrade recovered from the first marker write failure on one retry.'
     $upgradeOwnership = Test-Path -LiteralPath $ownershipPath -PathType Leaf
 
     $null = Invoke-InstallerPhase 'uninstall' $uninstaller @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART')

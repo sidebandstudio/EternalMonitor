@@ -271,6 +271,13 @@ jobs:
           name: EternalMonitor-Setup-beta
           path: build\out\EternalMonitor-Setup.exe
 
+      - name: Approve the bundled driver publisher for the smoke test
+        if: github.event_name == 'pull_request'
+        shell: pwsh
+        run: |
+          .\scripts\win\Trust-SetupSmokePublisher.ps1 -VendorSetup "installer\vendor\vdd\$env:VDD_ASSET" `
+              -LogDirectory build\setup-smoke
+
       - name: Smoke test Setup install, upgrade and uninstall
         if: github.event_name == 'pull_request'
         shell: pwsh
