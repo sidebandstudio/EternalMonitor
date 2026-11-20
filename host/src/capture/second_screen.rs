@@ -48,7 +48,7 @@ pub(crate) const PANEL_LOST_BEFORE: &str = "panel_lost_before";
 use memory::{Hold, Memory};
 
 #[cfg(any(windows, test, debug_assertions))]
-use super::{wait_for_virtual_output, AttachResult, OutputInfo, Reuse};
+use super::{wait_for_virtual_output, AttachPoll, AttachResult, OutputInfo, Reuse};
 #[cfg(any(windows, test, debug_assertions))]
 use crate::vdd::EnableReport;
 #[cfg(any(windows, test, debug_assertions))]
@@ -1285,6 +1285,10 @@ pub fn note_attached(shared: &SharedControl, device_name: String) {
     let mut status = shared.vdd_status.lock();
     *status = VddStatus::Active;
     let mut state = shared.second_screen.lock();
+    record_attached(&mut state);
+}
+
+fn record_attached(state: &mut State) {
     state.switch_pending = true;
     state.proving = None;
     state.proven = None;
@@ -1333,6 +1337,204 @@ fn listed(shared: &SharedControl, driver: &impl Driver) -> Vec<OutputInfo> {
     outputs
 }
 
+/// One worker observation. Only a wholly unreadable identity permits the
+/// historical name-difference rule. A partial or ambiguous map fails closed.
+#[cfg(any(windows, test, debug_assertions))]
+struct Desktop {
+    outputs: Vec<OutputInfo>,
+    paths: Option<crate::vdd_snapshot::ConnectedDisplays>,
+}
+
+#[cfg(any(windows, test, debug_assertions))]
+impl Desktop {
+    fn names_only(&self) -> bool {
+        let mut names = std::collections::HashSet::new();
+        if self
+            .outputs
+            .iter()
+            .any(|output| !names.insert(output.device_name.to_ascii_uppercase()))
+        {
+            return false;
+        }
+        self.paths.as_ref().is_none_or(|paths| {
+            // Even without monitor IDs, a shared or unmatched source
+            // disqualifies a new-name guess.
+            !paths.active.is_empty()
+                && paths.inactive.iter().all(Option::is_none)
+                && paths.active.len() == self.outputs.len()
+                && paths.active.iter().all(|path| {
+                    path.virtual_display.is_none()
+                        && (path.source.is_empty()
+                            || names.remove(&path.source.to_ascii_uppercase()))
+                })
+        })
+    }
+
+    fn matching(&self, expected: &OutputInfo) -> Option<OutputInfo> {
+        self.virtual_output()
+            .filter(|output| {
+                output.device_name == expected.device_name
+                    && output.adapter_id == expected.adapter_id
+            })
+            .cloned()
+    }
+
+    fn only_virtual(&self) -> bool {
+        self.paths.as_ref().is_some_and(|paths| {
+            !paths.active.is_empty() && paths.active.iter().all(|p| p.virtual_display == Some(true))
+        })
+    }
+
+    fn mapped_sources(&self) -> Option<Vec<(&OutputInfo, bool)>> {
+        let paths = &self.paths.as_ref()?.active;
+        let mut outputs: std::collections::HashMap<_, _> = self
+            .outputs
+            .iter()
+            .map(|output| (output.device_name.to_ascii_uppercase(), output))
+            .collect();
+        if paths.len() != self.outputs.len() || outputs.len() != paths.len() {
+            return None;
+        }
+        // Removing each match rejects clones (two targets sharing a source).
+        paths
+            .iter()
+            .map(|path| {
+                if path.source.is_empty() {
+                    return None;
+                }
+                Some((
+                    outputs.remove(&path.source.to_ascii_uppercase())?,
+                    path.virtual_display?,
+                ))
+            })
+            .collect()
+    }
+
+    fn virtual_output(&self) -> Option<&OutputInfo> {
+        let sources = self.mapped_sources()?;
+        if sources.len() < 2 {
+            return None;
+        }
+        let mut virtuals = sources.into_iter().filter(|(_, vdd)| *vdd);
+        let (output, _) = virtuals.next()?;
+        (!output.is_primary && virtuals.next().is_none()).then_some(output)
+    }
+
+    /// None when Windows cannot identify a connected, inactive VDD and
+    /// a real desktop. Err when Extend would also change another target.
+    fn extension(&self) -> Option<Result<(), &'static str>> {
+        let paths = self.paths.as_ref()?;
+        let inactive = &paths.inactive;
+        if !inactive.contains(&Some(true))
+            || paths.active.iter().any(|p| p.virtual_display == Some(true))
+        {
+            return None;
+        }
+        if inactive.len() != 1 {
+            return Some(Err("another connected target is inactive"));
+        }
+        let sources = self.mapped_sources()?;
+        if !sources.iter().any(|(output, _)| output.is_primary) {
+            return None;
+        }
+        Some(Ok(()))
+    }
+}
+
+#[cfg(any(windows, test, debug_assertions))]
+fn desktop(shared: &SharedControl, driver: &impl Driver) -> Desktop {
+    Desktop {
+        outputs: listed(shared, driver),
+        paths: driver.connected_displays(),
+    }
+}
+
+#[cfg(any(windows, test, debug_assertions))]
+fn owned_output(shared: &SharedControl, driver: &impl Driver) -> Option<OutputInfo> {
+    let name = shared.vdd_output.lock().clone()?;
+    let desktop = desktop(shared, driver);
+    let output = if desktop.names_only() {
+        desktop
+            .outputs
+            .iter()
+            .find(|output| !output.is_primary && output.device_name == name)
+    } else {
+        desktop
+            .virtual_output()
+            .filter(|output| output.device_name == name)
+    };
+    output.cloned()
+}
+
+#[cfg(any(windows, test, debug_assertions))]
+#[derive(Default)]
+enum Extension {
+    #[default]
+    Unused,
+    Kept(&'static str),
+    Cancelled,
+    Requested,
+    Refused(i32),
+}
+
+#[cfg(any(windows, test, debug_assertions))]
+impl Extension {
+    fn consider(&mut self, shared: &SharedControl, driver: &impl Driver, observed: &mut Desktop) {
+        if !matches!(self, Self::Unused) {
+            return;
+        }
+        match observed.extension() {
+            None => return,
+            Some(Err(reason)) => {
+                *self = Self::Kept(reason);
+                return;
+            }
+            Some(Ok(())) => {}
+        }
+        // Recheck on the same turn as Enable and Disable. The queue may
+        // have received a release while Windows was listing targets.
+        driver.confirm_enabled(|| {
+            *observed = desktop(shared, driver);
+            match observed.extension()? {
+                Err(reason) => {
+                    *self = Self::Kept(reason);
+                    None
+                }
+                Ok(()) => {
+                    if !claim_start(shared, |_| *self = Self::Requested) {
+                        *self = Self::Cancelled;
+                        return None;
+                    }
+                    if let Err(code) = driver.extend() {
+                        *self = Self::Refused(code);
+                    }
+                    Some(())
+                }
+            }
+        });
+    }
+
+    fn log(&self, extended_output_found: bool) {
+        match self {
+            Self::Unused | Self::Cancelled => {}
+            Self::Kept(reason) => info!(
+                reason,
+                extended_output_found,
+                "Virtual display connected but inactive — kept the current layout"
+            ),
+            Self::Requested => info!(
+                extended_output_found,
+                "Virtual display connected but inactive — Windows accepted Extend"
+            ),
+            Self::Refused(code) => warn!(
+                code,
+                extended_output_found,
+                "Virtual display connected but inactive — Windows refused Extend"
+            ),
+        }
+    }
+}
+
 /// [`note_attached`], unless the mode changed or quitting began. The mode
 /// is held while the display is recorded, so a mode change either comes
 /// first and is seen here, or comes after, and its capture generation finds
@@ -1340,11 +1542,15 @@ fn listed(shared: &SharedControl, driver: &impl Driver) -> Vec<OutputInfo> {
 #[cfg(any(windows, test, debug_assertions))]
 fn note_attached_if_selected(shared: &SharedControl, device_name: String) -> bool {
     let mode = shared.capture_target.lock();
-    if *mode != CaptureTarget::VirtualExtended || quitting(shared) {
+    if *mode != CaptureTarget::VirtualExtended {
         return false;
     }
-    note_attached(shared, device_name);
-    true
+    let mut owned = shared.vdd_output.lock();
+    with_start_claim(shared, |status, state| {
+        *owned = Some(device_name);
+        *status = VddStatus::Active;
+        record_attached(state);
+    })
 }
 
 /// Capture `generation` streams the second screen from `now`. The first
@@ -1957,6 +2163,20 @@ fn retry_saving_at(shared: &SharedControl, now: Instant) {
 #[cfg(any(windows, test, debug_assertions))]
 pub(crate) trait Driver {
     fn outputs(&self) -> Vec<OutputInfo>;
+    fn connected_displays(&self) -> Option<crate::vdd_snapshot::ConnectedDisplays> {
+        None
+    }
+
+    fn extend(&self) -> Result<(), i32> {
+        Err(-1)
+    }
+
+    /// Revalidate an enabled device and act on it on the task gate's turn,
+    /// after any in-process Disable already running has recorded its result.
+    fn confirm_enabled<T>(&self, claim: impl FnOnce() -> Option<T>) -> Option<T> {
+        claim()
+    }
+
     /// Prepare the driver's settings for the connected iPad, just before the
     /// Enable: the graphics card to render on and the modes. `outputs` are
     /// the displays before it.
@@ -2093,14 +2313,7 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
     }
     // Still on from before (its release saw this start coming): reuse it,
     // with no change to wait for.
-    let outputs = listed(shared, driver);
-    let owned = shared.vdd_output.lock().clone();
-    if let Some(output) = owned.and_then(|name| {
-        outputs
-            .iter()
-            .find(|output| !output.is_primary && output.device_name == name)
-            .cloned()
-    }) {
+    if let Some(output) = owned_output(shared, driver) {
         // It has the modes written for the iPad it was turned on for.
         let reuse = super::reuse_vdd(shared);
         // A failure recorded since this start was claimed: its fallback
@@ -2170,9 +2383,16 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
         return;
     }
     driver.prepare(&outputs);
-    let before: Vec<String> = outputs
-        .into_iter()
-        .map(|output| output.device_name)
+    // Preparing the mode list can take time. Decide whether to enable
+    // from the desktop and the worker's claim as they stand afterwards.
+    let mut initial = desktop(shared, driver);
+    if !claim_start(shared, |_| {}) {
+        return;
+    }
+    let before: Vec<String> = initial
+        .outputs
+        .iter()
+        .map(|o| o.device_name.clone())
         .collect();
     // After "kept your desktop off it" the user switches Windows to Extend
     // while this attempt waits, so give them time to.
@@ -2180,53 +2400,120 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
         Some(VddProblem::NotExtended) => timeout.max(EXTEND_TIMEOUT),
         _ => timeout,
     };
-    let Some(enabled) = enable(shared, driver) else {
+    let mut extension = Extension::default();
+    extension.consider(shared, driver, &mut initial);
+    if matches!(extension, Extension::Cancelled) {
+        return;
+    }
+    let already_on = initial.virtual_output().cloned();
+    let ran_enable = already_on.is_none() && matches!(extension, Extension::Unused);
+    let enabled = if !ran_enable {
+        Ok(())
+    } else if let Some(result) = enable(shared, driver) {
+        result
+    } else {
         info!("Quitting before the virtual display was turned on — leaving it off");
         return;
     };
-    if let Err(report) = enabled {
-        warn!(
-            second_screen_fallback = "enable_failed",
-            reason = crate::vdd::enable_failure_reason(report),
-            device = %report.map_or_else(|_| "unknown".to_string(), |device| device.to_string()),
-            "Virtual display could not be enabled — capturing the primary display instead"
-        );
-        driver.report(Failure::Enable(report));
-        // The task enabled a device that cannot show a display.
-        if report.is_ok_and(|device| device != DeviceState::Missing) {
-            disable(shared, driver);
-        }
-        let windows_10 = windows_10_hold_applies(shared);
-        let problem = *shared.vdd_problem.lock();
-        let now = driver.now();
-        let mut status = shared.vdd_status.lock();
-        *status = VddStatus::TaskFailed;
-        let mut state = shared.second_screen.lock();
-        state.failure = Some("enable_failed");
-        if windows_10 {
-            state.windows_10_failed("enable_failed", problem, now);
-        }
-        return;
-    }
+
     let waiting_since = driver.now();
-    // No wait for a display that can't attach.
-    let turned_on = driver.turned_on();
-    let result = if turned_on != TurnedOn::Beside {
-        AttachResult::TimedOut
+    let mut identified = !initial.names_only();
+    let mut turned_on = TurnedOn::Beside;
+    let result = if let Some(output) = &already_on {
+        AttachResult::Attached(output.clone())
     } else {
+        if ran_enable && enabled.is_ok() {
+            turned_on = driver.turned_on();
+        }
         let mut watch = NoMonitorWatch::default();
         wait_for_virtual_output(
             &before,
             timeout,
-            || selected().then(|| listed(shared, driver)),
+            || {
+                if !selected() {
+                    return None;
+                }
+                let mut current = desktop(shared, driver);
+                // A failed task can also have triggered the panel guard.
+                // The guard distinguishes a lost laptop panel from a lone display.
+                if enabled.is_err() && current.only_virtual() {
+                    turned_on = driver.turned_on();
+                }
+                if turned_on == TurnedOn::Beside {
+                    extension.consider(shared, driver, &mut current);
+                    if matches!(extension, Extension::Cancelled) {
+                        return None;
+                    }
+                }
+                identified |= !current.names_only();
+                let poll = if let Some(output) = current.virtual_output() {
+                    AttachPoll::Done(AttachResult::Attached(output.clone()))
+                } else if turned_on != TurnedOn::Beside || (!identified && enabled.is_err()) {
+                    AttachPoll::Done(AttachResult::TimedOut)
+                } else if !identified {
+                    current.outputs.into()
+                } else {
+                    AttachPoll::Waiting
+                };
+                Some(poll)
+            },
             || driver.now(),
             |duration| driver.sleep(duration),
             || watch.gave_up(driver.now(), || driver.device()),
         )
     };
+    extension.log(matches!(result, AttachResult::Attached(_)));
+    let left_layout_alone = !ran_enable && matches!(extension, Extension::Kept(_));
+    if let Err(report) = enabled {
+        if !matches!(result, AttachResult::Attached(_) | AttachResult::Cancelled)
+            && turned_on != TurnedOn::PanelLost
+        {
+            warn!(
+                second_screen_fallback = "enable_failed",
+                reason = crate::vdd::enable_failure_reason(report),
+                device = %report.map_or_else(|_| "unknown".to_string(), |device| device.to_string()),
+                "Virtual display could not be enabled — capturing the primary display instead"
+            );
+            driver.report(Failure::Enable(report));
+            // The task enabled a device that cannot show a display.
+            if report.is_ok_and(|device| device != DeviceState::Missing) {
+                disable(shared, driver);
+            }
+            let windows_10 = windows_10_hold_applies(shared);
+            let problem = *shared.vdd_problem.lock();
+            let now = driver.now();
+            let mut status = shared.vdd_status.lock();
+            *status = VddStatus::TaskFailed;
+            let mut state = shared.second_screen.lock();
+            state.failure = Some("enable_failed");
+            if windows_10 {
+                state.windows_10_failed("enable_failed", problem, now);
+            }
+            return;
+        }
+    }
     #[cfg(windows)]
     let result = match result {
         AttachResult::Attached(_) if super::simulated_attach_timeout() => AttachResult::TimedOut,
+        result => result,
+    };
+    let result = match result {
+        AttachResult::Attached(output) => {
+            let output = if identified {
+                let Some(current) = desktop(shared, driver).matching(&output) else {
+                    return;
+                };
+                current
+            } else {
+                output
+            };
+            // A pick before the claim is included when the mode is read.
+            if claim_start(shared, |state| state.settle_asked = false) {
+                AttachResult::Attached(output)
+            } else {
+                AttachResult::Cancelled
+            }
+        }
         result => result,
     };
     match result {
@@ -2242,22 +2529,46 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
             if super::snapshot_cancelled_attach(waited, &shared.vdd_worker.cancelled_snapshot) {
                 driver.report(Failure::Cancelled(waited));
             }
-            disable(shared, driver);
+            if !left_layout_alone {
+                disable(shared, driver);
+            }
         }
         AttachResult::Attached(chosen) => {
             // Setting the mode can take seconds, and the user may choose
             // another mode meanwhile. A size picked while the display came
             // up counts too.
-            // This settle reads the saved choice: a pick before it is in.
-            shared.second_screen.lock().settle_asked = false;
             let (wanted, choice) = super::wanted_vdd(shared);
-            let chosen = driver.settle(chosen, wanted);
-            super::note_settled_for(shared, choice);
-            let (device, width, height) = (chosen.device_name.clone(), chosen.width, chosen.height);
-            live_since(shared, &chosen);
-            if note_attached_if_selected(shared, chosen.device_name.clone()) {
+            let settled = driver.settle(chosen.clone(), wanted);
+            // A scheduled Disable can finish while Windows applies the mode.
+            let publish = |output: OutputInfo| {
+                let attached = note_attached_if_selected(shared, output.device_name.clone());
+                (output, attached)
+            };
+            let (chosen, attached) = if identified {
+                let Some(claim) = driver
+                    .confirm_enabled(|| desktop(shared, driver).matching(&chosen).map(publish))
+                else {
+                    return;
+                };
+                claim
+            } else {
+                publish(settled)
+            };
+            let (device, width, height) = (&chosen.device_name, chosen.width, chosen.height);
+            if attached {
+                super::note_settled_for(shared, choice);
+                live_since(shared, &chosen);
+                let adoption = if already_on.is_some() {
+                    Some("already on before Enable")
+                } else if enabled.is_err() {
+                    Some("on after failed Enable")
+                } else if ran_enable && identified && before.contains(device) {
+                    Some("on after Enable changed no output name")
+                } else {
+                    None
+                };
                 info!(
-                    %device,
+                    %device, adoption,
                     width, height, "Virtual display attached — capturing it"
                 );
             } else if quitting(shared) {
@@ -2310,7 +2621,9 @@ pub(crate) fn attach(shared: &SharedControl, driver: &impl Driver, timeout: Dura
             driver.report(Failure::AttachTimeout);
             // Enable succeeded but nothing attached: turn it back off so no
             // half-enabled device lingers as a phantom monitor.
-            disable(shared, driver);
+            if !left_layout_alone {
+                disable(shared, driver);
+            }
             let blocked = mirror_blocked_now(shared, |_, _| true);
             let copied_problem = *shared.vdd_problem.lock();
             let copied = copied_problem == Some(VddProblem::NotExtended);
@@ -2381,12 +2694,7 @@ fn settle_attached(shared: &SharedControl, driver: &impl Driver) {
     if !streaming_on_it(shared) || !shared.second_screen.lock().settle_asked {
         return;
     }
-    let owned = shared.vdd_output.lock().clone();
-    let Some(output) = owned.and_then(|name| {
-        listed(shared, driver)
-            .into_iter()
-            .find(|output| !output.is_primary && output.device_name == name)
-    }) else {
+    let Some(output) = owned_output(shared, driver) else {
         return;
     };
     // Modes left to the driver: nothing to set, the request waits.
@@ -2423,12 +2731,7 @@ fn check_kept(shared: &SharedControl, driver: &impl Driver, attach_timeout: Dura
     {
         return;
     }
-    let owned = shared.vdd_output.lock().clone();
-    let Some(output) = owned.and_then(|name| {
-        listed(shared, driver)
-            .into_iter()
-            .find(|output| !output.is_primary && output.device_name == name)
-    }) else {
+    let Some(output) = owned_output(shared, driver) else {
         return;
     };
     match super::reuse_vdd(shared) {
@@ -2498,15 +2801,26 @@ fn claim_streaming(
 /// locks.
 #[cfg(any(windows, test, debug_assertions))]
 fn claim_start(shared: &SharedControl, claim: impl FnOnce(&mut State)) -> bool {
-    let status = shared.vdd_status.lock();
+    let mode = shared.capture_target.lock();
+    *mode == CaptureTarget::VirtualExtended && with_start_claim(shared, |_, state| claim(state))
+}
+
+#[cfg(any(windows, test, debug_assertions))]
+fn with_start_claim(
+    shared: &SharedControl,
+    claim: impl FnOnce(&mut VddStatus, &mut State),
+) -> bool {
+    let mut status = shared.vdd_status.lock();
     let mut state = shared.second_screen.lock();
-    let failed = state.failure.is_some()
+    let queue = shared.vdd_worker.queue.lock();
+    if state.failure.is_some()
         || matches!(*status, VddStatus::Failed | VddStatus::TaskFailed)
-        || ending_queued(shared);
-    if failed {
+        || queue.quitting
+        || queue.ending()
+    {
         return false;
     }
-    claim(&mut state);
+    claim(&mut status, &mut state);
     true
 }
 
@@ -2516,13 +2830,16 @@ fn claim_start(shared: &SharedControl, claim: impl FnOnce(&mut State)) -> bool {
 /// last, after any other.
 #[cfg(any(windows, test, debug_assertions))]
 fn ending_queued(shared: &SharedControl) -> bool {
-    shared
-        .vdd_worker
-        .queue
-        .lock()
-        .commands
-        .iter()
-        .any(|command| matches!(command, Command::Release | Command::Fallback(_)))
+    shared.vdd_worker.queue.lock().ending()
+}
+
+#[cfg(any(windows, test, debug_assertions))]
+impl Queue {
+    fn ending(&self) -> bool {
+        self.commands
+            .iter()
+            .any(|command| matches!(command, Command::Release | Command::Fallback(_)))
+    }
 }
 
 /// Tests: whether a settle was asked for and has not run.
@@ -2703,6 +3020,18 @@ impl WindowsDriver<'_> {
 impl Driver for WindowsDriver<'_> {
     fn outputs(&self) -> Vec<OutputInfo> {
         super::listing::outputs(self.shared)
+    }
+
+    fn connected_displays(&self) -> Option<crate::vdd_snapshot::ConnectedDisplays> {
+        crate::vdd_snapshot::connected_displays()
+    }
+
+    fn extend(&self) -> Result<(), i32> {
+        crate::display_guard::extend_for_second_screen()
+    }
+
+    fn confirm_enabled<T>(&self, claim: impl FnOnce() -> Option<T>) -> Option<T> {
+        crate::vdd::confirm_enabled(claim)
     }
 
     fn prepare(&self, outputs: &[OutputInfo]) {
@@ -2933,6 +3262,10 @@ mod tests {
         sets: RefCell<Vec<(u32, u32)>>,
         /// Runs once, at the next listing: what happens elsewhere while the
         /// worker lists the displays.
+        inactive: Option<&'a dyn Fn() -> Vec<Option<bool>>>,
+        extend: Option<&'a dyn Fn() -> Result<(), i32>>,
+        screens: Option<&'a dyn Fn() -> Vec<OutputInfo>>,
+        paths: Option<&'a dyn Fn() -> Vec<crate::vdd_snapshot::ActivePath>>,
         on_outputs: Cell<Option<&'a dyn Fn()>>,
     }
 
@@ -2960,6 +3293,10 @@ mod tests {
                 settle_to: None,
                 size: Cell::new(None),
                 sets: RefCell::new(Vec::new()),
+                inactive: None,
+                extend: None,
+                screens: None,
+                paths: None,
                 on_outputs: Cell::new(None),
             }
         }
@@ -2990,9 +3327,24 @@ mod tests {
             }
         }
 
+        fn extend(&self) -> Result<(), i32> {
+            self.extend.expect("unexpected Extend")()
+        }
+
+        fn connected_displays(&self) -> Option<crate::vdd_snapshot::ConnectedDisplays> {
+            self.paths
+                .map(|paths| crate::vdd_snapshot::ConnectedDisplays {
+                    active: paths(),
+                    inactive: self.inactive.map_or_else(Vec::new, |read| read()),
+                })
+        }
+
         fn outputs(&self) -> Vec<OutputInfo> {
             if let Some(hook) = self.on_outputs.take() {
                 hook();
+            }
+            if let Some(screens) = self.screens {
+                return screens();
             }
             let mut outputs = vec![output("primary", true)];
             let attached = self
@@ -5165,6 +5517,389 @@ mod tests {
         }
         run(shared, driver, ATTACH_TIMEOUT, false);
         step
+    }
+
+    fn path(source: &str, virtual_display: bool) -> crate::vdd_snapshot::ActivePath {
+        crate::vdd_snapshot::ActivePath {
+            source: source.into(),
+            virtual_display: Some(virtual_display),
+        }
+    }
+
+    #[test]
+    fn live_display_survives_an_enable_error_or_no_change_and_skips_an_unneeded_enable() {
+        for (already_on, failure) in [
+            (true, None),
+            (false, Some(Ok(DeviceState::Ready))),
+            (false, Some(Err("display task timed out"))),
+            (false, None),
+        ] {
+            let shared = second_screen_selected();
+            let elapsed = Cell::new(Duration::ZERO);
+            let advance = |time| elapsed.set(time);
+            let screens = || vec![output("primary", true), output("virtual", false)];
+            let paths = || {
+                let mut paths = vec![path("primary", false)];
+                // DXGI already has both names. DisplayConfig confirms Extend
+                // later, even after a task timeout.
+                if already_on || elapsed.get() >= secs(1.2) {
+                    paths.push(path("VIRTUAL", true));
+                }
+                paths
+            };
+            let driver = FakeDriver {
+                screens: Some(&screens),
+                paths: Some(&paths),
+                enable_fails: failure,
+                ..FakeDriver::new(secs(1.0), None, &advance)
+            };
+            connect_ipad(&shared, 1, (1488, 2266));
+            let modes = crate::vdd_settings::modes_for_client(1488, 2266, 60);
+            assert!(shared
+                .vdd_resolutions
+                .lock()
+                .choices
+                .choose(1, &modes, (1132, 744)));
+            prepare_for_connected(&shared);
+            note_connected(&shared, driver.now());
+            assert_eq!(tick(&shared, &driver), Step::Attach);
+            assert_eq!(*shared.vdd_status.lock(), VddStatus::Active);
+            assert_eq!(shared.vdd_output.lock().as_deref(), Some("virtual"));
+            assert_eq!(*driver.wanted.borrow(), [Some(mode(1132, 744))]);
+            let mut expected = vec![Call::Prepare];
+            if !already_on {
+                expected.push(Call::Enable);
+            }
+            expected.push(Call::Settle);
+            assert_eq!(driver.calls(), expected);
+            assert_eq!(remembered_failure(&shared), None);
+            assert_eq!(tick(&shared, &driver), Step::Switch);
+            start_proving_on(&shared, 1, driver.now(), Some(((0, 1), "virtual".into())));
+            note_image(&shared, 1);
+            assert!(!proving(&shared));
+            disconnect(&shared);
+            assert_eq!(tick(&shared, &driver), Step::Nothing);
+            driver.sleep(RELEASE_GRACE);
+            assert_eq!(next_step(&shared, driver.now()), Step::Release);
+            send(&shared, Command::Release);
+            run(&shared, &driver, ATTACH_TIMEOUT, false);
+            expected.push(Call::Disable);
+            assert_eq!(driver.calls(), expected);
+            assert!(shared.vdd_output.lock().is_none());
+        }
+    }
+
+    #[test]
+    fn live_display_rejects_unsafe_topologies_even_with_a_new_dxgi_name() {
+        for (paths, outputs) in [
+            (
+                vec![path("primary", true), path("new", false)],
+                vec!["primary", "new"],
+            ),
+            (vec![path("primary", true)], vec!["primary"]),
+            (
+                vec![path("primary", false), path("primary", true)],
+                vec!["primary", "new"],
+            ),
+            (
+                vec![
+                    path("primary", false),
+                    path("new", true),
+                    path("other", true),
+                ],
+                vec!["primary", "new", "other"],
+            ),
+            (
+                vec![path("primary", false), path("new", false)],
+                vec!["primary", "new"],
+            ),
+            (
+                vec![path("primary", false), path("new", true)],
+                vec!["primary", "new", "new"],
+            ),
+            (
+                vec![
+                    path("primary", false),
+                    crate::vdd_snapshot::ActivePath {
+                        source: "new".into(),
+                        virtual_display: None,
+                    },
+                ],
+                vec!["primary", "new"],
+            ),
+        ] {
+            let shared = second_screen_selected();
+            let enabled = Cell::new(false);
+            let advance = |_| enabled.set(true);
+            let screens = || {
+                if enabled.get() {
+                    outputs
+                        .iter()
+                        .map(|name| output(name, *name == "primary"))
+                        .collect()
+                } else {
+                    vec![output("primary", true)]
+                }
+            };
+            let paths = || {
+                if enabled.get() {
+                    paths.clone()
+                } else {
+                    vec![path("primary", false)]
+                }
+            };
+            let driver = FakeDriver {
+                turned_on: if outputs.len() == 1 {
+                    TurnedOn::PanelLost
+                } else {
+                    TurnedOn::Beside
+                },
+                screens: Some(&screens),
+                paths: Some(&paths),
+                ..FakeDriver::new(secs(1.0), None, &advance)
+            };
+            connect_viewer(&shared);
+            note_connected(&shared, driver.now());
+            assert_eq!(tick(&shared, &driver), Step::Attach);
+            assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
+            assert!(shared.vdd_output.lock().is_none());
+            assert!(!driver.calls().contains(&Call::Settle));
+            if outputs.len() == 1 {
+                assert!(!driver.calls().contains(&Call::Disable));
+            }
+        }
+    }
+
+    #[test]
+    fn live_display_removed_during_settle_is_left_for_the_next_attach() {
+        let shared = second_screen_selected();
+        let removed = Cell::new(false);
+        let remove = |_| removed.set(true);
+        let paths = || vec![path("primary", false), path("virtual", true)];
+        let screens = || {
+            let mut screens = vec![output("primary", true)];
+            if !removed.get() {
+                screens.push(output("virtual", false));
+            }
+            screens
+        };
+        let driver = FakeDriver {
+            paths: Some(&paths),
+            screens: Some(&screens),
+            settle_takes: secs(0.5),
+            ..FakeDriver::new(Duration::ZERO, None, &remove)
+        };
+        connect_viewer(&shared);
+        note_connected(&shared, driver.now());
+        assert_eq!(tick(&shared, &driver), Step::Attach);
+        assert_eq!(driver.calls(), [Call::Prepare, Call::Settle]);
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::WaitingForClient);
+        assert!(shared.vdd_output.lock().is_none());
+        assert_eq!(next_step(&shared, driver.now()), Step::Attach);
+    }
+
+    #[test]
+    fn live_display_removed_after_the_claim_reopens_the_mirror() {
+        let shared = second_screen_selected();
+        let display = fake::FakeDisplay::new(Some(Duration::ZERO), ATTACH_TIMEOUT);
+        display.set_enabled(true);
+        let screens = || display.outputs();
+        let paths = || {
+            screens()
+                .iter()
+                .map(|output| path(&output.device_name, !output.is_primary))
+                .collect()
+        };
+        let driver = FakeDriver {
+            paths: Some(&paths),
+            screens: Some(&screens),
+            ..FakeDriver::new(Duration::ZERO, None, &|_| {})
+        };
+        connect_viewer(&shared);
+        note_connected(&shared, driver.now());
+        assert_eq!(tick(&shared, &driver), Step::Attach);
+        assert_eq!(tick(&shared, &driver), Step::Switch);
+        // Give capture the same desktop that the worker just claimed.
+        *shared.vdd_worker.fake.lock() = Some(display.clone());
+        let generation = crate::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
+        let reconcile =
+            || reconcile_virtual_display(&CaptureTarget::VirtualExtended, &shared, generation);
+        assert_eq!(reconcile(), Some(CaptureTarget::Output("virtual".into())));
+        assert!(proving(&shared));
+        note_image(&shared, generation);
+        assert!(!proving(&shared));
+        display.set_enabled(false);
+        assert_eq!(reconcile(), Some(CaptureTarget::PrimaryAuto));
+        assert_eq!(*shared.vdd_status.lock(), VddStatus::WaitingForClient);
+        assert_eq!(next_step(&shared, driver.now()), Step::Attach);
+    }
+
+    #[test]
+    fn inactive_target_extends_once_before_or_after_enable_and_attaches() {
+        for (initially_connected, failure) in [
+            (true, None),
+            (false, None),
+            (false, Some(Ok(DeviceState::Ready))),
+            (false, Some(Err("display task timed out"))),
+        ] {
+            let shared = second_screen_selected();
+            let connected = Cell::new(initially_connected);
+            let active = Cell::new(false);
+            let calls = Cell::new(0);
+            let enable = |_| connected.set(true);
+            let extend = || {
+                calls.set(calls.get() + 1);
+                active.set(true);
+                Ok(())
+            };
+            let screens = || {
+                let mut outputs = vec![output("primary", true), output("external", false)];
+                if active.get() {
+                    outputs.push(output("virtual", false));
+                }
+                outputs
+            };
+            let paths = || {
+                screens()
+                    .into_iter()
+                    .map(|o| path(&o.device_name, o.device_name == "virtual"))
+                    .collect()
+            };
+            let inactive = || {
+                if connected.get() && !active.get() {
+                    vec![Some(true)]
+                } else {
+                    vec![]
+                }
+            };
+            let driver = FakeDriver {
+                screens: Some(&screens),
+                paths: Some(&paths),
+                inactive: Some(&inactive),
+                extend: Some(&extend),
+                enable_fails: failure,
+                ..FakeDriver::new(secs(1.0), None, &enable)
+            };
+            connect_viewer(&shared);
+            note_connected(&shared, driver.now());
+            assert_eq!(tick(&shared, &driver), Step::Attach);
+            assert_eq!(calls.get(), 1);
+            assert_eq!(driver.calls().contains(&Call::Enable), !initially_connected);
+            assert_eq!(*shared.vdd_status.lock(), VddStatus::Active);
+            assert_eq!(shared.vdd_output.lock().as_deref(), Some("virtual"));
+            assert_eq!(remembered_failure(&shared), None);
+            assert_eq!(tick(&shared, &driver), Step::Switch);
+        }
+    }
+
+    #[test]
+    fn inactive_target_preserves_a_real_monitor_left_off_even_as_extend_is_claimed() {
+        for other_off_initially in [true, false] {
+            let shared = second_screen_selected();
+            let reads = Cell::new(0);
+            let inactive = || {
+                reads.set(reads.get() + 1);
+                if other_off_initially || reads.get() > 1 {
+                    vec![Some(true), Some(false)]
+                } else {
+                    vec![Some(true)]
+                }
+            };
+            let paths = || vec![path("primary", false)];
+            let driver = FakeDriver {
+                paths: Some(&paths),
+                inactive: Some(&inactive),
+                ..FakeDriver::new(Duration::ZERO, None, &|_| {})
+            };
+            connect_viewer(&shared);
+            note_connected(&shared, driver.now());
+            let log = crate::capture::tests::logged(|| {
+                assert_eq!(tick(&shared, &driver), Step::Attach);
+            });
+            let decisions = log
+                .lines()
+                .filter(|line| line.contains("connected but inactive"))
+                .collect::<Vec<_>>();
+            assert_eq!(decisions.len(), 1, "{log}");
+            assert!(decisions[0].contains("another connected target is inactive"));
+            assert!(decisions[0].contains("extended_output_found=false"));
+            assert!(
+                !driver.calls().contains(&Call::Enable),
+                "the connected device was left alone"
+            );
+            assert!(!driver.calls().contains(&Call::Settle));
+            assert!(!driver.calls().contains(&Call::Disable));
+            assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
+            assert!(shared.vdd_output.lock().is_none());
+        }
+    }
+
+    #[test]
+    fn inactive_target_that_stays_inactive_can_extend_again_on_try_again() {
+        for result in [Ok(()), Err(31)] {
+            let shared = second_screen_selected();
+            let calls = Cell::new(0);
+            let extend = || {
+                calls.set(calls.get() + 1);
+                result
+            };
+            let driver = FakeDriver {
+                paths: Some(&|| vec![path("primary", false)]),
+                inactive: Some(&|| vec![Some(true)]),
+                extend: Some(&extend),
+                ..FakeDriver::new(Duration::ZERO, None, &|_| {})
+            };
+            connect_viewer(&shared);
+            note_connected(&shared, driver.now());
+            for attempt in 1..=2 {
+                assert_eq!(tick(&shared, &driver), Step::Attach);
+                assert_eq!(calls.get(), attempt);
+                assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
+                assert!(shared.vdd_output.lock().is_none());
+                retry(&shared);
+            }
+        }
+    }
+
+    #[test]
+    fn inactive_target_with_unknown_identity_or_availability_never_requests_extend() {
+        for (available, active_identity) in [(true, None), (true, Some(false)), (false, None)] {
+            let shared = second_screen_selected();
+            let paths = || {
+                vec![crate::vdd_snapshot::ActivePath {
+                    source: "primary".into(),
+                    virtual_display: active_identity,
+                }]
+            };
+            let inactive = || {
+                vec![if active_identity.is_some() {
+                    None
+                } else {
+                    Some(true)
+                }]
+            };
+            let driver = FakeDriver {
+                paths: available.then_some(&paths),
+                inactive: Some(&inactive),
+                ..FakeDriver::new(
+                    Duration::ZERO,
+                    (!available).then_some(Duration::ZERO),
+                    &|_| {},
+                )
+            };
+            connect_viewer(&shared);
+            note_connected(&shared, driver.now());
+            assert_eq!(tick(&shared, &driver), Step::Attach);
+            assert!(driver.calls().contains(&Call::Enable));
+            if available {
+                assert_eq!(*shared.vdd_status.lock(), VddStatus::Failed);
+                assert!(shared.vdd_output.lock().is_none());
+            } else {
+                // An unreadable inventory keeps the old new-output rule.
+                assert_eq!(*shared.vdd_status.lock(), VddStatus::Active);
+                assert_eq!(shared.vdd_output.lock().as_deref(), Some("virtual"));
+            }
+        }
     }
 
     /// iPad 1 leaves; `device` connects within the grace, as the transport

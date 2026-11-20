@@ -493,6 +493,20 @@ const VDD_ATTACH_TIMEOUT_DEFAULT_SECS: u64 = 30;
 const VDD_POLL_INTERVAL: Duration = Duration::from_millis(120);
 
 #[cfg(any(windows, test, debug_assertions))]
+enum AttachPoll {
+    Waiting,
+    Done(AttachResult),
+    Unidentified(Vec<OutputInfo>),
+}
+
+#[cfg(any(windows, test, debug_assertions))]
+impl From<Vec<OutputInfo>> for AttachPoll {
+    fn from(outputs: Vec<OutputInfo>) -> Self {
+        Self::Unidentified(outputs)
+    }
+}
+
+#[cfg(any(windows, test, debug_assertions))]
 enum AttachResult {
     Attached(OutputInfo),
     TimedOut,
@@ -504,10 +518,10 @@ enum AttachResult {
 /// Polling remains bounded even while startup heartbeats keep the watchdog alive.
 /// A cancelled generation returns before inspecting or changing display state.
 #[cfg(any(windows, test, debug_assertions))]
-fn wait_for_virtual_output(
+fn wait_for_virtual_output<T: Into<AttachPoll>>(
     before: &[String],
     timeout: Duration,
-    mut poll: impl FnMut() -> Option<Vec<OutputInfo>>,
+    mut poll: impl FnMut() -> Option<T>,
     mut now: impl FnMut() -> Instant,
     mut wait: impl FnMut(Duration),
     mut no_monitor: impl FnMut() -> bool,
@@ -517,8 +531,14 @@ fn wait_for_virtual_output(
         let Some(outputs) = poll() else {
             return AttachResult::Cancelled;
         };
-        if let Some(chosen) = pick_new_virtual_output(before, &outputs) {
-            return AttachResult::Attached(chosen.clone());
+        match outputs.into() {
+            AttachPoll::Done(result) => return result,
+            AttachPoll::Unidentified(outputs) => {
+                if let Some(chosen) = pick_new_virtual_output(before, &outputs) {
+                    return AttachResult::Attached(chosen.clone());
+                }
+            }
+            AttachPoll::Waiting => {}
         }
         if now() >= deadline {
             return AttachResult::TimedOut;
@@ -1678,7 +1698,7 @@ mod tests {
     use crate::control::SharedControl;
 
     /// Log lines `run` writes on this thread.
-    fn logged(run: impl FnOnce()) -> String {
+    pub(super) fn logged(run: impl FnOnce()) -> String {
         #[derive(Clone)]
         struct Captured(Arc<Mutex<Vec<u8>>>);
         impl std::io::Write for Captured {

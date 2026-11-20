@@ -100,8 +100,8 @@ struct TaskGate {
     health: VddTaskHealth,
     /// When a task last timed out, and whether it was the Enable task.
     stuck: Option<(Instant, bool)>,
-    /// An Enable task ran since the last completed Disable, so the display
-    /// may be on, even when that Enable timed out and is still running.
+    /// The display may be on: an Enable ran (possibly timing out), or the
+    /// worker confirmed an active display since the last completed Disable.
     enable_ran: bool,
 }
 
@@ -212,6 +212,19 @@ impl DriverTasks {
 
     fn health(&self) -> VddTaskHealth {
         self.gate.lock().health
+    }
+
+    /// On the same turn as task bookkeeping, act on a confirmed enabled
+    /// display device. A previous Disable may have recorded it off, or an Enable
+    /// that timed out may still finish. A task result can no longer tell
+    /// whether a later request is already done.
+    fn confirm_enabled<T>(&self, claim: impl FnOnce() -> Option<T>) -> Option<T> {
+        let _serial = self.serial.lock();
+        let result = claim()?;
+        let mut gate = self.gate.lock();
+        gate.known_enabled = None;
+        gate.enable_ran = true;
+        Some(result)
     }
 
     /// The Disable at startup and at quit: on its own turn, no task runs
@@ -437,6 +450,11 @@ fn simulated_enable_failure(task: &str) -> Option<TaskOutcome> {
         "failed" => Some(TaskOutcome::Failed(None)),
         _ => None,
     }
+}
+
+#[cfg(windows)]
+pub(crate) fn confirm_enabled<T>(claim: impl FnOnce() -> Option<T>) -> Option<T> {
+    TASKS.confirm_enabled(claim)
 }
 
 /// Complete one installer-owned driver action while capture reports startup progress.
@@ -710,6 +728,28 @@ mod tests {
         gate.after(true, TaskOutcome::Done, now);
         assert_eq!(gate.before(true, Purpose::Attempt, now), Gate::AlreadyDone);
         assert_eq!(gate.before(false, Purpose::Attempt, now), Gate::Run);
+    }
+
+    #[test]
+    fn releasing_a_confirmed_display_runs_disable_even_after_a_previous_disable() {
+        let tasks = DriverTasks::new();
+        let disables = std::cell::Cell::new(0);
+        let release = || {
+            tasks.set_enabled(
+                false,
+                Purpose::Attempt,
+                || {},
+                |_, _| {
+                    disables.set(disables.get() + 1);
+                    TaskOutcome::Done
+                },
+            )
+        };
+        assert!(release());
+        assert_eq!(tasks.confirm_enabled(|| Some(())), Some(()));
+        assert!(release());
+        assert!(release());
+        assert_eq!(disables.get(), 2);
     }
 
     #[test]

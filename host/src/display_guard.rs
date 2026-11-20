@@ -12,8 +12,9 @@
 //! off, if the PC has lost every real screen it had before the display was
 //! turned on, the guard re-applies that layout, or else switches Windows to
 //! "PC screen only" when the built-in panel was on, and logs the result.
-//! Nothing else ever changes the layout, which stays the user's: a PC that
-//! keeps any real screen sees no change at all.
+//! The guard leaves a desktop that keeps a real screen alone. When Second
+//! screen finds only its virtual target connected but inactive, it can ask
+//! for "Extend" once, with every connected real monitor already active.
 //!
 //! Turning the display off while it is the only screen on is what loses the
 //! panel for good: on a hybrid laptop, Windows then stops reporting any
@@ -915,6 +916,12 @@ pub(crate) fn around<T>(
     let done = done(&result);
     GUARD.lock().after(enabled, done, &mut displays);
     result
+}
+
+/// The second-screen worker has confirmed that only its target needs Extend.
+#[cfg(windows)]
+pub(crate) fn extend_for_second_screen() -> Result<(), i32> {
+    windows_impl::Windows::new(crate::startup::ProcessId::current(), |_, _| {}, false).extend()
 }
 
 /// Whether the last turn on left the virtual display alone, with no real

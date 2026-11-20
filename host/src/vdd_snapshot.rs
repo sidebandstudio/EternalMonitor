@@ -18,6 +18,24 @@ const MAX_NAME: usize = 48;
 /// The virtual display's monitor reports the driver's EDID ID in its path.
 const VDD_MONITOR: &str = "MTT1337";
 
+/// A target on the active desktop and the GDI source DXGI opens for it.
+#[cfg(any(windows, test, debug_assertions))]
+#[derive(Clone)]
+pub(crate) struct ActivePath {
+    pub source: String,
+    pub virtual_display: Option<bool>,
+}
+
+/// Active paths and the identities of connected targets off the desktop.
+#[cfg(any(windows, test, debug_assertions))]
+pub(crate) struct ConnectedDisplays {
+    pub active: Vec<ActivePath>,
+    pub inactive: Vec<Option<bool>>,
+}
+
+#[cfg(windows)]
+pub(crate) use windows_impl::connected_displays;
+
 /// A DXGI adapter.
 #[derive(Debug, Clone)]
 pub struct Adapter {
@@ -367,6 +385,34 @@ mod windows_impl {
         } else {
             String::new()
         }
+    }
+
+    pub(crate) fn connected_displays() -> Option<super::ConnectedDisplays> {
+        let (paths, _) = display_config(QDC_ALL_PATHS)?;
+        let mut connected = std::collections::HashSet::new();
+        let mut active = Vec::new();
+        let mut inactive = Vec::new();
+        let identity = |path: &DISPLAYCONFIG_PATH_INFO| {
+            let monitor = monitor_path(path);
+            (!monitor.is_empty()).then(|| super::is_vdd_monitor(&monitor))
+        };
+        let target =
+            |path: &DISPLAYCONFIG_PATH_INFO| (value(path.targetInfo.adapterId), path.targetInfo.id);
+        for path in paths.iter().filter(|p| p.flags & PATH_ACTIVE != 0) {
+            connected.insert(target(path));
+            active.push(super::ActivePath {
+                source: crate::gpu_preference::source_name(path).unwrap_or_default(),
+                virtual_display: identity(path),
+            });
+        }
+        // ALL_PATHS includes alternative routes to an already active target.
+        // Only a distinct available target can be turned on by Extend.
+        for path in &paths {
+            if path.targetInfo.targetAvailable.as_bool() && connected.insert(target(path)) {
+                inactive.push(identity(path));
+            }
+        }
+        Some(super::ConnectedDisplays { active, inactive })
     }
 
     /// Every active path, then each available target no active path uses.
