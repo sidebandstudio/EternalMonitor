@@ -1,3 +1,67 @@
+## EternalMonitor v0.3.5
+
+Released [date set at release].
+Windows and iPad versions listed on the download page work together.
+Each 0.3.5 app works with the other app on 0.3.4 and 0.3.3.
+
+This release fixes the problems reported with 0.3.4.
+
+### Problems you reported
+
+- Second screen now starts when the virtual display is already on, instead
+  of showing the PC's own screen.
+- On laptops, Second screen's background tasks can now run on battery.
+  Updating repairs them on existing installs.
+- Each iPad can have its own second screen resolution, in Settings >
+  Display. A smaller size makes text and windows larger, and motion
+  smoother on a slower PC.
+- When Windows starts EternalMonitor at sign-in, it opens minimised.
+- If Windows Firewall keeps iPads out, the PC says so and offers a
+  one-click fix. Setup removes a block left by a dismissed firewall prompt.
+- Screens with an odd width or height now stream.
+
+### On the iPad
+
+- The iPad finds a saved PC again when its address changes, and connects
+  by itself when a PC that didn't answer comes back.
+- The iPad says when the PC is locked, restarting its stream, stopped for
+  good, out of date, or unable to capture from its graphics card.
+- The iPad says when Wi-Fi is off or Apple Devices is missing on the PC.
+- The pointer is drawn by the iPad, apart from the video, so it moves even
+  when the desktop is still.
+
+### Reliability
+
+- On lossy Wi-Fi, a keyframe is repaired until it completes, and a first
+  picture that never completes is recovered.
+- If no video arrives, the PC tries smaller packets or its other address.
+- If a hardware video encoder hangs while opening, video starts on the
+  processor, and that encoder is skipped next time.
+- NVIDIA and Intel Quick Sync encoders change quality without restarting.
+- PC audio comes back when another app lets go of the output.
+- Capture recovers after sleep, a lost display and repeated access loss. A
+  lost graphics device no longer stops the window or the stream.
+- A stuck graphics driver no longer holds the window at start.
+- Second screen keeps working after the PC is locked, when a laptop's own
+  panel goes dark, and when its settings were saved in another code page.
+- The iPad's session stays up while the PC restarts its stream, and the PC
+  says goodbye when it sleeps, shuts down or signs out.
+- iPad input reaches Windows on its own thread, so a busy network no longer
+  delays it.
+- A laptop's second graphics card is woken when an iPad looks for PCs, so
+  the first picture comes sooner.
+- USB connections survive a failed device list.
+
+### Diagnostics
+
+- When a PC doesn't answer, the iPad records why in its diagnostics.
+
+### Known issues
+
+- If Second screen still shows the PC's own screen after you update, press
+  Win+P and choose **Extend** once. Windows can remember **PC screen only**
+  for the virtual display.
+
 ## EternalMonitor v0.3.4
 
 Released November 3, 2026.
