@@ -98,17 +98,18 @@ pub(crate) struct TaskRun {
     expired: bool,
 }
 
-impl From<TaskOutcome> for TaskRun {
-    fn from(outcome: TaskOutcome) -> Self {
-        Self {
-            outcome,
-            expired: false,
-        }
-    }
-}
-
 #[cfg_attr(not(windows), allow(dead_code))]
 impl TaskRun {
+    pub(crate) const DONE: Self = Self {
+        outcome: TaskOutcome::Done,
+        expired: false,
+    };
+
+    fn record(self, ran: &mut Option<Self>) -> TaskOutcome {
+        *ran = Some(self);
+        self.outcome
+    }
+
     pub(crate) fn wrapper_error(stderr: &str) -> Self {
         Self {
             outcome: TaskOutcome::from_stderr(stderr),
@@ -118,7 +119,7 @@ impl TaskRun {
     }
 
     /// Both exits kill the child and keep the gate's original timeout report.
-    /// Only a deadline (the runner was still pending) merits the attach wait.
+    /// Only a child still pending at its deadline permits a second display read.
     pub(crate) fn stopped(result: &std::io::Result<Option<std::process::ExitStatus>>) -> Self {
         Self {
             outcome: TaskOutcome::TimedOut,
@@ -126,24 +127,10 @@ impl TaskRun {
         }
     }
 
-    pub(crate) fn runner_error() -> Self {
-        TaskOutcome::Failed(None).into()
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct EnableFailure {
-    pub report: EnableReport,
-    pub expired: bool,
-}
-
-impl EnableFailure {
-    pub(crate) fn immediate(report: EnableReport) -> Self {
-        Self {
-            report,
-            expired: false,
-        }
-    }
+    pub(crate) const FAILED: Self = Self {
+        outcome: TaskOutcome::Failed(None),
+        expired: false,
+    };
 }
 
 /// Remembers what the driver tasks last did. Every idle pipeline start used to
@@ -265,42 +252,22 @@ impl DriverTasks {
         }
     }
 
-    pub(crate) fn enable_with(
+    #[cfg(test)]
+    pub(crate) fn test_enable(
         &self,
-        progress: impl FnMut(),
-        run: impl FnOnce(bool, &mut dyn FnMut()) -> TaskRun,
-    ) -> Result<(), EnableFailure> {
-        let mut ran = None;
-        if self.set_enabled_on_turn(
-            true,
-            Purpose::Attempt,
-            progress,
-            || {},
-            |enabled, progress| {
-                let result = run(enabled, progress);
-                ran = Some(result);
-                result.outcome
-            },
-        ) {
-            return Ok(());
-        }
-        Err(match ran {
-            Some(result) => EnableFailure {
-                report: result.outcome.report(),
-                expired: result.expired,
-            },
-            None => EnableFailure::immediate(refused(self.health())),
-        })
+        expired: &mut bool,
+        run: impl FnOnce() -> TaskRun,
+    ) -> Result<(), EnableReport> {
+        enable_result(
+            expired,
+            |ran| self.set_enabled(true, Purpose::Attempt, || {}, |_, _| run().record(ran)),
+            || self.health(),
+        )
     }
 
     #[cfg(test)]
-    pub(crate) fn test_disable(&self, result: Option<TaskRun>) -> bool {
-        self.set_enabled(
-            false,
-            Purpose::Attempt,
-            || {},
-            |_, _| result.map_or(TaskOutcome::Done, |run| run.outcome),
-        )
+    pub(crate) fn test_disable(&self, result: TaskRun) -> bool {
+        self.set_enabled(false, Purpose::Attempt, || {}, |_, _| result.outcome)
     }
 
     fn health(&self) -> VddTaskHealth {
@@ -458,7 +425,7 @@ fn run_task(task: &str, progress: &mut dyn FnMut()) -> TaskRun {
         Ok(child) => child,
         Err(error) => {
             warn!(task, %error, "Failed to invoke the VDD task");
-            return TaskRun::runner_error();
+            return TaskRun::FAILED;
         }
     };
     let call = if task == TASK_ENABLE {
@@ -495,7 +462,7 @@ fn run_task(task: &str, progress: &mut dyn FnMut()) -> TaskRun {
                 took_ms = started.elapsed().as_millis() as u64,
                 "Completed VDD scheduled task"
             );
-            TaskOutcome::Done.into()
+            TaskRun::DONE
         }
         Ok(out) => {
             let stderr = String::from_utf8_lossy(&out.stderr);
@@ -511,7 +478,7 @@ fn run_task(task: &str, progress: &mut dyn FnMut()) -> TaskRun {
         }
         Err(error) => {
             warn!(task, error = %error, "Failed to read the VDD task result");
-            TaskRun::runner_error()
+            TaskRun::FAILED
         }
     }
 }
@@ -538,7 +505,7 @@ fn simulated_enable_failure(task: &str) -> Option<TaskOutcome> {
 /// Complete one installer-owned driver action while capture reports startup progress.
 #[cfg_attr(not(windows), allow(dead_code))] // Only Windows capture asks.
 pub(crate) fn set_enabled(enabled: bool, progress: impl FnMut()) -> bool {
-    request(enabled, Purpose::Attempt, progress)
+    request(enabled, Purpose::Attempt, progress, &mut None)
 }
 
 /// Why an Enable the gate did not run failed.
@@ -566,16 +533,39 @@ pub(crate) fn enable_failure_reason(report: EnableReport) -> &'static str {
 }
 
 /// Turn the virtual display on. On failure, what the Enable task found
-/// wrong with the device, or why it could not say.
-#[cfg(windows)]
-pub(crate) fn enable(progress: impl FnMut()) -> Result<(), EnableFailure> {
-    TASKS.enable_with(progress, |enabled, progress| {
-        run_on_turn(enabled, Purpose::Attempt, progress)
-    })
+/// wrong with the device, or why it could not say. `expired` is set only
+/// for a deadline observed by the runner that took this turn.
+#[cfg_attr(not(windows), allow(dead_code))] // Only Windows capture asks.
+pub(crate) fn enable(progress: impl FnMut(), expired: &mut bool) -> Result<(), EnableReport> {
+    enable_result(
+        expired,
+        |ran| request(true, Purpose::Attempt, progress, ran),
+        task_health,
+    )
 }
 
-fn request(enabled: bool, purpose: Purpose, progress: impl FnMut()) -> bool {
-    request_on_turn(enabled, purpose, progress, || {})
+fn enable_result(
+    expired: &mut bool,
+    request: impl FnOnce(&mut Option<TaskRun>) -> bool,
+    health: impl FnOnce() -> VddTaskHealth,
+) -> Result<(), EnableReport> {
+    let mut ran = None;
+    let done = request(&mut ran);
+    *expired = ran.is_some_and(|run| run.expired);
+    if done {
+        Ok(())
+    } else {
+        Err(ran.map_or_else(|| refused(health()), |run| run.outcome.report()))
+    }
+}
+
+fn request(
+    enabled: bool,
+    purpose: Purpose,
+    progress: impl FnMut(),
+    ran: &mut Option<TaskRun>,
+) -> bool {
+    request_on_turn(enabled, purpose, progress, || {}, ran)
 }
 
 fn request_on_turn(
@@ -583,16 +573,17 @@ fn request_on_turn(
     purpose: Purpose,
     progress: impl FnMut(),
     on_turn: impl FnOnce(),
+    ran: &mut Option<TaskRun>,
 ) -> bool {
     #[cfg(windows)]
     {
         TASKS.set_enabled_on_turn(enabled, purpose, progress, on_turn, |enabled, progress| {
-            run_on_turn(enabled, purpose, progress).outcome
+            run_on_turn(enabled, purpose, progress).record(ran)
         })
     }
     #[cfg(not(windows))]
     {
-        let _ = (enabled, purpose, progress);
+        let _ = (enabled, purpose, progress, ran);
         on_turn();
         false
     }
@@ -601,7 +592,7 @@ fn request_on_turn(
 /// Run the driver task for `enabled`, once the gate let a request run.
 #[cfg(windows)]
 fn run_on_turn(enabled: bool, purpose: Purpose, progress: &mut dyn FnMut()) -> TaskRun {
-    let mut outcome = TaskOutcome::Failed(None).into();
+    let mut run = TaskRun::FAILED;
     // Read here, after the gate decided and before the task runs.
     let display_off = TASKS.gate.lock().known_enabled == Some(false);
     crate::startup::display::change(enabled, progress, |progress| {
@@ -613,16 +604,16 @@ fn run_on_turn(enabled: bool, purpose: Purpose, progress: &mut dyn FnMut()) -> T
             // Start-up, quit and panics: nothing streams it after.
             cleanup: !enabled && purpose == Purpose::Cleanup,
         };
-        outcome = crate::display_guard::around(
+        run = crate::display_guard::around(
             change,
             || run_task(if enabled { TASK_ENABLE } else { TASK_DISABLE }, progress),
             |run| run.outcome == TaskOutcome::Done,
             // Left on: the next turn off tries again.
-            || TaskOutcome::Failed(None).into(),
+            || TaskRun::FAILED,
         );
-        outcome.outcome == TaskOutcome::Done
+        run.outcome == TaskOutcome::Done
     });
-    outcome
+    run
 }
 
 /// `run_on_turn` for the Disable at startup, at quit and in a panic.
@@ -644,7 +635,7 @@ pub fn disable() -> bool {
     }
     #[cfg(not(windows))]
     {
-        request(false, Purpose::Cleanup, || {})
+        request(false, Purpose::Cleanup, || {}, &mut None)
     }
 }
 
@@ -668,7 +659,7 @@ pub fn disable_in_background() {
             #[cfg(windows)]
             TASKS.disable_unless_off(on_turn, device_off, run_cleanup);
             #[cfg(not(windows))]
-            request_on_turn(false, Purpose::Cleanup, || {}, on_turn);
+            request_on_turn(false, Purpose::Cleanup, || {}, on_turn, &mut None);
         });
     match spawned {
         Ok(_) => {
