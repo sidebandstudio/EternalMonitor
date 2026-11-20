@@ -1273,8 +1273,7 @@ async fn execute_actions(
         if let Some(end) = ended.take() {
             crate::diagnostics::log_session_end(&end, shared);
         }
-        let session_id = shared.session.lock().session_id();
-        if let Some(session_id) = session_id {
+        if let Some(session_id) = shared.session.lock().session_id() {
             crate::diagnostics::note_session_start(session_id, shared);
         }
     }
@@ -1547,9 +1546,7 @@ mod tests {
             "{}",
             summaries[0]
         );
-        let (v1, capture) = summaries[0].split_once(" captured_size=").unwrap();
-        assert_eq!(capture, "- capture_changes=0");
-        crate::diagnostics::tests::assert_contract(v1);
+        crate::diagnostics::tests::assert_contract(&summaries[0]);
     }
 
     /// A socket on one address signs that address; one on every address

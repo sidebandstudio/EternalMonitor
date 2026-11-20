@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::sync::{atomic::AtomicU64, Arc};
 use std::time::Instant;
 
 use once_cell::sync::Lazy;
@@ -11,14 +10,6 @@ pub static PIPELINE_STATS: Lazy<Mutex<PipelineStats>> =
 
 const FPS_WINDOW_SECS: f64 = 1.0;
 const HISTORY_LEN: usize = 300;
-
-/// Process-lifetime counters for interval rates, including across resets.
-#[derive(Clone, Copy, Default)]
-pub(crate) struct StreamTotals {
-    pub captured: u64,
-    pub encoded: u64,
-    pub sent: u64,
-}
 
 #[derive(Clone)]
 pub struct PipelineStats {
@@ -32,13 +23,6 @@ pub struct PipelineStats {
     /// stream config, the GUI and the stats summary report it.
     pub capture_resolution: (u32, u32),
     pub capture_frame_count: u64,
-    pub(crate) fresh_captured: u64,
-    pub(crate) capture_replaced: Arc<AtomicU64>,
-    pub(crate) capture_generation: Option<u64>,
-    pub(crate) capture_observation: crate::diagnostics::CaptureObservation,
-    /// DXGI staging readback of the latest publication, when timed.
-    pub(crate) readback_us: Option<u128>,
-    pub(crate) stream_totals: StreamTotals,
     pub gpu_name: String,
     /// Active capture source, e.g. `\\.\DISPLAY3 (2732x2048)`. Empty until capture starts.
     pub capture_display: String,
@@ -50,9 +34,6 @@ pub struct PipelineStats {
     /// The last frame's conversion from capture's BGRA to the encoder's
     /// input (or its copy into a BGRA frame), before `encode_time_us` starts.
     pub convert_time_us: u128,
-    /// On the BGRA path, the existing input preparation span: copy, optional
-    /// held-picture clone, and release of the capture buffer.
-    pub(crate) input_copy_us: Option<u128>,
     pub encode_frame_count: u64,
     pub nal_bytes_last: usize,
     pub bitrate_bps: u32,
@@ -127,12 +108,6 @@ impl PipelineStats {
             capture_fps: 0.0,
             capture_resolution: (0, 0),
             capture_frame_count: 0,
-            fresh_captured: 0,
-            capture_replaced: Arc::default(),
-            capture_generation: None,
-            capture_observation: Default::default(),
-            readback_us: None,
-            stream_totals: StreamTotals::default(),
             gpu_name: String::new(),
             capture_display: String::new(),
             capture_timestamps: VecDeque::with_capacity(128),
@@ -140,7 +115,6 @@ impl PipelineStats {
             encode_fps: 0.0,
             encode_time_us: 0,
             convert_time_us: 0,
-            input_copy_us: None,
             encode_frame_count: 0,
             nal_bytes_last: 0,
             bitrate_bps: 0,
@@ -185,9 +159,6 @@ impl PipelineStats {
     /// Returns the audio stats it replaced, for their final log line.
     pub fn reset_for_restart(&mut self) -> crate::audio::AudioStats {
         let previous = std::mem::take(self);
-        self.stream_totals = previous.stream_totals;
-        self.capture_observation = previous.capture_observation;
-        self.capture_observation.reset_source();
         self.gpu_name = previous.gpu_name;
         self.capture_display = previous.capture_display;
         self.listen_addr = previous.listen_addr;
@@ -258,37 +229,21 @@ impl PipelineStats {
         self.using_software_fallback = using_software_fallback;
     }
 
-    pub(crate) fn record_capture(
-        &mut self,
-        generation: u64,
-        (width, height): (u32, u32),
-        cached: bool,
-        source: u64,
-        readback_us: Option<u128>,
-    ) {
-        if self.capture_generation != Some(generation) {
-            return;
-        }
+    pub fn record_capture(&mut self, width: u32, height: u32) {
         let now = Instant::now();
         self.capture_frame_count += 1;
-        self.stream_totals.captured += 1;
-        self.fresh_captured += u64::from(!cached);
-        self.readback_us = readback_us;
-        self.capture_observation.record(source, (width, height));
         self.capture_resolution = crate::encoder::encoded_size(width, height);
         self.capture_timestamps.push_back(now);
         self.capture_fps = Self::calc_fps(&mut self.capture_timestamps, now);
     }
 
-    pub fn record_convert(&mut self, convert_us: u128, copied: bool) {
+    pub fn record_convert(&mut self, convert_us: u128) {
         self.convert_time_us = convert_us;
-        self.input_copy_us = copied.then_some(convert_us);
     }
 
     pub fn record_encode(&mut self, encode_us: u128, nal_bytes: usize, bitrate_bps: u32) {
         let now = Instant::now();
         self.encode_frame_count += 1;
-        self.stream_totals.encoded += 1;
         self.encode_time_us = encode_us;
         self.nal_bytes_last = nal_bytes;
         self.bitrate_bps = bitrate_bps;
@@ -311,7 +266,6 @@ impl PipelineStats {
     ) {
         let now = Instant::now();
         self.transport_packets_sent += 1;
-        self.stream_totals.sent += 1;
         self.transport_fragments_sent += fragments;
         self.transport_bytes_sent += bytes;
         self.transport_timestamps.push_back(now);
@@ -364,43 +318,6 @@ impl PipelineStats {
 #[cfg(test)]
 mod tests {
     use super::PipelineStats;
-
-    #[test]
-    fn retired_capture_cannot_write_during_or_after_a_stats_reset() {
-        use std::sync::atomic::Ordering;
-
-        let mut stats = PipelineStats::new();
-        stats.capture_generation = Some(1);
-        let old_slot_count = stats.capture_replaced.clone();
-        stats.record_capture(1, (1280, 800), false, 0, Some(100));
-        stats.reset_for_restart();
-
-        stats.record_capture(1, (1280, 800), false, 0, Some(101));
-        assert_eq!(stats.capture_frame_count, 0);
-        assert_eq!(stats.capture_resolution, (0, 0));
-        assert_eq!(stats.readback_us, None);
-
-        stats.capture_generation = Some(2);
-        stats.record_capture(2, (1440, 900), false, 0, Some(200));
-        stats.record_capture(1, (1280, 800), false, 0, Some(102));
-        old_slot_count.fetch_add(1, Ordering::Relaxed);
-        assert_eq!(stats.capture_frame_count, 1);
-        assert_eq!(stats.capture_resolution, (1440, 900));
-        assert_eq!(stats.capture_replaced.load(Ordering::Relaxed), 0);
-        assert_eq!(stats.readback_us, Some(200));
-    }
-
-    #[test]
-    fn untimed_publication_clears_the_previous_frames_readback() {
-        let mut stats = PipelineStats::new();
-        stats.capture_generation = Some(1);
-        stats.record_capture(1, (1280, 800), false, 0, Some(280));
-        assert_eq!(stats.readback_us, Some(280));
-        stats.record_capture(1, (1280, 800), true, 0, None);
-        assert_eq!(stats.readback_us, None);
-        assert_eq!(stats.capture_frame_count, 2);
-        assert_eq!(stats.fresh_captured, 1);
-    }
 
     #[test]
     fn a_new_viewer_starts_counting_pictures_given_again_from_zero() {

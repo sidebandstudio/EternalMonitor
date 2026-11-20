@@ -117,8 +117,6 @@ const KINDS: [Kind; 3] = [
             ("usb_devices", Last),
             ("capture_heartbeat_age_ms", Gauge),
             ("encode_heartbeat_age_ms", Gauge),
-            ("readback_us", Gauge),
-            ("input_copy_us", Gauge),
         ],
     },
 ];
@@ -298,12 +296,7 @@ impl Periodic {
             state.generation = generation.or(state.generation.take());
         }
         state.lines += 1;
-        let mixed_stream_rates =
-            kind.prefix == "stream" && fields.contains(&("rates_same_session", "false"));
         for (slot, (name, field)) in kind.fields.iter().enumerate() {
-            if mixed_stream_rates && matches!(*name, "capture_fps" | "encode_fps" | "send_fps") {
-                continue;
-            }
             let Some((_, text)) = fields.iter().find(|(found, _)| found == name) else {
                 continue;
             };
@@ -486,53 +479,6 @@ mod tests {
              gpu=NVIDIA hybrid=false",
             stamp(second)
         )
-    }
-
-    #[test]
-    fn stream_aggregation_reads_appended_capture_fields_by_name() {
-        let mut periodic = Periodic::default();
-        let at = Instant::now();
-        let first = format!(
-            "{} fresh_captured=80 capture_replaced=10 readback_us=400 input_copy_us=-",
-            summary(7, 0)
-        );
-        let next = format!(
-            "{} input_copy_us=200 readback_us=600 capture_replaced=13 fresh_captured=84",
-            summary(7, 10)
-        );
-        assert!(periodic.push(&first, at).is_empty());
-        assert!(periodic
-            .push(&next, at + Duration::from_secs(10))
-            .is_empty());
-        let lines = periodic.flush_due(at + WINDOW);
-        let line = &lines[0];
-        assert!(!line.contains("fresh_captured="), "{line}");
-        assert!(!line.contains("capture_replaced="), "{line}");
-        assert!(line.contains(" stream_readback_us=400/500/600 "), "{line}");
-        assert!(
-            line.ends_with(" stream_input_copy_us=200/200/200"),
-            "{line}"
-        );
-    }
-
-    #[test]
-    fn a_mixed_viewer_interval_contributes_no_uploaded_rate_samples() {
-        let mut periodic = Periodic::default();
-        let at = Instant::now();
-        let mixed = format!("{} rates_same_session=false", summary(7, 0));
-        assert!(periodic.push(&mixed, at).is_empty());
-        let lines = periodic.flush_due(at + WINDOW);
-        let line = &lines[0];
-        for name in ["capture_fps=", "encode_fps=", "send_fps="] {
-            assert!(!line.contains(name), "{line}");
-        }
-        assert!(line.contains(" stream_sent=0(+0) "), "{line}");
-        assert!(line.contains(" stream_encode_us=2100/2100/2100 "), "{line}");
-
-        let stable = format!("{} rates_same_session=true", summary(7, 60));
-        assert!(periodic.push(&stable, at + WINDOW).is_empty());
-        let lines = periodic.flush_due(at + 2 * WINDOW);
-        assert!(lines[0].contains(" stream_send_fps=59.9/59.9/59.9 "));
     }
 
     #[test]

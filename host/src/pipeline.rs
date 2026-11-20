@@ -6,7 +6,7 @@
 use std::sync::mpsc;
 
 use tokio::sync::mpsc as tokio_mpsc;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::control::{SharedControl, SupervisorCommand};
 use crate::gpu::GpuInfo;
@@ -114,6 +114,7 @@ pub async fn run_pipeline_supervised(
     reporter.stage_exited(Stage::Transport, transport_outcome);
 
     stats::PIPELINE_STATS.lock().mark_pipeline_stopped();
+    info!(generation, "Pipeline ended");
 }
 
 /// A transport that could not bind the stream port waits for it (see

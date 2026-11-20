@@ -302,7 +302,6 @@ pub fn run_capture_loop(
     let mut dirty_rect_buf: Vec<RECT> = Vec::with_capacity(64);
     // Time of the last frame handed downstream — drives the idle keepalive (T1d).
     let mut last_send = Instant::now();
-    let slot = &slot.for_output(&chosen);
 
     // Desktop Duplication never bakes the mouse cursor into the desktop image — it sends
     // the position every frame and the shape only when it changes. Cache the shape and
@@ -463,21 +462,16 @@ pub fn run_capture_loop(
                 let now = Instant::now();
                 if idle.on_frame(client_connected(&shared), now) == FrameUse::Publish {
                     *frame_number += 1;
-                    slot.publish_captured(
-                        &PIPELINE_STATS,
-                        &shared.hb_capture_frame_ms,
-                        (tex_width, tex_height),
-                        true,
-                        None,
-                        || RawFrame {
-                            frame_number: *frame_number,
-                            timestamp: now,
-                            data: Arc::clone(&last_frame),
-                            width: tex_width,
-                            height: tex_height,
-                            cached: true,
-                        },
-                    );
+                    PIPELINE_STATS.lock().record_capture(tex_width, tex_height);
+                    heartbeat(&shared.hb_capture_frame_ms);
+                    slot.publish(RawFrame {
+                        frame_number: *frame_number,
+                        timestamp: now,
+                        data: Arc::clone(&last_frame),
+                        width: tex_width,
+                        height: tex_height,
+                        cached: true,
+                    });
                     last_send = now;
                 }
             }
@@ -636,7 +630,6 @@ pub fn run_capture_loop(
                     }
                 }
                 let seen_image = &mut picture.seen_image;
-                let mut readback_us = None;
                 let frame_data = read_back_image(&shared, generation, seen_image, || {
                     windows::core::Result::Ok(if let Some(ref resource) = desktop_resource {
                         match resource.cast::<ID3D11Texture2D>() {
@@ -658,8 +651,6 @@ pub fn run_capture_loop(
                                     _ => frame_buffer(frame_bytes),
                                 };
 
-                                // Time staging Map, pixel copy, and Unmap together.
-                                let readback_start = Instant::now();
                                 copy_staging(
                                     &device_context,
                                     &staging_texture,
@@ -667,8 +658,6 @@ pub fn run_capture_loop(
                                     row_bytes,
                                     &mut pixel_buf,
                                 )?;
-
-                                readback_us = Some(readback_start.elapsed().as_micros());
 
                                 // Composite the mouse cursor into the BGRA frame.
                                 if composite_pointer(
@@ -716,21 +705,17 @@ pub fn run_capture_loop(
                 if let Some(data) = frame_data {
                     picture.cached();
                     if idle.on_frame(client_connected(&shared), now) == FrameUse::Publish {
-                        slot.publish_captured(
-                            &PIPELINE_STATS,
-                            &shared.hb_capture_frame_ms,
-                            (tex_width, tex_height),
-                            false,
-                            readback_us,
-                            || RawFrame {
-                                frame_number: *frame_number,
-                                timestamp: now,
-                                data: Arc::clone(&data),
-                                width: tex_width,
-                                height: tex_height,
-                                cached: false,
-                            },
-                        );
+                        PIPELINE_STATS.lock().record_capture(tex_width, tex_height);
+                        heartbeat(&shared.hb_capture_frame_ms);
+
+                        slot.publish(RawFrame {
+                            frame_number: *frame_number,
+                            timestamp: now,
+                            data: Arc::clone(&data),
+                            width: tex_width,
+                            height: tex_height,
+                            cached: false,
+                        });
                         last_send = now;
                     } else {
                         idle_heartbeat(&shared, crate::clock::host_now_us() / 1000);
@@ -1073,21 +1058,16 @@ fn resend_last_frame(
 ) {
     *frame_number += 1;
     let now = Instant::now();
-    slot.publish_captured(
-        &PIPELINE_STATS,
-        &shared.hb_capture_frame_ms,
-        (width, height),
-        true,
-        None,
-        || RawFrame {
-            frame_number: *frame_number,
-            timestamp: now,
-            data: Arc::clone(last_frame),
-            width,
-            height,
-            cached: true,
-        },
-    );
+    PIPELINE_STATS.lock().record_capture(width, height);
+    heartbeat(&shared.hb_capture_frame_ms);
+    slot.publish(RawFrame {
+        frame_number: *frame_number,
+        timestamp: now,
+        data: Arc::clone(last_frame),
+        width,
+        height,
+        cached: true,
+    });
     *last_send = now;
 }
 

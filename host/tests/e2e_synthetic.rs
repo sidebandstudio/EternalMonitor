@@ -184,14 +184,6 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for SummaryCapture {
 }
 
 /// The summaries logged so far that name `nonce`.
-fn uploaded_summary(local: &str) -> String {
-    let uploaded =
-        eternal_host::telemetry::uploaded(&format!("2026-01-01T00:00:00Z  INFO {local}"));
-    assert!(local.contains(" captured_size="), "{local}");
-    assert!(!uploaded.contains(" captured_size="), "{uploaded}");
-    uploaded
-}
-
 fn summaries_with_nonce(nonce: u32) -> Vec<String> {
     let nonce = format!(" nonce={nonce:016x} ");
     SUMMARIES
@@ -2373,7 +2365,7 @@ fn a_session_ends_with_one_summary_naming_the_clients_nonce() {
 
     let lines = summaries_with_nonce(NONCE);
     assert_eq!(lines.len(), 1, "{lines:?}");
-    let line = uploaded_summary(&lines[0]);
+    let line = &lines[0];
     let start = format!(
         "session_summary v=1 role=pc session_id={} nonce=000000005e551011 transport=wifi \
          mode=mirror stage=video_sent outcome=streamed failure=none fallback=none end=goodbye ttff_ms=",
@@ -2476,7 +2468,7 @@ fn a_screen_refused_from_this_graphics_card_is_told_to_the_ipad() {
         );
         std::thread::sleep(Duration::from_millis(20));
     }
-    let line = uploaded_summary(&summaries_with_nonce(REFUSED)[0]);
+    let line = summaries_with_nonce(REFUSED)[0].clone();
     assert!(
         line.contains(" stage=accepted outcome=no_picture failure=capture_failed "),
         "{line}"

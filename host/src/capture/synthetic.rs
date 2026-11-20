@@ -162,21 +162,17 @@ pub fn run_capture_loop(
         };
 
         if let Some(data) = data {
-            slot.publish_captured(
-                &PIPELINE_STATS,
-                &shared.hb_capture_frame_ms,
-                (width, height),
+            PIPELINE_STATS.lock().record_capture(width, height);
+            heartbeat(&shared.hb_capture_frame_ms);
+
+            slot.publish(RawFrame {
+                frame_number: *frame_number,
+                timestamp: frame_start,
+                data,
+                width,
+                height,
                 cached,
-                None,
-                || RawFrame {
-                    frame_number: *frame_number,
-                    timestamp: frame_start,
-                    data,
-                    width,
-                    height,
-                    cached,
-                },
-            );
+            });
             if !std::mem::replace(&mut resumed, true) {
                 super::recovery::note_capture_resumed(&shared);
             }

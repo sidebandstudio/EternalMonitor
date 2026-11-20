@@ -701,7 +701,6 @@ fn run_encode_loop(
             Ordering::Relaxed,
         );
 
-        let copied = encoder.frame.format() == ffmpeg_next::format::Pixel::BGRA;
         let convert_start = Instant::now();
         encoder.convert(&raw_frame.data, (raw_frame.width * 4) as usize)?;
         // The picture is kept only while a session's first keyframe may stay
@@ -715,7 +714,7 @@ fn run_encode_loop(
         let convert_time = convert_start.elapsed();
         PIPELINE_STATS
             .lock()
-            .record_convert(convert_time.as_micros(), copied);
+            .record_convert(convert_time.as_micros());
         let pts = encoder.next_pts(raw_frame.timestamp, raw_frame.frame_number);
         encoder.frame.set_pts(Some(pts));
         let force_idr = take_keyframe_request(
