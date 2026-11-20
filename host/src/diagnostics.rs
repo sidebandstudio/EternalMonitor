@@ -166,7 +166,7 @@ impl Drop for Monitor {
     }
 }
 
-pub(crate) fn log_stream_summary(shared: &SharedControl) {
+fn log_stream_summary(shared: &SharedControl) {
     use std::sync::atomic::Ordering::Relaxed;
     // Don't keep pipeline locks held while formatting/writing tracing events.
     let session_id = shared.session.lock().session_id();
@@ -180,8 +180,7 @@ pub(crate) fn log_stream_summary(shared: &SharedControl) {
         codec = %sample.codec_name,
         cpu_fallback = sample.using_software_fallback,
         resolution = ?sample.capture_resolution, bitrate = sample.bitrate_bps,
-        target_fps = shared.effective_fps(), cpu_fps_limit = shared.cpu_fps_limit.load(Relaxed),
-        max_dgram = shared.max_dgram.load(Relaxed),
+        target_fps = shared.effective_fps(), max_dgram = shared.max_dgram.load(Relaxed),
         input = ?*shared.encoder_input.lock(), hevc = shared.hevc_enabled.load(Relaxed),
         retransmits = sample.transport_retransmits, usb_drops = sample.usb_frames_dropped,
         pointer_sent = sample.pointer_states_sent, pointer_shapes = sample.pointer_shapes_sent,

@@ -107,7 +107,6 @@ const KINDS: [Kind; 3] = [
             ("resolution", Last),
             ("bitrate", Gauge),
             ("target_fps", Last),
-            ("cpu_fps_limit", Gauge),
             ("max_dgram", Last),
             ("input", Last),
             ("hevc", Last),

@@ -23,9 +23,6 @@ pub struct SharedControl {
     pub encoder_reopens_for_bitrate: Arc<AtomicBool>,
     pub target_fps: Arc<AtomicU32>,
     pub client_preferred_fps: Arc<AtomicU32>,
-    /// The rate a software encoder holds capture to while it cannot keep
-    /// up with the stream's, 0 for none (see `encoder::software_rate`).
-    pub cpu_fps_limit: Arc<AtomicU32>,
     pub encoder_input: Arc<Mutex<crate::encoder::input::EncoderInput>>,
     pub max_dgram: Arc<AtomicU32>,
     pub target_addr: Arc<Mutex<PeerId>>,
@@ -212,7 +209,6 @@ impl SharedControl {
             encoder_reopens_for_bitrate: Arc::new(AtomicBool::new(false)),
             target_fps: Arc::new(AtomicU32::new(DEFAULT_TARGET_FPS)),
             client_preferred_fps: Arc::new(AtomicU32::new(0)),
-            cpu_fps_limit: Arc::new(AtomicU32::new(0)),
             encoder_input: Arc::new(Mutex::new(Default::default())),
             max_dgram: Arc::new(AtomicU32::new(eternal_wire::v2::MAX_DGRAM_SIZE as u32)),
             target_addr: Arc::new(Mutex::new(PeerId::udp(SocketAddr::from((
@@ -268,15 +264,6 @@ impl SharedControl {
             self.target_fps.load(Ordering::SeqCst),
             self.client_preferred_fps.load(Ordering::SeqCst),
         )
-    }
-
-    /// The rate capture runs at: the stream's, or the software encoder's
-    /// limit when that is lower. The iPad is told the stream's.
-    pub fn capture_fps(&self) -> u32 {
-        match self.cpu_fps_limit.load(Ordering::Relaxed) {
-            0 => self.effective_fps(),
-            limit => self.effective_fps().min(limit),
-        }
     }
 
     /// Is a client actually watching? Protocol v2 makes the session the only
@@ -404,25 +391,6 @@ mod tests {
             shared.client_preferred_fps.store(client, Ordering::SeqCst);
             assert_eq!(shared.effective_fps(), expected);
             assert_eq!(shared.target_fps.load(Ordering::SeqCst), host);
-        }
-    }
-
-    /// Capture runs at the software encoder's limit only while it is below
-    /// the stream's rate.
-    #[test]
-    fn capture_runs_at_the_lower_of_the_stream_rate_and_the_encoders_limit() {
-        let shared = SharedControl::new(9876, 15_000_000);
-        for (host, client, limit, expected) in [
-            (120, 0, 0, 120),
-            (120, 0, 45, 45),
-            (120, 60, 90, 60),
-            (30, 0, 45, 30),
-        ] {
-            shared.target_fps.store(host, Ordering::SeqCst);
-            shared.client_preferred_fps.store(client, Ordering::SeqCst);
-            shared.cpu_fps_limit.store(limit, Ordering::SeqCst);
-            assert_eq!(shared.capture_fps(), expected);
-            assert_eq!(shared.effective_fps(), merge_fps(host, client));
         }
     }
 
