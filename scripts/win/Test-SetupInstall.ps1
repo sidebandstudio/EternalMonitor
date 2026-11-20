@@ -17,7 +17,9 @@ $setupFlags = @('/SP-', '/SILENT', '/SUPPRESSMSGBOXES', '/NORESTART',
 function Invoke-InstallerPhase([string]$Phase, [string]$Exe, [string[]]$Flags) {
     $log = Join-Path $LogDirectory "$Phase.log"
     $commandLine = ($Flags -join ' ') + " /LOG=`"$log`""
+    $startedAt = [datetime]::UtcNow
     $timer = [Diagnostics.Stopwatch]::StartNew()
+    $limit = if ($Phase -eq 'fresh-install') { 240 } else { 600 }
     # On Windows -Wait tracks descendants. Inno's uninstaller launcher can
     # exit before its temporary copy has finished removing the directory.
     $job = Start-ThreadJob -ScriptBlock {
@@ -26,11 +28,18 @@ function Invoke-InstallerPhase([string]$Phase, [string]$Exe, [string[]]$Flags) {
             -WorkingDirectory $using:LogDirectory -PassThru -Wait).ExitCode
     }
     try {
-        if (!(Wait-Job $job -Timeout 600)) {
-            # The unique /LOG argument is also passed to the temporary copy,
-            # so it can be found even after its original parent exits.
-            $logArgument = [regex]::Escape("/LOG=`"$log`"")
-            $processes = Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -match $logArgument }
+        if (!(Wait-Job $job -Timeout $limit)) {
+            try {
+                $capture = @{Phase=$Phase; LogDirectory=$LogDirectory; SetupLog=$log; StartedAt=$startedAt}
+                $processes = @(& (Join-Path $PSScriptRoot 'Get-SetupTimeout.ps1') @capture)
+            } catch {
+                Write-Warning "Timeout diagnostics failed. $($_.Exception.Message)"
+            }
+            if (!$processes) {
+                $logArgument = [regex]::Escape(('/LOG="{0}"' -f $log))
+                $processes = Get-CimInstance Win32_Process -OperationTimeoutSec 10 |
+                    Where-Object CommandLine -Match $logArgument
+            }
             foreach ($item in $processes) {
                 $process = Get-Process -Id $item.ProcessId -ErrorAction SilentlyContinue
                 if ($process -and !$process.HasExited) {
@@ -40,7 +49,7 @@ function Invoke-InstallerPhase([string]$Phase, [string]$Exe, [string[]]$Flags) {
                     }
                 }
             }
-            throw "$Phase timed out after 600 seconds. See $log."
+            throw "$Phase timed out after $limit seconds. See $log."
         }
         $code = Receive-Job $job
         Write-Host ('{0} exit code {1} after {2:F1} seconds.' -f $Phase, $code, $timer.Elapsed.TotalSeconds)
