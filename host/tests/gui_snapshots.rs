@@ -461,6 +461,52 @@ fn stream_settings_pairing_and_recovery_are_visible_and_operable() {
     harness.run_steps(4);
     snapshot(&mut harness, &shared, "settings");
 
+    // The second screen's size, remembered for this iPad, then its own again.
+    let resolution = |value: &'static str| kittest::by().role(Role::ComboBox).value(value);
+    let record = dir.join("EternalMonitor").join("vdd-resolutions.json");
+    shared.vdd_resolutions.lock().path = Some(record.clone());
+    for (open, pick, chosen) in [
+        ("2420 × 1668 (native)", "1814 × 1250", Some((1814, 1250))),
+        ("1814 × 1250", "2420 × 1668 (native)", None),
+    ] {
+        harness.get(resolution(open)).click();
+        harness.run_steps(4);
+        harness.get_by_label("1920 × 1200 (16:10)");
+        harness.get_by_label(pick).click();
+        harness.run_steps(4);
+        harness.get(resolution(pick));
+        assert_eq!(shared.vdd_resolutions.lock().choices.chosen(7), chosen);
+        // Written on the saver's thread.
+        let saver = shared.vdd_resolutions.lock().saver.clone();
+        assert!(saver.flush(std::time::Duration::from_secs(10)));
+        let saved = eternal_host::vdd_settings::ResolutionChoices::load(&record);
+        assert_eq!(saved.chosen(7), chosen);
+    }
+    // The open list: the iPad's nine sizes, 1814 × 1250 chosen.
+    harness.get(resolution("2420 × 1668 (native)")).click();
+    harness.run_steps(4);
+    harness.get_by_label("1814 × 1250").click();
+    harness.run_steps(4);
+    harness.get(resolution("1814 × 1250")).click();
+    harness.run_steps(4);
+    for size in [
+        "2420 × 1668 (native)",
+        "1614 × 1112",
+        "1210 × 834",
+        "970 × 668",
+        "870 × 600",
+        "1920 × 1080 (16:9)",
+        "1920 × 1200 (16:10)",
+        "2048 × 1536 (4:3)",
+    ] {
+        harness.get_by_label(size);
+    }
+    snapshot(&mut harness, &shared, "settings-resolution-open");
+    harness.get_by_label("2420 × 1668 (native)").click();
+    harness.run_steps(4);
+    harness.get(resolution("2420 × 1668 (native)"));
+    assert_eq!(shared.vdd_resolutions.lock().choices.chosen(7), None);
+
     // General sits below the fold of the Settings page.
     harness
         .get_by_label("Automatic update checks")

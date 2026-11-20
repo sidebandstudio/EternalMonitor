@@ -216,6 +216,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     *shared.encoder_override.lock() = overrides.encoder.value.clone();
     *shared.encoder_input.lock() = overrides.encoder_input.value;
     *shared.gpu_switch.lock() = persisted.gpu_switch.clone();
+    if let Some(dir) = eternal_host::settings::app_data_dir() {
+        *shared.vdd_resolutions.lock() = eternal_host::vdd_settings::ResolutionMemory::open(
+            dir.join(eternal_host::vdd_settings::RESOLUTION_RECORD),
+        );
+    }
     *shared.capture_target.lock() =
         eternal_host::control::CaptureTarget::from_setting(persisted.capture_display.as_deref());
     eternal_host::remote_config::load();

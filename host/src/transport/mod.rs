@@ -1366,6 +1366,11 @@ async fn execute_actions(
             info!("Virtual display ready — restarting pipeline to stream it");
             true
         }
+        second_screen::Step::CheckKept => {
+            info!("Client connected to the virtual display kept from before — checking its modes");
+            second_screen::send(shared, second_screen::Command::CheckKept);
+            false
+        }
         second_screen::Step::Release => {
             info!("No iPad came back to the virtual display — restarting pipeline to turn it off");
             true

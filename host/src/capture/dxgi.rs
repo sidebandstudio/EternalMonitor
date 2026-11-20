@@ -260,6 +260,10 @@ pub fn run_capture_loop(
         height = tex_height,
         "Desktop duplication dimensions"
     );
+    if second_screen {
+        // The size the second screen is at, for the app; a resize updates it.
+        super::note_vdd_size(&shared, &chosen.device_name, (tex_width, tex_height));
+    }
     if tex_width == 0 || tex_height == 0 {
         return Err(format!(
             "Desktop duplication reported invalid dimensions {tex_width}x{tex_height}"
@@ -958,6 +962,10 @@ pub fn run_capture_loop(
                     last_frame = Arc::new(frame_buffer(frame_bytes));
                     picture.resized();
                     start_picture.duplicated(Instant::now());
+                    if second_screen {
+                        // The size the app shows; nothing else is done.
+                        super::note_vdd_size(&shared, &chosen.device_name, (new_w, new_h));
+                    }
                     staging_texture = unsafe {
                         let mut tex = None;
                         device.CreateTexture2D(
