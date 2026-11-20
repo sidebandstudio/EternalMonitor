@@ -43,6 +43,7 @@
   "Measuring": "正在测量",
   "Mirror my screen": "镜像",
   "Mirroring": "正在镜像",
+  "Native": "原生",
   "New code": "新配对码",
   "Next": "下一步",
   "No iPad connected": "没有连接 iPad",
@@ -63,6 +64,7 @@
   "Ready for your iPad": "已准备好连接 iPad",
   "Refresh displays": "刷新显示器",
   "Require pairing": "需要配对",
+  "Resolution": "显示器分辨率",
   "Restart": "重新启动",
   "Resume code pairing": "恢复配对码配对",
   "Run setup again": "重新运行设置向导",
@@ -105,5 +107,6 @@
   "Wi-Fi, and USB whenever the cable is plugged in.": "Wi-Fi，插上数据线时也用 USB。",
   "You can switch at any time on the Stream page.": "随时可以在“串流”页面切换。",
   "Your iPad and this PC are on the same local network.": "iPad 和这台电脑在同一本地网络中。",
-  "{display} (not connected)": "{display}（未连接）"
+  "{display} (not connected)": "{display}（未连接）",
+  "{size} (native)": "{size}（原生）"
 }

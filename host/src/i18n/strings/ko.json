@@ -43,6 +43,7 @@
   "Measuring": "측정 중",
   "Mirror my screen": "미러링",
   "Mirroring": "미러링 중",
+  "Native": "기본",
   "New code": "새 코드",
   "Next": "다음",
   "No iPad connected": "연결된 iPad 없음",
@@ -63,6 +64,7 @@
   "Ready for your iPad": "iPad 연결 준비 완료",
   "Refresh displays": "디스플레이 새로 고침",
   "Require pairing": "페어링 필수",
+  "Resolution": "디스플레이 해상도",
   "Restart": "다시 시작",
   "Resume code pairing": "코드 페어링 재개",
   "Run setup again": "초기 설정 다시 실행",
@@ -105,5 +107,6 @@
   "Wi-Fi, and USB whenever the cable is plugged in.": "Wi-Fi, 그리고 케이블을 연결하면 USB.",
   "You can switch at any time on the Stream page.": "스트림 페이지에서 언제든 바꿀 수 있습니다.",
   "Your iPad and this PC are on the same local network.": "iPad와 이 PC가 같은 로컬 네트워크에 있습니다.",
-  "{display} (not connected)": "{display} (연결 안 됨)"
+  "{display} (not connected)": "{display} (연결 안 됨)",
+  "{size} (native)": "{size} (기본)"
 }

@@ -43,6 +43,7 @@
   "Measuring": "Измерение",
   "Mirror my screen": "Повтор экрана",
   "Mirroring": "Идёт повтор экрана",
+  "Native": "Родное",
   "New code": "Новый код",
   "Next": "Далее",
   "No iPad connected": "iPad не подключён",
@@ -63,6 +64,7 @@
   "Ready for your iPad": "Готов к подключению iPad",
   "Refresh displays": "Обновить список экранов",
   "Require pairing": "Требовать сопряжение",
+  "Resolution": "Разрешение экрана",
   "Restart": "Перезапустить",
   "Resume code pairing": "Возобновить сопряжение по коду",
   "Run setup again": "Повторить настройку",
@@ -105,5 +107,6 @@
   "Wi-Fi, and USB whenever the cable is plugged in.": "Wi-Fi, а при подключённом кабеле — USB.",
   "You can switch at any time on the Stream page.": "Переключить можно в любой момент на странице «Трансляция».",
   "Your iPad and this PC are on the same local network.": "iPad и этот ПК в одной локальной сети.",
-  "{display} (not connected)": "{display} (не подключён)"
+  "{display} (not connected)": "{display} (не подключён)",
+  "{size} (native)": "{size} (родное)"
 }

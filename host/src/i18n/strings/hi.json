@@ -43,6 +43,7 @@
   "Measuring": "माप रहे हैं",
   "Mirror my screen": "मिरर",
   "Mirroring": "मिरर हो रहा है",
+  "Native": "मूल",
   "New code": "नया कोड",
   "Next": "आगे",
   "No iPad connected": "कोई iPad कनेक्ट नहीं है",
@@ -63,6 +64,7 @@
   "Ready for your iPad": "आपके iPad के लिए तैयार",
   "Refresh displays": "डिस्प्ले रीफ़्रेश करें",
   "Require pairing": "पेयरिंग ज़रूरी करें",
+  "Resolution": "स्क्रीन रिज़ॉल्यूशन",
   "Restart": "रीस्टार्ट करें",
   "Resume code pairing": "कोड से पेयरिंग फिर शुरू करें",
   "Run setup again": "सेटअप फिर से चलाएँ",
@@ -105,5 +107,6 @@
   "Wi-Fi, and USB whenever the cable is plugged in.": "Wi-Fi, और केबल लगने पर USB।",
   "You can switch at any time on the Stream page.": "आप स्ट्रीम पेज पर कभी भी बदल सकते हैं।",
   "Your iPad and this PC are on the same local network.": "आपका iPad और यह PC एक ही लोकल नेटवर्क पर हैं।",
-  "{display} (not connected)": "{display} (कनेक्ट नहीं)"
+  "{display} (not connected)": "{display} (कनेक्ट नहीं)",
+  "{size} (native)": "{size} (मूल)"
 }

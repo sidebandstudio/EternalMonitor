@@ -43,6 +43,7 @@
   "Measuring": "測定中",
   "Mirror my screen": "ミラーリング",
   "Mirroring": "ミラーリング中",
+  "Native": "ネイティブ",
   "New code": "新しいコード",
   "Next": "次へ",
   "No iPad connected": "iPadが接続されていません",
@@ -63,6 +64,7 @@
   "Ready for your iPad": "iPadを接続できます",
   "Refresh displays": "ディスプレイを更新",
   "Require pairing": "ペアリングを必須にする",
+  "Resolution": "ディスプレイの解像度",
   "Restart": "再起動",
   "Resume code pairing": "コードでのペアリングを再開",
   "Run setup again": "セットアップをやり直す",
@@ -105,5 +107,6 @@
   "Wi-Fi, and USB whenever the cable is plugged in.": "Wi-Fiに加え、ケーブルをつないだときはUSB。",
   "You can switch at any time on the Stream page.": "「ストリーム」ページでいつでも切り替えられます。",
   "Your iPad and this PC are on the same local network.": "iPadとこのPCが同じローカルネットワークにあります。",
-  "{display} (not connected)": "{display}（未接続）"
+  "{display} (not connected)": "{display}（未接続）",
+  "{size} (native)": "{size}（ネイティブ）"
 }
