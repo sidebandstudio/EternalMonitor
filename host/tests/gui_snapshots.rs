@@ -1962,7 +1962,9 @@ fn feedback_and_star(shared: &SharedControl, dir: &std::path::Path, results: &mu
     window.get_by_label("Copy message").click();
     window.step();
     let copied = copied_text(&window).expect("Copy message copies");
-    assert!(copied.starts_with("To: hello@sideband.studio\nSubject: EternalMonitor 0.3.4 for Windows: Something I like"), "{copied}");
+    let version = env!("CARGO_PKG_VERSION");
+    let subject = format!("Subject: EternalMonitor {version} for Windows: Something I like");
+    assert!(copied.starts_with(&format!("To: hello@sideband.studio\n{subject}")), "{copied}");
     assert!(copied.contains("Drawing on the iPad in Krita feels great."));
     assert!(copied.contains("Setup: Second screen, USB, iPad 2420 × 1668 at 120 Hz"));
     assert!(!copied.contains("Test iPad Pro") && !copied.contains("192.0.2.10"));
@@ -1975,9 +1977,9 @@ fn feedback_and_star(shared: &SharedControl, dir: &std::path::Path, results: &mu
     window.step();
     let url = opened_url(&window).expect("Open in my email app opens a mailto link");
     assert!(
-        url.starts_with(
-            "mailto:hello@sideband.studio?subject=EternalMonitor%200.3.4%20for%20Windows"
-        ),
+        url.starts_with(&format!(
+            "mailto:hello@sideband.studio?subject=EternalMonitor%20{version}%20for%20Windows"
+        )),
         "{url}"
     );
     assert!(url.contains("Krita") && url.len() <= eternal_host::feedback::MAILTO_LIMIT);
@@ -1992,10 +1994,7 @@ fn feedback_and_star(shared: &SharedControl, dir: &std::path::Path, results: &mu
     window.step();
     let copied = copied_text(&window).unwrap();
     // The subject keeps the kind and version, for sorting mail.
-    assert!(
-        copied.contains("Subject: EternalMonitor 0.3.4 for Windows: Something I like"),
-        "{copied}"
-    );
+    assert!(copied.contains(&subject), "{copied}");
     assert!(
         !copied.contains("iPad 2420") && !copied.contains("Setup:") && !copied.contains("App:"),
         "{copied}"
