@@ -32,6 +32,10 @@ on:
       - .github/workflows/nightly.yml
       - .github/workflows/beta-installer.yml
       - scripts/nightly.py
+      - scripts/win/Test-SetupInstall.ps1
+      - scripts/win/Get-SetupTimeout.ps1
+      - scripts/win/Trust-SetupSmokePublisher.ps1
+      - scripts/win/Block-SetupSmokeMarker.ps1
       - installer/**
 
 permissions: {}
