@@ -46,15 +46,12 @@ These need the 0.3.5 iPad app, and most also need the 0.3.5 PC app.
 - When the PC sleeps, shuts down or signs out, the iPad is told at once
   instead of waiting.
 - When a PC doesn't answer over Wi-Fi, the iPad's diagnostics record
-  whether it was seen on the network at the address tried, and which
-  network path the iPad used.
+  whether it was seen at the address tried.
 
 ### Reliability
 
 - If a hardware video encoder is slow to open, video starts on the
-  processor and switches over if the encoder opens in time. A hardware
-  encoder that fails to open isn't tried again at that size until the app
-  restarts.
+  processor and switches over if the encoder opens in time.
 - Supported NVIDIA and Intel Quick Sync encoders change quality without
   restarting.
 - PC audio comes back when another app lets go of the output.
@@ -73,7 +70,6 @@ These need the 0.3.5 iPad app, and most also need the 0.3.5 PC app.
   can't hold the connection up.
 - On a laptop, the graphics card that encodes video can be woken when an
   iPad looks for PCs, which can shorten the wait for the first picture.
-- USB connections survive a failed device list.
 
 ### Known issues
 
