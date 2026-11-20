@@ -72,6 +72,11 @@ pub fn run_encode_stage(
 /// dropped — a lost P-frame corrupts until the next IDR).
 pub const NAL_CHANNEL_CAPACITY: usize = CHANNEL_CAPACITY;
 
+#[cfg(test)]
+thread_local! {
+    static PICTURE_TAKE_TIME: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
 fn run_encode_loop(
     frames: FrameSlot,
     tx: mpsc::Sender<NALUnit>,
@@ -192,16 +197,18 @@ fn run_encode_loop(
     let mut owed_keyframe: Option<OwedKeyframe> = None;
     let mut cadence = CaptureCadence::default();
     loop {
-        let (raw_frame, given_again) = match owed_keyframe.as_mut() {
-            None => match frames.blocking_take() {
-                Some(frame) => (frame, false),
+        let (raw_frame, given_again, ready) = match owed_keyframe.as_mut() {
+            None => match frames.blocking_take_with_ready() {
+                Some((frame, ready)) => (frame, false, ready),
                 None => break,
             },
             Some(owed) => match owed.next(&frames) {
-                Next::Frame(frame) => (frame, false),
+                // Only AMF can hold its opening keyframe. This path
+                // supplies no saturation evidence for a software encoder.
+                Next::Frame(frame) => (frame, false, false),
                 Next::Again(frame) => {
                     PIPELINE_STATS.lock().keyframe_resubmits += 1;
-                    (frame, true)
+                    (frame, true, false)
                 }
                 Next::Closed => break,
                 Next::GaveUp => {
@@ -701,6 +708,16 @@ fn run_encode_loop(
             Ordering::Relaxed,
         );
 
+        let taken_at = Instant::now();
+        #[cfg(test)]
+        let taken_at = PICTURE_TAKE_TIME.get().unwrap_or(taken_at);
+        software_rate.note_taken(
+            &encoder.opened_encoder,
+            stream_fps,
+            taken_at,
+            !raw_frame.cached && !given_again,
+            ready,
+        );
         let convert_start = Instant::now();
         encoder.convert(&raw_frame.data, (raw_frame.width * 4) as usize)?;
         // The picture is kept only while a session's first keyframe may stay
@@ -752,21 +769,10 @@ fn run_encode_loop(
         }
 
         let mut keyframe_out = false;
-        // The frame's cost, for a software encoder's rate, once its packet
-        // is out. A picture given again is not a new one.
-        let mut costed = raw_frame.cached || given_again;
         while reset_refused.is_none() {
             match encoder.encoder.receive_packet(&mut encoder.packet) {
                 Ok(()) => {
                     let encode_us = encode_start.elapsed().as_micros();
-                    if !std::mem::replace(&mut costed, true) {
-                        software_rate.note_encoded(
-                            &encoder.opened_encoder,
-                            software_rate::frame_cost(convert_time + encode_start.elapsed()),
-                            stream_fps,
-                            Instant::now(),
-                        );
-                    }
                     let packet_bytes = encoder.packet.data().unwrap_or_default();
                     let packet_is_key = encoder.packet.is_key();
                     let (nal_data, is_keyframe) = if opened_is_hevc {
@@ -3432,11 +3438,90 @@ mod tests {
         rows
     }
 
-    /// The encode loop with real libx264 and a cost of 20 ms a frame (the
-    /// field case at 120 fps): the loop's measurements hold capture to 45
-    /// fps and reopen the session at 45. A new viewer session after that
-    /// starts without the limit: its first frame reopens the session at
-    /// 120, and the frames after it reopen nothing.
+    fn capture_picture(frame_number: u64, timestamp: Instant) -> RawFrame {
+        RawFrame {
+            frame_number,
+            timestamp,
+            data: std::sync::Arc::new(synthetic_capture(64, 48, frame_number)),
+            width: 64,
+            height: 48,
+            cached: false,
+        }
+    }
+
+    /// Keep a picture ready for each take, giving the limiter a
+    /// deterministic intake cadence through the real encode loop.
+    fn feed_ready_pictures(
+        producer: &std::sync::Arc<FrameSlot>,
+        consumer: &FrameSlot,
+        count: u64,
+        interval: Duration,
+        picture_latency: Duration,
+    ) {
+        let start = Instant::now();
+        let mut number = 1;
+        producer.publish(capture_picture(number, start - picture_latency));
+        let producer = std::sync::Arc::downgrade(producer);
+        consumer.after_take(move || {
+            let now = start + interval * (number as u32 - 1);
+            PICTURE_TAKE_TIME.set(Some(now));
+            number += 1;
+            if number <= count {
+                producer
+                    .upgrade()
+                    .unwrap()
+                    .publish(capture_picture(number, now + interval - picture_latency));
+            }
+        });
+    }
+
+    #[test]
+    fn the_encode_loop_preserves_47_fps_at_a_60_fps_request() {
+        use std::sync::Arc;
+        ffmpeg_next::init().unwrap();
+        let (producer, consumer) = crate::capture::frame_slot();
+        let producer = Arc::new(producer);
+        let (tx, mut rx) = mpsc::channel(NAL_CHANNEL_CAPACITY);
+        let shared = SharedControl::new(0, 8_000_000);
+        shared.running.store(true, Ordering::SeqCst);
+        shared.target_fps.store(60, Ordering::SeqCst);
+        *shared.encoder_override.lock() = Some("libx264".into());
+        let generation = crate::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
+        // A 23.6 ms picture latency can coexist with 47.6 takes per second
+        // when more than one picture is in flight across the pipeline.
+        let count = 140;
+        feed_ready_pictures(
+            &producer,
+            &consumer,
+            count,
+            Duration::from_micros(21_008),
+            Duration::from_micros(23_600),
+        );
+        let stage = {
+            let shared = shared.clone();
+            std::thread::spawn(move || {
+                run_encode_loop(
+                    consumer,
+                    tx,
+                    shared,
+                    GpuInfo::software_fallback(),
+                    generation,
+                )
+                .map_err(|err| err.to_string())
+            })
+        };
+        for _ in 0..count {
+            assert!(rx.blocking_recv().is_some(), "libx264 emits each picture");
+        }
+        producer.close();
+        stage.join().unwrap().unwrap();
+        assert_eq!(shared.capture_fps(), 60);
+        assert_eq!(shared.cpu_fps_limit.load(Ordering::SeqCst), 0);
+    }
+
+    /// A saturated 40 fps intake under a 120 fps request holds capture
+    /// at 45 fps and reopens libx264 there. The first frame for a new
+    /// viewer reopens at 120 fps and its next frames reopen nothing.
     #[test]
     fn the_encode_loop_holds_a_slow_libx264_to_45_fps_and_a_new_session_to_120() {
         use std::sync::{mpsc as std_mpsc, Arc};
@@ -3462,6 +3547,15 @@ mod tests {
         };
 
         let (producer, consumer) = crate::capture::frame_slot();
+        let producer = Arc::new(producer);
+        let count = 89;
+        feed_ready_pictures(
+            &producer,
+            &consumer,
+            count,
+            Duration::from_millis(25),
+            Duration::from_millis(25),
+        );
         let (tx, mut rx) = mpsc::channel(NAL_CHANNEL_CAPACITY);
         let shared = SharedControl::new(0, 8_000_000);
         shared.running.store(true, Ordering::SeqCst);
@@ -3477,7 +3571,6 @@ mod tests {
                     .with_writer(move || Sink(Arc::clone(&writer)))
                     .finish();
                 crate::logging::prepare_log_capture();
-                software_rate::FRAME_COST.with(|cost| cost.set(Some(Duration::from_millis(20))));
                 tracing::subscriber::with_default(subscriber, || {
                     run_encode_stage(
                         consumer,
@@ -3498,28 +3591,21 @@ mod tests {
                 }
             }
         });
-        let mut number = 0;
+        for _ in 0..count {
+            encoded
+                .recv_timeout(Duration::from_secs(10))
+                .expect("the frame is encoded");
+        }
+        let mut number = count;
         // One picture, and its packet.
         let mut frame = || {
             number += 1;
-            producer.publish(RawFrame {
-                frame_number: number,
-                timestamp: Instant::now(),
-                data: Arc::new(synthetic_capture(64, 48, number)),
-                width: 64,
-                height: 48,
-                cached: false,
-            });
+            producer.publish(capture_picture(number, Instant::now()));
             encoded
                 .recv_timeout(Duration::from_secs(10))
                 .expect("the frame is encoded");
         };
 
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while shared.cpu_fps_limit.load(Ordering::SeqCst) != 45 {
-            assert!(Instant::now() < deadline, "no limit: {}", text());
-            frame();
-        }
         assert_eq!(shared.capture_fps(), 45);
         frame();
         assert_eq!(opened_at(&text()), ["120", "45"], "{}", text());

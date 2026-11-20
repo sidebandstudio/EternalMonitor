@@ -289,7 +289,7 @@ pub struct FrameSlot {
 struct SlotInner {
     state: Mutex<SlotState>,
     condvar: Condvar,
-    /// Runs after [`FrameSlot::take_within`] took a frame and let go of the
+    /// Runs after a taker took a frame and let go of the
     /// mailbox, where a taker can be descheduled.
     #[cfg(test)]
     after_take: Mutex<Option<Box<dyn FnMut() + Send>>>,
@@ -333,10 +333,21 @@ impl FrameSlot {
 
     /// Blocks until a frame is available or the producer closed the slot.
     pub fn blocking_take(&self) -> Option<RawFrame> {
+        self.blocking_take_with_ready().map(|(frame, _)| frame)
+    }
+
+    /// Also reports whether the picture was ready before waiting.
+    pub(crate) fn blocking_take_with_ready(&self) -> Option<(RawFrame, bool)> {
         let mut state = self.inner.state.lock();
+        let ready = state.frame.is_some();
         loop {
             if let Some(frame) = state.frame.take() {
-                return Some(frame);
+                #[cfg(test)]
+                {
+                    drop(state);
+                    self.run_after_take();
+                }
+                return Some((frame, ready));
             }
             if state.closed {
                 return None;
@@ -374,11 +385,16 @@ impl FrameSlot {
         };
         #[cfg(test)]
         if matches!(taken, Taken::Frame(_)) {
-            if let Some(hook) = self.inner.after_take.lock().as_mut() {
-                hook();
-            }
+            self.run_after_take();
         }
         taken
+    }
+
+    #[cfg(test)]
+    fn run_after_take(&self) {
+        if let Some(hook) = self.inner.after_take.lock().as_mut() {
+            hook();
+        }
     }
 
     #[cfg(test)]

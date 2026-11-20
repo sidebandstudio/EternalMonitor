@@ -1,11 +1,8 @@
 //! The frame rate a software encoder holds. libx264 and libx265 encode on the
-//! processor, and on a slow one a frame at the user's 120 fps can take
-//! longer to encode than it lasts. The capture slot keeps only the newest
-//! picture, so nothing queues in front of the encoder, but capture still
-//! read back 120 pictures a second for it to skip most of them, and those
-//! readbacks took processor time from the encoder. This holds capture to a
-//! rate the encoder keeps up with, in steps, and raises it again once the
-//! encoder has steady headroom. Hardware encoders are left as they are.
+//! processor. When capture outruns the encoder, the capture slot replaces
+//! unread pictures with newer ones. The limiter uses the rate the encoder
+//! actually takes pictures to reduce those wasted readbacks. It tries
+//! raising the cap when a moving desktop leaves the encoder waiting.
 //!
 //! The iPad is told the stream's rate as before (`StreamConfig.fps` is the
 //! user's setting): it already takes a stream whose rate varies, as a still
@@ -18,25 +15,19 @@ use std::time::{Duration, Instant};
 
 use tracing::info;
 
-/// The rates capture steps down through, below the stream's own rate (the
-/// user's setting or the iPad's, whichever is lower).
-const STEPS: [u32; 5] = [120, 90, 60, 45, 30];
 /// Capture is never held below this.
 pub(crate) const FLOOR_FPS: u32 = 30;
-/// The encoder's cost is averaged over this long before a rate changes.
+/// The rates capture steps down through, below the stream's own rate (the
+/// user's setting or the iPad's, whichever is lower).
+const STEPS: [u32; 5] = [120, 90, 60, 45, FLOOR_FPS];
+/// Measure the rate of new pictures over this interval.
 const WINDOW: Duration = Duration::from_secs(1);
-/// Fewer new pictures than this in a window say nothing about the encoder,
-/// a still desktop, unless the encoder was busy most of the window (see
-/// [`HOLDS`]): then they were few because each took long.
+/// Fewer real pictures indicate a still desktop unless every take had a
+/// new picture ready, in which case the encoder itself can be that slow.
 const MIN_FRAMES: u32 = 5;
-/// A rate holds while a frame's conversion and encoding take at most this
-/// share of its interval; capture and the transport need the rest.
-const HOLDS: f64 = 0.9;
-/// The next rate up is tried only while a frame would take at most this
-/// share of that rate's interval. The gap to [`HOLDS`] keeps a cost near one
-/// step's limit from going up and straight back down.
-const HEADROOM: f64 = 0.7;
-/// Headroom must last this long before the rate goes up a step.
+/// Leave room above the measured throughput when choosing a lower step.
+const THROUGHPUT_MARGIN: f64 = 1.05;
+/// The encoder must wait for pictures at a cap for this long to go up.
 const UP_AFTER: Duration = Duration::from_secs(5);
 /// A step up that has to come down within this was one too many, as when
 /// the higher capture rate itself slows the encoder down: the wait for the
@@ -53,8 +44,14 @@ pub(crate) struct Step {
     pub from: u32,
     /// The stream's own rate when the limit ends.
     pub to: u32,
-    /// The window's average conversion and encode time per frame.
-    pub cost: Duration,
+}
+
+#[derive(Debug)]
+struct Window {
+    start: Instant,
+    ceiling: u32,
+    frames: u32,
+    saturated: bool,
 }
 
 /// Holds capture to a software encoder's rate through `published`, the
@@ -70,9 +67,9 @@ pub(crate) struct SoftwareRate {
     frozen: bool,
     /// The rate capture is held to, while it is below the stream's.
     limit: Option<u32>,
-    /// Since when, the summed cost and the frames of the current window.
-    window: Option<(Instant, Duration, u32)>,
-    headroom_since: Option<Instant>,
+    window: Option<Window>,
+    previous_saturated_fps: Option<f64>,
+    waiting_since: Option<Instant>,
     up_after: Duration,
     raised_at: Option<Instant>,
 }
@@ -88,27 +85,12 @@ impl SoftwareRate {
             frozen: false,
             limit: None,
             window: None,
-            headroom_since: None,
+            previous_saturated_fps: None,
+            waiting_since: None,
             up_after: UP_AFTER,
             raised_at: None,
         }
     }
-}
-
-#[cfg(test)]
-thread_local! {
-    /// A test's cost for each frame the encode loop on this thread notes.
-    pub(crate) static FRAME_COST: std::cell::Cell<Option<Duration>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// The cost a frame is noted with: as measured, or a test's.
-pub(crate) fn frame_cost(measured: Duration) -> Duration {
-    #[cfg(test)]
-    if let Some(cost) = FRAME_COST.with(std::cell::Cell::get) {
-        return cost;
-    }
-    measured
 }
 
 /// libx264 and libx265: every encoder that is not a graphics card's.
@@ -119,10 +101,6 @@ pub(crate) fn is_software_encoder(encoder_name: &str) -> bool {
 /// The rates capture can run at under `ceiling`, highest first.
 fn levels(ceiling: u32) -> impl Iterator<Item = u32> {
     std::iter::once(ceiling).chain(STEPS.into_iter().filter(move |&step| step < ceiling))
-}
-
-fn holds(cost: Duration, fps: u32, share: f64) -> bool {
-    cost.as_secs_f64() * f64::from(fps.max(1)) <= share
 }
 
 /// The rate the session for `encoder_name` opens at. x264's and x265's
@@ -147,81 +125,99 @@ impl SoftwareRate {
             .unwrap_or(ceiling)
     }
 
-    /// A frame the software encoder converted and encoded from a new
-    /// picture in `cost`. `ceiling` is the stream's rate. Returns a change
-    /// of the rate capture is held to.
-    pub(crate) fn encoded(&mut self, cost: Duration, ceiling: u32, now: Instant) -> Option<Step> {
+    /// Observe one take. A cached or resubmitted picture neither counts
+    /// toward throughput nor indicates a ready supply of new pictures.
+    fn took(
+        &mut self,
+        ceiling: u32,
+        now: Instant,
+        new_picture: bool,
+        ready: bool,
+    ) -> Option<(Step, f64)> {
         let current = self.rate(ceiling);
         if self.limit.is_some_and(|limit| limit >= ceiling) {
             self.limit = None;
         }
-        let (start, sum, frames) = self.window.get_or_insert((now, Duration::ZERO, 0));
-        *sum += cost;
-        *frames += 1;
-        let start = *start;
-        let elapsed = now.saturating_duration_since(start);
+        let saturated = new_picture && ready;
+        let Some(window) = self
+            .window
+            .as_mut()
+            .filter(|window| window.ceiling == ceiling)
+        else {
+            self.window = Some(Window {
+                start: now,
+                ceiling,
+                frames: 0,
+                saturated,
+            });
+            self.previous_saturated_fps = None;
+            self.waiting_since = None;
+            return None;
+        };
+        window.frames += u32::from(new_picture);
+        window.saturated &= saturated;
+        let elapsed = now.saturating_duration_since(window.start);
         if elapsed < WINDOW {
             return None;
         }
-        let (_, sum, frames) = self.window.take().expect("filled above");
-        // Few frames from an encoder busy all the window: each took long.
-        let busy = sum.as_secs_f64() >= HOLDS * elapsed.as_secs_f64();
-        if frames < MIN_FRAMES && !busy {
-            self.headroom_since = None;
+        let start = window.start;
+        let frames = window.frames;
+        let saturated = window.saturated;
+        window.start = now;
+        window.frames = 0;
+        window.saturated = true;
+
+        if frames < MIN_FRAMES && !saturated {
+            self.previous_saturated_fps = None;
+            self.waiting_since = None;
             return None;
         }
-        let cost = sum / frames;
         if self
             .raised_at
             .is_some_and(|at| now.saturating_duration_since(at) >= UP_FAILED_WITHIN)
         {
-            // The last step up held.
             self.raised_at = None;
             self.up_after = UP_AFTER;
         }
-        if !holds(cost, current, HOLDS) {
-            self.headroom_since = None;
+
+        let measured_fps = f64::from(frames) / elapsed.as_secs_f64();
+        let previous = std::mem::replace(
+            &mut self.previous_saturated_fps,
+            saturated.then_some(measured_fps),
+        );
+        let to = if saturated {
+            self.waiting_since = None;
+            // Protect the faster of the two completed windows.
+            let required = previous?.max(measured_fps) * THROUGHPUT_MARGIN;
             let to = levels(ceiling)
-                .find(|&fps| fps < current && holds(cost, fps, HOLDS))
-                .unwrap_or(FLOOR_FPS.min(ceiling));
+                .filter(|&fps| f64::from(fps) >= required)
+                .min()
+                .unwrap_or(ceiling);
             if to >= current {
                 return None;
             }
             if self.raised_at.take().is_some() {
                 self.up_after = (self.up_after * 2).min(UP_AFTER_MAX);
             }
-            self.limit = Some(to);
-            return Some(Step {
-                from: current,
-                to,
-                cost,
-            });
-        }
-        if self.limit.is_none() || frames < MIN_FRAMES {
-            self.headroom_since = None;
-            return None;
-        }
-        let next = levels(ceiling)
-            .filter(|&fps| fps > current)
-            .min()
-            .expect("a limit is below the ceiling");
-        let steady = f64::from(frames) >= STEADY * f64::from(current) * elapsed.as_secs_f64();
-        if !(steady && holds(cost, next, HEADROOM)) {
-            self.headroom_since = None;
-            return None;
-        }
-        let since = *self.headroom_since.get_or_insert(start);
-        if now.saturating_duration_since(since) < self.up_after {
-            return None;
-        }
-        self.headroom_since = None;
-        self.raised_at = Some(now);
-        self.limit = (next < ceiling).then_some(next);
-        Some(Step {
-            from: current,
-            to: next,
-            cost,
-        })
+            to
+        } else {
+            if self.limit.is_none() || measured_fps < STEADY * f64::from(current) {
+                self.waiting_since = None;
+                return None;
+            }
+            let since = *self.waiting_since.get_or_insert(start);
+            if now.saturating_duration_since(since) < self.up_after {
+                return None;
+            }
+            self.raised_at = Some(now);
+            levels(ceiling)
+                .filter(|&fps| fps > current)
+                .min()
+                .expect("a limit is below the ceiling")
+        };
+        self.limit = (to < ceiling).then_some(to);
+        self.window = None;
+        Some((Step { from: current, to }, measured_fps))
     }
 
     /// Forgets the measurements and ends any limit, for the same encoder
@@ -239,6 +235,11 @@ impl SoftwareRate {
     /// nothing changes: the session streaming meanwhile cannot reopen, and
     /// one that opened with the pipeline was never limited.
     pub(crate) fn before_frame(&mut self, session: Option<u32>, opening_behind: bool) {
+        if opening_behind && !self.frozen {
+            self.window = None;
+            self.previous_saturated_fps = None;
+            self.waiting_since = None;
+        }
         self.frozen = opening_behind;
         if !self.frozen && self.session != Some(session) {
             self.reset();
@@ -246,15 +247,15 @@ impl SoftwareRate {
         }
     }
 
-    /// After each frame the open session encoded from a new picture: holds
-    /// capture to the rate a software encoder keeps up with. A hardware
-    /// session or another encoder starts again without a limit.
-    pub(crate) fn note_encoded(
+    /// Observe the take once the active encoder is known. Switching
+    /// encoders clears the previous encoder's limit.
+    pub(crate) fn note_taken(
         &mut self,
         encoder_name: &str,
-        cost: Duration,
         ceiling: u32,
         now: Instant,
+        new_picture: bool,
+        ready: bool,
     ) {
         if self.frozen {
             return;
@@ -266,19 +267,18 @@ impl SoftwareRate {
         if !is_software_encoder(encoder_name) {
             return;
         }
-        let step = self.encoded(cost, ceiling, now);
+        let step = self.took(ceiling, now, new_picture, ready);
         // Also when a lower stream rate ended the limit without a step.
         self.published
             .store(self.limit.unwrap_or(0), Ordering::Relaxed);
-        let Some(step) = step else {
+        let Some((step, measured_fps)) = step else {
             return;
         };
-        let encode_us = step.cost.as_micros() as u64;
         if step.to < step.from {
             info!(
                 from = step.from,
                 to = step.to,
-                encode_us,
+                measured_fps,
                 encoder = encoder_name,
                 "The software encoder cannot hold the frame rate; capturing fewer frames per second"
             );
@@ -286,7 +286,7 @@ impl SoftwareRate {
             info!(
                 from = step.from,
                 to = step.to,
-                encode_us,
+                measured_fps,
                 encoder = encoder_name,
                 "The software encoder has headroom again; capturing more frames per second"
             );
@@ -356,6 +356,7 @@ mod tests {
         // The capture interval of each published frame, by frame number.
         let mut intervals = std::collections::HashMap::new();
         let mut kept = None;
+        let mut waiting = false;
         loop {
             let capture_fps = shared.capture_fps();
             if run.rates.last().is_none_or(|&(_, fps)| fps != capture_fps) {
@@ -395,11 +396,15 @@ mod tests {
                     encoder_free = now + spent;
                     if limiter {
                         rate.before_frame(Some(1), false);
-                        rate.note_encoded(encoder, spent, shared.effective_fps(), encoder_free);
+                        rate.note_taken(encoder, shared.effective_fps(), now, true, !waiting);
                     }
+                    waiting = false;
                 }
                 // Idle until the next capture.
-                _ => encoder_free = next_capture,
+                _ => {
+                    waiting = true;
+                    encoder_free = next_capture;
+                }
             }
         }
         run.last = shared.capture_fps();
@@ -412,29 +417,29 @@ mod tests {
         shared
     }
 
-    /// The field case: libx264 at 120 fps on a processor that takes 20 ms a
-    /// frame. Capture comes down to 45 fps, which the encoder holds, and no
-    /// picture waits in front of it longer than a frame. Once frames cost
-    /// 6 ms, capture goes back up a step at a time to 90 fps and stays
-    /// there: 120 fps would want 6 ms to be at most 70% of its 8.3 ms.
+    /// A 40 fps encoder under a 120 fps capture picks 45. When it
+    /// gets faster, it recovers one step at a time.
     #[test]
     fn a_slow_software_encoder_holds_capture_to_a_rate_it_keeps_up_with() {
         let shared = shared_at(120);
-        let run = simulate(&shared, "libx264", 60.0, true, |second, _| {
-            if second < 20.0 {
-                20 * MS
-            } else {
+        let run = simulate(&shared, "libx264", 60.0, true, |second, fps| {
+            if second >= 20.0 {
                 6 * MS
+            } else if fps == 45 {
+                // Fewer readbacks let the encoder keep up at this rate.
+                crate::capture::frame_budget_for(fps)
+            } else {
+                25 * MS
             }
         });
         assert_eq!(run.rate_at(0.0), 120);
-        assert_eq!(run.rate_at(1.1), 45, "{:?}", run.rates);
+        assert_eq!(run.rate_at(2.1), 45, "{:?}", run.rates);
         assert_eq!(run.rate_at(19.9), 45, "{:?}", run.rates);
         // At 45 fps the encoder takes every picture capture reads back.
         let at_45 = run
             .submitted
             .iter()
-            .filter(|&&n| (200..800).contains(&n))
+            .filter(|&&n| (300..900).contains(&n))
             .count();
         assert_eq!(at_45, 600, "every picture at 45 fps is encoded");
         assert!(
@@ -443,19 +448,19 @@ mod tests {
             run.worst_wait,
             run.worst_wait_interval
         );
-        // Back up a step after 5 s of headroom each, then no more changes.
+        // Back up a step after 5 s of headroom each, until the limit clears.
         let rates: Vec<u32> = run.rates.iter().map(|&(_, fps)| fps).collect();
-        assert_eq!(rates, [120, 45, 60, 90], "{:?}", run.rates);
+        assert_eq!(rates, [120, 45, 60, 90, 120], "{:?}", run.rates);
         assert!(
-            run.rate_at(28.0) == 60 && run.rate_at(35.0) == 90,
+            run.rate_at(27.0) == 60 && run.rate_at(32.0) == 90,
             "{:?}",
             run.rates
         );
-        assert_eq!(run.last, 90);
+        assert_eq!(run.last, 120);
     }
 
     /// The base had no limit: at 120 fps and 20 ms a frame the encoder
-    /// skipped five pictures of six, which capture had read back for it.
+    /// skipped seven pictures of twelve, which capture had read back for it.
     #[test]
     fn without_the_limit_capture_reads_back_pictures_the_encoder_skips() {
         let shared = shared_at(120);
@@ -469,12 +474,11 @@ mod tests {
     /// take its processor time), a step up comes back down, and each such
     /// try waits twice as long as the one before.
     #[test]
-    fn a_cost_that_rises_with_the_rate_does_not_go_up_and_down_every_few_seconds() {
+    fn throughput_that_drops_at_higher_rates_backs_off_retries() {
         let shared = shared_at(120);
         let run = simulate(&shared, "libx264", 300.0, true, |_, fps| match fps {
-            // Holds 60 with room for 90, but not 90 itself.
-            120 => 12 * MS,
-            90 => 10500 * Duration::from_micros(1),
+            // Saturated at the higher rates, waiting at 60.
+            120 | 90 => 20 * MS,
             _ => 7 * MS,
         });
         let ups: Vec<f64> = run
@@ -483,7 +487,7 @@ mod tests {
             .filter(|pair| pair[1].1 > pair[0].1)
             .map(|pair| pair[1].0)
             .collect();
-        assert!(ups.len() <= 8, "{:?}", run.rates);
+        assert!((5..=8).contains(&ups.len()), "{:?}", run.rates);
         let gaps: Vec<f64> = ups.windows(2).map(|pair| pair[1] - pair[0]).collect();
         assert!(
             gaps.windows(2).all(|pair| pair[1] >= pair[0] - 0.1),
@@ -516,7 +520,7 @@ mod tests {
         shared.client_preferred_fps.store(90, Ordering::SeqCst);
         let run = simulate(&shared, "libx264", 40.0, true, |second, _| {
             if second < 10.0 {
-                14 * MS
+                20 * MS
             } else {
                 MS
             }
@@ -554,20 +558,20 @@ mod tests {
         }
     }
 
-    /// Frames of `cost` every `cost` (an encoder busy all the time) from
+    /// A picture every `interval` (an encoder busy all the time) from
     /// `at` for `seconds`, for `encoder` in `session` at `ceiling`.
     fn busy(
         rate: &mut SoftwareRate,
         (encoder, session, ceiling): (&str, Option<u32>, u32),
-        cost: Duration,
+        interval: Duration,
         at: &mut Instant,
         seconds: u32,
     ) {
         let end = *at + seconds * 1000 * MS;
         while *at < end {
-            *at += cost;
+            *at += interval;
             rate.before_frame(session, false);
-            rate.note_encoded(encoder, cost, ceiling, *at);
+            rate.note_taken(encoder, ceiling, *at, true, true);
         }
     }
 
@@ -579,7 +583,7 @@ mod tests {
         let shared = shared_at(120);
         let mut rate = SoftwareRate::new(Arc::clone(&shared.cpu_fps_limit));
         let mut at = Instant::now();
-        busy(&mut rate, ("libx264", Some(1), 120), 20 * MS, &mut at, 3);
+        busy(&mut rate, ("libx264", Some(1), 120), 25 * MS, &mut at, 3);
         assert_eq!(shared.capture_fps(), 45);
         shared.target_fps.store(30, Ordering::SeqCst);
         busy(&mut rate, ("libx264", Some(1), 30), MS, &mut at, 3);
@@ -602,7 +606,7 @@ mod tests {
         let limited = |shared: &SharedControl| {
             let mut rate = SoftwareRate::new(Arc::clone(&shared.cpu_fps_limit));
             let mut at = Instant::now();
-            busy(&mut rate, ("libx264", Some(1), 120), 20 * MS, &mut at, 2);
+            busy(&mut rate, ("libx264", Some(1), 120), 25 * MS, &mut at, 3);
             assert_eq!(shared.capture_fps(), 45);
             (rate, at)
         };
@@ -618,7 +622,7 @@ mod tests {
             if session != Some(1) {
                 assert_eq!(super::encode_fps(encoder, &shared), 120, "{session:?}");
             }
-            rate.note_encoded(encoder, MS, 120, at + MS);
+            rate.note_taken(encoder, 120, at + MS, true, false);
             assert_eq!(shared.cpu_fps_limit.load(Ordering::SeqCst), 0, "{encoder}");
             assert_eq!(shared.capture_fps(), 120, "{encoder} {session:?}");
         }
@@ -647,17 +651,17 @@ mod tests {
         for _ in 0..200 {
             at += 20 * MS;
             rate.before_frame(None, true);
-            rate.note_encoded("libx264", 20 * MS, 120, at);
+            rate.note_taken("libx264", 120, at, true, true);
         }
         assert_eq!(shared.capture_fps(), 120);
         assert_eq!(super::encode_fps("libx264", &shared), 120);
         // Once it opened, the measurements start.
-        busy(&mut rate, ("libx264", None, 120), 20 * MS, &mut at, 2);
+        busy(&mut rate, ("libx264", None, 120), 25 * MS, &mut at, 3);
         assert_eq!(shared.capture_fps(), 45);
         for session in [None, Some(3)] {
             at += 20 * MS;
             rate.before_frame(session, true);
-            rate.note_encoded("libx264", MS, 120, at);
+            rate.note_taken("libx264", 120, at, true, false);
             assert_eq!(shared.capture_fps(), 45);
             assert_eq!(super::encode_fps("libx264", &shared), 45);
         }
@@ -677,30 +681,62 @@ mod tests {
         }
     }
 
-    /// A still desktop, whose few pictures are cheap, is no headroom.
+    #[test]
+    fn two_saturated_windows_pick_the_lowest_step_that_covers_throughput() {
+        for (throughput, request, expected) in [
+            (47.6, 60, 60),
+            (47.6, 120, 60),
+            (73.9, 90, 90),
+            (28.0, 60, 30),
+        ] {
+            let mut rate = SoftwareRate::new(Arc::default());
+            let start = Instant::now();
+            for n in 0..=(throughput * 3.0) as u32 {
+                let at = Duration::from_secs_f64(f64::from(n) / throughput);
+                rate.took(request, start + at, true, true);
+                if at < 2 * WINDOW {
+                    assert_eq!(rate.rate(request), request);
+                }
+            }
+            assert_eq!(
+                rate.rate(request),
+                expected,
+                "{throughput} fps at {request}"
+            );
+        }
+    }
+
     #[test]
     fn a_still_desktop_does_not_raise_or_lower_the_rate() {
         let mut rate = SoftwareRate::new(Arc::default());
-        let start = Instant::now();
-        let mut at = start;
-        for _ in 0..60 {
-            at += 22 * MS;
-            rate.encoded(20 * MS, 120, at);
+        let mut at = Instant::now();
+        busy(&mut rate, ("libx264", Some(1), 120), 25 * MS, &mut at, 3);
+        assert_eq!(rate.rate(120), 45);
+        for n in 0..600 {
+            at += 100 * MS;
+            // Mostly cached pictures, with one new picture every 400 ms.
+            assert_eq!(rate.took(120, at, n % 4 == 0, false), None);
         }
         assert_eq!(rate.rate(120), 45);
-        // A picture every 250 ms for a minute, a millisecond each.
-        for _ in 0..240 {
-            at += 250 * MS;
-            assert_eq!(rate.encoded(MS, 120, at), None);
+    }
+
+    #[test]
+    fn a_waiting_encoder_on_a_moving_desktop_raises_one_step_after_up_after() {
+        let mut rate = SoftwareRate::new(Arc::default());
+        rate.limit = Some(45);
+        let mut at = Instant::now();
+        rate.took(120, at, true, false);
+        let start = at;
+        while at + 23 * MS < start + UP_AFTER {
+            at += 23 * MS;
+            assert_eq!(rate.took(120, at, true, false), None);
         }
-        assert_eq!(rate.rate(120), 45);
-        // Nor do fewer than five a second lower it while the encoder is
-        // mostly idle, though 40 ms is more than 90% of a 45 fps frame.
-        for _ in 0..150 {
-            at += 400 * MS;
-            assert_eq!(rate.encoded(40 * MS, 120, at), None);
+        while rate.rate(120) == 45 {
+            at += 23 * MS;
+            assert!(at < start + UP_AFTER + WINDOW);
+            rate.took(120, at, true, false);
         }
-        assert_eq!(rate.rate(120), 45);
+        assert_eq!(rate.rate(120), 60);
     }
 
     /// The summary every 10 s says what capture is held to.
