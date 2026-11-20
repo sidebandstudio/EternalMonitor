@@ -54,7 +54,7 @@ impl AnalyzerApp {
     }
 
     /// Update, restart and fault notices, most urgent first.
-    fn notices(&mut self, ui: &mut Ui, snap: &StatsSnapshot, client: &ClientSnapshot) {
+    pub(super) fn notices(&mut self, ui: &mut Ui, snap: &StatsSnapshot, client: &ClientSnapshot) {
         self.port_notice(ui);
         let firewall = crate::firewall::latest();
         let progress = crate::firewall_fix::progress();
