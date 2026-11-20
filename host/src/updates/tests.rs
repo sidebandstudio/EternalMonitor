@@ -1959,6 +1959,26 @@ fn a_setup_that_failed_after_installing_the_new_version_is_reported() {
 }
 
 #[test]
+fn unverified_display_tasks_warn_once_without_reoffering_the_installed_version() {
+    let (saved, dir) = pending_saved("0.3.4", "0.3.5", Some("setup_exit=21\n"));
+    let mut state = State::new("0.3.5", true, saved);
+    std::fs::remove_dir_all(dir).unwrap();
+    assert_eq!(
+        state.notice(0),
+        Some(Notice::Incomplete(
+            "Some parts of the update didn't finish. Reinstall from the website.".into()
+        ))
+    );
+    assert_eq!(state.saved.pending, None);
+    assert_eq!(state.saved.pending_result, None);
+    state.later(0);
+    assert_eq!(state.finish_check(1000, false, Ok(release("0.3.5"))), None);
+    assert_eq!(state.notice(1000), None);
+    state.finish_check(2000, false, Ok(release("0.3.6")));
+    assert_eq!(state.notice(2000), Some(Notice::Available("0.3.6".into())));
+}
+
+#[test]
 fn a_failed_update_is_logged_and_explained_from_the_helper_s_result() {
     let case = |result: Option<&str>| {
         let (saved, dir) = pending_saved("0.3.4", "0.3.5", result);

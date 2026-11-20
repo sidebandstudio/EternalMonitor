@@ -1896,6 +1896,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn power_source_can_contain_a_name_in_free_form_output() {
+        let names = Names::new(None, None, Some("ExamplePC"));
+        assert_cases(
+            &names,
+            &[
+                ("power_source=ExamplePC", "power_source=%COMPUTERNAME%"),
+                (
+                    "power_source=battery ExamplePC",
+                    "power_source=battery %COMPUTERNAME%",
+                ),
+            ],
+        );
+        let names = Names::new(None, None, Some("battery-laptop"));
+        assert_cases(
+            &names,
+            &[("power_source=battery-laptop", "power_source=%COMPUTERNAME%")],
+        );
+        let names = Names::new(None, Some("battery backup"), None);
+        assert_cases(
+            &names,
+            &[("power_source=battery backup", "power_source=%USERNAME%")],
+        );
+    }
+
+    #[test]
+    fn ordinary_power_source_values_survive_redaction() {
+        let names = Names::new(None, Some("example-user"), Some("ExamplePC"));
+        for source in ["ac", "battery", "unknown"] {
+            for line in [
+                format!(r#"{STAMP}  INFO Support system information details="Windows build=26100.1 power_source={source}""#),
+                format!("{STAMP}  WARN Virtual display failure snapshot device=no_monitor power_source={source} pin=none"),
+            ] {
+                assert_eq!(redact(&line, &names), line);
+            }
+        }
+    }
+
     /// Every enumerated field the host logs keeps its value when the user or
     /// the PC has that name.
     #[test]
@@ -1913,6 +1951,7 @@ mod tests {
             ("none", "INFO remote_config=applied rollout=none ss_rule=none attach_s=6"),
             ("defaults", "INFO remote_config=defaults reason=offline rollout=7d"),
             ("NotInstalled", "vdd_device=missing problem=NotInstalled"),
+            ("task_queued", "WARN Virtual display could not be enabled second_screen_fallback=enable_failed reason=task_queued device=unknown"),
             (
                 "unknown",
                 r#"WARN Virtual display failure snapshot vdd_device=no_monitor pin=none pin_reason="unknown" render=unknown hags=unset settings_path=unknown"#,
