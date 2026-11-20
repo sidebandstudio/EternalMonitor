@@ -125,7 +125,7 @@ pub fn run_capture_loop(
         }
 
         let frame_start = Instant::now();
-        let frame_budget = frame_budget_for(shared.capture_fps());
+        let frame_budget = frame_budget_for(shared.effective_fps());
 
         heartbeat(&shared.hb_capture_loop_ms);
 
