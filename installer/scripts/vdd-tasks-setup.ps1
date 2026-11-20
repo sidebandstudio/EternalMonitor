@@ -19,7 +19,8 @@ if (-not (Test-Path $toggle)) {
 }
 
 $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
-$settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
+$settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+    -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
 
 function Register-VddTask([string]$Name, [string]$ToggleAction) {
     $argument = "-NoProfile -ExecutionPolicy Bypass -File `"$toggle`" -Action $ToggleAction"

@@ -1,4 +1,4 @@
-# Pure script checks for host/src/vdd_task.ps1. Task Scheduler is replaced in
+# Script checks for host/src/vdd_task.ps1. Task Scheduler is replaced in
 # a child process, so no real task runs. The host runs the script the same way:
 # `& { <script> } -Task <name> -After <other direction>`.
 $ErrorActionPreference = 'Stop'
@@ -100,6 +100,36 @@ if ($case.Code -ne 1 -or $case.Output -notmatch '0x80070002' -or $case.Output -m
     throw "A missing requested task was not reported: $($case.Output)"
 }
 Write-Output 'VDD task checks passed: waits for the other direction, earlier runs, hung Enable bound, queued instance, no -After, missing tasks'
+
+# Run the real Setup registration on the Windows CI runner. Use an inert
+# toggle so Setup's final direct disable cannot touch a display device.
+$names = 'EternalMonitor VDD Enable', 'EternalMonitor VDD Disable'
+foreach ($name in $names) {
+    if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
+        throw "Refusing to replace existing scheduled task '$name' in the test."
+    }
+}
+$fixture = Join-Path $env:TEMP ('em-vdd-task-setup-test-' + [guid]::NewGuid().ToString('N'))
+try {
+    New-Item -ItemType Directory -Path $fixture | Out-Null
+    Copy-Item (Join-Path $PSScriptRoot '..\..\installer\scripts\vdd-tasks-setup.ps1') $fixture
+    Set-Content -Path (Join-Path $fixture 'vdd-toggle.ps1') -Value 'param([string]$Action); exit 0'
+    & (Join-Path $fixture 'vdd-tasks-setup.ps1')
+    foreach ($name in $names) {
+        $settings = (Get-ScheduledTask -TaskName $name).Settings
+        if ($settings.DisallowStartIfOnBatteries -ne $false -or $settings.StopIfGoingOnBatteries -ne $false) {
+            throw "'$name' must be allowed to start and keep running on battery."
+        }
+    }
+    Write-Output 'Setup registered both tasks with battery power allowed.'
+} finally {
+    foreach ($name in $names) {
+        if (Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue) {
+            Unregister-ScheduledTask -TaskName $name -Confirm:$false
+        }
+    }
+    Remove-Item -LiteralPath $fixture -Recurse -Force -ErrorAction SilentlyContinue
+}
 # Some cases end their child with exit code 1 on purpose. Without this the
 # last one stays in $LASTEXITCODE, and a CI step that ends with it fails.
 # Every failure above throws, which exits 1.

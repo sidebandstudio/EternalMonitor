@@ -597,13 +597,14 @@ fn windows_system_report() -> Vec<String> {
     let mut lines = vec![format!(
         // ProductName can retain "Windows 10" on Windows 11. Name the OS from
         // the build, and keep the registry label beside it as the source.
-        "Windows os={} registry_product={} installation_type={} display_version={} build={}.{}",
+        "Windows os={} registry_product={} installation_type={} display_version={} build={}.{} power_source={}",
         windows_name(&product, &build),
         product,
         registry_string(os_key, "InstallationType"),
         registry_string(os_key, "DisplayVersion"),
         build,
-        registry_dword(os_key, "UBR")
+        registry_dword(os_key, "UBR"),
+        crate::power::power_source(),
     )];
     lines.push(format!(
         "CPU={} identifier={}",

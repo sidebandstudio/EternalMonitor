@@ -26,6 +26,27 @@ pub const SLEEP_WAIT: Duration = Duration::from_millis(500);
 /// Longest the end-of-session message waits for it.
 pub const END_SESSION_WAIT: Duration = Duration::from_millis(1500);
 
+/// The current Windows power source, for support logs.
+#[cfg(windows)]
+pub(crate) fn power_source() -> &'static str {
+    use windows::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
+
+    let mut status = SYSTEM_POWER_STATUS::default();
+    let ac_line_status = unsafe { GetSystemPowerStatus(&mut status) }
+        .ok()
+        .map(|()| status.ACLineStatus);
+    power_source_text(ac_line_status)
+}
+
+#[cfg(any(windows, test))]
+fn power_source_text(ac_line_status: Option<u8>) -> &'static str {
+    match ac_line_status {
+        Some(1) => "ac",
+        Some(0) => "battery",
+        _ => "unknown",
+    }
+}
+
 /// Wakes the transport to send a goodbye the PC going down left, and counts
 /// the goodbyes it sent, so the message can wait for its own.
 #[derive(Debug, Default)]
@@ -568,6 +589,14 @@ mod windows_impl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn power_source_text_from_windows_status() {
+        assert_eq!(power_source_text(Some(1)), "ac");
+        assert_eq!(power_source_text(Some(0)), "battery");
+        assert_eq!(power_source_text(Some(255)), "unknown");
+        assert_eq!(power_source_text(None), "unknown");
+    }
 
     /// Only an installer closing the app, or a WM_CLOSE, quits it; the PC
     /// going down, or a sign-out, leaves that to Windows.

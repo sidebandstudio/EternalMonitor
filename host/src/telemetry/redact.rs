@@ -177,6 +177,7 @@ const DIAGNOSTIC_KEYS: &[&str] = &[
     "bypass_rules",
     "lan",
     "verdict",
+    "power_source",
     // The virtual display snapshot.
     "driver",
     "tech",
@@ -1913,9 +1914,12 @@ mod tests {
             ("none", "INFO remote_config=applied rollout=none ss_rule=none attach_s=6"),
             ("defaults", "INFO remote_config=defaults reason=offline rollout=7d"),
             ("NotInstalled", "vdd_device=missing problem=NotInstalled"),
+            ("ac", r#"INFO Support system information details="Windows build=26100.1 power_source=ac""#),
+            ("battery", "WARN Virtual display failure snapshot device=no_monitor power_source=battery"),
+            ("task_queued", "WARN Virtual display could not be enabled second_screen_fallback=enable_failed reason=task_queued device=unknown"),
             (
                 "unknown",
-                r#"WARN Virtual display failure snapshot vdd_device=no_monitor pin=none pin_reason="unknown" render=unknown hags=unset settings_path=unknown"#,
+                r#"WARN Virtual display failure snapshot vdd_device=no_monitor power_source=unknown pin=none pin_reason="unknown" render=unknown hags=unset settings_path=unknown"#,
             ),
             (
                 "Iris",
