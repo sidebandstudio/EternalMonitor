@@ -49,7 +49,7 @@ use tracing::{info, warn};
 use crate::autostart::{first_lan_ipv4, read_startup_registry, set_startup_registry};
 use crate::capture::recovery::CaptureBlock;
 use crate::capture::{listing, OutputInfo};
-use crate::control::{CaptureTarget, GuiControl};
+use crate::control::{CaptureTarget, GuiControl, RestartReason};
 use crate::gpu_preference::{Change, Preference, SwitchRecord};
 use crate::handoff::Handoff;
 use crate::i18n::{self, tr, trf, Lang};
@@ -715,7 +715,7 @@ impl AnalyzerApp {
         }
         self.set_capture_display(display);
         if running {
-            self.restart_stream();
+            self.restart_stream(Some(RestartReason::SetSecondScreen));
         }
     }
 
@@ -723,7 +723,7 @@ impl AnalyzerApp {
     fn reset_video_settings(&mut self) {
         self.set_encoder_choice(ENCODER_AUTO_LABEL);
         self.set_encoder_input(crate::encoder::input::EncoderInput::default());
-        self.restart_stream();
+        self.restart_stream(Some(RestartReason::ResetVideoSettings));
     }
 
     fn refresh_outputs(&mut self) {
@@ -847,11 +847,15 @@ impl AnalyzerApp {
         }
     }
 
-    fn restart_stream(&mut self) {
+    fn restart_stream(&mut self, reason: Option<RestartReason>) {
         self.restart_pending = false;
         // The user may have updated a driver, as the fallback notice asks.
         crate::encoder::forget_launch_failures();
-        self.control.request_restart();
+        if let Some(reason) = reason {
+            self.control.request_restart_for(reason);
+        } else {
+            self.control.request_restart();
+        }
     }
 
     /// The Stream page notice: move EternalMonitor onto the card the screen

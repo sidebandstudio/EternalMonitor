@@ -1,9 +1,10 @@
 //! Low-frequency support evidence. Never collect credentials or user documents.
 use std::ffi::CStr;
 use std::sync::{mpsc, Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::control::{CaptureTarget, SharedControl};
+use crate::stats::{PipelineStats, PIPELINE_STATS};
 use crate::transport::link::LinkId;
 use crate::transport::session::{EndReason, SessionEnd, StageFailure, StreamStop};
 use tracing::info;
@@ -146,12 +147,13 @@ impl Monitor {
     pub fn start(shared: SharedControl) -> Self {
         let (stop, receiver) = mpsc::channel();
         let thread = std::thread::spawn(move || {
+            let mut interval = StreamInterval::default();
             while receiver.recv_timeout(Duration::from_secs(10))
                 == Err(mpsc::RecvTimeoutError::Timeout)
             {
-                log_stream_summary(&shared);
+                log_interval_summary(&shared, &mut interval);
             }
-            log_stream_summary(&shared);
+            log_interval_summary(&shared, &mut interval);
         });
         Self(stop, Some(thread))
     }
@@ -166,16 +168,57 @@ impl Drop for Monitor {
     }
 }
 
-pub(crate) fn log_stream_summary(shared: &SharedControl) {
-    use std::sync::atomic::Ordering::Relaxed;
-    // Don't keep pipeline locks held while formatting/writing tracing events.
+#[derive(Default)]
+struct StreamInterval {
+    previous: Option<(Instant, [u64; 3])>,
+}
+
+impl StreamInterval {
+    fn rates(&mut self, sample: &PipelineStats, at: Instant) -> [f64; 3] {
+        let counts = [
+            sample.capture_frame_count,
+            sample.encode_frame_count,
+            sample.transport_packets_sent,
+        ];
+        let Some((previous_at, previous)) = self.previous.replace((at, counts)) else {
+            return [0.0; 3];
+        };
+        let elapsed = at.duration_since(previous_at);
+        if elapsed.is_zero() {
+            return [0.0; 3];
+        }
+        // A counter that decreased reset mid-interval. Its full delta is unknown.
+        std::array::from_fn(|i| {
+            counts[i].saturating_sub(previous[i]) as f64 / elapsed.as_secs_f64()
+        })
+    }
+}
+
+fn log_interval_summary(shared: &SharedControl, interval: &mut StreamInterval) {
+    // Keep the same session and stats snapshot order as the counters in the log.
     let session_id = shared.session.lock().session_id();
-    let sample = crate::stats::PIPELINE_STATS.lock().clone();
+    let sample = PIPELINE_STATS.lock().clone();
+    let rates = interval.rates(&sample, Instant::now());
+    write_stream_summary(shared, session_id, &sample, rates);
+}
+
+// Entry point for the encoder's summary-field test.
+#[cfg(test)]
+pub(crate) fn log_stream_summary(shared: &SharedControl) {
+    log_interval_summary(shared, &mut StreamInterval::default());
+}
+
+fn write_stream_summary(
+    shared: &SharedControl,
+    session_id: Option<u32>,
+    sample: &PipelineStats,
+    [capture_fps, encode_fps, send_fps]: [f64; 3],
+) {
+    use std::sync::atomic::Ordering::Relaxed;
     let now_ms = crate::clock::host_now_us() / 1000;
     info!(session_id = ?session_id, running = sample.pipeline_running,
         captured = sample.capture_frame_count, encoded = sample.encode_frame_count,
-        sent = sample.transport_packets_sent, capture_fps = sample.capture_fps,
-        encode_fps = sample.encode_fps, send_fps = sample.transport_fps,
+        sent = sample.transport_packets_sent, capture_fps, encode_fps, send_fps,
         encode_us = sample.encode_time_us, convert_us = sample.convert_time_us,
         codec = %sample.codec_name,
         cpu_fallback = sample.using_software_fallback,
@@ -716,6 +759,71 @@ pub(crate) fn registry_dword(key: &str, name: &str) -> String {
 pub(crate) mod tests {
     use super::*;
     use eternal_wire::v2::control::{ByeReason, HelloStatus};
+
+    #[test]
+    fn stream_summary_reports_interval_rates_when_busy_idle_stopped_or_reset() {
+        struct Writer(Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let log = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let sink = Arc::clone(&log);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(move || Writer(Arc::clone(&sink)))
+            .finish();
+        crate::logging::prepare_log_capture();
+        let shared = SharedControl::new(9876, 15_000_000);
+        let start = Instant::now();
+        let mut interval = StreamInterval::default();
+        let mut sample = PipelineStats::new();
+        // These rolling values can stay nonzero after the pipeline stops.
+        sample.capture_fps = 50.0;
+        sample.encode_fps = 48.0;
+        sample.transport_fps = 47.0;
+
+        tracing::subscriber::with_default(subscriber, || {
+            let mut check = |second, running, [captured, encoded, sent]: [u64; 3], expected| {
+                sample.pipeline_running = running;
+                sample.capture_frame_count = captured;
+                sample.encode_frame_count = encoded;
+                sample.transport_packets_sent = sent;
+                let rates = interval.rates(&sample, start + Duration::from_secs(second));
+                write_stream_summary(&shared, None, &sample, rates);
+                let line = String::from_utf8(std::mem::take(&mut *log.lock())).unwrap();
+                assert!(
+                    line.contains("Support stream summary session_id=None"),
+                    "{line}"
+                );
+                assert!(line.contains(&format!(" running={running} ")), "{line}");
+                let printed = ["capture_fps=", "encode_fps=", "send_fps="].map(|key| {
+                    line.split_whitespace()
+                        .find_map(|field| field.strip_prefix(key))
+                        .unwrap_or_else(|| panic!("{key} missing in {line}"))
+                        .parse::<f64>()
+                        .unwrap()
+                });
+                assert_eq!(printed, expected, "{line}");
+            };
+
+            check(0, true, [10, 10, 5], [0.0; 3]); // No previous summary.
+            check(10, true, [30, 20, 10], [2.0, 1.0, 0.5]);
+            check(20, true, [30, 20, 10], [0.0; 3]); // Idle without a viewer.
+            check(30, false, [30, 20, 10], [0.0; 3]); // Stopped.
+            check(40, true, [40, 30, 1], [1.0, 1.0, 0.0]); // New connection.
+            check(50, true, [5, 4, 3], [0.0, 0.0, 0.2]); // Capture and encode reset.
+            check(60, true, [15, 9, 8], [1.0, 0.5, 0.5]);
+            check(70, true, [1, 1, 1], [0.0; 3]); // New generation.
+        });
+    }
 
     /// The backend's check of a summary line, ported from
     /// `copy_session_summaries` (b-session-summaries.sql): the whole message
