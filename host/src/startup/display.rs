@@ -95,7 +95,7 @@ pub(crate) fn change<P: FnMut()>(enabled: bool, progress: P, run: impl FnOnce(P)
     }
 }
 
-pub(crate) fn change_at<P: FnMut()>(
+fn change_at<P: FnMut()>(
     path: &Path,
     lock: &Path,
     enabled: bool,

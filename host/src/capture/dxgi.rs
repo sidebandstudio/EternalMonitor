@@ -19,10 +19,9 @@ use super::recovery::{
 use super::{
     acquired, client_connected, composite_pointer, frame_budget_for, frame_buffer, heartbeat,
     idle_heartbeat, keepalive_allowed, keepalive_due, nap_unless, pointer_apart, pointer_place,
-    read_back_image, reconcile_virtual_display, recovery_poll, redraw_cached,
-    resolve_capture_output, Acquired, FrameSlot, FrameUse, IdleGate, OutputInfo, Picture,
-    PointerPlace, RawFrame, Redraw, StartPicture, ACQUIRE_TIMEOUT_MS, FPS_WINDOW, FRAME_PADDING,
-    PICTURE_HOLD,
+    read_back_image, reconcile_virtual_display, recovery_poll, redraw_cached, resolve_target,
+    Acquired, FrameSlot, FrameUse, IdleGate, OutputInfo, Picture, PointerPlace, RawFrame, Redraw,
+    StartPicture, ACQUIRE_TIMEOUT_MS, FPS_WINDOW, FRAME_PADDING, PICTURE_HOLD,
 };
 use crate::control::{CaptureTarget, SharedControl};
 use crate::gpu_preference::Outcome;
@@ -151,8 +150,8 @@ pub fn run_capture_loop(
     let Some(target) = reconcile_virtual_display(&requested_target, &shared, generation) else {
         return Ok(());
     };
-    let second_screen = requested_target == CaptureTarget::VirtualExtended
-        && matches!(&target, CaptureTarget::Output(_));
+    let second_screen = matches!(&target, CaptureTarget::Output(name)
+        if shared.vdd_output.lock().as_deref() == Some(name.as_str()));
     // DXGI factories snapshot adapters at creation. Enable the driver first,
     // then enumerate and open the chosen output from the same fresh factory.
     let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1()? };
@@ -175,7 +174,7 @@ pub fn run_capture_loop(
         info!(outputs = outputs.len(), "A display output is back");
     }
     // No output listed is a display change the stage waits out, not a failure.
-    let Some(index) = resolve_capture_output(&outputs, &target, second_screen)? else {
+    let Some(index) = resolve_target(&outputs, &target) else {
         if !NO_OUTPUTS.swap(true, Ordering::Relaxed) {
             info!(
                 adapters,
@@ -524,7 +523,7 @@ pub fn run_capture_loop(
             Ok(()) => {
                 *frame_number += 1;
                 if !super::second_screen::PROOF_NEEDS_IMAGE {
-                    super::second_screen::note_image_on(&shared, generation, Some(&chosen));
+                    super::second_screen::note_image(&shared, generation);
                 }
 
                 // --- Track cursor shape/position (must read shape before ReleaseFrame) ---
@@ -631,7 +630,7 @@ pub fn run_capture_loop(
                     }
                 }
                 let seen_image = &mut picture.seen_image;
-                let read = || {
+                let frame_data = read_back_image(&shared, generation, seen_image, || {
                     windows::core::Result::Ok(if let Some(ref resource) = desktop_resource {
                         match resource.cast::<ID3D11Texture2D>() {
                             Ok(desktop_texture) => {
@@ -694,8 +693,7 @@ pub fn run_capture_loop(
                         }
                         None
                     })
-                };
-                let frame_data = read_back_image(&shared, generation, &chosen, seen_image, read);
+                });
                 let frame_data = match frame_data {
                     Ok(frame_data) => frame_data,
                     Err(error) => {

@@ -1242,7 +1242,7 @@ mod windows_impl {
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
     use std::collections::VecDeque;
 
@@ -1440,40 +1440,6 @@ pub(crate) mod tests {
         fn kept(&mut self) -> Option<String> {
             self.kept.clone()
         }
-    }
-
-    /// The worker test uses the real owner file and guard around its fake task.
-    pub(crate) fn record_test_enable<E>(
-        dir: &std::path::Path,
-        task: impl FnOnce() -> Result<(), E>,
-    ) -> Result<(), E> {
-        let owner = crate::startup::ProcessId::current().to_string();
-        let mut displays = Fake::reading([vec![panel(), vdd()]]);
-        displays.owner = Some(owner.clone());
-        let mut result = None;
-        crate::startup::display::change_at(
-            &dir.join("virtual-display-owner"),
-            &dir.join("driver.lock"),
-            true,
-            || {},
-            |_| {
-                let mut guard = Guard::new();
-                assert!(guard.before(true, false, &mut displays));
-                let ran = task();
-                let done = ran.is_ok();
-                guard.after(true, done, &mut displays);
-                let record = displays
-                    .kept()
-                    .expect("the guard retained the pre-Enable desktop");
-                assert_eq!(
-                    parse::<usize>(&owner, &record).unwrap().screens,
-                    [panel(), vdd()]
-                );
-                result = Some(ran);
-                done
-            },
-        );
-        result.unwrap()
     }
 
     /// A Second screen session: before and after the turn on, then the

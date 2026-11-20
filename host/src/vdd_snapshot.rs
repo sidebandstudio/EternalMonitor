@@ -396,9 +396,22 @@ mod windows_impl {
                 if monitor.is_empty() || !path.targetInfo.targetAvailable.as_bool() {
                     return None;
                 }
-                // Without QDC_VIRTUAL_MODE_AWARE this is a source mode index.
-                let mode = modes.get(unsafe { path.sourceInfo.Anonymous.modeInfoIdx } as usize)?;
-                if mode.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
+                // In the virtual-mode layout the low half is the clone group
+                // and the high half is the source mode index.
+                let raw = unsafe { path.sourceInfo.Anonymous.modeInfoIdx };
+                let index = if path.flags
+                    & windows::Win32::Graphics::Gdi::DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE
+                    != 0
+                {
+                    raw >> 16
+                } else {
+                    raw
+                };
+                let mode = modes.get(index as usize)?;
+                if mode.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE
+                    || mode.id != path.sourceInfo.id
+                    || mode.adapterId != path.sourceInfo.adapterId
+                {
                     return None;
                 }
                 let pos = unsafe { mode.Anonymous.sourceMode.position };
