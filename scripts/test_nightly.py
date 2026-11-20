@@ -706,6 +706,14 @@ class WorkflowTest(unittest.TestCase):
         self.assertEqual(self.text.count("contents: write"), 1)
         self.assertIn("contents: write", publish)
 
+    def test_pull_requests_compile_their_own_installer(self):
+        # A pull request that changes Setup builds it, from its own commit.
+        paths = self.text.partition("\n  pull_request:\n")[2].partition("\n\n")[0]
+        self.assertIn("- installer/**", paths)
+        check = self.text.partition("\n  check:\n")[2].partition("\n\n")[0]
+        self.assertIn("sha: ${{ github.sha }}", check)
+        self.assertNotIn("needs.plan.outputs.sha", check)
+
     def test_releases_are_published_by_nightly_py(self):
         # GitHubCommandTest checks its commands are pre-releases that never become latest.
         self.assertNotRegex(self.text, r"gh release (create|edit|upload)|releases/assets|git/refs")

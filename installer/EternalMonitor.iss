@@ -216,14 +216,13 @@ Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""E
 ; screen at all. The check after them puts the saved screens back only then. Both always exit 0.
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\display-guard.ps1"" -Action save -Path ""{tmp}\display-layout.json"""; Flags: runhidden waituntilterminated logoutput
 ; The vendor setup prompts to uninstall an existing installation even with silent
-; switches. Preserve an existing driver and install only when it is absent, and only on
-; Windows 11: Second screen needs it (see WindowsRunsVdd).
+; switches. Preserve an existing driver and install only when it is absent.
 Filename: "{app}\driver\vdd-setup-x64.exe"; Parameters: "/VERYSILENT /SUPPRESSMSGBOXES /NORESTART"; StatusMsg: "{cm:DriverStatus}"; Flags: waituntilterminated; Check: NeedsVddInstall; AfterInstall: RecordVddOwnership
 ; Register the enable/disable scheduled tasks and leave the virtual display OFF by default —
 ; EternalMonitor turns it on only while streaming to it, so there's no phantom monitor.
 ; A preserved driver whose device was removed or broke is repaired first. On Windows 10 a
-; driver an earlier version installed keeps its tasks, which keep it off.
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\vdd-tasks-setup.ps1"""; StatusMsg: "{cm:DisplayStatus}"; Flags: runhidden waituntilterminated; Check: VddTasksWanted; BeforeInstall: RepairVddDriver; AfterInstall: VerifyVddDriver
+; repair or check that fails is logged and Setup goes on (see FailVddStep).
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\vdd-tasks-setup.ps1"""; StatusMsg: "{cm:DisplayStatus}"; Flags: runhidden waituntilterminated; Check: VddInstallSucceeded; BeforeInstall: RepairVddDriver; AfterInstall: VerifyVddDriver
 ; After the Disable above, and also when a failed driver step skipped it.
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\display-guard.ps1"" -Action check -Path ""{tmp}\display-layout.json"""; Flags: runhidden waituntilterminated logoutput
 #endif
@@ -311,11 +310,11 @@ end;
 const
   FirstWindows11Build = 22000;
 
-{ The bundled driver needs Windows 11's display driver framework. On Windows 10
-  it installs and starts, but Windows never adds its screen, and the app shows
-  the mirror there without turning it on (second_screen::driver_supports_windows
-  in the host). }
-function WindowsRunsVdd: Boolean;
+{ Setup installs the bundled driver on Windows 10 and 11. Windows 11 adds its
+  screen. On Windows 10 Windows adds it on some PCs only, and not every time:
+  the app tries Second screen there and shows the mirror when it doesn't start
+  (second_screen in the host). }
+function IsWindows11: Boolean;
 var
   Windows: TWindowsVersion;
 begin
@@ -329,37 +328,32 @@ var
 begin
   Result := not ReadVddRegistration(Directory, Version);
   if not Result then
-    Log('Preserving existing Virtual Display Driver package ' + Version)
-  else if not WindowsRunsVdd then begin
-    Log('Not installing the Virtual Display Driver: Second screen needs Windows 11');
-    Result := False;
-  end;
+    Log('Preserving existing Virtual Display Driver package ' + Version);
 end;
 
-{ The driver's tasks: wherever a driver is installed, so one an earlier version
-  installed on Windows 10 stays off. None on Windows 10 without one. }
-function VddTasksWanted: Boolean;
-var
-  Directory, Version: String;
+{ A driver repair or check failed. On Windows 11 Setup fails with Message. On
+  Windows 10 a driver that Windows installs but doesn't bind or start must not
+  fail Setup: it is logged, and the app mirrors when Second screen fails. }
+procedure FailVddStep(const Message: String);
 begin
-  Result := VddInstallSucceeded and (WindowsRunsVdd or ReadVddRegistration(Directory, Version));
+  if not IsWindows11 then begin
+    Log('Virtual Display Driver step failed on Windows 10, Setup goes on: ' + Message);
+    exit;
+  end;
+  VddInstallFailed := True;
+  RaiseException(Message);
 end;
 
 procedure VerifyVddDriver;
 var
   ExitCode: Integer;
 begin
-  { Windows 10 doesn't use the driver: a kept one isn't checked. }
-  if not WindowsRunsVdd then
-    exit;
   { [Run] ignores a child process's exit code. Check the actual PnP binding
     explicitly, including upgrades that preserve an existing registration. }
   if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
       '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\scripts\vdd-driver-verify.ps1') + '"',
-      '', SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then begin
-    VddInstallFailed := True;
-    RaiseException('Windows did not finish installing the virtual display driver. Run setup while signed into Windows and approve its publisher prompt. If the driver already exists, repair it before trying again.');
-  end;
+      '', SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then
+    FailVddStep('Windows did not finish installing the virtual display driver. Run setup while signed into Windows and approve its publisher prompt. If the driver already exists, repair it before trying again.');
 end;
 
 procedure RepairVddDriver;
@@ -369,12 +363,7 @@ var
 begin
   { Setup keeps an existing driver instead of running its setup again. When
     Setup installed it and no device works, put one back (exit codes in the
-    script). A driver another app installed is left alone. Windows 10 doesn't
-    use the driver: a kept one is left as it is, with no device changes. }
-  if not WindowsRunsVdd then begin
-    Log('Leaving the Virtual Display Driver as it is: Second screen needs Windows 11');
-    exit;
-  end;
+    script). A driver another app installed is left alone. }
   if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
       '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\scripts\vdd-driver-repair.ps1') + '"',
       '', SW_HIDE, ewWaitUntilTerminated, ExitCode) then
@@ -387,8 +376,7 @@ begin
   else
     Message := 'Setup could not repair the virtual display driver. Restart the PC and run this setup again. If it still fails, uninstall "Virtual Display Driver" in Windows Settings > Apps > Installed apps, then run this setup again.';
   end;
-  VddInstallFailed := True;
-  RaiseException(Message);
+  FailVddStep(Message);
 end;
 
 procedure RecordVddOwnership;
