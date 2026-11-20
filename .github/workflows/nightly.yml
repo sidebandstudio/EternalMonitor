@@ -32,6 +32,7 @@ on:
       - .github/workflows/nightly.yml
       - .github/workflows/beta-installer.yml
       - scripts/nightly.py
+      - scripts/win/Test-SetupInstall.ps1
       - installer/**
 
 permissions: {}

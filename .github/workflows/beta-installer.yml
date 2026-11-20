@@ -270,3 +270,18 @@ jobs:
         with:
           name: EternalMonitor-Setup-beta
           path: build\out\EternalMonitor-Setup.exe
+
+      - name: Smoke test Setup install, upgrade and uninstall
+        if: github.event_name == 'pull_request'
+        shell: pwsh
+        run: |
+          .\scripts\win\Test-SetupInstall.ps1 -Setup build\out\EternalMonitor-Setup.exe `
+              -LogDirectory "$env:RUNNER_TEMP\setup-smoke"
+
+      - name: Upload Setup smoke logs
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: setup-smoke-logs
+          path: ${{ runner.temp }}/setup-smoke/*.log
+          if-no-files-found: ignore
