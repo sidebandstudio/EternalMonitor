@@ -164,7 +164,7 @@ impl Machine {
 
     pub fn on_command(&mut self, command: &SupervisorCommand) -> Effect {
         match command {
-            SupervisorCommand::Restart => match self.state {
+            SupervisorCommand::Restart | SupervisorCommand::RestartFor(_) => match self.state {
                 SupervisorState::ShutDown => Effect::None,
                 _ => {
                     // User/receiver-driven restarts reset the failure budget.
@@ -378,6 +378,7 @@ pub fn run(
     let mut generation = CURRENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
     let mut machine = Machine::new(generation);
     let mut pipeline = None;
+    let mut started_by = "unknown";
     if crate::startup::port::check(listen_port) {
         pipeline = Some(spawn_generation(
             generation,
@@ -410,6 +411,10 @@ pub fn run(
             healthy_since = now;
         }
 
+        let command = match &message {
+            Ok(SupMsg::Command(command)) => command.log_name(),
+            _ => "unknown",
+        };
         let effect = match message {
             Ok(SupMsg::Command(command)) => machine.on_command(&command),
             Ok(SupMsg::Health {
@@ -440,7 +445,7 @@ pub fn run(
                     .lock()
                     .set_not_streaming(not_streaming(&machine.state, &shared));
                 stop_pipeline(&shared, &machine.state);
-                bounded_join(&mut pipeline, generation);
+                bounded_join(&mut pipeline, generation, started_by, command);
             }
             Effect::Restart | Effect::Start => {
                 // A HELLO2 meanwhile is told to ask again in a moment.
@@ -449,7 +454,7 @@ pub fn run(
                     .lock()
                     .set_not_streaming(Some(NotStreaming::Restarting));
                 shared.stop();
-                bounded_join(&mut pipeline, generation);
+                bounded_join(&mut pipeline, generation, started_by, command);
                 // The check below binds the port: the standby lets go first.
                 if let Some(standby) = standby.take() {
                     standby.stop();
@@ -469,6 +474,7 @@ pub fn run(
                 });
                 generation = CURRENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
                 machine.note_started(generation);
+                started_by = command;
                 settle(&machine, &shared, &mut standby, listen_port);
                 healthy_since = Instant::now();
                 if adopt_late_detection(&mut gpu_info, &shared, crate::gpu::take_late_detection) {
@@ -487,7 +493,7 @@ pub fn run(
             }
             Effect::Shutdown => {
                 shared.stop();
-                bounded_join(&mut pipeline, generation);
+                bounded_join(&mut pipeline, generation, started_by, command);
                 // The port closes as the stream ends, as it always did: a
                 // copy that takes over after this one quits binds it.
                 shared.stream_socket.lock().take();
@@ -795,7 +801,12 @@ fn spawn_generation(
 /// Join with a deadline; on timeout, DETACH — the generation counter already
 /// poisoned the zombie (its health reports are filtered and its channel sends
 /// fail as the new generation's stages replace the endpoints).
-fn bounded_join(pipeline: &mut Option<std::thread::JoinHandle<()>>, generation: u64) {
+fn bounded_join(
+    pipeline: &mut Option<std::thread::JoinHandle<()>>,
+    generation: u64,
+    started_by: &str,
+    command: &str,
+) {
     let Some(handle) = pipeline.take() else {
         return;
     };
@@ -806,6 +817,7 @@ fn bounded_join(pipeline: &mut Option<std::thread::JoinHandle<()>>, generation: 
                 generation,
                 "Pipeline generation refused to exit within 5s — detaching (poisoned)"
             );
+            info!(generation, started_by, command, "Pipeline ended");
             return; // handle dropped => detached
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -813,11 +825,79 @@ fn bounded_join(pipeline: &mut Option<std::thread::JoinHandle<()>>, generation: 
     if let Err(panic) = handle.join() {
         error!(generation, ?panic, "Pipeline thread panicked");
     }
+    info!(generation, started_by, command, "Pipeline ended");
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generation_end_log_names_capture_choice_try_again_and_stop() {
+        use crate::control::{GuiControl, RestartReason};
+
+        let (tx, rx) = mpsc::channel();
+        let gui = GuiControl {
+            shared: SharedControl::new(9876, 15_000_000),
+            supervisor_tx: tx,
+        };
+        let capture = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        struct EndLines(std::sync::Arc<parking_lot::Mutex<Vec<String>>>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EndLines {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                struct Command(Option<String>);
+                impl tracing::field::Visit for Command {
+                    fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {
+                    }
+                    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                        if field.name() == "command" {
+                            self.0 = Some(value.to_owned());
+                        }
+                    }
+                }
+                let mut command = Command(None);
+                event.record(&mut command);
+                if let Some(command) = command.0 {
+                    self.0.lock().push(command);
+                }
+            }
+        }
+        use tracing_subscriber::prelude::*;
+        let subscriber = tracing_subscriber::registry().with(EndLines(capture.clone()));
+        crate::logging::prepare_log_capture();
+        tracing::subscriber::with_default(subscriber, || {
+            // The restart methods also recheck the process-wide VDD task gate.
+            // Queue the same commands without touching that gate in this test.
+            for reason in [RestartReason::SetSecondScreen, RestartReason::TryAgain] {
+                gui.supervisor_tx
+                    .send(SupervisorCommand::RestartFor(reason))
+                    .unwrap();
+            }
+            gui.request_stop();
+            let mut machine = Machine::new(1);
+            for (generation, effect) in [Effect::Restart, Effect::Restart, Effect::StopPipeline]
+                .into_iter()
+                .enumerate()
+            {
+                let generation = generation as u64 + 1;
+                let command = rx.try_recv().unwrap();
+                assert_eq!(machine.on_command(&command), effect);
+                let mut pipeline = Some(std::thread::spawn(|| {}));
+                bounded_join(&mut pipeline, generation, "unknown", command.log_name());
+                if effect == Effect::Restart {
+                    machine.note_started(generation + 1);
+                }
+            }
+        });
+        assert_eq!(
+            *capture.lock(),
+            ["set_second_screen", "try_again", "request_stop"]
+        );
+    }
 
     #[test]
     fn a_late_detection_is_used_by_the_next_pipeline_only_after_a_stall() {

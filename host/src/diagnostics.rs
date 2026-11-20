@@ -1,9 +1,10 @@
 //! Low-frequency support evidence. Never collect credentials or user documents.
 use std::ffi::CStr;
 use std::sync::{mpsc, Arc, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::control::{CaptureTarget, SharedControl};
+use crate::stats::{PipelineStats, StreamTotals, PIPELINE_STATS};
 use crate::transport::link::LinkId;
 use crate::transport::session::{EndReason, SessionEnd, StageFailure, StreamStop};
 use tracing::info;
@@ -145,13 +146,14 @@ pub struct Monitor(mpsc::Sender<()>, Option<std::thread::JoinHandle<()>>);
 impl Monitor {
     pub fn start(shared: SharedControl) -> Self {
         let (stop, receiver) = mpsc::channel();
+        let mut interval = StreamInterval::new();
         let thread = std::thread::spawn(move || {
             while receiver.recv_timeout(Duration::from_secs(10))
                 == Err(mpsc::RecvTimeoutError::Timeout)
             {
-                log_stream_summary(&shared);
+                log_stream_summary(&shared, &mut interval);
             }
-            log_stream_summary(&shared);
+            log_stream_summary(&shared, &mut interval);
         });
         Self(stop, Some(thread))
     }
@@ -166,16 +168,53 @@ impl Drop for Monitor {
     }
 }
 
-pub(crate) fn log_stream_summary(shared: &SharedControl) {
+pub(crate) struct StreamInterval {
+    previous: StreamTotals,
+    sampled_at: Instant,
+}
+
+impl StreamInterval {
+    pub(crate) fn new() -> Self {
+        Self {
+            previous: PIPELINE_STATS.lock().stream_totals,
+            sampled_at: Instant::now(),
+        }
+    }
+
+    fn sample(&mut self, current: StreamTotals, at: Instant) -> [f64; 3] {
+        let previous = std::mem::replace(&mut self.previous, current);
+        let elapsed = at.duration_since(std::mem::replace(&mut self.sampled_at, at));
+        if elapsed.is_zero() {
+            return [0.0; 3];
+        }
+        [
+            current.captured - previous.captured,
+            current.encoded - previous.encoded,
+            current.sent - previous.sent,
+        ]
+        .map(|count| count as f64 / elapsed.as_secs_f64())
+    }
+}
+
+pub(crate) fn log_stream_summary(shared: &SharedControl, interval: &mut StreamInterval) {
+    let sample = PIPELINE_STATS.lock().clone();
+    let rates = interval.sample(sample.stream_totals, Instant::now());
+    log_stream_sample(shared, &sample, rates);
+}
+
+fn log_stream_sample(
+    shared: &SharedControl,
+    sample: &PipelineStats,
+    [capture_fps, encode_fps, send_fps]: [f64; 3],
+) {
     use std::sync::atomic::Ordering::Relaxed;
     // Don't keep pipeline locks held while formatting/writing tracing events.
     let session_id = shared.session.lock().session_id();
-    let sample = crate::stats::PIPELINE_STATS.lock().clone();
     let now_ms = crate::clock::host_now_us() / 1000;
+    let micros = |value: Option<u128>| value.map_or_else(|| "-".to_owned(), |us| us.to_string());
     info!(session_id = ?session_id, running = sample.pipeline_running,
         captured = sample.capture_frame_count, encoded = sample.encode_frame_count,
-        sent = sample.transport_packets_sent, capture_fps = sample.capture_fps,
-        encode_fps = sample.encode_fps, send_fps = sample.transport_fps,
+        sent = sample.transport_packets_sent, capture_fps, encode_fps, send_fps,
         encode_us = sample.encode_time_us, convert_us = sample.convert_time_us,
         codec = %sample.codec_name,
         cpu_fallback = sample.using_software_fallback,
@@ -188,6 +227,9 @@ pub(crate) fn log_stream_summary(shared: &SharedControl) {
         usb_state = %sample.usb_link_state, usb_devices = sample.usb_devices,
         capture_heartbeat_age_ms = now_ms.saturating_sub(shared.hb_capture_frame_ms.load(Relaxed)),
         encode_heartbeat_age_ms = now_ms.saturating_sub(shared.hb_encode_frame_ms.load(Relaxed)),
+        fresh_captured = sample.fresh_captured, capture_replaced = sample.capture_replaced,
+        readback_us = %micros(sample.readback_us), input_copy_us = %micros(sample.input_copy_us),
+        keyframe_resubmits = sample.keyframe_resubmits,
         "Support stream summary");
 }
 
@@ -288,6 +330,54 @@ fn hybrid(cards: &[(u32, u32)]) -> Option<bool> {
     (!cards.is_empty()).then_some(distinct.len() > 1)
 }
 
+/// Last output to yield a picture and its changes across pipeline restarts.
+#[derive(Default)]
+pub(crate) struct CaptureObservation {
+    source: String,
+    adapter: Option<crate::gpu_preference::AdapterId>,
+    size: Option<(u32, u32)>,
+    changes: u64,
+    session: Option<(u32, u64)>,
+}
+
+impl CaptureObservation {
+    fn record(
+        &mut self,
+        (adapter, source): (Option<crate::gpu_preference::AdapterId>, &str),
+        size: (u32, u32),
+    ) {
+        if self.adapter == adapter && self.source == source && self.size == Some(size) {
+            return;
+        }
+        self.changes += u64::from(self.size.is_some());
+        self.source.clear();
+        self.source.push_str(source);
+        self.adapter = adapter;
+        self.size = Some(size);
+    }
+
+    fn finish(&mut self, session_id: Option<u32>) -> (Option<(u32, u32)>, u64) {
+        if let Some((_, baseline)) = self.session.filter(|(id, _)| Some(*id) == session_id) {
+            self.session = None;
+            (self.size, self.changes - baseline)
+        } else {
+            (None, 0)
+        }
+    }
+}
+
+pub(crate) fn note_capture_output(
+    shared: &SharedControl,
+    generation: u64,
+    source: (Option<crate::gpu_preference::AdapterId>, &str),
+    size: (u32, u32),
+) {
+    let mut observation = shared.capture_observation.lock();
+    if crate::supervisor::generation_is_current(generation) {
+        observation.record(source, size);
+    }
+}
+
 /// The live session with its mode, and the first `second_screen_fallback`
 /// reason logged while it was live in Second screen mode. Reasons logged
 /// between sessions, or while the session mirrors, are dropped.
@@ -313,6 +403,10 @@ pub fn note_session_start(session_id: u32, shared: &SharedControl) {
         tests::FALLBACK_SLOT.is_locked(),
         "a test that starts a session holds diagnostics::tests::FALLBACK_SLOT"
     );
+    {
+        let mut capture = shared.capture_observation.lock();
+        capture.session = Some((session_id, capture.changes));
+    }
     *SESSION_FALLBACK.lock() = SessionFallback {
         session_id: Some(session_id),
         mode: Some(Arc::clone(&shared.capture_target)),
@@ -408,13 +502,16 @@ pub fn log_session_end(end: &SessionEnd, shared: &SharedControl) {
 /// The summary of `end`, with what the PC knows at the end, for
 /// [`log_session_end`] and [`log_session_end_now`] alike.
 fn summary_line(end: &SessionEnd, shared: &SharedControl) -> String {
+    let (size, changes) = shared.capture_observation.lock().finish(end.session_id);
     let second_screen = *shared.capture_target.lock() == CaptureTarget::VirtualExtended;
     // `mode=` is the mode at the end; the fallback was counted in Second
     // screen mode, perhaps before a switch to Mirror.
     let fallback = end.session_id.and_then(take_fallback);
     let refused = *shared.capture_block.lock()
         == Some(crate::capture::recovery::CaptureBlock::UnsupportedOnThisGpu);
-    session_summary(end, second_screen, fallback, refused, host_facts())
+    let summary = session_summary(end, second_screen, fallback, refused, host_facts());
+    let size = size.map_or_else(|| "-".to_owned(), |(w, h)| format!("{w}x{h}"));
+    format!("{summary} captured_size={size} capture_changes={changes}")
 }
 
 /// The app is quitting: the summary of the stream it stops. Its iPad is
@@ -716,6 +813,125 @@ pub(crate) fn registry_dword(key: &str, name: &str) -> String {
 pub(crate) mod tests {
     use super::*;
     use eternal_wire::v2::control::{ByeReason, HelloStatus};
+
+    #[test]
+    fn stopped_and_idle_stream_rates_reach_zero_and_keepalives_are_repeats() {
+        let shared = SharedControl::new(9876, 15_000_000);
+        let mut stats = PipelineStats::new();
+        let start = Instant::now();
+        let mut interval = StreamInterval {
+            previous: stats.stream_totals,
+            sampled_at: start,
+        };
+
+        let sink = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        struct Writer(Arc<parking_lot::Mutex<Vec<u8>>>);
+        impl std::io::Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let writer = Arc::clone(&sink);
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_writer(move || Writer(Arc::clone(&writer)))
+                .finish(),
+        );
+        crate::logging::prepare_log_capture();
+        let mut report = |stats: &PipelineStats, second, expected: [f64; 3]| {
+            let at = start + Duration::from_secs(second);
+            let rates = interval.sample(stats.stream_totals, at);
+            tracing::dispatcher::with_default(&dispatch, || {
+                log_stream_sample(&shared, stats, rates)
+            });
+            let line = String::from_utf8(std::mem::take(&mut *sink.lock())).unwrap();
+            let number = |field: &str| {
+                line.split_whitespace()
+                    .find_map(|word| word.strip_prefix(field))
+                    .unwrap_or_else(|| panic!("missing {field} in {line}"))
+                    .parse::<f64>()
+                    .unwrap()
+            };
+            assert_eq!(
+                [
+                    number("capture_fps="),
+                    number("encode_fps="),
+                    number("send_fps=")
+                ],
+                expected,
+                "{line}"
+            );
+            assert_eq!(number("fresh_captured=") as u64, stats.fresh_captured);
+        };
+
+        stats.mark_pipeline_started();
+        stats.record_capture(1280, 800, false, false, None);
+        stats.record_encode(100, 100, 15_000_000);
+        stats.record_transport(100, 1, 0.0, String::new());
+        report(&stats, 10, [0.1; 3]);
+
+        // A static desktop publishes a cached picture for the viewer.
+        stats.record_capture(1280, 800, true, false, None);
+        stats.record_encode(100, 100, 15_000_000);
+        stats.record_transport(100, 1, 0.0, String::new());
+        report(&stats, 20, [0.1; 3]);
+        assert_eq!(stats.capture_frame_count - stats.fresh_captured, 1);
+        assert_eq!(stats.fresh_captured, 1);
+
+        // No viewer and no new frames. The GUI's rolling rates are deliberately stale.
+        stats.capture_fps = 10.0;
+        stats.encode_fps = 10.0;
+        stats.transport_fps = 10.0;
+        stats.reset_connection_stats();
+        stats.transport_fps = 10.0;
+        report(&stats, 30, [0.0; 3]);
+        stats.mark_pipeline_stopped();
+        report(&stats, 40, [0.0; 3]);
+
+        stats.reset_for_restart();
+        stats.record_capture(1280, 800, false, false, None);
+        stats.record_encode(100, 100, 15_000_000);
+        stats.record_transport(100, 1, 0.0, String::new());
+        report(&stats, 50, [0.1; 3]);
+    }
+
+    #[test]
+    fn session_summary_counts_two_size_changes_and_reports_the_final_capture_size() {
+        let _slot = FALLBACK_SLOT.lock();
+        let shared = SharedControl::new(9876, 15_000_000);
+        let id = 1;
+        let record = |source, size| {
+            shared
+                .capture_observation
+                .lock()
+                .record((None, source), size)
+        };
+        record("output-a", (1280, 800));
+        note_session_start(id, &shared);
+        record("output-a", (1280, 800));
+        record("output-b", (1600, 900));
+        record("output-b", (1600, 900));
+        record("output-b", (1440, 900));
+        let ended = SessionEnd {
+            session_id: Some(id),
+            ..end(EndReason::Shutdown, Some(150), 20_000)
+        };
+        let line = summary_line(&ended, &shared);
+        assert!(
+            line.ends_with(" captured_size=1440x900 capture_changes=2"),
+            "{line}"
+        );
+        let (v1, _) = line.split_once(" captured_size=").unwrap();
+        assert_contract(v1);
+        let logged = format!("2026-01-01T00:00:00Z  INFO {line}");
+        assert_eq!(crate::telemetry::uploaded(&logged), v1);
+    }
 
     /// The backend's check of a summary line, ported from
     /// `copy_session_summaries` (b-session-summaries.sql): the whole message
@@ -1289,7 +1505,8 @@ pub(crate) mod tests {
             .lock()
             .iter()
             .map(|line| {
-                assert_contract(line);
+                let (v1, _) = line.split_once(" captured_size=").unwrap();
+                assert_contract(v1);
                 ["mode=", "fallback="]
                     .map(|key| {
                         line.split(' ')
@@ -1344,14 +1561,15 @@ pub(crate) mod tests {
         let lines = summaries.lock().clone();
         assert_eq!(lines.len(), 2, "{lines:?}");
         for (line, token) in lines.iter().zip(["vdd_only", "panel_lost"]) {
-            assert_contract(line);
+            let (v1, _) = line.split_once(" captured_size=").unwrap();
+            assert_contract(v1);
             assert!(line.contains(&format!(" fallback={token} ")), "{line}");
             let logged = format!("2026-11-07T01:02:03.123456Z  INFO {line}");
             assert_eq!(
                 crate::telemetry::session_summary(&logged),
                 Some(line.as_str())
             );
-            assert_eq!(crate::telemetry::uploaded(&logged), *line);
+            assert_eq!(crate::telemetry::uploaded(&logged), v1);
         }
     }
 

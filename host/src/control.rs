@@ -115,6 +115,7 @@ pub struct SharedControl {
     /// normalized touch coordinates onto this rect. `None` until the first
     /// capture stage comes up.
     pub capture_geometry: Arc<Mutex<Option<crate::input::CaptureGeometry>>>,
+    pub(crate) capture_observation: Arc<Mutex<crate::diagnostics::CaptureObservation>>,
     /// The one thread that hands iPad input to Windows, for every stream
     /// generation of this app.
     pub input: Arc<crate::input::InputThread>,
@@ -246,6 +247,7 @@ impl SharedControl {
             transport_beat: Default::default(),
             power: Default::default(),
             capture_geometry: Arc::new(Mutex::new(None)),
+            capture_observation: Arc::default(),
             input: Arc::default(),
             hevc_enabled: Arc::new(AtomicBool::new(false)),
             audio_enabled: Arc::new(AtomicBool::new(true)),
@@ -336,6 +338,7 @@ pub fn merge_fps(host: u32, client: u32) -> u32 {
 pub enum SupervisorCommand {
     /// Tear the current pipeline down and start a fresh generation.
     Restart,
+    RestartFor(RestartReason),
     /// The stream of `generation` asks to start again: its chosen network
     /// changed, or its virtual display has to go. Only while that stream
     /// still runs: one the user stopped, or one a newer stream replaced,
@@ -350,6 +353,30 @@ pub enum SupervisorCommand {
     Shutdown,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartReason {
+    SetSecondScreen,
+    TryAgain,
+    ResetVideoSettings,
+    RestartNow,
+}
+
+impl SupervisorCommand {
+    pub(crate) fn log_name(self) -> &'static str {
+        match self {
+            Self::Restart => "request_restart",
+            Self::RestartFor(RestartReason::SetSecondScreen) => "set_second_screen",
+            Self::RestartFor(RestartReason::TryAgain) => "try_again",
+            Self::RestartFor(RestartReason::ResetVideoSettings) => "reset_video_settings",
+            Self::RestartFor(RestartReason::RestartNow) => "restart_now",
+            Self::RestartStream { .. } => "restart_stream",
+            Self::Stop => "request_stop",
+            Self::Start => "request_start",
+            Self::Shutdown => "request_shutdown",
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct GuiControl {
     pub shared: SharedControl,
@@ -358,9 +385,17 @@ pub struct GuiControl {
 
 impl GuiControl {
     pub fn request_restart(&self) {
+        self.send_restart(SupervisorCommand::Restart);
+    }
+
+    pub(crate) fn request_restart_for(&self, reason: RestartReason) {
+        self.send_restart(SupervisorCommand::RestartFor(reason));
+    }
+
+    fn send_restart(&self, command: SupervisorCommand) {
         crate::vdd::recheck_tasks();
         self.shared.retry_second_screen();
-        if let Err(error) = self.supervisor_tx.send(SupervisorCommand::Restart) {
+        if let Err(error) = self.supervisor_tx.send(command) {
             warn!(error = %error, "Failed to send restart command");
         }
     }

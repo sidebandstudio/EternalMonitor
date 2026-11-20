@@ -117,6 +117,11 @@ const KINDS: [Kind; 3] = [
             ("usb_devices", Last),
             ("capture_heartbeat_age_ms", Gauge),
             ("encode_heartbeat_age_ms", Gauge),
+            ("fresh_captured", Counter),
+            ("capture_replaced", Counter),
+            ("readback_us", Gauge),
+            ("input_copy_us", Gauge),
+            ("keyframe_resubmits", Counter),
         ],
     },
 ];
@@ -479,6 +484,33 @@ mod tests {
              gpu=NVIDIA hybrid=false",
             stamp(second)
         )
+    }
+
+    #[test]
+    fn stream_aggregation_reads_appended_capture_fields_by_name() {
+        let mut periodic = Periodic::default();
+        let at = Instant::now();
+        let first = format!(
+            "{} fresh_captured=80 capture_replaced=10 readback_us=400 input_copy_us=-",
+            summary(7, 0)
+        );
+        let next = format!(
+            "{} input_copy_us=200 readback_us=600 capture_replaced=13 fresh_captured=84",
+            summary(7, 10)
+        );
+        assert!(periodic.push(&first, at).is_empty());
+        assert!(periodic
+            .push(&next, at + Duration::from_secs(10))
+            .is_empty());
+        let lines = periodic.flush_due(at + WINDOW);
+        let line = &lines[0];
+        assert!(line.contains(" stream_fresh_captured=84(+4) "), "{line}");
+        assert!(line.contains(" stream_capture_replaced=13(+3) "), "{line}");
+        assert!(line.contains(" stream_readback_us=400/500/600 "), "{line}");
+        assert!(
+            line.ends_with(" stream_input_copy_us=200/200/200"),
+            "{line}"
+        );
     }
 
     #[test]

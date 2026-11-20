@@ -583,11 +583,17 @@ pub(crate) fn uploaded(line: &str) -> String {
 fn event(line: &str, level: &str) -> Event {
     event_with(line, level, &redact::NAMES.read())
 }
-/// A session summary uploads as written. Other lines leave out the user's
+/// A session summary uploads in the backend's ordered v1 format. Other lines leave out the user's
 /// and the PC's names (see [`redact`]).
 fn event_with(line: &str, level: &str, names: &redact::Names) -> Event {
     let (category, message) = match session_summary(line) {
-        Some(summary) => ("summary", crate::logging::redact_support_text(summary)),
+        Some(summary) => {
+            // The backend requires the v1 message to end at hybrid=.
+            let v1 = summary
+                .split_once(" captured_size=")
+                .map_or(summary, |(v1, _)| v1);
+            ("summary", crate::logging::redact_support_text(v1))
+        }
         None => (
             "host",
             redact::redact(&crate::logging::redact_support_text(line), names),

@@ -1546,7 +1546,9 @@ mod tests {
             "{}",
             summaries[0]
         );
-        crate::diagnostics::tests::assert_contract(&summaries[0]);
+        let (v1, capture) = summaries[0].split_once(" captured_size=").unwrap();
+        assert_eq!(capture, "- capture_changes=0");
+        crate::diagnostics::tests::assert_contract(v1);
     }
 
     /// A socket on one address signs that address; one on every address

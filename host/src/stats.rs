@@ -11,6 +11,14 @@ pub static PIPELINE_STATS: Lazy<Mutex<PipelineStats>> =
 const FPS_WINDOW_SECS: f64 = 1.0;
 const HISTORY_LEN: usize = 300;
 
+/// Process-lifetime counters for interval rates, including across resets.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct StreamTotals {
+    pub captured: u64,
+    pub encoded: u64,
+    pub sent: u64,
+}
+
 #[derive(Clone)]
 pub struct PipelineStats {
     pub listen_addr: String,
@@ -23,6 +31,11 @@ pub struct PipelineStats {
     /// stream config, the GUI and the stats summary report it.
     pub capture_resolution: (u32, u32),
     pub capture_frame_count: u64,
+    pub(crate) fresh_captured: u64,
+    pub(crate) capture_replaced: u64,
+    /// Last successful DXGI staging readback for a published frame.
+    pub(crate) readback_us: Option<u128>,
+    pub(crate) stream_totals: StreamTotals,
     pub gpu_name: String,
     /// Active capture source, e.g. `\\.\DISPLAY3 (2732x2048)`. Empty until capture starts.
     pub capture_display: String,
@@ -34,6 +47,7 @@ pub struct PipelineStats {
     /// The last frame's conversion from capture's BGRA to the encoder's
     /// input (or its copy into a BGRA frame), before `encode_time_us` starts.
     pub convert_time_us: u128,
+    pub(crate) input_copy_us: Option<u128>,
     pub encode_frame_count: u64,
     pub nal_bytes_last: usize,
     pub bitrate_bps: u32,
@@ -108,6 +122,10 @@ impl PipelineStats {
             capture_fps: 0.0,
             capture_resolution: (0, 0),
             capture_frame_count: 0,
+            fresh_captured: 0,
+            capture_replaced: 0,
+            readback_us: None,
+            stream_totals: StreamTotals::default(),
             gpu_name: String::new(),
             capture_display: String::new(),
             capture_timestamps: VecDeque::with_capacity(128),
@@ -115,6 +133,7 @@ impl PipelineStats {
             encode_fps: 0.0,
             encode_time_us: 0,
             convert_time_us: 0,
+            input_copy_us: None,
             encode_frame_count: 0,
             nal_bytes_last: 0,
             bitrate_bps: 0,
@@ -159,6 +178,7 @@ impl PipelineStats {
     /// Returns the audio stats it replaced, for their final log line.
     pub fn reset_for_restart(&mut self) -> crate::audio::AudioStats {
         let previous = std::mem::take(self);
+        self.stream_totals = previous.stream_totals;
         self.gpu_name = previous.gpu_name;
         self.capture_display = previous.capture_display;
         self.listen_addr = previous.listen_addr;
@@ -229,21 +249,36 @@ impl PipelineStats {
         self.using_software_fallback = using_software_fallback;
     }
 
-    pub fn record_capture(&mut self, width: u32, height: u32) {
+    pub(crate) fn record_capture(
+        &mut self,
+        width: u32,
+        height: u32,
+        cached: bool,
+        replaced: bool,
+        readback_us: Option<u128>,
+    ) {
         let now = Instant::now();
         self.capture_frame_count += 1;
+        self.stream_totals.captured += 1;
+        self.fresh_captured += u64::from(!cached);
+        self.capture_replaced += u64::from(replaced);
+        if readback_us.is_some() {
+            self.readback_us = readback_us;
+        }
         self.capture_resolution = crate::encoder::encoded_size(width, height);
         self.capture_timestamps.push_back(now);
         self.capture_fps = Self::calc_fps(&mut self.capture_timestamps, now);
     }
 
-    pub fn record_convert(&mut self, convert_us: u128) {
+    pub fn record_convert(&mut self, convert_us: u128, copied: bool) {
         self.convert_time_us = convert_us;
+        self.input_copy_us = copied.then_some(convert_us);
     }
 
     pub fn record_encode(&mut self, encode_us: u128, nal_bytes: usize, bitrate_bps: u32) {
         let now = Instant::now();
         self.encode_frame_count += 1;
+        self.stream_totals.encoded += 1;
         self.encode_time_us = encode_us;
         self.nal_bytes_last = nal_bytes;
         self.bitrate_bps = bitrate_bps;
@@ -266,6 +301,7 @@ impl PipelineStats {
     ) {
         let now = Instant::now();
         self.transport_packets_sent += 1;
+        self.stream_totals.sent += 1;
         self.transport_fragments_sent += fragments;
         self.transport_bytes_sent += bytes;
         self.transport_timestamps.push_back(now);

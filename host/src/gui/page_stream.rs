@@ -10,7 +10,7 @@ use super::{
     CAPTURE_AUTO_LABEL, CAPTURE_VIRTUAL_LABEL, CAPTURE_VIRTUAL_SENTINEL, ENCODER_AUTO_LABEL,
 };
 use crate::capture::recovery::CaptureBlock;
-use crate::control::VddStatus;
+use crate::control::{RestartReason, VddStatus};
 use crate::i18n::{tr, trf};
 use crate::vdd::VddTaskHealth;
 use crate::vdd_device::VddProblem;
@@ -140,7 +140,7 @@ impl AnalyzerApp {
                 self.reset_video_settings();
             }
             if restart {
-                self.restart_stream();
+                self.restart_stream(None);
             }
             ui.add_space(GAP - 10.0);
         }
@@ -201,7 +201,7 @@ impl AnalyzerApp {
                 },
             );
             if retry {
-                self.restart_stream();
+                self.restart_stream(Some(RestartReason::TryAgain));
             }
             if copy_logs {
                 if let Some(text) = crate::logging::session_log_text() {
@@ -370,7 +370,7 @@ impl AnalyzerApp {
             },
         );
         if restart {
-            self.restart_stream();
+            self.restart_stream(Some(RestartReason::RestartNow));
         }
         ui.add_space(GAP - 10.0);
     }
@@ -565,7 +565,7 @@ impl AnalyzerApp {
             match action {
                 Some(HeaderAction::Stop) => self.control.request_stop(),
                 Some(HeaderAction::Start) => self.control.request_start(),
-                Some(HeaderAction::Restart) => self.restart_stream(),
+                Some(HeaderAction::Restart) => self.restart_stream(None),
                 None => {}
             }
         });

@@ -284,6 +284,7 @@ pub fn frame_buffer(frame_bytes: usize) -> Vec<u8> {
 /// dropping an unencoded capture frame just skips a tick.
 pub struct FrameSlot {
     inner: Arc<SlotInner>,
+    capture_generation: u64,
 }
 
 struct SlotInner {
@@ -304,6 +305,7 @@ struct SlotState {
 impl FrameSlot {
     fn new() -> Self {
         Self {
+            capture_generation: 0,
             inner: Arc::new(SlotInner {
                 state: Mutex::new(SlotState::default()),
                 condvar: Condvar::new(),
@@ -316,13 +318,25 @@ impl FrameSlot {
     fn handle(&self) -> FrameSlot {
         FrameSlot {
             inner: Arc::clone(&self.inner),
+            capture_generation: self.capture_generation,
         }
     }
 
-    pub fn publish(&self, frame: RawFrame) {
+    /// Returns whether this publication displaced a frame the encoder had not taken.
+    pub fn publish(&self, frame: RawFrame) -> bool {
         let mut state = self.inner.state.lock();
-        state.frame = Some(frame); // displaces any unconsumed frame
+        let displaced = state.frame.replace(frame).is_some();
         self.inner.condvar.notify_one();
+        displaced
+    }
+
+    pub(crate) fn publish_captured(&self, frame: RawFrame, readback_us: Option<u128>) {
+        let (width, height, cached) = (frame.width, frame.height, frame.cached);
+        let replaced = self.publish(frame);
+        let mut stats = crate::stats::PIPELINE_STATS.lock();
+        if crate::supervisor::generation_is_current(self.capture_generation) {
+            stats.record_capture(width, height, cached, replaced, readback_us);
+        }
     }
 
     pub fn close(&self) {
@@ -1464,7 +1478,7 @@ pub(crate) fn read_back_image<T, E>(
 /// Runs the platform capture loop on the CURRENT thread until stop/close,
 /// publishing frames into `slot`. The supervisor spawns and monitors this.
 pub fn run_capture_stage(
-    slot: FrameSlot,
+    mut slot: FrameSlot,
     shared: SharedControl,
     generation: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -1474,6 +1488,7 @@ pub fn run_capture_stage(
             self.0.close();
         }
     }
+    slot.capture_generation = generation;
     let guard = CloseOnExit(slot.handle());
     let result = recovery::run_until_unblocked(
         &shared,
@@ -1745,6 +1760,37 @@ mod tests {
         assert!(super::stopping(&shared, live));
         shared.running.store(true, Ordering::SeqCst);
         assert!(super::stopping(&shared, live.wrapping_add(1_000_000)));
+    }
+
+    #[test]
+    fn slower_encoder_leaves_one_pending_frame_and_counts_every_replacement() {
+        let (producer, consumer) = super::frame_slot();
+        let mut stats = crate::stats::PipelineStats::new();
+        let mut taken = 0;
+        for number in 1..=5 {
+            let displaced = producer.publish(super::RawFrame {
+                frame_number: number,
+                timestamp: std::time::Instant::now(),
+                data: std::sync::Arc::new(Vec::new()),
+                width: 1280,
+                height: 800,
+                cached: false,
+            });
+            stats.record_capture(1280, 800, false, displaced, None);
+            if number == 3 {
+                assert_eq!(consumer.blocking_take().unwrap().frame_number, 3);
+                taken += 1;
+            }
+        }
+        assert_eq!(stats.capture_replaced, 3);
+        assert_eq!(
+            stats.capture_frame_count,
+            taken + stats.capture_replaced + 1
+        );
+
+        assert_eq!(consumer.blocking_take().unwrap().frame_number, 5);
+        taken += 1;
+        assert_eq!(stats.capture_frame_count - taken, stats.capture_replaced);
     }
 
     #[test]

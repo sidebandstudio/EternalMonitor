@@ -2381,7 +2381,10 @@ fn a_session_ends_with_one_summary_naming_the_clients_nonce() {
             .open(path)
             .unwrap();
         // One write: tests running at once must not interleave lines.
-        file.write_all(format!("{line}\n").as_bytes()).unwrap();
+        let (v1, _) = line
+            .split_once(" captured_size=")
+            .expect("local capture fields");
+        file.write_all(format!("{v1}\n").as_bytes()).unwrap();
     }
 }
 
@@ -2522,7 +2525,10 @@ fn a_screen_refused_from_this_graphics_card_is_told_to_the_ipad() {
             .append(true)
             .open(path)
             .unwrap();
-        file.write_all(format!("{line}\n").as_bytes()).unwrap();
+        let (v1, _) = line
+            .split_once(" captured_size=")
+            .expect("local capture fields");
+        file.write_all(format!("{v1}\n").as_bytes()).unwrap();
     }
 }
 
