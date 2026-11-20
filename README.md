@@ -33,13 +33,13 @@ on the iPad, and every tap, keystroke and Pencil stroke goes back to the PC.
 
 ## Quick start
 
-[![Download for Windows](https://img.shields.io/badge/Download_for_Windows-v0.3.3-e8ff47?style=for-the-badge&labelColor=111)](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.3/EternalMonitor-Setup.exe)
+[![Download for Windows](https://img.shields.io/badge/Download_for_Windows-v0.3.4-e8ff47?style=for-the-badge&labelColor=111)](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.4/EternalMonitor-Setup.exe)
 [![Get the iPad app on TestFlight](https://img.shields.io/badge/iPad_app-TestFlight-e8ff47?style=for-the-badge&labelColor=111)](https://testflight.apple.com/join/ppc9QfXc)
 
-1. **Install the Windows app.** Run [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.3/EternalMonitor-Setup.exe)
+1. **Install the Windows app.** Run [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.4/EternalMonitor-Setup.exe)
    on Windows 10 (version 1809 or later) or Windows 11, 64-bit, with NVIDIA, AMD
    or Intel graphics. If Windows SmartScreen asks, choose **More info**, then
-   **Run anyway**. The [release page](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.3)
+   **Run anyway**. The [release page](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.4)
    lists the file's SHA-256.
 2. **Install the iPad app.** On an iPad with iPadOS 17 or later, install
    **TestFlight** from the App Store, then open the
@@ -111,13 +111,13 @@ permission, it goes on the compatibility page.
 
 ## Status
 
-The current release is v0.3.3 for Windows, with v0.3.3 (build 364) for the iPad.
-It brings **Second screen** to more laptops with Intel and NVIDIA graphics: the
-iPad shows the PC's main screen right away, then switches to the second screen
-once Windows adds it. [RELEASE_NOTES.md](RELEASE_NOTES.md) covers every version,
+The current release is v0.3.4 for Windows, with v0.3.4 (build 698) for the iPad.
+It fixes the problems reported with 0.3.3: start-up crashes on AMD and Intel
+graphics, USB freezes on slower PCs and smeared frames on Wi-Fi. Both apps now
+come in 11 languages. [RELEASE_NOTES.md](RELEASE_NOTES.md) covers every version,
 and [ROADMAP.md](ROADMAP.md) what comes next.
 
-The v0.3.3 release checks passed on Windows, macOS and iPad simulators, and
+The v0.3.4 release checks passed on Windows, macOS and iPad simulators, and
 [docs/hardware-verification.md](docs/hardware-verification.md) records hands-on
 results on a real PC and iPad from v0.3.0.
 
