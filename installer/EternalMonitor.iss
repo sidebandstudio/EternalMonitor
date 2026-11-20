@@ -250,6 +250,7 @@ Type: files; Name: "{app}\driver\installed-by-eternalmonitor.txt"
 [Code]
 var
   VddInstallFailed: Boolean;
+  VddTasksFailed: Boolean;
 #ifdef IncludeDriver
   VddFailedBeforeTasks: Boolean;
 #endif
@@ -260,13 +261,14 @@ begin
 end;
 
 { Inno Setup's own exit codes are 1 to 8 (1: Setup failed to initialize).
-  The update helper reports Setup's code to the relaunched app, so this one
-  stays clear of them. }
+  The update helper reports these codes to the relaunched app. }
 function GetCustomSetupExitCode: Integer;
 begin
   Result := 0;
   if VddInstallFailed then
-    Result := 20;
+    Result := 20
+  else if VddTasksFailed and WizardSilent then
+    Result := 21;
 end;
 
 const
@@ -389,34 +391,42 @@ begin
     RepairVddDriver;
 end;
 
+procedure RunVddTaskStep(const Script, Args, Step: String);
+var
+  ExitCode: Integer;
+begin
+  try
+    if ExecAndLogOutput(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+        '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\scripts\') +
+        Script + '" ' + Args, '', SW_SHOWNORMAL, ewWaitUntilTerminated, ExitCode, nil) then
+      Log(Step + ' exited with code ' + IntToStr(ExitCode))
+    else
+      Log('Could not start ' + Step + ': ' + IntToStr(ExitCode));
+  except
+    Log(Step + ' failed: ' + GetExceptionMessage);
+  end;
+end;
+
 procedure FinishVddTasks;
 var
   Marker: String;
-  ExitCode: Integer;
 begin
-  { Inno logs the [Run] exit code but doesn't act on it. The script writes the
-    marker after reading back both tasks and before trying to disable the device. }
+  { Inno logs the [Run] exit code but doesn't act on it. Verify the marker
+    the script writes after reading back both tasks. }
   Marker := ExpandConstant('{tmp}\vdd-tasks-verified');
   if not FileExists(Marker) then begin
     Log('Virtual display task registration was not verified. Retrying.');
-    try
-      if ExecAndLogOutput(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
-          '-NoProfile -ExecutionPolicy Bypass -File "' +
-          ExpandConstant('{app}\scripts\vdd-tasks-setup.ps1') + '" -ResultMarker "' + Marker + '"',
-          '', SW_SHOWNORMAL, ewWaitUntilTerminated, ExitCode, nil) then
-        Log('Virtual display task registration retry exited with code ' + IntToStr(ExitCode))
-      else
-        Log('Could not start the virtual display task registration retry: ' + IntToStr(ExitCode));
-    except
-      Log('Virtual display task registration retry failed: ' + GetExceptionMessage);
-    end;
+    RunVddTaskStep('vdd-tasks-setup.ps1', '-ResultMarker "' + Marker + '"',
+      'Virtual display task registration retry');
   end;
-  { Existing display failure messages are about the driver. A task-only
-    failure belongs in the Setup log until there is a message for it. }
-  if FileExists(Marker) then
-    Log('Both virtual display tasks were verified.')
+  VddTasksFailed := not FileExists(Marker);
+  if VddTasksFailed then
+    Log('Virtual display task registration could not be verified after two attempts.')
   else
-    Log('Virtual display task registration could not be verified after two attempts.');
+    Log('Both virtual display tasks were verified.');
+  { Stopping an old toggle can leave the device enabled. Disable it once
+    after the registration attempts, even if neither succeeded. }
+  RunVddTaskStep('vdd-toggle.ps1', '-Action disable', 'Virtual display device disable');
   if not VddFailedBeforeTasks then
     VerifyVddDriver;
 end;

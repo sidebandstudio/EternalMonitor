@@ -935,18 +935,6 @@ impl Fields {
                 || description.is_some_and(|(_, field)| field == Some(key.as_str()))
             {
                 kept.push((equals + 1, end));
-            } else if key == "power_source" {
-                // The startup report ends this token with the details field's quote.
-                let start = equals + 1;
-                let token: String = chars
-                    .iter()
-                    .skip(start)
-                    .copied()
-                    .take_while(|c| !c.is_whitespace() && *c != '"')
-                    .collect();
-                if matches!(token.as_str(), "ac" | "battery" | "unknown") {
-                    kept.push((start, start + token.chars().count()));
-                }
             }
             if !NAME_FIELDS.contains(&key.as_str()) {
                 values.push((equals + 1, end));
@@ -1909,7 +1897,7 @@ mod tests {
     }
 
     #[test]
-    fn power_source_only_exempts_the_known_token() {
+    fn power_source_can_contain_a_name_in_free_form_output() {
         let names = Names::new(None, None, Some("ExamplePC"));
         assert_cases(
             &names,
@@ -1926,6 +1914,24 @@ mod tests {
             &names,
             &[("power_source=battery-laptop", "power_source=%COMPUTERNAME%")],
         );
+        let names = Names::new(None, Some("battery backup"), None);
+        assert_cases(
+            &names,
+            &[("power_source=battery backup", "power_source=%USERNAME%")],
+        );
+    }
+
+    #[test]
+    fn ordinary_power_source_values_survive_redaction() {
+        let names = Names::new(None, Some("example-user"), Some("ExamplePC"));
+        for source in ["ac", "battery", "unknown"] {
+            for line in [
+                format!(r#"{STAMP}  INFO Support system information details="Windows build=26100.1 power_source={source}""#),
+                format!("{STAMP}  WARN Virtual display failure snapshot device=no_monitor power_source={source} pin=none"),
+            ] {
+                assert_eq!(redact(&line, &names), line);
+            }
+        }
     }
 
     /// Every enumerated field the host logs keeps its value when the user or
@@ -1945,12 +1951,10 @@ mod tests {
             ("none", "INFO remote_config=applied rollout=none ss_rule=none attach_s=6"),
             ("defaults", "INFO remote_config=defaults reason=offline rollout=7d"),
             ("NotInstalled", "vdd_device=missing problem=NotInstalled"),
-            ("ac", r#"INFO Support system information details="Windows build=26100.1 power_source=ac""#),
-            ("battery", "WARN Virtual display failure snapshot device=no_monitor power_source=battery"),
             ("task_queued", "WARN Virtual display could not be enabled second_screen_fallback=enable_failed reason=task_queued device=unknown"),
             (
                 "unknown",
-                r#"WARN Virtual display failure snapshot vdd_device=no_monitor power_source=unknown pin=none pin_reason="unknown" render=unknown hags=unset settings_path=unknown"#,
+                r#"WARN Virtual display failure snapshot vdd_device=no_monitor pin=none pin_reason="unknown" render=unknown hags=unset settings_path=unknown"#,
             ),
             (
                 "Iris",

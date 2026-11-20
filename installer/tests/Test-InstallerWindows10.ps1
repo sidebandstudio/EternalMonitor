@@ -45,7 +45,6 @@ function Get-Failures([string]$Text) {
     # repair/verify path gated by the failure state before registration.
     $tasks = $Text -split "\r?\n" | Where-Object { $_ -match '^Filename: "powershell\.exe";.*vdd-tasks-setup\.ps1' }
     if (@($tasks).Count -ne 1 -or $tasks -match 'Check:|skipifsilent|postinstall' -or
-        $tasks -notmatch '-ResultMarker ""\{tmp\}\\vdd-tasks-verified""' -or
         $tasks -notmatch 'BeforeInstall: PrepareVddTasks; AfterInstall: FinishVddTasks') {
         $failures += 'Setup does not register and check the tasks on every driver-bundled install'
     }
@@ -54,11 +53,27 @@ function Get-Failures([string]$Text) {
         $failures += 'Setup does not repair the driver when the earlier driver step succeeded'
     }
     $finish = Get-Routine $Text 'procedure FinishVddTasks;'
-    if ($finish -notmatch '(?s)if not FileExists\(Marker\) then begin.*?ExecAndLogOutput\(.*?vdd-tasks-setup\.ps1.*?-ResultMarker.*?ewWaitUntilTerminated' -or
-        $finish -notmatch '(?s)if FileExists\(Marker\) then\s*Log\([^\n]*\)\s*else\s*Log\([^\n]*after two attempts' -or
+    $runMarker = [regex]::Match(($tasks -join "`n"), '-ResultMarker ""([^"]+)""')
+    $checkedMarker = [regex]::Match($finish, "Marker := ExpandConstant\('([^']+)'\);")
+    if (!$runMarker.Success -or !$checkedMarker.Success -or
+        $runMarker.Groups[1].Value -cne $checkedMarker.Groups[1].Value) {
+        $failures += 'The task [Run] entry and its completion check use different marker paths'
+    }
+    $runner = Get-Routine $Text 'procedure RunVddTaskStep(const Script, Args, Step: String);'
+    if ($finish -notmatch "(?s)if not FileExists\(Marker\) then begin.*?RunVddTaskStep\('vdd-tasks-setup\.ps1', '-ResultMarker `"' \+ Marker" -or
+        $runner -notmatch '(?s)ExecAndLogOutput\(.*?ewWaitUntilTerminated' -or
+        $finish -notmatch '(?s)VddTasksFailed := not FileExists\(Marker\);\s*if VddTasksFailed then\s*Log\([^\n]*after two attempts' -or
         $finish -notmatch '(?s)if not VddFailedBeforeTasks then\s*VerifyVddDriver;\s*end;' -or
         $finish -match 'FailVddStep\(|VddInstallFailed\s*:=|RaiseException\(') {
         $failures += 'Setup does not retry unverified registration once and log the result independently of the driver'
+    }
+    $exitCode = Get-Routine $Text 'function GetCustomSetupExitCode: Integer;'
+    if ($exitCode -notmatch '(?s)Result := 0;\s*if VddInstallFailed then\s*Result := 20\s*else if VddTasksFailed and WizardSilent then\s*Result := 21;') {
+        $failures += 'Setup does not report task failure only to a silent caller or preserve driver failure priority'
+    }
+    if ($finish -notmatch "(?s)Log\('Both virtual display tasks were verified\.'\);\s*(?:\{[^}]*\}\s*)*RunVddTaskStep\('vdd-toggle\.ps1', '-Action disable'" -or
+        [regex]::Matches($finish, "RunVddTaskStep\('vdd-toggle\.ps1'").Count -ne 1) {
+        $failures += 'Setup does not attempt one device disable after the task registration outcome'
     }
 
     # A failed step fails Setup on Windows 11 only (build 22000 and later): it sets the failure
@@ -98,6 +113,10 @@ $broken = [ordered]@{
     'tasks skipped after a driver failure' = $iss.Replace('BeforeInstall: PrepareVddTasks;', 'Check: VddInstallSucceeded; BeforeInstall: PrepareVddTasks;')
     'retry skipped' = $iss.Replace('if not FileExists(Marker) then begin', 'if False then begin')
     'retry failure not logged' = $iss.Replace('could not be verified after two attempts', 'done')
+    'marker paths differ' = $iss.Replace("Marker := ExpandConstant('{tmp}\vdd-tasks-verified');", "Marker := ExpandConstant('{tmp}\other-marker');")
+    'task exit code missing' = $iss.Replace('Result := 21;', 'Result := 0;')
+    'task exit code during interactive setup' = $iss.Replace('VddTasksFailed and WizardSilent', 'VddTasksFailed')
+    'disable skipped after failed registration' = $iss.Replace("  RunVddTaskStep('vdd-toggle.ps1'", "  if not VddTasksFailed then RunVddTaskStep('vdd-toggle.ps1'")
     'repair skipped on Windows 10' = Add-AfterBegin $iss 'procedure RepairVddDriver;' '  if not IsWindows11 then exit;'
     'verify skipped on Windows 10' = Add-AfterBegin $iss 'procedure VerifyVddDriver;' '  if not IsWindows11 then exit;'
     'repair skipped' = Add-AfterBegin $iss 'procedure RepairVddDriver;' '  exit;'

@@ -1,5 +1,5 @@
-# Registers the EternalMonitor virtual-display enable/disable scheduled tasks and leaves the
-# device DISABLED by default. Run elevated by the installer.
+# Registers the EternalMonitor virtual-display enable/disable scheduled tasks.
+# Run elevated by the installer, which disables the device after registration.
 #
 # The tasks run as SYSTEM with highest privileges, so the (non-elevated) EternalMonitor host
 # can flip the virtual display on/off via `schtasks /Run` without a UAC prompt. The task names
@@ -28,22 +28,41 @@ $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccou
 $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 2)
 
-$service = New-Object -ComObject Schedule.Service
-$service.Connect()
-$folder = $service.GetFolder('\')
+# Stop all instances before replacing either definition. The in-app updater
+# waits for the host to exit. Interactive Setup offers to close it through
+# Restart Manager, and the user can decline.
+# Share ten seconds across both tasks. A Scheduler call that never returns
+# can still hold Setup, as can registration and the later PnP disable.
+$stopWatch = [Diagnostics.Stopwatch]::StartNew()
+function Assert-VddStopTime {
+    if ($stopWatch.ElapsedMilliseconds -ge 10000) {
+        throw 'Timed out stopping previous virtual display tasks.'
+    }
+}
 
-# Replacing the definitions does not establish that an old instance went away.
-# Stop all instances before replacing either definition.
+Assert-VddStopTime
+$service = New-Object -ComObject Schedule.Service
+Assert-VddStopTime
+$service.Connect()
+Assert-VddStopTime
+$folder = $service.GetFolder('\')
+Assert-VddStopTime
 foreach ($name in $names) {
     try {
+        Assert-VddStopTime
         $task = $folder.GetTask($name)
+        Assert-VddStopTime
         $task.Stop(0)
-        $deadline = (Get-Date).AddSeconds(5)
-        while ($folder.GetTask($name).State -in @(2, 4)) {
-            if ((Get-Date) -ge $deadline) { throw "Previous VDD task did not stop: $name" }
+        Assert-VddStopTime
+        while ($true) {
+            $state = $task.State
+            Assert-VddStopTime
+            if ($state -notin @(2, 4)) { break }
             Start-Sleep -Milliseconds 50
+            Assert-VddStopTime
         }
     } catch {
+        Assert-VddStopTime
         # ERROR_FILE_NOT_FOUND and SCHED_E_TASK_NOT_RUNNING are expected if
         # the task is absent or its last instance has already finished.
         if ($_.Exception.GetBaseException().HResult -notin @(-2147024894, -2147216629)) { throw }
@@ -70,12 +89,6 @@ foreach ($name in $names) {
     }
 }
 
-# Setup checks this separately from the device toggle, which requires a working driver.
 if ($ResultMarker) { [IO.File]::WriteAllText($ResultMarker, 'verified') }
 
-# Off by default — the host turns it on only while streaming to it (and only once an iPad
-# connects). Resolve + disable via the same toggle script so the logic stays in one place.
-& powershell.exe -NoProfile -ExecutionPolicy Bypass -File "$toggle" -Action disable | Out-Null
-if ($LASTEXITCODE -ne 0) { throw 'The virtual display could not be disabled after task registration.' }
-
-Write-Output "Registered EternalMonitor VDD tasks (device resolved at trigger time; left disabled)."
+Write-Output 'Registered and verified both virtual display tasks.'
