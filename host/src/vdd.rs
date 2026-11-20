@@ -58,6 +58,7 @@ enum Gate {
 enum TaskOutcome {
     Done,
     TimedOut,
+    Queued,
     Missing,
     /// With the device state the Enable task found, when it said.
     Failed(Option<crate::vdd_device::DeviceState>),
@@ -75,6 +76,7 @@ impl TaskOutcome {
             Self::Failed(Some(state)) => Ok(state),
             Self::Failed(None) => Err("display task failed"),
             Self::TimedOut => Err("display task timed out"),
+            Self::Queued => Err("display task queued"),
             Self::Missing => Err("display tasks missing"),
             Self::Done => Err("display task finished"),
         }
@@ -82,7 +84,11 @@ impl TaskOutcome {
 
     fn from_stderr(stderr: &str) -> Self {
         if stderr.contains("timed out") {
-            Self::TimedOut
+            if stderr.trim_end().ends_with(" (queued)") {
+                Self::Queued
+            } else {
+                Self::TimedOut
+            }
         } else if stderr.contains("0x80070002") {
             Self::Missing
         } else {
@@ -166,7 +172,7 @@ impl TaskGate {
                 self.health = VddTaskHealth::Ok;
                 self.stuck = None;
             }
-            TaskOutcome::TimedOut => {
+            TaskOutcome::TimedOut | TaskOutcome::Queued => {
                 self.health = VddTaskHealth::NotResponding;
                 self.stuck = Some((now, enabled));
             }
@@ -457,13 +463,15 @@ fn refused(health: VddTaskHealth) -> EnableReport {
 
 /// Why an Enable failed, for its log line's `reason=`: `task_missing` (the
 /// installer's tasks are gone), `task_failed` (the task ran and failed; the
-/// device state it found, when it said, is in the report), `timeout` (it,
-/// or an earlier one still stuck, did not finish in time), or `other`.
+/// device state it found, when it said, is in the report), `task_queued` (the
+/// wrapper timed out with an instance still queued), `timeout` (any other
+/// timeout or cooldown), or `other`.
 #[cfg_attr(not(windows), allow(dead_code))] // Only Windows capture asks.
 pub(crate) fn enable_failure_reason(report: EnableReport) -> &'static str {
     match report {
         Ok(_) | Err("display task failed") => "task_failed",
         Err("display tasks missing") => "task_missing",
+        Err("display task queued") => "task_queued",
         Err("display task timed out" | "display task not responding") => "timeout",
         Err(_) => "other",
     }
@@ -1324,6 +1332,7 @@ mod tests {
             ),
             (TaskOutcome::Failed(None), "task_failed"),
             (TaskOutcome::TimedOut, "timeout"),
+            (TaskOutcome::Queued, "task_queued"),
             (TaskOutcome::Missing, "task_missing"),
             (TaskOutcome::Done, "other"),
         ] {
@@ -1433,6 +1442,16 @@ mod tests {
 
     #[test]
     fn task_errors_are_classified_from_the_script_output() {
+        for stderr in [
+            "VDD task timed out: EternalMonitor VDD Enable (queued)\r\n",
+            "Previous VDD task timed out: EternalMonitor VDD Disable (queued)",
+        ] {
+            assert_eq!(TaskOutcome::from_stderr(stderr), TaskOutcome::Queued);
+        }
+        assert_eq!(
+            TaskOutcome::from_stderr("VDD task timed out: EternalMonitor VDD Enable (in progress)"),
+            TaskOutcome::TimedOut
+        );
         assert_eq!(
             TaskOutcome::from_stderr("Previous VDD task timed out: EternalMonitor VDD Disable"),
             TaskOutcome::TimedOut

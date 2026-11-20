@@ -99,6 +99,7 @@ pub fn driver_render_card<'a>(
 pub struct Snapshot {
     /// The device state, or why there is none.
     pub device: Result<DeviceState, &'static str>,
+    pub power_source: &'static str,
     /// The graphics card the host asked the driver for, or why it asked for none.
     pub pin: Result<String, &'static str>,
     /// The card the driver renders on (`driver_render_card`).
@@ -160,6 +161,7 @@ pub fn line(snapshot: &Snapshot) -> String {
         Some(false) => " settings_path=other",
         None => " settings_path=unknown",
     };
+    out += &format!(" power_source={}", snapshot.power_source);
 
     let adapters: Vec<String> = snapshot
         .adapters
@@ -233,6 +235,7 @@ pub fn collect(
     let (adapters, targets) = (adapters(), targets());
     Snapshot {
         device,
+        power_source: crate::power::power_source(),
         pin,
         render: driver_render_card(&adapters, &targets, before).map(str::to_string),
         hags: crate::diagnostics::registry_dword(
@@ -415,6 +418,7 @@ mod tests {
     fn snapshot() -> Snapshot {
         Snapshot {
             device: Ok(DeviceState::NoMonitor),
+            power_source: "battery",
             pin: Ok("Intel(R) Iris(R) Xe Graphics".into()),
             render: None,
             hags: Some(2),
@@ -463,7 +467,7 @@ mod tests {
         assert_eq!(
             line(&snapshot()),
             "device=no_monitor pin=\"Intel(R) Iris(R) Xe Graphics\" pin_matched=true render=unknown hags=on \
-             settings_path=default adapters=[d2c1 \"Intel(R) Iris(R) Xe Graphics\" 8086:46a6 \
+             settings_path=default power_source=battery adapters=[d2c1 \"Intel(R) Iris(R) Xe Graphics\" 8086:46a6 \
              driver=32.0.101.7092 outputs=1 | 10000e5f0 \"NVIDIA GeForce RTX 3050 Ti Laptop GPU\" \
              10de:25a0 driver=32.0.16.1742 outputs=0] paths=[active src=d2c1/0 tgt=d2c1/4352 \
              tech=-2147483648 vdd=no | inactive available tgt=200000101/256 tech=5 vdd=yes]"
