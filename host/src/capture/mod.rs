@@ -454,6 +454,25 @@ pub(crate) fn resolve_target(
     }
 }
 
+/// Reconcile again if the named second screen vanished between the worker's
+/// selection and the factory used to open the duplication.
+#[cfg(any(windows, test))]
+fn resolve_capture_output(
+    outputs: &[OutputInfo],
+    target: &CaptureTarget,
+    second_screen: bool,
+) -> Result<Option<usize>, recovery::Reopen> {
+    let index = resolve_target(outputs, target);
+    if let (true, CaptureTarget::Output(name), Some(i)) = (second_screen, target, index) {
+        if outputs[i].is_primary || outputs[i].device_name != *name {
+            return Err(recovery::Reopen {
+                detail: format!("second screen {name} left the desktop before capture opened it"),
+            });
+        }
+    }
+    Ok(index)
+}
+
 /// After the duplication was lost: whether `target` now resolves to another
 /// output than `current`, the one being duplicated, by device name and
 /// adapter LUID. A display unplugged or back, a dock or a driver restart
@@ -493,20 +512,6 @@ const VDD_ATTACH_TIMEOUT_DEFAULT_SECS: u64 = 30;
 const VDD_POLL_INTERVAL: Duration = Duration::from_millis(120);
 
 #[cfg(any(windows, test, debug_assertions))]
-enum AttachPoll {
-    Waiting,
-    Done(AttachResult),
-    Unidentified(Vec<OutputInfo>),
-}
-
-#[cfg(any(windows, test, debug_assertions))]
-impl From<Vec<OutputInfo>> for AttachPoll {
-    fn from(outputs: Vec<OutputInfo>) -> Self {
-        Self::Unidentified(outputs)
-    }
-}
-
-#[cfg(any(windows, test, debug_assertions))]
 enum AttachResult {
     Attached(OutputInfo),
     TimedOut,
@@ -518,30 +523,37 @@ enum AttachResult {
 /// Polling remains bounded even while startup heartbeats keep the watchdog alive.
 /// A cancelled generation returns before inspecting or changing display state.
 #[cfg(any(windows, test, debug_assertions))]
-fn wait_for_virtual_output<T: Into<AttachPoll>>(
-    before: &[String],
+fn wait_for_virtual_output(
+    before: Option<&[String]>,
     timeout: Duration,
-    mut poll: impl FnMut() -> Option<T>,
+    mut poll: impl FnMut() -> Option<Vec<OutputInfo>>,
+    mut identify: impl FnMut(&[OutputInfo]) -> Option<OutputInfo>,
     mut now: impl FnMut() -> Instant,
     mut wait: impl FnMut(Duration),
     mut no_monitor: impl FnMut() -> bool,
 ) -> AttachResult {
-    let deadline = now() + timeout;
+    let mut next_identity = now();
+    let deadline = next_identity + timeout;
     loop {
         let Some(outputs) = poll() else {
             return AttachResult::Cancelled;
         };
-        match outputs.into() {
-            AttachPoll::Done(result) => return result,
-            AttachPoll::Unidentified(outputs) => {
-                if let Some(chosen) = pick_new_virtual_output(before, &outputs) {
-                    return AttachResult::Attached(chosen.clone());
-                }
-            }
-            AttachPoll::Waiting => {}
+        if let Some(chosen) = before.and_then(|names| pick_new_virtual_output(names, &outputs)) {
+            return AttachResult::Attached(chosen.clone());
         }
         if now() >= deadline {
             return AttachResult::TimedOut;
+        }
+        if now() >= next_identity {
+            let identified = identify(&outputs);
+            let read_at = now();
+            if read_at >= deadline {
+                return AttachResult::TimedOut;
+            }
+            if let Some(output) = identified {
+                return AttachResult::Attached(output);
+            }
+            next_identity = read_at + Duration::from_millis(500);
         }
         if no_monitor() {
             return AttachResult::NoMonitor;
@@ -660,6 +672,7 @@ fn prepare_vdd_settings(shared: &SharedControl, outputs: &[OutputInfo]) -> VddRe
                 Ok(_) => {
                     let choice = shared.vdd_resolutions.lock().choices.chosen(device);
                     *shared.vdd_prepared.lock() = Some(PreparedModes {
+                        loaded: true,
                         device,
                         modes: modes.clone(),
                         choice,
@@ -710,6 +723,9 @@ fn prepare_vdd_settings(shared: &SharedControl, outputs: &[OutputInfo]) -> VddRe
     let cursor =
         crate::vdd_settings::starting_cursor(settings.as_deref(), reads_cursor, overridden);
     let instance = crate::vdd_device::run_state();
+    if let Some(prepared) = shared.vdd_prepared.lock().as_mut() {
+        prepared.loaded = instance == crate::vdd_settings::DriverRun::Off;
+    }
     info!(
         ?instance,
         reads_cursor,
@@ -755,6 +771,8 @@ pub(crate) fn running_driver_cursor() -> crate::vdd_settings::DriverCursor {
 /// iPad it was written for (0 when none was connected or it sent no id).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedModes {
+    /// An already running driver may still have the modes from its previous start.
+    pub loaded: bool,
     pub device: u64,
     pub modes: Vec<crate::vdd_settings::VddMode>,
     /// The saved choice the display was last settled for (none: the
@@ -772,6 +790,11 @@ pub fn connected_vdd_modes(
     Some((info.device_id, modes))
 }
 
+pub(crate) struct SettledFor {
+    device: u64,
+    choice: Option<(u32, u32)>,
+}
+
 /// The mode the second screen should have now: the connected iPad's latest
 /// choice among the modes written for the driver, or the first of them.
 /// None when this host left the modes to the driver.
@@ -779,7 +802,7 @@ pub fn connected_vdd_modes(
 /// own), which a settle records.
 pub(crate) fn wanted_vdd(
     shared: &SharedControl,
-) -> (Option<crate::vdd_settings::VddMode>, Option<(u32, u32)>) {
+) -> (Option<crate::vdd_settings::VddMode>, Option<SettledFor>) {
     // The connected iPad's modes; the written ones when none is connected.
     let prepared = shared.vdd_prepared.lock().as_ref().map(|p| p.modes.clone());
     let connected = connected_vdd_modes(shared);
@@ -787,7 +810,13 @@ pub(crate) fn wanted_vdd(
     let chosen = device.and_then(|device| shared.vdd_resolutions.lock().choices.chosen(device));
     let modes = prepared.map(|written| connected.map_or(written, |(_, modes)| modes));
     let wanted = modes.and_then(|modes| crate::vdd_settings::requested_mode(&modes, chosen));
-    (wanted, chosen)
+    (
+        wanted,
+        device.map(|device| SettledFor {
+            device,
+            choice: chosen,
+        }),
+    )
 }
 
 /// The app's Resolution choice for the connected iPad.
@@ -878,18 +907,10 @@ pub(crate) enum Reuse {
 /// `choice`, on the modes written for the driver: a reuse keeps it only for
 /// that iPad and choice.
 #[cfg(any(windows, test, debug_assertions))]
-pub(crate) fn note_settled_for(shared: &SharedControl, choice: Option<(u32, u32)>) {
-    let Some(device) = shared
-        .session
-        .lock()
-        .client_info()
-        .map(|info| info.device_id)
-    else {
-        return;
-    };
-    if let Some(prepared) = shared.vdd_prepared.lock().as_mut() {
-        prepared.device = device;
-        prepared.choice = choice;
+pub(crate) fn note_settled_for(shared: &SharedControl, settled: Option<SettledFor>) {
+    if let (Some(prepared), Some(settled)) = (shared.vdd_prepared.lock().as_mut(), settled) {
+        prepared.device = settled.device;
+        prepared.choice = settled.choice;
     }
 }
 
@@ -899,7 +920,7 @@ pub(crate) fn note_settled_for(shared: &SharedControl, choice: Option<(u32, u32)
 /// list alone keeps the display. Kept for the iPad and saved choice it was
 /// last settled for (for the same iPad with no choice: kept, as before
 /// resolutions could be chosen); otherwise settled again.
-pub(crate) fn reuse_vdd(shared: &SharedControl) -> Reuse {
+pub(crate) fn reuse_vdd(shared: &SharedControl, live: Option<(u32, u32)>) -> Reuse {
     let Some(prepared) = shared.vdd_prepared.lock().clone() else {
         return Reuse::Keep;
     };
@@ -907,6 +928,15 @@ pub(crate) fn reuse_vdd(shared: &SharedControl) -> Reuse {
         return Reuse::Keep;
     };
     let (wanted, choice) = wanted_vdd(shared);
+    if !prepared.loaded {
+        // Only the worker has a fresh listing. A transport tick must queue
+        // CheckKept so the actual size can decide whether to restart.
+        return match live {
+            None => Reuse::Settle,
+            Some(size) if wanted.is_some_and(|m| (m.width, m.height) == size) => Reuse::Keep,
+            Some(_) => Reuse::Restart,
+        };
+    }
     let loaded = crate::vdd_settings::sizes(&prepared.modes);
     let needed = modes.first().into_iter().chain(&wanted);
     if needed
@@ -915,7 +945,9 @@ pub(crate) fn reuse_vdd(shared: &SharedControl) -> Reuse {
     {
         return Reuse::Restart;
     }
-    if device == prepared.device && choice == prepared.choice {
+    if device == prepared.device
+        && choice.is_some_and(|c| c.device == device && c.choice == prepared.choice)
+    {
         Reuse::Keep
     } else {
         Reuse::Settle
@@ -1471,12 +1503,13 @@ pub(crate) fn keepalive_due(
 pub(crate) fn read_back_image<T, E>(
     shared: &SharedControl,
     generation: u64,
+    captured: &OutputInfo,
     seen_image: &mut bool,
     read: impl FnOnce() -> Result<Option<T>, E>,
 ) -> Result<Option<T>, E> {
     let image = read()?;
     if image.is_some() && !std::mem::replace(seen_image, true) {
-        second_screen::note_image(shared, generation);
+        second_screen::note_image_on(shared, generation, Some(captured));
     }
     Ok(image)
 }
@@ -2144,6 +2177,7 @@ mod tests {
         let (device, modes) = super::connected_vdd_modes(shared).expect("an iPad");
         let choice = shared.vdd_resolutions.lock().choices.chosen(device);
         *shared.vdd_prepared.lock() = Some(super::PreparedModes {
+            loaded: true,
             device,
             modes,
             choice,
@@ -2669,7 +2703,7 @@ mod tests {
         let elapsed = Cell::new(Duration::ZERO);
         let before = vec!["primary".to_string(), "physical-secondary".to_string()];
         let result = wait_for_virtual_output(
-            &before,
+            Some(&before),
             Duration::from_secs(VDD_ATTACH_TIMEOUT_DEFAULT_SECS),
             || {
                 startup_heartbeat(&shared, 1_000 + elapsed.get().as_millis() as u64);
@@ -2679,6 +2713,7 @@ mod tests {
                 }
                 Some(outputs)
             },
+            |_| None,
             || start + elapsed.get(),
             |duration| {
                 elapsed.set(elapsed.get() + duration);
@@ -2720,9 +2755,10 @@ mod tests {
         let elapsed = Cell::new(Duration::ZERO);
         let timeout = Duration::from_secs(VDD_ATTACH_TIMEOUT_DEFAULT_SECS);
         let result = wait_for_virtual_output(
-            &[],
+            Some(&[]),
             timeout,
             || Some(Vec::new()),
+            |_| None,
             || start + elapsed.get(),
             |duration| elapsed.set(elapsed.get() + duration),
             || false,
@@ -2732,7 +2768,7 @@ mod tests {
 
         let cancelled_at = Cell::new(false);
         let result = wait_for_virtual_output(
-            &[],
+            Some(&[]),
             timeout,
             || {
                 if cancelled_at.get() {
@@ -2741,6 +2777,7 @@ mod tests {
                     Some(Vec::new())
                 }
             },
+            |_| None,
             || start + elapsed.get(),
             |duration| {
                 elapsed.set(elapsed.get() + duration);

@@ -12,9 +12,8 @@
 //! off, if the PC has lost every real screen it had before the display was
 //! turned on, the guard re-applies that layout, or else switches Windows to
 //! "PC screen only" when the built-in panel was on, and logs the result.
-//! The guard leaves a desktop that keeps a real screen alone. When Second
-//! screen finds only its virtual target connected but inactive, it can ask
-//! for "Extend" once, with every connected real monitor already active.
+//! Nothing else ever changes the layout, which stays the user's: a PC that
+//! keeps any real screen sees no change at all.
 //!
 //! Turning the display off while it is the only screen on is what loses the
 //! panel for good: on a hybrid laptop, Windows then stops reporting any
@@ -918,12 +917,6 @@ pub(crate) fn around<T>(
     result
 }
 
-/// The second-screen worker has confirmed that only its target needs Extend.
-#[cfg(windows)]
-pub(crate) fn extend_for_second_screen() -> Result<(), i32> {
-    windows_impl::Windows::new(crate::startup::ProcessId::current(), |_, _| {}, false).extend()
-}
-
 /// Whether the last turn on left the virtual display alone, with no real
 /// screen beside it: then it does not attach as a second screen.
 #[cfg(windows)]
@@ -1249,7 +1242,7 @@ mod windows_impl {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::VecDeque;
 
@@ -1447,6 +1440,40 @@ mod tests {
         fn kept(&mut self) -> Option<String> {
             self.kept.clone()
         }
+    }
+
+    /// The worker test uses the real owner file and guard around its fake task.
+    pub(crate) fn record_test_enable<E>(
+        dir: &std::path::Path,
+        task: impl FnOnce() -> Result<(), E>,
+    ) -> Result<(), E> {
+        let owner = crate::startup::ProcessId::current().to_string();
+        let mut displays = Fake::reading([vec![panel(), vdd()]]);
+        displays.owner = Some(owner.clone());
+        let mut result = None;
+        crate::startup::display::change_at(
+            &dir.join("virtual-display-owner"),
+            &dir.join("driver.lock"),
+            true,
+            || {},
+            |_| {
+                let mut guard = Guard::new();
+                assert!(guard.before(true, false, &mut displays));
+                let ran = task();
+                let done = ran.is_ok();
+                guard.after(true, done, &mut displays);
+                let record = displays
+                    .kept()
+                    .expect("the guard retained the pre-Enable desktop");
+                assert_eq!(
+                    parse::<usize>(&owner, &record).unwrap().screens,
+                    [panel(), vdd()]
+                );
+                result = Some(ran);
+                done
+            },
+        );
+        result.unwrap()
     }
 
     /// A Second screen session: before and after the turn on, then the

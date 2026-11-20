@@ -2757,11 +2757,11 @@ mod tests {
             self.display.set_enabled(enabled)
         }
 
-        fn enable(&self) -> Result<(), crate::vdd::EnableReport> {
+        fn enable(&self) -> Result<(), crate::vdd::EnableFailure> {
             self.display.set_enabled(true);
             if self.start == Start::EnableFails {
                 self.display.disables.set(self.display.disables.get() + 1);
-                return Err(Err("display task failed"));
+                return Err(crate::vdd::EnableFailure::Task(Err("display task failed")));
             }
             Ok(())
         }

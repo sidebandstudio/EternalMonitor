@@ -23,18 +23,12 @@ const VDD_MONITOR: &str = "MTT1337";
 #[derive(Clone)]
 pub(crate) struct ActivePath {
     pub source: String,
-    pub virtual_display: Option<bool>,
-}
-
-/// Active paths and the identities of connected targets off the desktop.
-#[cfg(any(windows, test, debug_assertions))]
-pub(crate) struct ConnectedDisplays {
-    pub active: Vec<ActivePath>,
-    pub inactive: Vec<Option<bool>>,
+    pub virtual_display: bool,
+    pub position: (i32, i32),
 }
 
 #[cfg(windows)]
-pub(crate) use windows_impl::connected_displays;
+pub(crate) use windows_impl::active_paths;
 
 /// A DXGI adapter.
 #[derive(Debug, Clone)]
@@ -67,6 +61,9 @@ impl Target {
 }
 
 /// Whether a monitor device path is the virtual display's.
+/// The guard and capture both match the driver's stock EDID marker in the
+/// monitor path. This cannot distinguish a custom EDID or prove a PnP node.
+/// The same driver installed by another app is the device our tasks control.
 pub fn is_vdd_monitor(monitor_path: &str) -> bool {
     monitor_path.to_ascii_uppercase().contains(VDD_MONITOR)
 }
@@ -387,32 +384,31 @@ mod windows_impl {
         }
     }
 
-    pub(crate) fn connected_displays() -> Option<super::ConnectedDisplays> {
-        let (paths, _) = display_config(QDC_ALL_PATHS)?;
-        let mut connected = std::collections::HashSet::new();
-        let mut active = Vec::new();
-        let mut inactive = Vec::new();
-        let identity = |path: &DISPLAYCONFIG_PATH_INFO| {
-            let monitor = monitor_path(path);
-            (!monitor.is_empty()).then(|| super::is_vdd_monitor(&monitor))
+    pub(crate) fn active_paths() -> Option<Vec<super::ActivePath>> {
+        use windows::Win32::Devices::Display::{
+            DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, QDC_ONLY_ACTIVE_PATHS,
         };
-        let target =
-            |path: &DISPLAYCONFIG_PATH_INFO| (value(path.targetInfo.adapterId), path.targetInfo.id);
-        for path in paths.iter().filter(|p| p.flags & PATH_ACTIVE != 0) {
-            connected.insert(target(path));
-            active.push(super::ActivePath {
-                source: crate::gpu_preference::source_name(path).unwrap_or_default(),
-                virtual_display: identity(path),
-            });
-        }
-        // ALL_PATHS includes alternative routes to an already active target.
-        // Only a distinct available target can be turned on by Extend.
-        for path in &paths {
-            if path.targetInfo.targetAvailable.as_bool() && connected.insert(target(path)) {
-                inactive.push(identity(path));
-            }
-        }
-        Some(super::ConnectedDisplays { active, inactive })
+        let (paths, modes) = display_config(QDC_ONLY_ACTIVE_PATHS)?;
+        paths
+            .iter()
+            .map(|path| {
+                let monitor = monitor_path(path);
+                if monitor.is_empty() || !path.targetInfo.targetAvailable.as_bool() {
+                    return None;
+                }
+                // Without QDC_VIRTUAL_MODE_AWARE this is a source mode index.
+                let mode = modes.get(unsafe { path.sourceInfo.Anonymous.modeInfoIdx } as usize)?;
+                if mode.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE {
+                    return None;
+                }
+                let pos = unsafe { mode.Anonymous.sourceMode.position };
+                Some(super::ActivePath {
+                    source: crate::gpu_preference::source_name(path)?,
+                    virtual_display: super::is_vdd_monitor(&monitor),
+                    position: (pos.x, pos.y),
+                })
+            })
+            .collect()
     }
 
     /// Every active path, then each available target no active path uses.
