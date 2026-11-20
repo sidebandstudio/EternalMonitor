@@ -727,7 +727,7 @@ mod tests {
             tracing::subscriber::with_default(subscriber, || {
                 crate::diagnostics::log_stream_summary(
                     shared,
-                    &mut crate::diagnostics::StreamInterval::new(),
+                    &mut crate::diagnostics::StreamInterval::new(shared),
                 )
             });
             let text = String::from_utf8(out.lock().clone()).unwrap();

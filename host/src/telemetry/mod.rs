@@ -575,9 +575,9 @@ pub(crate) fn session_summary(line: &str) -> Option<&str> {
         .strip_prefix("INFO ")
         .filter(|message| message.starts_with("session_summary v="))
 }
-/// What uploads say for `line`.
-#[cfg(test)]
-pub(crate) fn uploaded(line: &str) -> String {
+/// What uploads say for `line`. Also used by the external session fixtures.
+#[doc(hidden)]
+pub fn uploaded(line: &str) -> String {
     event(line, level(line)).message
 }
 fn event(line: &str, level: &str) -> Event {

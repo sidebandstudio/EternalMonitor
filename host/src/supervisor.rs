@@ -143,6 +143,7 @@ pub struct Machine {
     pub state: SupervisorState,
     restarts: Vec<Instant>,
     attempt: u32,
+    pending_start: Option<&'static str>,
     /// When the watchdog last looked at the live generation's heartbeats.
     watched_ms: Option<u64>,
     /// When the watchdog last found such a gap, during [`WAKE_GRACE_MS`].
@@ -157,13 +158,14 @@ impl Machine {
             },
             restarts: Vec::new(),
             attempt: 0,
+            pending_start: None,
             watched_ms: None,
             woke_ms: None,
         }
     }
 
     pub fn on_command(&mut self, command: &SupervisorCommand) -> Effect {
-        match command {
+        let effect = match command {
             SupervisorCommand::Restart | SupervisorCommand::RestartFor(_) => match self.state {
                 SupervisorState::ShutDown => Effect::None,
                 _ => {
@@ -212,7 +214,13 @@ impl Machine {
                 self.state = SupervisorState::ShutDown;
                 Effect::Shutdown
             }
+        };
+        match effect {
+            Effect::Start | Effect::Restart => self.pending_start = Some(command.log_name()),
+            Effect::StopPipeline | Effect::Shutdown => self.pending_start = None,
+            Effect::None => {}
         }
+        effect
     }
 
     /// A stage from the LIVE generation ended.
@@ -314,11 +322,12 @@ impl Machine {
         }
     }
 
-    pub fn note_started(&mut self, generation: u64) {
+    pub fn note_started(&mut self, generation: u64) -> &'static str {
         self.state = SupervisorState::Running { generation };
         // Joining the old generation can take seconds; that is no sleep.
         self.watched_ms = None;
         self.woke_ms = None;
+        self.pending_start.take().unwrap_or("unknown")
     }
 
     /// A successful stretch of running clears the failure budget.
@@ -438,23 +447,25 @@ pub fn run(
         match effect {
             Effect::None => {}
             Effect::StopPipeline => {
-                // Before the join: a HELLO2 the stopping transport still
-                // takes hears why.
-                shared
-                    .session
-                    .lock()
-                    .set_not_streaming(not_streaming(&machine.state, &shared));
-                stop_pipeline(&shared, &machine.state);
-                bounded_join(&mut pipeline, generation, started_by, command);
+                retire_pipeline(&mut pipeline, generation, started_by, command, || {
+                    // Before the join: a HELLO2 the stopping transport still
+                    // takes hears why.
+                    shared
+                        .session
+                        .lock()
+                        .set_not_streaming(not_streaming(&machine.state, &shared));
+                    stop_pipeline(&shared, &machine.state);
+                });
             }
             Effect::Restart | Effect::Start => {
-                // A HELLO2 meanwhile is told to ask again in a moment.
-                shared
-                    .session
-                    .lock()
-                    .set_not_streaming(Some(NotStreaming::Restarting));
-                shared.stop();
-                bounded_join(&mut pipeline, generation, started_by, command);
+                retire_pipeline(&mut pipeline, generation, started_by, command, || {
+                    // A HELLO2 meanwhile is told to ask again in a moment.
+                    shared
+                        .session
+                        .lock()
+                        .set_not_streaming(Some(NotStreaming::Restarting));
+                    shared.stop();
+                });
                 // The check below binds the port: the standby lets go first.
                 if let Some(standby) = standby.take() {
                     standby.stop();
@@ -473,8 +484,7 @@ pub fn run(
                     stats.set_bitrate(shared.abr_current_bps.load(Ordering::SeqCst));
                 });
                 generation = CURRENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
-                machine.note_started(generation);
-                started_by = command;
+                started_by = machine.note_started(generation);
                 settle(&machine, &shared, &mut standby, listen_port);
                 healthy_since = Instant::now();
                 if adopt_late_detection(&mut gpu_info, &shared, crate::gpu::take_late_detection) {
@@ -492,8 +502,9 @@ pub fn run(
                 ));
             }
             Effect::Shutdown => {
-                shared.stop();
-                bounded_join(&mut pipeline, generation, started_by, command);
+                retire_pipeline(&mut pipeline, generation, started_by, command, || {
+                    shared.stop()
+                });
                 // The port closes as the stream ends, as it always did: a
                 // copy that takes over after this one quits binds it.
                 shared.stream_socket.lock().take();
@@ -765,6 +776,7 @@ fn spawn_generation(
     }
     {
         let mut stats = PIPELINE_STATS.lock();
+        stats.capture_generation = Some(generation);
         stats.mark_pipeline_started();
         stats.set_bitrate(shared.abr_current_bps.load(Ordering::SeqCst));
         stats.set_target_addr(shared.target_addr.lock().to_string());
@@ -798,15 +810,19 @@ fn spawn_generation(
     })
 }
 
-/// Join with a deadline; on timeout, DETACH — the generation counter already
-/// poisoned the zombie (its health reports are filtered and its channel sends
-/// fail as the new generation's stages replace the endpoints).
-fn bounded_join(
+/// Log retirement before a stop or join can block. On timeout, detach the
+/// old thread. The supervisor filters its health reports once it is retired.
+fn retire_pipeline(
     pipeline: &mut Option<std::thread::JoinHandle<()>>,
     generation: u64,
     started_by: &str,
     command: &str,
+    stop: impl FnOnce(),
 ) {
+    if pipeline.is_some() {
+        info!(generation, started_by, command, "Pipeline ended");
+    }
+    stop();
     let Some(handle) = pipeline.take() else {
         return;
     };
@@ -817,7 +833,6 @@ fn bounded_join(
                 generation,
                 "Pipeline generation refused to exit within 5s — detaching (poisoned)"
             );
-            info!(generation, started_by, command, "Pipeline ended");
             return; // handle dropped => detached
         }
         std::thread::sleep(Duration::from_millis(25));
@@ -825,7 +840,6 @@ fn bounded_join(
     if let Err(panic) = handle.join() {
         error!(generation, ?panic, "Pipeline thread panicked");
     }
-    info!(generation, started_by, command, "Pipeline ended");
 }
 
 #[cfg(test)]
@@ -842,7 +856,11 @@ mod tests {
             supervisor_tx: tx,
         };
         let capture = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
-        struct EndLines(std::sync::Arc<parking_lot::Mutex<Vec<String>>>);
+        let (release_join, wait_for_log) = mpsc::channel();
+        struct EndLines(
+            std::sync::Arc<parking_lot::Mutex<Vec<String>>>,
+            mpsc::Sender<()>,
+        );
         impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EndLines {
             fn on_event(
                 &self,
@@ -862,12 +880,18 @@ mod tests {
                 let mut command = Command(None);
                 event.record(&mut command);
                 if let Some(command) = command.0 {
+                    if command == "request_stop" {
+                        let _ = self.1.send(());
+                    }
                     self.0.lock().push(command);
                 }
             }
         }
         use tracing_subscriber::prelude::*;
-        let subscriber = tracing_subscriber::registry().with(EndLines(capture.clone()));
+        let subscriber =
+            tracing_subscriber::registry().with(EndLines(capture.clone(), release_join));
+        let mut wait_for_log = Some(wait_for_log);
+        let learned_before_join = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(subscriber, || {
             // The restart methods also recheck the process-wide VDD task gate.
@@ -886,17 +910,61 @@ mod tests {
                 let generation = generation as u64 + 1;
                 let command = rx.try_recv().unwrap();
                 assert_eq!(machine.on_command(&command), effect);
-                let mut pipeline = Some(std::thread::spawn(|| {}));
-                bounded_join(&mut pipeline, generation, "unknown", command.log_name());
+                let wait = if effect == Effect::StopPipeline {
+                    wait_for_log.take()
+                } else {
+                    None
+                };
+                let learned = learned_before_join.clone();
+                let mut pipeline = Some(std::thread::spawn(move || {
+                    if let Some(wait) = wait {
+                        learned.store(
+                            wait.recv_timeout(Duration::from_secs(2)).is_ok(),
+                            Ordering::Relaxed,
+                        );
+                    }
+                }));
+                retire_pipeline(
+                    &mut pipeline,
+                    generation,
+                    "unknown",
+                    command.log_name(),
+                    || {},
+                );
                 if effect == Effect::Restart {
                     machine.note_started(generation + 1);
                 }
             }
         });
+        assert!(learned_before_join.load(Ordering::Relaxed));
         assert_eq!(
             *capture.lock(),
             ["set_second_screen", "try_again", "request_stop"]
         );
+    }
+
+    #[test]
+    fn start_or_restart_keeps_its_command_across_port_checks() {
+        let at = Instant::now();
+        for command in [SupervisorCommand::Start, SupervisorCommand::Restart] {
+            let mut machine = Machine::new(1);
+            machine.wait_for_port(at);
+            assert_ne!(machine.on_command(&command), Effect::None);
+            for _ in 0..2 {
+                machine.wait_for_port(at);
+                assert_eq!(machine.on_tick(at), Effect::Start);
+            }
+            assert_eq!(machine.note_started(2), command.log_name());
+
+            machine.wait_for_port(at);
+            assert_eq!(machine.on_command(&SupervisorCommand::Start), Effect::Start);
+            machine.wait_for_port(at);
+            assert_eq!(
+                machine.on_command(&SupervisorCommand::Stop),
+                Effect::StopPipeline
+            );
+            assert_eq!(machine.note_started(3), "unknown");
+        }
     }
 
     #[test]

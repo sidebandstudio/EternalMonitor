@@ -285,6 +285,8 @@ pub fn frame_buffer(frame_bytes: usize) -> Vec<u8> {
 pub struct FrameSlot {
     inner: Arc<SlotInner>,
     capture_generation: u64,
+    capture_source: u64,
+    capture_replaced: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 struct SlotInner {
@@ -306,6 +308,8 @@ impl FrameSlot {
     fn new() -> Self {
         Self {
             capture_generation: 0,
+            capture_source: 0,
+            capture_replaced: None,
             inner: Arc::new(SlotInner {
                 state: Mutex::new(SlotState::default()),
                 condvar: Condvar::new(),
@@ -319,6 +323,8 @@ impl FrameSlot {
         FrameSlot {
             inner: Arc::clone(&self.inner),
             capture_generation: self.capture_generation,
+            capture_source: self.capture_source,
+            capture_replaced: self.capture_replaced.clone(),
         }
     }
 
@@ -326,17 +332,43 @@ impl FrameSlot {
     pub fn publish(&self, frame: RawFrame) -> bool {
         let mut state = self.inner.state.lock();
         let displaced = state.frame.replace(frame).is_some();
+        if displaced {
+            if let Some(count) = &self.capture_replaced {
+                count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         self.inner.condvar.notify_one();
         displaced
     }
 
-    pub(crate) fn publish_captured(&self, frame: RawFrame, readback_us: Option<u128>) {
-        let (width, height, cached) = (frame.width, frame.height, frame.cached);
-        let replaced = self.publish(frame);
-        let mut stats = crate::stats::PIPELINE_STATS.lock();
-        if crate::supervisor::generation_is_current(self.capture_generation) {
-            stats.record_capture(width, height, cached, replaced, readback_us);
-        }
+    #[cfg(windows)]
+    fn for_output(&self, output: &OutputInfo) -> Self {
+        use std::hash::{DefaultHasher, Hash, Hasher};
+        let mut hasher = DefaultHasher::new();
+        (output.adapter_id, &output.device_name).hash(&mut hasher);
+        let mut slot = self.handle();
+        slot.capture_source = hasher.finish();
+        slot
+    }
+
+    fn publish_captured(
+        &self,
+        stats: &Mutex<crate::stats::PipelineStats>,
+        heartbeat_target: &std::sync::atomic::AtomicU64,
+        size: (u32, u32),
+        cached: bool,
+        readback_us: Option<u128>,
+        frame: impl FnOnce() -> RawFrame,
+    ) {
+        stats.lock().record_capture(
+            self.capture_generation,
+            size,
+            cached,
+            self.capture_source,
+            readback_us,
+        );
+        heartbeat(heartbeat_target);
+        self.publish(frame());
     }
 
     pub fn close(&self) {
@@ -1489,6 +1521,12 @@ pub fn run_capture_stage(
         }
     }
     slot.capture_generation = generation;
+    {
+        let stats = crate::stats::PIPELINE_STATS.lock();
+        if stats.capture_generation == Some(generation) {
+            slot.capture_replaced = Some(Arc::clone(&stats.capture_replaced));
+        }
+    }
     let guard = CloseOnExit(slot.handle());
     let result = recovery::run_until_unblocked(
         &shared,
@@ -1763,34 +1801,42 @@ mod tests {
     }
 
     #[test]
-    fn slower_encoder_leaves_one_pending_frame_and_counts_every_replacement() {
-        let (producer, consumer) = super::frame_slot();
-        let mut stats = crate::stats::PipelineStats::new();
+    fn capture_updates_the_size_before_publishing_and_counts_replacements() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let (mut producer, consumer) = super::frame_slot();
+        let stats = parking_lot::Mutex::new(crate::stats::PipelineStats::new());
+        stats.lock().capture_generation = Some(1);
+        producer.capture_generation = 1;
+        producer.capture_replaced = Some(std::sync::Arc::clone(&stats.lock().capture_replaced));
+        let heartbeat = AtomicU64::new(0);
         let mut taken = 0;
         for number in 1..=5 {
-            let displaced = producer.publish(super::RawFrame {
-                frame_number: number,
-                timestamp: std::time::Instant::now(),
-                data: std::sync::Arc::new(Vec::new()),
-                width: 1280,
-                height: 800,
-                cached: false,
+            let size = (1280 + 2 * number as u32, 800);
+            producer.publish_captured(&stats, &heartbeat, size, false, None, || {
+                assert_eq!(stats.lock().capture_resolution, size);
+                super::RawFrame {
+                    frame_number: number,
+                    timestamp: std::time::Instant::now(),
+                    data: std::sync::Arc::new(Vec::new()),
+                    width: size.0,
+                    height: size.1,
+                    cached: false,
+                }
             });
-            stats.record_capture(1280, 800, false, displaced, None);
             if number == 3 {
                 assert_eq!(consumer.blocking_take().unwrap().frame_number, 3);
                 taken += 1;
             }
         }
-        assert_eq!(stats.capture_replaced, 3);
-        assert_eq!(
-            stats.capture_frame_count,
-            taken + stats.capture_replaced + 1
-        );
+        let stats = stats.lock();
+        let replaced = stats.capture_replaced.load(Ordering::Relaxed);
+        assert_eq!(replaced, 3);
+        assert_eq!(stats.capture_frame_count, taken + replaced + 1);
 
         assert_eq!(consumer.blocking_take().unwrap().frame_number, 5);
         taken += 1;
-        assert_eq!(stats.capture_frame_count - taken, stats.capture_replaced);
+        assert_eq!(stats.capture_frame_count - taken, replaced);
     }
 
     #[test]

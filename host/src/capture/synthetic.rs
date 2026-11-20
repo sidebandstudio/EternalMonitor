@@ -23,6 +23,7 @@ use tracing::info;
 use super::pointer::{convert_shape, PointerImage, Position, SHAPE_COLOR};
 use super::{frame_budget_for, heartbeat, keepalive_due, FrameSlot, RawFrame, IDLE_KEEPALIVE};
 use crate::control::SharedControl;
+use crate::stats::PIPELINE_STATS;
 
 const DEFAULT_WIDTH: u32 = 1280;
 const DEFAULT_HEIGHT: u32 = 720;
@@ -161,18 +162,13 @@ pub fn run_capture_loop(
         };
 
         if let Some(data) = data {
-            if !resumed {
-                crate::diagnostics::note_capture_output(
-                    &shared,
-                    generation,
-                    (None, "synthetic"),
-                    (width, height),
-                );
-            }
-            heartbeat(&shared.hb_capture_frame_ms);
-
             slot.publish_captured(
-                RawFrame {
+                &PIPELINE_STATS,
+                &shared.hb_capture_frame_ms,
+                (width, height),
+                cached,
+                None,
+                || RawFrame {
                     frame_number: *frame_number,
                     timestamp: frame_start,
                     data,
@@ -180,7 +176,6 @@ pub fn run_capture_loop(
                     height,
                     cached,
                 },
-                None,
             );
             if !std::mem::replace(&mut resumed, true) {
                 super::recovery::note_capture_resumed(&shared);

@@ -1273,7 +1273,8 @@ async fn execute_actions(
         if let Some(end) = ended.take() {
             crate::diagnostics::log_session_end(&end, shared);
         }
-        if let Some(session_id) = shared.session.lock().session_id() {
+        let session_id = shared.session.lock().session_id();
+        if let Some(session_id) = session_id {
             crate::diagnostics::note_session_start(session_id, shared);
         }
     }

@@ -115,7 +115,6 @@ pub struct SharedControl {
     /// normalized touch coordinates onto this rect. `None` until the first
     /// capture stage comes up.
     pub capture_geometry: Arc<Mutex<Option<crate::input::CaptureGeometry>>>,
-    pub(crate) capture_observation: Arc<Mutex<crate::diagnostics::CaptureObservation>>,
     /// The one thread that hands iPad input to Windows, for every stream
     /// generation of this app.
     pub input: Arc<crate::input::InputThread>,
@@ -247,7 +246,6 @@ impl SharedControl {
             transport_beat: Default::default(),
             power: Default::default(),
             capture_geometry: Arc::new(Mutex::new(None)),
-            capture_observation: Arc::default(),
             input: Arc::default(),
             hevc_enabled: Arc::new(AtomicBool::new(false)),
             audio_enabled: Arc::new(AtomicBool::new(true)),
