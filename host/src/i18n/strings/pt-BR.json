@@ -43,6 +43,7 @@
   "Measuring": "Medindo",
   "Mirror my screen": "Espelhar",
   "Mirroring": "Espelhando",
+  "Native": "Nativa",
   "New code": "Novo código",
   "Next": "Avançar",
   "No iPad connected": "Nenhum iPad conectado",
@@ -63,6 +64,7 @@
   "Ready for your iPad": "Pronto para seu iPad",
   "Refresh displays": "Atualizar telas",
   "Require pairing": "Exigir pareamento",
+  "Resolution": "Resolução da tela",
   "Restart": "Reiniciar",
   "Resume code pairing": "Retomar pareamento por código",
   "Run setup again": "Refazer a configuração",
@@ -105,5 +107,6 @@
   "Wi-Fi, and USB whenever the cable is plugged in.": "Wi-Fi, e USB quando o cabo estiver conectado.",
   "You can switch at any time on the Stream page.": "Você pode trocar a qualquer momento na página Transmissão.",
   "Your iPad and this PC are on the same local network.": "Seu iPad e este PC estão na mesma rede local.",
-  "{display} (not connected)": "{display} (desconectado)"
+  "{display} (not connected)": "{display} (desconectado)",
+  "{size} (native)": "{size} (nativa)"
 }
