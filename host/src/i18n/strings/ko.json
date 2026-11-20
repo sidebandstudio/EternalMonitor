@@ -43,7 +43,7 @@
   "Measuring": "측정 중",
   "Mirror my screen": "미러링",
   "Mirroring": "미러링 중",
-  "Native": "기본",
+  "Native": "네이티브",
   "New code": "새 코드",
   "Next": "다음",
   "No iPad connected": "연결된 iPad 없음",
@@ -108,5 +108,5 @@
   "You can switch at any time on the Stream page.": "스트림 페이지에서 언제든 바꿀 수 있습니다.",
   "Your iPad and this PC are on the same local network.": "iPad와 이 PC가 같은 로컬 네트워크에 있습니다.",
   "{display} (not connected)": "{display} (연결 안 됨)",
-  "{size} (native)": "{size} (기본)"
+  "{size} (native)": "{size} (네이티브)"
 }
