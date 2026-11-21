@@ -1,10 +1,10 @@
 {
   "schema": 1,
   "windows": {
-    "version": "0.3.4",
-    "installer": "https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.4/EternalMonitor-Setup.exe",
-    "sha256": "fd504888b11aff376fd004c0f50ab15459c5ca2a4544b3b6cd975d4be3368f09",
-    "note": "Fixes the problems reported with 0.3.3: start-up crashes on AMD and Intel graphics, USB freezes on slower PCs and smeared frames on Wi-Fi. Update the iPad app in TestFlight once 0.3.4 appears."
+    "version": "0.3.5",
+    "installer": "https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.5/EternalMonitor-Setup.exe",
+    "sha256": "6e816f8de624fddd9aed5a8f3aa8228ca410ba4464fcc2619a93364ac6409643",
+    "note": "Fixes Second screen on laptops running on battery and when the virtual display is already on, adds a Resolution choice for each iPad, and opens minimised at sign-in."
   },
   "ipad": {
     "version": "0.3.4",
