@@ -19,6 +19,7 @@
 //! `author_id`, see `widgets::automation_id`): scripts and tests find them by
 //! that id first, then by name, so the same name works in every language.
 
+mod driver_wait;
 mod feedback_panel;
 mod fonts;
 mod icons;
@@ -29,10 +30,13 @@ mod page_troubleshooting;
 mod port_notice;
 pub(crate) mod renderer;
 mod setup;
+mod sign_in;
 mod theme;
 mod update_banner;
 mod update_toast;
 mod widgets;
+
+pub use sign_in::ShowRequests;
 
 use std::collections::VecDeque;
 use std::sync::atomic::Ordering;
@@ -44,7 +48,7 @@ use tracing::{info, warn};
 
 use crate::autostart::{first_lan_ipv4, read_startup_registry, set_startup_registry};
 use crate::capture::recovery::CaptureBlock;
-use crate::capture::{enumerate_outputs, OutputInfo};
+use crate::capture::{listing, OutputInfo};
 use crate::control::{CaptureTarget, GuiControl};
 use crate::gpu_preference::{Change, Preference, SwitchRecord};
 use crate::handoff::Handoff;
@@ -81,6 +85,8 @@ struct StatsSnapshot {
     codec_name: String,
     using_software_fallback: bool,
     nvidia_driver_outdated: bool,
+    gpu_detection_stalled: bool,
+    driver_update_vendors: Vec<crate::gpu::GpuVendor>,
     gpu_name: String,
     capture_display: String,
     transport_fps: f64,
@@ -119,6 +125,8 @@ impl StatsSnapshot {
             codec_name: s.codec_name.clone(),
             using_software_fallback: s.using_software_fallback,
             nvidia_driver_outdated: s.nvidia_driver_outdated,
+            gpu_detection_stalled: s.gpu_detection_stalled,
+            driver_update_vendors: s.driver_update_vendors.clone(),
             gpu_name: s.gpu_name.clone(),
             capture_display: s.capture_display.clone(),
             transport_fps: s.transport_fps,
@@ -303,6 +311,7 @@ pub struct AnalyzerApp {
     settings_fps_target: u32,
     settings_encoder_input: crate::encoder::input::EncoderInput,
     settings_check_updates: bool,
+    settings_beta_updates: bool,
     updates: crate::updates::Updater,
     /// The update popup is on screen; it stays until a button is chosen.
     update_popup_open: bool,
@@ -363,7 +372,9 @@ pub struct AnalyzerApp {
     update_refused: bool,
     history: History,
     quality: QualityMeter,
-    logo: Option<(f32, egui::TextureHandle)>,
+    /// The logo for a scale and the window renderer's device it was made
+    /// on: textures go with a lost device.
+    logo: Option<(f32, u64, egui::TextureHandle)>,
     /// The saved language choice (see `i18n::resolve`).
     settings_language: Option<String>,
     /// A language whose fonts were just installed; it shows from the next
@@ -371,10 +382,17 @@ pub struct AnalyzerApp {
     pending_language: Option<Lang>,
     /// First-run setup, while open.
     setup: Option<setup::Setup>,
+    /// Windows started this launch at sign-in, until the window is like any
+    /// other ([`sign_in::SignIn`]).
+    sign_in: Option<sign_in::SignIn>,
+    /// Where the warnings are drawn while the window is minimised in
+    /// [`sign_in::GRACE`], to see whether it would show one.
+    offscreen: Option<egui::Context>,
 }
 
 impl AnalyzerApp {
     pub fn new(cc: &eframe::CreationContext<'_>, control: GuiControl) -> Self {
+        renderer::remember_window(cc);
         // Load persisted settings first; values fall back to the live runtime state when the
         // file is missing or unreadable.
         let persisted = SettingsFile::load();
@@ -441,7 +459,8 @@ impl AnalyzerApp {
                 String::new()
             }
         };
-        let available_outputs = enumerate_outputs();
+        // Before the first paint, so a stuck driver must not hold it.
+        let available_outputs = listing::outputs_at_startup(&control.shared);
 
         // Same model as encoder_override: push the persisted preference into
         // SharedControl so the encoder honours it without a restart.
@@ -454,25 +473,17 @@ impl AnalyzerApp {
             .audio_enabled
             .store(persisted.stream_audio, Ordering::SeqCst);
 
-        let start_on_boot = if persisted.start_on_boot != read_startup_registry() {
-            // Persisted state disagrees with the registry — trust the registry as ground truth.
-            read_startup_registry()
-        } else {
-            persisted.start_on_boot
-        };
-
-        // If autostart is enabled, refresh the stored HKCU\Run path to the *current* exe location.
-        // After an installer upgrade or a move, the old path would silently fail to launch on boot.
-        if start_on_boot {
-            if let Err(error) = set_startup_registry(true) {
-                warn!(error = %error, "Failed to refresh startup registry path on launch");
-            }
-        }
+        // The registry is the ground truth; an entry that is on is written
+        // again for the current exe, with the sign-in argument.
+        let start_on_boot = crate::autostart::refresh_at_launch(read_startup_registry(), || {
+            set_startup_registry(true)
+        });
 
         let updates = {
             let ctx = cc.egui_ctx.clone();
             crate::updates::Updater::start(
                 persisted.check_for_updates,
+                persisted.beta_updates,
                 control.shared.session.clone(),
                 control.shared.handoff.clone(),
                 std::sync::Arc::new(move |version: Option<&str>| {
@@ -489,6 +500,7 @@ impl AnalyzerApp {
         Self {
             settings_encoder_input: persisted.encoder_input,
             settings_check_updates: persisted.check_for_updates,
+            settings_beta_updates: persisted.beta_updates,
             updates,
             update_popup_open: false,
             ipad_last_seen: Some(popup_now()),
@@ -535,7 +547,17 @@ impl AnalyzerApp {
             settings_language: persisted.language,
             pending_language: None,
             setup: crate::settings::fresh_install().then(setup::Setup::default),
+            sign_in: None,
+            offscreen: None,
         }
+    }
+
+    /// Windows started this launch at sign-in ("Start with Windows"): the
+    /// window goes to the taskbar once it is confirmed drawing.
+    /// `show_requests` hears later launches asking to show it.
+    pub fn started_at_sign_in(mut self, show_requests: ShowRequests) -> Self {
+        self.sign_in = Some(sign_in::SignIn::new(show_requests));
+        self
     }
 
     fn persist_settings(&self) {
@@ -565,6 +587,7 @@ impl AnalyzerApp {
             encoder_override,
             encoder_input: self.settings_encoder_input,
             check_for_updates: self.settings_check_updates,
+            beta_updates: self.settings_beta_updates,
             capture_display: if self.settings_capture_display.is_empty() {
                 None
             } else {
@@ -704,7 +727,7 @@ impl AnalyzerApp {
     }
 
     fn refresh_outputs(&mut self) {
-        self.available_outputs = enumerate_outputs();
+        self.available_outputs = listing::outputs(&self.control.shared);
         info!(
             count = self.available_outputs.len(),
             "Re-enumerated display outputs"
@@ -787,11 +810,17 @@ impl AnalyzerApp {
         self.persist_settings();
     }
 
+    fn set_beta_updates(&mut self, enabled: bool) {
+        self.settings_beta_updates = enabled;
+        self.updates.set_beta(enabled);
+        self.persist_settings();
+    }
+
     fn set_require_pairing(&mut self, required: bool) {
         {
             let mut pairing = self.control.shared.pairing.lock();
             pairing.required = required;
-            pairing.warn_if_off();
+            pairing.log_if_off();
         }
         self.persist_settings();
     }
@@ -820,6 +849,8 @@ impl AnalyzerApp {
 
     fn restart_stream(&mut self) {
         self.restart_pending = false;
+        // The user may have updated a driver, as the fallback notice asks.
+        crate::encoder::forget_launch_failures();
         self.control.request_restart();
     }
 
@@ -1074,8 +1105,9 @@ impl eframe::App for AnalyzerApp {
         CANVAS.to_normalized_gamma_f32()
     }
 
-    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         renderer::frame_started(ui.ctx());
+        renderer::release_render_state(frame);
         crate::startup::simulate_window_failure();
         let ctx = ui.ctx().clone();
         if let Some(language) = self.pending_language.take() {
@@ -1089,25 +1121,10 @@ impl eframe::App for AnalyzerApp {
             }
         }
         // (A debounced write still pending at window close is flushed by on_exit.)
-        // Live numbers refresh five times a second. Input and animations
-        // repaint on their own, and a quieter window leaves the GPU to the
-        // encoder.
-        ctx.request_repaint_after(Duration::from_millis(200));
-
-        // Holds no lock: a second screen record writer that could not start
-        // is started here, once its wait is over.
-        crate::capture::second_screen::retry_saving(&self.control.shared);
+        // Work that must go on while the window is minimised is in `logic`.
         let snap = StatsSnapshot::take();
         let client = ClientSnapshot::take(&self.control);
         self.history.sample(&snap, Instant::now());
-        self.observe_session(&client);
-        // The new copy runs: this one leaves.
-        if self.restart.poll() {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
-        }
-        if self.restart.busy() {
-            ctx.request_repaint_after(Duration::from_millis(100));
-        }
         // A refusal is shown while what refused it still hands over.
         let holder = self.control.shared.handoff.holder();
         if holder != Some(Handoff::Update) {
@@ -1115,12 +1132,6 @@ impl eframe::App for AnalyzerApp {
         }
         if holder != Some(Handoff::Restart) {
             self.update_refused = false;
-        }
-        // Capture recorded how a graphics card switch went: save that.
-        let gpu_switch = self.control.shared.gpu_switch.lock().clone();
-        if gpu_switch != self.saved_gpu_switch {
-            self.saved_gpu_switch = gpu_switch;
-            self.persist_settings();
         }
         if !snap.pipeline_running {
             // A stopped pipeline starts with the new settings anyway.
@@ -1151,6 +1162,7 @@ impl eframe::App for AnalyzerApp {
                                 ui.set_opacity(shown);
                                 ui.set_max_width(ui.available_width().min(980.0));
                                 ui.spacing_mut().item_spacing.y = 10.0;
+                                self.tick_updates(ui.ctx(), &snap, &client);
                                 self.update_banner(ui, &snap, &client);
                                 self.restart_banner(ui);
                                 match self.page {
@@ -1168,6 +1180,133 @@ impl eframe::App for AnalyzerApp {
         self.draw_setup(&ctx, &snap);
         self.update_popup(&ctx, &client);
         self.draw_feedback_panel(&ctx, &client);
+        self.finish_sign_in_pass(&ctx);
+    }
+
+    /// eframe calls this before every UI pass and, while the window is
+    /// minimised and runs no UI pass, on its own: the work here goes on
+    /// whether or not the window is drawn.
+    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Live numbers refresh five times a second. Input and animations
+        // repaint on their own, and a quieter window leaves the GPU to the
+        // encoder. Minimised, this keeps `logic` running.
+        ctx.request_repaint_after(Duration::from_millis(200));
+
+        // Holds no lock: a second screen record writer that could not start
+        // is started here, once its wait is over.
+        crate::capture::second_screen::retry_saving(&self.control.shared);
+        self.observe_session(&ClientSnapshot::take(&self.control));
+        // The new copy runs: this one leaves.
+        if self.restart.poll() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+        if self.restart.busy() {
+            ctx.request_repaint_after(Duration::from_millis(100));
+        }
+        // Capture recorded how a graphics card switch went: save that.
+        let gpu_switch = self.control.shared.gpu_switch.lock().clone();
+        if gpu_switch != self.saved_gpu_switch {
+            self.saved_gpu_switch = gpu_switch;
+            self.persist_settings();
+        }
+        self.sign_in_logic(ctx);
+    }
+}
+
+impl AnalyzerApp {
+    /// A sign-in start, at every pass and while minimised: whether the user
+    /// took the window, and in the grace, whether a warning brings it back.
+    fn sign_in_logic(&mut self, ctx: &egui::Context) {
+        let Some(sign_in) = self.sign_in.as_mut() else {
+            return;
+        };
+        let now = Instant::now();
+        let (focused, minimized) = ctx.input(|i| (i.viewport().focused, i.viewport().minimized));
+        sign_in.observe(now, ctx.cumulative_frame_nr(), focused, minimized);
+        if minimized == Some(true) && sign_in.in_grace() {
+            // Nothing draws a minimised window: draw its warnings offscreen.
+            let needs_user = self.setup.is_some() || self.warning_offscreen(ctx);
+            let command = self
+                .sign_in
+                .as_mut()
+                .and_then(|sign_in| sign_in.decide(now, true, needs_user));
+            sign_in_command(ctx, command);
+        }
+        if self.sign_in.as_ref().is_some_and(sign_in::SignIn::done) {
+            self.sign_in = None;
+            self.offscreen = None;
+        }
+    }
+
+    /// After the pass drew everything: whether a window started at sign-in
+    /// goes to the taskbar now, stays on screen, or comes back.
+    fn finish_sign_in_pass(&mut self, ctx: &egui::Context) {
+        if self.sign_in.is_none() {
+            return;
+        }
+        // Read only in a UI pass: `logic` alone sees the last pass's input.
+        let user_acted = ctx.input(|i| {
+            i.pointer.any_pressed()
+                || i.events
+                    .iter()
+                    .any(|e| matches!(e, egui::Event::Key { pressed: true, .. }))
+        });
+        let needs_user =
+            self.setup.is_some() || self.update_popup_open || widgets::warning_shown(ctx);
+        let Some(sign_in) = self.sign_in.as_mut() else {
+            return;
+        };
+        if user_acted {
+            sign_in.user_input();
+        }
+        let command = sign_in.decide(Instant::now(), renderer::drawing(), needs_user);
+        sign_in_command(ctx, command);
+    }
+
+    /// Whether the banners the Stream page starts with would show a warning
+    /// or error now ([`widgets::warning_shown`]), drawn where no one sees them.
+    fn warning_offscreen(&mut self, ctx: &egui::Context) -> bool {
+        let offscreen = self
+            .offscreen
+            .get_or_insert_with(|| {
+                let offscreen = egui::Context::default();
+                offscreen.set_fonts(ctx.fonts(|fonts| fonts.definitions().clone()));
+                offscreen.set_theme(egui::Theme::Dark);
+                offscreen.set_style_of(egui::Theme::Dark, ctx.style_of(egui::Theme::Dark));
+                offscreen
+            })
+            .clone();
+        let snap = StatsSnapshot::take();
+        let client = ClientSnapshot::take(&self.control);
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1000.0, 640.0),
+            )),
+            ..Default::default()
+        };
+        let mut shown = false;
+        let output = offscreen.run_ui(input, |ui| {
+            self.update_banner(ui, &snap, &client);
+            self.restart_banner(ui);
+            self.notices(ui, &snap, &client);
+            shown = widgets::warning_shown(ui.ctx());
+        });
+        // Nothing is painted: its fonts' texture is never made.
+        output.drop_without_applying_deltas();
+        shown
+    }
+}
+
+fn sign_in_command(ctx: &egui::Context, command: Option<sign_in::Command>) {
+    match command {
+        Some(sign_in::Command::Minimise) => {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true))
+        }
+        Some(sign_in::Command::Restore) => {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false))
+        }
+        None => {}
     }
 }
 
@@ -1270,14 +1409,19 @@ impl AnalyzerApp {
     fn draw_brand(&mut self, ui: &mut egui::Ui) {
         const LOGO: f32 = 30.0;
         let ppp = ui.ctx().pixels_per_point();
-        if self.logo.as_ref().is_none_or(|(scale, _)| *scale != ppp) {
+        let device = renderer::devices();
+        if self
+            .logo
+            .as_ref()
+            .is_none_or(|(scale, made_on, _)| (*scale, *made_on) != (ppp, device))
+        {
             let pixels = (LOGO * ppp).round().max(1.0) as usize;
-            self.logo = logo_texture(ui.ctx(), pixels).map(|texture| (ppp, texture));
+            self.logo = logo_texture(ui.ctx(), pixels).map(|texture| (ppp, device, texture));
         }
         ui.horizontal(|ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
             let (rect, _) = ui.allocate_exact_size(vec2(LOGO, LOGO), Sense::hover());
-            if let Some((_, texture)) = &self.logo {
+            if let Some((_, _, texture)) = &self.logo {
                 ui.painter().image(
                     texture.id(),
                     rect,
@@ -1760,8 +1904,25 @@ pub fn shown_address(ip: std::net::Ipv4Addr, listen_port: u16) -> String {
     }
 }
 
+/// The app quits from outside its window, as when Windows closes it for an
+/// installer, perhaps before the window is confirmed drawing. As for a quit
+/// from the graphics driver notice, this launch's renderer marker goes
+/// without counting, so the next launch avoids no backend, and nothing still
+/// in the driver saves it again.
+pub fn quitting_from_outside() {
+    renderer::abandon();
+}
+
 /// Launch the GUI window. Blocks the calling thread.
-pub fn run_gui(control: GuiControl) -> eframe::Result<()> {
+/// Runs the window until it closes; `sign_in` when Windows started this
+/// launch at sign-in, with its show requests. `quit_while_stuck` is the app's quit
+/// path, for a Cancel in the graphics driver notice while the window's
+/// thread is stuck before its first frame; it ends the process.
+pub fn run_gui(
+    control: GuiControl,
+    sign_in: Option<ShowRequests>,
+    quit_while_stuck: Box<dyn FnOnce() + Send>,
+) -> eframe::Result<()> {
     let icon = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon_256.png"))
         .expect("embedded icon PNG is valid");
 
@@ -1773,13 +1934,67 @@ pub fn run_gui(control: GuiControl) -> eframe::Result<()> {
             .with_icon(std::sync::Arc::new(icon)),
         ..Default::default()
     };
-    renderer::configure(&mut options.wgpu_options);
+    // The window's thread makes its first graphics call only once the
+    // driver has answered the same calls on another thread, and is watched
+    // until it is confirmed drawing.
+    let prepared = renderer::prepare();
+    #[cfg(windows)]
+    let watch = {
+        let prompt = driver_wait::Prompt::new(driver_wait::MessageNotice::default());
+        let skip_listing = prepared.listing_avoided();
+        let probe_limits = crate::stall::Call::GpuProbe.limits();
+        let opened = driver_wait::before_window(
+            crate::stall::lanes(),
+            crate::stall::Call::GpuDetect.limits(),
+            probe_limits,
+            &prompt,
+            driver_wait::POLL,
+            || renderer::adapter_list(skip_listing),
+            |adapters| {
+                renderer::configure(&mut options.wgpu_options, prepared, adapters);
+                renderer::probe_spec(&options.wgpu_options)
+            },
+            |spec| renderer::adapter_probe(spec.clone()),
+        );
+        if !opened {
+            renderer::abandon();
+            return Ok(());
+        }
+        let watch = driver_wait::watch_first_paint(
+            prompt,
+            probe_limits.limit,
+            driver_wait::PROOF_WITHIN,
+            driver_wait::POLL,
+            std::time::Instant::now,
+            renderer::last_pass,
+            renderer::window_held,
+            move || {
+                renderer::abandon();
+                quit_while_stuck();
+            },
+        );
+        renderer::when_drawing(watch.finisher());
+        watch
+    };
+    #[cfg(not(windows))]
+    {
+        renderer::configure(&mut options.wgpu_options, prepared, Vec::new());
+        drop(quit_while_stuck);
+    }
 
     let result = eframe::run_native(
         "EternalMonitor",
         options,
-        Box::new(|cc| Ok(Box::new(AnalyzerApp::new(cc, control)))),
+        Box::new(move |cc| {
+            let app = AnalyzerApp::new(cc, control);
+            Ok(Box::new(match sign_in {
+                Some(show_requests) => app.started_at_sign_in(show_requests),
+                None => app,
+            }))
+        }),
     );
+    #[cfg(windows)]
+    let _ = watch.stop();
     if result.is_ok() {
         renderer::window_closed();
     }

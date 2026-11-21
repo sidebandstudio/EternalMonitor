@@ -171,12 +171,14 @@ try {
     # existing driver is preserved, and names each outcome.
     if ($iss -notmatch 'Source: "scripts\\vdd-driver-repair\.ps1"') { $failures += 'Setup does not install the repair script' }
     $tasks = ($iss -split "`n") | Where-Object { $_ -match 'vdd-tasks-setup\.ps1' -and $_ -match '^Filename:' }
-    if ($tasks -notmatch 'BeforeInstall: RepairVddDriver' -or $tasks -match 'Check: NeedsVddInstall') {
+    $prepare = [regex]::Match($iss, '(?s)procedure PrepareVddTasks;.*?\nend;').Value
+    if ($tasks -notmatch 'BeforeInstall: PrepareVddTasks' -or $tasks -match 'Check: NeedsVddInstall' -or
+        $prepare -notmatch 'RepairVddDriver;') {
         $failures += 'Setup does not repair a preserved driver before registering the tasks'
     }
     $code = [regex]::Match($iss, '(?s)procedure RepairVddDriver;.*?\nend;').Value
     if ($code -notmatch 'vdd-driver-repair\.ps1' -or $code -notmatch "10: Message := 'Another app installed" -or
-        $code -notmatch '11: Message' -or $code -notmatch 'VddInstallFailed := True' -or $code -notmatch 'RaiseException') {
+        $code -notmatch '11: Message' -or $code -notmatch 'FailVddStep\(Message\);') {
         $failures += 'Setup does not report each repair failure'
     }
     if ($failures) { throw "Repair checks failed:`n  " + ($failures -join "`n  ") }

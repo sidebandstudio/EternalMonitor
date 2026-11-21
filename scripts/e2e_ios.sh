@@ -28,6 +28,9 @@ case "$TRANSPORT" in udp|usb|takeover) ;; *) echo "Invalid EM_TRANSPORT: $TRANSP
 SIZE="${EM_SIZE:-640x360}"
 SYNTH_W="${SIZE%x*}"
 SYNTH_H="${SIZE#*x}"
+# An odd size streams without its last column or row.
+VIDEO_W=$((SYNTH_W / 2 * 2))
+VIDEO_H=$((SYNTH_H / 2 * 2))
 SCENARIO="${EM_SCENARIO:-$CODEC-$TRANSPORT}"
 OUT="${EM_OUTPUT_DIR:-$ROOT/build/e2e/$SCENARIO}"
 SHOT="${EM_SCREENSHOT:-$ROOT/build/screenshots/e2e-$SCENARIO.png}"
@@ -325,8 +328,8 @@ if [ "$TRANSPORT" = takeover ] && ! grep -q 'superseding session in place' "$HOS
     echo "FAIL: host did not preserve the session during USB takeover"; exit 1
 fi
 
-if ! grep -q "w=$SYNTH_W h=$SYNTH_H" <<<"$last_stats"; then
-    echo "FAIL: decoded resolution mismatch: $last_stats (expected ${SYNTH_W}x${SYNTH_H})"
+if ! grep -q "w=$VIDEO_W h=$VIDEO_H" <<<"$last_stats"; then
+    echo "FAIL: decoded resolution mismatch: $last_stats (expected ${VIDEO_W}x${VIDEO_H})"
     exit 1
 fi
 
@@ -349,7 +352,7 @@ PYBITRATE
 fi
 
 "$ROOT/scripts/screenshot.sh" "$UDID" "$SHOT"
-"$ROOT/scripts/pixels.sh" "$SHOT" --video "$SIZE" --assert-pattern > "$OUT/pixels.json"
+"$ROOT/scripts/pixels.sh" "$SHOT" --video "${VIDEO_W}x${VIDEO_H}" --assert-pattern > "$OUT/pixels.json"
 python3 "$ROOT/scripts/e2e_stats.py" "$MEASURED_LOG" --output "$OUT/result.json" \
     --scenario "$SCENARIO" --screenshot "$SHOT" --elapsed "$((SECONDS - STARTED))" \
     --min-frames "$WANT_DECODED" --duration "$MIN_SECONDS" --min-fps "$MIN_FPS" \

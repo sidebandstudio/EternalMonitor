@@ -14,7 +14,7 @@ use eternal_wire::h264::{
     normalize_h264_payload_with_info, parameter_sets_from_extradata, H264BitstreamState,
 };
 
-use crate::capture::FrameSlot;
+use crate::capture::{FrameSlot, RawFrame, Taken};
 use crate::control::SharedControl;
 use crate::gpu::{GpuInfo, GpuVendor};
 use crate::stats::PIPELINE_STATS;
@@ -28,6 +28,16 @@ const CHANNEL_CAPACITY: usize = 4;
 const AMF_CAPTURE_PACKET_LIMIT: u64 = 120;
 const AMF_IDR_WARNING_PACKET: u64 = 60;
 const AMF_FORCED_INTRA_PERIOD: u64 = 30;
+
+/// The size a capture of `width`x`height` streams at. 4:2:0 needs even
+/// dimensions, which libx264 enforces and hardware encoders may too, so a
+/// screen such as 1680x945 encodes without its odd last row (or column):
+/// cropped, not scaled, so every other pixel stays exact. Input still maps
+/// onto the whole capture (see [`crate::input::norm_to_output_pixel`]), so
+/// the cropped row stays reachable at the picture's edge.
+pub fn encoded_size(width: u32, height: u32) -> (u32, u32) {
+    (width & !1, height & !1)
+}
 
 /// Encoded H.264 NAL unit ready for transport.
 #[derive(Debug, Clone)]
@@ -96,14 +106,26 @@ fn run_encode_loop(
         return Err(format!("{} codec not found in FFmpeg", encoder_name).into());
     }
     info!(encoder = %encoder_name, "Found encoder codec");
+    // The processor encodes only because startup's GPU detection did not
+    // return in time, and no override chose the encoder.
+    let detection_stalled = gpu.detection_stalled && shared.encoder_override.lock().is_none();
     {
+        let (nvenc_failed, vendors) = {
+            let failures = LAUNCH_FAILURES.lock();
+            (failures.any("_nvenc"), failures.vendors.clone())
+        };
         let mut stats = PIPELINE_STATS.lock();
         stats.set_codec_name(&codec_display_name);
         // Fresh pipeline start: clear any stale software-fallback flag. The encode loop
         // re-sets it below only if a hardware encoder actually fails to open. A deliberate
-        // libx264 override is not a fallback, so it intentionally leaves this false.
-        stats.set_software_fallback(false);
-        stats.nvidia_driver_outdated = false;
+        // libx264 override is not a fallback, so it intentionally leaves this false. A
+        // stalled detection is one from the start.
+        stats.set_software_fallback(detection_stalled);
+        stats.gpu_detection_stalled = detection_stalled;
+        // A driver note stays while the failure that gave it is remembered,
+        // as that encoder is not tried again to give it anew.
+        stats.nvidia_driver_outdated &= nvenc_failed;
+        stats.driver_update_vendors = vendors;
     }
 
     let mut encoder_state: Option<EncoderState> = None;
@@ -134,6 +156,11 @@ fn run_encode_loop(
     let mut hevc_unavailable_warned = false;
     let mut hevc_open_failed = false;
     let mut stall_recovery = StallRecovery::default();
+    // An open in the lane going on in the background while libx264 streams.
+    let mut background: Option<Behind> = None;
+    // When a picture is due while no session is open: FIRST_PICTURE_WAIT
+    // after the first try of an encoder.
+    let mut first_picture_by: Option<Instant> = None;
     let mut last_keyframe_reopen: Option<Instant> = None;
     let mut pending_keyframe = false;
     let mut bitrate_pacer = BitratePacer::default();
@@ -157,7 +184,34 @@ fn run_encode_loop(
         }
     };
 
-    while let Some(raw_frame) = frames.blocking_take() {
+    let mut owed_keyframe: Option<OwedKeyframe> = None;
+    let mut cadence = CaptureCadence::default();
+    loop {
+        let (raw_frame, given_again) = match owed_keyframe.as_mut() {
+            None => match frames.blocking_take() {
+                Some(frame) => (frame, false),
+                None => break,
+            },
+            Some(owed) => match owed.next(&frames) {
+                Next::Frame(frame) => (frame, false),
+                Next::Again(frame) => {
+                    PIPELINE_STATS.lock().keyframe_resubmits += 1;
+                    (frame, true)
+                }
+                Next::Closed => break,
+                Next::GaveUp => {
+                    info!(
+                        given = owed.given,
+                        "The encoder still holds the session's first keyframe; waiting for the next capture"
+                    );
+                    owed_keyframe = None;
+                    continue;
+                }
+            },
+        };
+        if !given_again {
+            cadence.captured(raw_frame.timestamp, raw_frame.cached);
+        }
         if !shared.running.load(Ordering::SeqCst)
             || !crate::supervisor::generation_is_current(generation)
         {
@@ -194,30 +248,28 @@ fn run_encode_loop(
         if !hevc_wanted {
             hevc_open_failed = false;
         }
-        let preferred: String = if hevc_wanted && !hevc_open_failed {
-            match hevc_encoder_for(&encoder_name) {
-                Some(hevc) if ffmpeg_next::encoder::find_by_name(hevc).is_some() => {
-                    hevc.to_string()
-                }
-                _ => {
-                    if !hevc_unavailable_warned {
-                        hevc_unavailable_warned = true;
-                        warn!(
-                            encoder = %encoder_name,
-                            "HEVC requested but no H.265 encoder is available — staying on H.264"
-                        );
-                    }
-                    encoder_name.clone()
-                }
-            }
-        } else {
-            encoder_name.clone()
-        };
-        // No open given up on still holds FFmpeg's lock. Until then, an open
-        // in that lane would only be refused.
+        let preferred = preferred_encoder(
+            &encoder_name,
+            hevc_wanted,
+            hevc_open_failed,
+            &mut hevc_unavailable_warned,
+        );
+        // An HEVC open going on in the background is of no use once this
+        // frame wants H.264: the stream goes on, and reopens from there.
+        if drop_obsolete_background(&mut background, &preferred) {
+            stall_recovery.trying = false;
+        }
+        // No open given up on, or going on in the background, still holds
+        // FFmpeg's lock. Until then, an open in that lane would only be
+        // refused.
         let lane_clear = crate::stall::abandoned(crate::stall::Call::EncoderOpen) == 0;
         let desired_encoder =
             stall_recovery.encoder_for_frame(&preferred, Instant::now(), lane_clear);
+        // While an encoder opens in the background, libx264 streams on.
+        let desired_encoder = match (&background, &encoder_state) {
+            (Some(_), Some(state)) => state.opened_encoder.clone(),
+            _ => desired_encoder,
+        };
         forget_failed_reopen(
             &mut failed_reopen,
             &mut negotiated,
@@ -257,6 +309,14 @@ fn run_encode_loop(
         let size_changed = encoder_state
             .as_ref()
             .is_some_and(|state| !state.accepts_frame(raw_frame.width, raw_frame.height));
+        if size_changed {
+            if let Some(behind) = background.take() {
+                info!(
+                    encoder = behind.open.encoder(),
+                    "The capture size changed while an encoder opened in the background; that session will not be used"
+                );
+            }
+        }
         // Latch requests before deciding whether to reopen. Requests received
         // during the rate limit must survive until AMF can emit an IDR.
         pending_keyframe |= shared.force_next_idr.swap(false, Ordering::SeqCst);
@@ -270,25 +330,59 @@ fn run_encode_loop(
             });
 
         if encoder_state.is_none() {
-            match EncoderState::new(
+            let picture_by =
+                *first_picture_by.get_or_insert_with(|| Instant::now() + FIRST_PICTURE_WAIT);
+            match open_session(
+                &LAUNCH_FAILURES,
                 &desired_encoder,
                 raw_frame.width,
                 raw_frame.height,
                 desired_bitrate,
                 target_fps,
                 &mut input_mode,
-                first_open(&desired_encoder),
+                first_open(&desired_encoder, picture_by),
                 &mut opening,
             ) {
                 Ok(state) => {
                     encoder_state = Some(state);
+                    first_picture_by = None;
                     bitrate_pacer.opened(Instant::now());
                     if stall_recovery.opened(&desired_encoder, &preferred)
                         && desired_encoder != "libx265"
                     {
                         PIPELINE_STATS.lock().set_software_fallback(false);
                     }
-                    note_encoder_opened(&shared, &desired_encoder);
+                    note_encoder_opened(&shared, &desired_encoder, &gpu);
+                }
+                // No picture yet, and the iPad would give up waiting for
+                // it: libx264 streams while the open goes on.
+                Err(e) if is_still_opening(e.as_ref()) => {
+                    let open = take_still_opening(e.as_ref()).expect("the open going on");
+                    warn!(
+                        encoder = %desired_encoder,
+                        waited_ms = open.pending.running_for().as_millis() as u64,
+                        "The encoder has not opened yet; streaming on libx264 while it opens in the background"
+                    );
+                    let state = open_session(
+                        &LAUNCH_FAILURES,
+                        "libx264",
+                        raw_frame.width,
+                        raw_frame.height,
+                        desired_bitrate,
+                        target_fps,
+                        &mut input_mode,
+                        Opening::First,
+                        &mut opening,
+                    )?;
+                    stall_recovery.outwaited(&desired_encoder, "libx264", Instant::now());
+                    background = Some(Behind::first(open, desired_bitrate));
+                    encoder_state = Some(state);
+                    first_picture_by = None;
+                    bitrate_pacer.opened(Instant::now());
+                    PIPELINE_STATS
+                        .lock()
+                        .set_software_fallback(encoder_name != "libx264");
+                    note_encoder_opened(&shared, "libx264", &gpu);
                 }
                 Err(e) if is_hevc_encoder(&desired_encoder) => {
                     warn!(
@@ -310,105 +404,198 @@ fn run_encode_loop(
                         "Preferred encoder failed to open; trying remaining encoders"
                     );
                     let stalled = is_open_stall(e.as_ref());
+                    let mut still_opening = None;
                     let (name, state) = open_remaining_encoders(
                         (&desired_encoder, &e.to_string()),
                         crate::gpu::vendors_present,
                         |name| {
-                            EncoderState::new(
+                            let opened = open_session(
+                                &LAUNCH_FAILURES,
                                 name,
                                 raw_frame.width,
                                 raw_frame.height,
                                 desired_bitrate,
                                 target_fps,
                                 &mut input_mode,
-                                first_open(name),
+                                first_open(name, picture_by),
                                 &mut opening,
-                            )
+                            );
+                            if let Err(error) = &opened {
+                                if let Some(open) = take_still_opening(error.as_ref()) {
+                                    still_opening = Some(open);
+                                }
+                            }
+                            opened
                         },
                     )?;
-                    // After a stall the preferred encoder stays preferred,
-                    // to be tried again; a real error leaves it for good.
-                    if !stall_recovery.failed(stalled, &preferred, name, Instant::now()) {
-                        encoder_name = name.to_string();
+                    if let Some(open) = still_opening {
+                        // The preferred encoder failed for a reason of its
+                        // own (a stalled one leaves no lane for another),
+                        // and libx264 streams while the next one opens.
+                        warn!(
+                            encoder = open.encoder(),
+                            waited_ms = open.pending.running_for().as_millis() as u64,
+                            "The encoder has not opened yet; streaming on libx264 while it opens in the background"
+                        );
+                        encoder_name = open.encoder().to_string();
+                        stall_recovery.opened(name, &preferred);
+                        stall_recovery.outwaited(open.encoder(), name, Instant::now());
+                        background = Some(Behind::first(open, desired_bitrate));
+                    } else {
+                        // After a stall the preferred encoder stays preferred,
+                        // to be tried again; a real error leaves it for good.
+                        if !stall_recovery.failed(stalled, &preferred, name, Instant::now()) {
+                            encoder_name = name.to_string();
+                        }
+                        stall_recovery.opened(name, &preferred);
                     }
-                    stall_recovery.opened(name, &preferred);
                     encoder_state = Some(state);
+                    first_picture_by = None;
                     bitrate_pacer.opened(Instant::now());
                     PIPELINE_STATS
                         .lock()
                         .set_software_fallback(name == "libx264");
-                    note_encoder_opened(&shared, name);
+                    note_encoder_opened(&shared, name, &gpu);
                 }
                 Err(e) => return Err(e),
             }
-        } else if size_changed
-            || encoder_state.as_ref().is_some_and(|state| {
-                reopen_needed(
-                    (
-                        &state.opened_encoder,
-                        state.opened_bitrate,
-                        state.opened_fps,
-                    ),
-                    (&desired_encoder, wanted_bitrate, target_fps),
-                    keyframe_reopen,
-                    failed_reopen.as_ref(),
-                    lane_clear,
-                )
-            })
-        {
-            // Bitrate changed (ABR rung or the user's slider), the
-            // negotiated codec changed (HEVC toggle / client capability), the
-            // capture size changed (display mode change), or AMF owes a
-            // keyframe: hardware encoders ignore parameter pokes on an open
-            // context, so each means a session reopen (~50-200ms hiccup, no
-            // transport teardown, same stream epoch) followed by a forced IDR.
-            // So does a try of the preferred encoder after a stalled open.
-            // Every reopen takes the newest bitrate target, paced or not.
-            if keyframe_reopen {
-                last_keyframe_reopen = Some(Instant::now());
-            }
-            let (previous, current_encoder, reason) = encoder_state
-                .as_ref()
-                .map(|s| {
-                    let reason = reopen_reason(
-                        (&s.opened_encoder, s.opened_fps),
-                        (&desired_encoder, target_fps),
-                        size_changed,
-                        keyframe_reopen,
-                        stall_recovery
-                            .owed
-                            .as_ref()
-                            .is_some_and(|owed| owed.preferred == desired_encoder),
-                    );
-                    (s.opened_bitrate, s.opened_encoder.clone(), reason)
+        } else {
+            // A reopen this frame: the open that went on in the background,
+            // once it returned, or a new one.
+            let reopened = if let Some(result) = background.as_mut().and_then(|behind| {
+                behind.open.poll(&mut input_mode, |args| {
+                    EncoderState::new(
+                        &args.encoder_name,
+                        args.size.0,
+                        args.size.1,
+                        args.bitrate_bps,
+                        args.target_fps,
+                        &mut EncoderInput::Yuv420,
+                        Opening::Behind,
+                        &mut || {},
+                    )
                 })
-                .unwrap_or_default();
-            stall_recovery.starting(&desired_encoder);
-            match EncoderState::new(
-                &desired_encoder,
-                raw_frame.width,
-                raw_frame.height,
-                desired_bitrate,
-                target_fps,
-                &mut input_mode,
+            }) {
+                let behind = background.take().expect("it was just polled");
+                if let Err(error) = &result {
+                    note_open_failure(
+                        &LAUNCH_FAILURES,
+                        behind.open.encoder(),
+                        behind.open.args.size,
+                        error.as_ref(),
+                    );
+                }
+                Some((result, behind.reopen))
+            } else if background.is_none()
+                && (size_changed
+                    || encoder_state.as_ref().is_some_and(|state| {
+                        reopen_needed(
+                            (
+                                &state.opened_encoder,
+                                state.opened_bitrate,
+                                state.opened_fps,
+                            ),
+                            (&desired_encoder, wanted_bitrate, target_fps),
+                            keyframe_reopen,
+                            failed_reopen.as_ref(),
+                            lane_clear,
+                        )
+                    }))
+            {
+                // Bitrate changed (ABR rung or the user's slider), the
+                // negotiated codec changed (HEVC toggle / client capability), the
+                // capture size changed (display mode change), or AMF owes a
+                // keyframe: hardware encoders ignore parameter pokes on an open
+                // context, so each means a session reopen (~50-200ms hiccup, no
+                // transport teardown, same stream epoch) followed by a forced IDR.
+                // So does a try of the preferred encoder after a stalled open.
+                // Every reopen takes the newest bitrate target, paced or not.
+                if keyframe_reopen {
+                    last_keyframe_reopen = Some(Instant::now());
+                }
+                let (previous, current_encoder, reason) = encoder_state
+                    .as_ref()
+                    .map(|s| {
+                        let reason = reopen_reason(
+                            (&s.opened_encoder, s.opened_fps),
+                            (&desired_encoder, target_fps),
+                            size_changed,
+                            keyframe_reopen,
+                            stall_recovery
+                                .owed
+                                .as_ref()
+                                .is_some_and(|owed| owed.preferred == desired_encoder),
+                        );
+                        (s.opened_bitrate, s.opened_encoder.clone(), reason)
+                    })
+                    .unwrap_or_default();
+                stall_recovery.starting(&desired_encoder);
                 // The old session cannot take a frame of the new size.
-                if size_changed {
+                let how = if size_changed {
                     Opening::First
+                } else if opens_behind(&current_encoder, &desired_encoder) {
+                    Opening::Behind
                 } else {
                     Opening::Reopen
-                },
-                &mut opening,
-            ) {
-                Ok(state) => {
+                };
+                let reopen = Reopening {
+                    encoder: desired_encoder.clone(),
+                    from: previous,
+                    current: current_encoder,
+                    reason,
+                    size_changed,
+                    keyframe: keyframe_reopen,
+                    bitrate: desired_bitrate,
+                    fps: target_fps,
+                    first: false,
+                    in_background: false,
+                };
+                match open_session(
+                    &LAUNCH_FAILURES,
+                    &desired_encoder,
+                    raw_frame.width,
+                    raw_frame.height,
+                    desired_bitrate,
+                    target_fps,
+                    &mut input_mode,
+                    how,
+                    &mut opening,
+                ) {
+                    Err(e) if is_still_opening(e.as_ref()) => {
+                        let open = take_still_opening(e.as_ref()).expect("the open going on");
+                        info!(
+                            from = %reopen.current,
+                            encoder = %desired_encoder,
+                            reason,
+                            "Opening the encoder in the background; the stream goes on meanwhile"
+                        );
+                        background = Some(Behind {
+                            open,
+                            reopen: Reopening {
+                                in_background: true,
+                                ..reopen
+                            },
+                        });
+                        None
+                    }
+                    result => Some((result, reopen)),
+                }
+            } else {
+                None
+            };
+            match reopened {
+                None => {}
+                Some((Ok(state), reopen)) => {
                     info!(
-                        from = previous,
-                        to = desired_bitrate,
-                        encoder = %desired_encoder,
-                        width = raw_frame.width,
-                        height = raw_frame.height,
-                        size_changed,
-                        keyframe = keyframe_reopen,
-                        reason,
+                        from = reopen.from,
+                        to = state.opened_bitrate,
+                        encoder = %reopen.encoder,
+                        width = state.frame.width(),
+                        height = state.frame.height(),
+                        size_changed = reopen.size_changed,
+                        keyframe = reopen.keyframe,
+                        reason = reopen.reason,
+                        in_background = reopen.in_background,
                         "Reopened encoder session"
                     );
                     encoder_state = Some(state);
@@ -417,57 +604,80 @@ fn run_encode_loop(
                     pending_keyframe = true;
                     // Back from libx264 to hardware (libx265 only replaces a
                     // libx264 that was already preferred).
-                    if stall_recovery.opened(&desired_encoder, &preferred)
-                        && desired_encoder != "libx265"
+                    if stall_recovery.opened(&reopen.encoder, &preferred)
+                        && reopen.encoder != "libx265"
                     {
                         PIPELINE_STATS.lock().set_software_fallback(false);
                     }
-                    note_encoder_opened(&shared, &desired_encoder);
+                    note_encoder_opened(&shared, &reopen.encoder, &gpu);
                 }
                 // The old session cannot take a frame of the new size. A
                 // pipeline restart opens a fresh encoder, with the software
                 // fallback if the hardware one rejects this size.
-                Err(e) if size_changed => {
+                Some((Err(e), reopen)) if reopen.size_changed => {
                     return Err(format!(
-                        "{desired_encoder} could not reopen at {}x{}: {e}",
-                        raw_frame.width, raw_frame.height
+                        "{} could not reopen at {}x{}: {e}",
+                        reopen.encoder, raw_frame.width, raw_frame.height
                     )
                     .into());
                 }
-                Err(e) => {
+                // The pipeline's first open, which went on in the background.
+                Some((Err(e), reopen)) if reopen.first => {
+                    if is_open_stall(e.as_ref()) {
+                        // Tried again once the lane is clear, as after any
+                        // stalled open (see `StallRecovery::outwaited`).
+                        warn!(
+                            error = %e,
+                            encoder = %reopen.encoder,
+                            "The encoder did not open in the background; streaming on libx264 until it is tried again"
+                        );
+                    } else {
+                        warn!(
+                            error = %e,
+                            encoder = %reopen.encoder,
+                            "The encoder failed to open in the background; staying on libx264 for this pipeline"
+                        );
+                        stall_recovery.owed = None;
+                        if is_hevc_encoder(&reopen.encoder) {
+                            hevc_open_failed = true;
+                        } else {
+                            encoder_name = "libx264".to_string();
+                        }
+                    }
+                }
+                Some((Err(e), reopen)) => {
                     let stalled = is_open_stall(e.as_ref());
                     if stalled {
                         warn!(
                             error = %e,
-                            encoder = %desired_encoder,
+                            encoder = %reopen.encoder,
                             "Encoder reopen stalled — keeping the current session"
                         );
-                    } else if is_hevc_encoder(&desired_encoder) {
+                    } else if is_hevc_encoder(&reopen.encoder) {
                         warn!(
                             error = %e,
-                            encoder = %desired_encoder,
+                            encoder = %reopen.encoder,
                             "HEVC reopen failed — keeping the current session"
                         );
                     } else {
                         warn!(
                             error = %e,
-                            bitrate = desired_bitrate,
+                            bitrate = reopen.bitrate,
                             "Encoder reopen failed — keeping the current session"
                         );
                     }
                     // A stall is tried again once the lane is clear, while
                     // tries are left.
-                    if !stall_recovery.failed(stalled, &preferred, &current_encoder, Instant::now())
+                    if !stall_recovery.failed(stalled, &preferred, &reopen.current, Instant::now())
                     {
                         give_up_reopen(
-                            &desired_encoder,
-                            &current_encoder,
+                            &reopen.encoder,
+                            &reopen.current,
                             stall_recovery.owed.is_some(),
                             &mut encoder_name,
                             &mut hevc_open_failed,
                         );
-                        failed_reopen =
-                            Some((desired_encoder.clone(), desired_bitrate, target_fps));
+                        failed_reopen = Some((reopen.encoder.clone(), reopen.bitrate, reopen.fps));
                     }
                 }
             }
@@ -478,45 +688,18 @@ fn run_encode_loop(
             .expect("Encoder state must be initialized");
         let current_bitrate = encoder.opened_bitrate;
         let opened_is_hevc = is_hevc_encoder(&encoder.opened_encoder);
+        shared.encoder_reopens_for_bitrate.store(
+            !takes_bitrate_in_place(&encoder.opened_encoder, refused_this_launch),
+            Ordering::Relaxed,
+        );
 
-        let src_row_bytes = (raw_frame.width * 4) as usize;
         let convert_start = Instant::now();
-        #[cfg(target_os = "macos")]
-        let converted = match encoder.native_converter.as_ref().map(|converter| {
-            converter.convert(
-                &raw_frame.data,
-                raw_frame.width,
-                raw_frame.height,
-                src_row_bytes,
-                &mut encoder.frame,
-            )
-        }) {
-            Some(Ok(())) => true,
-            Some(Err(error)) => {
-                warn!(%error, "Using swscale after native color conversion failed");
-                encoder.native_converter = None;
-                false
-            }
-            None => false,
-        };
-        #[cfg(not(target_os = "macos"))]
-        let converted = false;
-        if !converted {
-            if let Some(scaler) = encoder.scaler.as_mut() {
-                input::convert_packed_bgra(scaler, &raw_frame.data, &mut encoder.frame)?;
-            } else {
-                // BGRA input: the encoder converts. Its frame takes a copy,
-                // so capture's buffer is free before the encoder can block.
-                let stride = encoder.frame.stride(0);
-                let bgra_plane = encoder.frame.data_mut(0);
-                for y in 0..raw_frame.height as usize {
-                    let src_offset = y * src_row_bytes;
-                    let dst_offset = y * stride;
-                    bgra_plane[dst_offset..dst_offset + src_row_bytes]
-                        .copy_from_slice(&raw_frame.data[src_offset..src_offset + src_row_bytes]);
-                }
-            }
-        }
+        encoder.convert(&raw_frame.data, (raw_frame.width * 4) as usize)?;
+        // The picture is kept only while a session's first keyframe may stay
+        // inside the encoder, to be given to it again.
+        let picture = (holds_last_frame(&encoder.opened_encoder)
+            && (encoder.frames_submitted == 0 || owed_keyframe.is_some()))
+        .then(|| raw_frame.clone());
         // Conversion finished synchronously. Recycle capture's buffer before
         // the codec or sender can block, including on the direct macOS path.
         drop(raw_frame.data);
@@ -540,9 +723,27 @@ fn run_encode_loop(
         );
 
         let encode_start = Instant::now();
-        encoder.send_frame(pts, raw_frame.timestamp, raw_frame.frame_number)?;
+        // A bitrate Quick Sync took in place applies with this frame: an
+        // error now is its refusal.
+        let qsv_change = encoder
+            .bitrate_change
+            .is_some_and(|change| change.live == LiveBitrate::QsvReset);
+        // NVENC reconfigures for a new bitrate while it takes this frame,
+        // and says so only in its verbose lines.
+        let nvenc_watch = encoder
+            .bitrate_change
+            .is_some_and(|change| change.live == LiveBitrate::NvencReconfig)
+            .then(crate::diagnostics::FfmpegWatch::start);
+        let mut reset_refused: Option<String> = None;
+        if let Err(error) = encoder.send_frame(pts, raw_frame.timestamp, raw_frame.frame_number) {
+            if !qsv_change {
+                return Err(error.into());
+            }
+            reset_refused = Some(error.to_string());
+        }
 
-        loop {
+        let mut keyframe_out = false;
+        while reset_refused.is_none() {
             match encoder.encoder.receive_packet(&mut encoder.packet) {
                 Ok(()) => {
                     let encode_us = encode_start.elapsed().as_micros();
@@ -586,6 +787,7 @@ fn run_encode_loop(
                             au_info.is_keyframe(packet_is_key, &encoder.opened_encoder);
                         (nal_data, is_keyframe)
                     };
+                    keyframe_out |= is_keyframe;
                     if !opened_is_hevc {
                         encoder.observe_amf_diagnostics(
                             &nal_data,
@@ -648,9 +850,45 @@ fn run_encode_loop(
                     }
                 }
                 Err(e) if is_eagain(&e) => break,
+                Err(e) if qsv_change => reset_refused = Some(e.to_string()),
                 Err(e) => return Err(e.into()),
             }
         }
+        if let Some(watch) = nvenc_watch {
+            if nvenc_reconfigured(&watch.finish()) {
+                encoder.bitrate_change = None;
+            } else if reset_refused.is_none() {
+                reset_refused = Some("NVENC did not reconfigure the session's bitrate".to_string());
+            }
+        }
+        if let Some(error) = reset_refused {
+            let live = encoder
+                .bitrate_change
+                .map_or(LiveBitrate::QsvReset, |change| change.live);
+            live.refused().store(true, Ordering::Relaxed);
+            warn!(
+                %error,
+                encoder = %encoder.opened_encoder,
+                bitrate = encoder.opened_bitrate,
+                "The encoder did not take the new bitrate on the open session; reopening it, as for its bitrate changes from now on"
+            );
+            encoder_state = None;
+            pending_keyframe = true;
+            // A kept picture belonged to that session; the new one starts
+            // with an IDR.
+            owed_keyframe = None;
+            continue;
+        }
+        if qsv_change {
+            encoder.bitrate_change = None;
+        }
+        owed_keyframe = OwedKeyframe::after_encode(
+            owed_keyframe.take(),
+            picture,
+            keyframe_out,
+            encode_start,
+            keyframe_flush_wait(target_fps, raw_frame.cached, cadence.pace()),
+        );
     }
 
     info!("Capture channel closed, encoder shutting down");
@@ -662,7 +900,7 @@ struct EncoderState {
     native_converter: Option<vimage::Converter>,
     encoder: ffmpeg_next::codec::encoder::video::Encoder,
     /// BGRA to the encoder's YUV input, reading capture's buffer directly.
-    scaler: Option<ffmpeg_next::software::scaling::Context>,
+    scaler: Option<input::Scaler>,
     frame: ffmpeg_next::frame::Video,
     packet: ffmpeg_next::Packet,
     h264: H264BitstreamState,
@@ -688,6 +926,93 @@ struct EncoderState {
     /// time_base 1/60 (escape hatch until the real-PTS path is verified on
     /// NVENC/AMF hardware).
     legacy_pts: bool,
+    /// A hardware bitrate change made in place that the session has not yet
+    /// been seen to take (see [`Unconfirmed`]).
+    bitrate_change: Option<Unconfirmed>,
+}
+
+/// How an encoder takes a new bitrate on the open session, without the
+/// reopen that costs a stutter. FFmpeg 7.1.1 checks the context's bitrate
+/// before each frame in three of its encoders:
+/// - libx264 applies bitrate and VBV changes through x264_encoder_reconfig.
+/// - Quick Sync resets the session's rate control to it (qsvenc.c,
+///   `update_bitrate` and `MFXVideoENCODE_Reset`), with no new sequence,
+///   instead of its slow open.
+/// - NVENC reconfigures the session (nvenc.c, `reconfig_encoder` and
+///   `nvEncReconfigureEncoder`) with an IDR, if the card can change its
+///   bitrate live (NV_ENC_CAPS_SUPPORT_DYN_BITRATE_CHANGE), instead of a
+///   new session.
+///
+/// AMF sets its bitrate only when it opens (amfenc_h264.c and
+/// amfenc_hevc.c), and libx265 has no reconfigure, so both reopen, and ABR
+/// steps up less often for them (see `AbrController::encoder_reopens`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveBitrate {
+    X264,
+    QsvReset,
+    NvencReconfig,
+}
+
+impl LiveBitrate {
+    fn of(encoder_name: &str) -> Option<Self> {
+        if encoder_name == "libx264" {
+            Some(Self::X264)
+        } else if encoder_name.ends_with("_qsv") {
+            Some(Self::QsvReset)
+        } else if encoder_name.ends_with("_nvenc") {
+            Some(Self::NvencReconfig)
+        } else {
+            None
+        }
+    }
+
+    /// Set once a session refused a bitrate change in place: from then on,
+    /// this launch, that encoder's bitrate changes reopen it, as before.
+    fn refused(self) -> &'static std::sync::atomic::AtomicBool {
+        static QSV: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static NVENC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        static NEVER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        match self {
+            Self::QsvReset => &QSV,
+            Self::NvencReconfig => &NVENC,
+            Self::X264 => &NEVER,
+        }
+    }
+}
+
+/// Whether `encoder_name` takes a new bitrate on the open session, unless
+/// `refused` says a session of its kind refused one.
+fn takes_bitrate_in_place(encoder_name: &str, refused: impl Fn(LiveBitrate) -> bool) -> bool {
+    LiveBitrate::of(encoder_name).is_some_and(|live| live == LiveBitrate::X264 || !refused(live))
+}
+
+fn refused_this_launch(live: LiveBitrate) -> bool {
+    live.refused().load(Ordering::Relaxed)
+}
+
+/// A hardware bitrate change made in place, settled by the end of the frame
+/// it goes in with: then the session took it, or it is replaced by one
+/// opened at the new bitrate, so the session's bitrate never outlives an
+/// unconfirmed change. Quick Sync applies it with that frame, and an error
+/// there is its refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Unconfirmed {
+    live: LiveBitrate,
+}
+
+/// Whether NVENC reconfigured its session for a new bitrate, from FFmpeg's
+/// lines while it took the change's frame. FFmpeg 7.1.1's nvenc.c
+/// (`reconfig_encoder`) logs "avg bitrate change" at verbose level when it
+/// calls nvEncReconfigureEncoder for one, and "failed to reconfigure nvenc"
+/// when that fails; it returns no error either way, and skips the change
+/// with no line on a card that cannot change its bitrate live. An IDR says
+/// nothing: one the frame forced, or the GOP's own, comes out either way.
+/// Anything but a reconfigure that ran and did not fail is a refusal.
+fn nvenc_reconfigured(lines: &[String]) -> bool {
+    lines.iter().any(|line| line.contains("avg bitrate change"))
+        && !lines
+            .iter()
+            .any(|line| line.contains("failed to reconfigure nvenc"))
 }
 
 impl EncoderState {
@@ -697,47 +1022,78 @@ impl EncoderState {
         bitrate_bps: u32,
         target_fps: u32,
     ) -> bool {
-        if self.opened_encoder != "libx264"
+        if !takes_bitrate_in_place(&self.opened_encoder, refused_this_launch)
             || desired_encoder != self.opened_encoder
             || target_fps != self.opened_fps
             || bitrate_bps == self.opened_bitrate
         {
             return false;
         }
-        // FFmpeg 7.1's libx264 wrapper applies bitrate and VBV changes through
-        // x264_encoder_reconfig before the next frame. Preserve its reference
-        // frames, PTS epoch and buffers instead of allocating a second encoder
-        // for every ABR step. Other encoders retain the existing reopen path.
+        // Preserve the encoder's reference frames, PTS epoch and buffers
+        // instead of allocating a second encoder for every ABR step. Other
+        // encoders retain the existing reopen path.
         self.encoder.set_bit_rate(bitrate_bps.max(500_000) as usize);
-        self.encoder
-            .set_max_bit_rate(bitrate_bps.max(500_000) as usize);
-        // A half-second VBV is enabled at open, as required for x264's live
-        // bitrate reconfiguration. The context belongs to this encode thread.
-        unsafe {
-            (*self.encoder.as_mut_ptr()).rc_buffer_size = (bitrate_bps.max(500_000) / 2) as i32
-        };
-        info!(
-            from = self.opened_bitrate,
-            to = bitrate_bps,
-            "Updated software encoder bitrate"
-        );
+        if self.opened_encoder == "libx264" {
+            self.encoder
+                .set_max_bit_rate(bitrate_bps.max(500_000) as usize);
+            // A half-second VBV is enabled at open, as required for x264's live
+            // bitrate reconfiguration. The context belongs to this encode thread.
+            unsafe {
+                (*self.encoder.as_mut_ptr()).rc_buffer_size = (bitrate_bps.max(500_000) / 2) as i32
+            };
+            info!(
+                from = self.opened_bitrate,
+                to = bitrate_bps,
+                "Updated software encoder bitrate"
+            );
+        } else {
+            let live = LiveBitrate::of(&self.opened_encoder).expect("takes it in place");
+            if live == LiveBitrate::NvencReconfig {
+                // NVENC sizes the VBV to two seconds of the bitrate when it
+                // opens, and reconfigures it with the bitrate, as a session
+                // opened at it would have.
+                unsafe {
+                    (*self.encoder.as_mut_ptr()).rc_buffer_size =
+                        (bitrate_bps.max(500_000) as i32).saturating_mul(2)
+                };
+            }
+            // Quick Sync opened in VBR with no maximum rate or buffer size,
+            // so only the target changes.
+            self.bitrate_change = Some(Unconfirmed { live });
+            info!(
+                from = self.opened_bitrate,
+                to = bitrate_bps,
+                encoder = %self.opened_encoder,
+                "Updated hardware encoder bitrate without reopening"
+            );
+        }
         self.opened_bitrate = bitrate_bps;
         true
     }
 
+    /// Opens a session for captures of `capture_width`x`capture_height`,
+    /// at their [`encoded_size`].
     #[allow(clippy::too_many_arguments)]
     fn new(
         encoder_name: &str,
-        width: u32,
-        height: u32,
+        capture_width: u32,
+        capture_height: u32,
         bitrate_bps: u32,
         target_fps: u32,
         input_mode: &mut EncoderInput,
         opening: Opening,
         progress: &mut dyn FnMut(),
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let (width, height) = encoded_size(capture_width, capture_height);
         info!(encoder = encoder_name, width, height, bitrate_bps, target_fps,
             input = ?input_mode, "Opening encoder session");
+        if (width, height) != (capture_width, capture_height) {
+            info!(
+                capture_size = %format_args!("{capture_width}x{capture_height}"),
+                encoded_size = %format_args!("{width}x{height}"),
+                "Encoding without the capture's odd last column or row"
+            );
+        }
         let codec = ffmpeg_next::encoder::find_by_name(encoder_name)
             .ok_or_else(|| format!("{} codec not found in FFmpeg", encoder_name))?;
         // AVCodec owns this terminated static list. A null list means that
@@ -752,7 +1108,7 @@ impl EncoderState {
             formats
         };
         info!(encoder = encoder_name, advertised_formats = ?supported, input = ?input_mode, "Encoder advertised input formats");
-        open_at_input(input_mode, encoder_name, &supported, |pixel_format| {
+        let opened = open_at_input(input_mode, encoder_name, &supported, |pixel_format| {
             Self::open_at(
                 codec,
                 encoder_name,
@@ -763,7 +1119,16 @@ impl EncoderState {
                 opening,
                 &mut *progress,
             )
-        })
+        });
+        // One that goes on in the background is tried at YUV420 there.
+        if let Err(error) = &opened {
+            if let Some(still) = error.downcast_ref::<StillOpening>() {
+                if let Some(open) = still.1.lock().as_mut() {
+                    open.yuv_retry = input::retries_as_yuv(*input_mode, open.args.pixel_format);
+                }
+            }
+        }
+        opened
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -806,7 +1171,42 @@ impl EncoderState {
         encoder.set_gop(30);
         configure_encoder_flags(&mut encoder, encoder_name);
 
-        let encoder = match open_encoder(encoder, encoder_name, opening, progress) {
+        let args = SessionArgs {
+            encoder_name: encoder_name.to_string(),
+            size: (width, height),
+            bitrate_bps,
+            target_fps,
+            pixel_format,
+            legacy_pts,
+        };
+        match open_encoder(encoder, encoder_name, opening, progress) {
+            Opened::Now(result) => Self::opened(result, &args),
+            Opened::Behind(pending) => Err(Box::new(StillOpening(
+                encoder_name.to_string(),
+                parking_lot::Mutex::new(Some(BackgroundOpen {
+                    pending,
+                    args,
+                    yuv_retry: false,
+                })),
+            ))),
+        }
+    }
+
+    /// The session from an open that returned with `result`, or its error.
+    fn opened(
+        result: OpenResult,
+        args: &SessionArgs,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        let SessionArgs {
+            ref encoder_name,
+            size: (width, height),
+            bitrate_bps,
+            target_fps,
+            pixel_format,
+            legacy_pts,
+        } = *args;
+        let encoder_name = encoder_name.as_str();
+        let encoder = match result {
             Ok(Ok(encoder)) => encoder,
             Ok(Err(error)) => {
                 note_nvidia_driver(encoder_name, error, crate::gpu::nvidia_driver_versions);
@@ -830,27 +1230,43 @@ impl EncoderState {
         let mut h264 = H264BitstreamState::default();
         h264.refresh_parameter_sets_from_extradata(encoder_extradata(&encoder));
 
-        let scaler = input::conversion_context(pixel_format, width, height)?;
-        if scaler.is_some() {
-            info!(output = ?pixel_format, "swscale BGRA conversion context created");
+        #[cfg(target_os = "macos")]
+        let native_converter = if pixel_format == ffmpeg_next::format::Pixel::YUV420P {
+            match vimage::Converter::new() {
+                Ok(converter) => {
+                    info!("Accelerate BGRA->YUV420P converter ready");
+                    Some(converter)
+                }
+                Err(error) => {
+                    warn!(%error, "Using swscale color conversion");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        // Where Accelerate converts, swscale is only its fallback, so it
+        // keeps no threads waiting.
+        #[cfg(target_os = "macos")]
+        let threads = if native_converter.is_some() {
+            1
+        } else {
+            input::scaler_threads()
+        };
+        #[cfg(not(target_os = "macos"))]
+        let threads = input::scaler_threads();
+        let scaler = input::conversion_context(pixel_format, width, height, threads)?;
+        if let Some(scaler) = &scaler {
+            info!(
+                output = ?pixel_format,
+                threads = scaler.threads(),
+                "swscale BGRA conversion context created"
+            );
         }
 
         Ok(Self {
             #[cfg(target_os = "macos")]
-            native_converter: if pixel_format == ffmpeg_next::format::Pixel::YUV420P {
-                match vimage::Converter::new() {
-                    Ok(converter) => {
-                        info!("Accelerate BGRA->YUV420P converter ready");
-                        Some(converter)
-                    }
-                    Err(error) => {
-                        warn!(%error, "Using swscale color conversion");
-                        None
-                    }
-                }
-            } else {
-                None
-            },
+            native_converter,
             encoder,
             scaler,
             frame: ffmpeg_next::frame::Video::new(pixel_format, width, height),
@@ -866,17 +1282,20 @@ impl EncoderState {
             last_pts: -1,
             in_flight: InFlightFrames::default(),
             legacy_pts,
+            bitrate_change: None,
         })
     }
 
     fn next_pts(&mut self, captured: Instant, frame_number: u64) -> i64 {
-        if self.legacy_pts {
-            return frame_number as i64;
-        }
-        let epoch = *self.pts_epoch.get_or_insert(captured);
-        let real = captured.saturating_duration_since(epoch).as_micros() as i64;
-        // Strict monotonicity (keepalive resends and clock quirks).
-        let pts = real.max(self.last_pts + 1);
+        let pts = if self.legacy_pts {
+            frame_number as i64
+        } else {
+            let epoch = *self.pts_epoch.get_or_insert(captured);
+            captured.saturating_duration_since(epoch).as_micros() as i64
+        };
+        // Strict monotonicity (keepalive resends, a picture given again with
+        // its capture number and time, and clock quirks).
+        let pts = pts.max(self.last_pts + 1);
         self.last_pts = pts;
         pts
     }
@@ -902,8 +1321,38 @@ impl EncoderState {
             .unwrap_or(just_submitted)
     }
 
+    /// Converts a capture whose rows lie `row_bytes` apart into `self.frame`:
+    /// its top-left `self.frame`-sized part, pixel for pixel, which leaves an
+    /// odd last column or row out (see [`encoded_size`]).
+    fn convert(&mut self, rows: &[u8], row_bytes: usize) -> Result<(), ffmpeg_next::Error> {
+        let (width, height) = (self.frame.width(), self.frame.height());
+        #[cfg(target_os = "macos")]
+        if let Some(converter) = self.native_converter.as_ref() {
+            match converter.convert(rows, width, height, row_bytes, &mut self.frame) {
+                Ok(()) => return Ok(()),
+                Err(error) => {
+                    warn!(%error, "Using swscale after native color conversion failed");
+                    self.native_converter = None;
+                }
+            }
+        }
+        if let Some(scaler) = self.scaler.as_mut() {
+            return input::convert_packed_bgra(scaler, rows, row_bytes, &mut self.frame);
+        }
+        // BGRA input: the encoder converts. Its frame takes a copy,
+        // so capture's buffer is free before the encoder can block.
+        let picture_bytes = width as usize * 4;
+        let stride = self.frame.stride(0);
+        let bgra_plane = self.frame.data_mut(0);
+        for y in 0..height as usize {
+            bgra_plane[y * stride..][..picture_bytes]
+                .copy_from_slice(&rows[y * row_bytes..][..picture_bytes]);
+        }
+        Ok(())
+    }
+
     fn accepts_frame(&self, width: u32, height: u32) -> bool {
-        self.frame.width() == width && self.frame.height() == height
+        encoded_size(width, height) == (self.frame.width(), self.frame.height())
     }
 
     fn observe_amf_diagnostics(
@@ -963,20 +1412,50 @@ type OpenResult = Result<
     crate::stall::Stall,
 >;
 
-/// What streams while an encoder session opens, which sets its time limit.
+/// What streams while an encoder session opens, which sets its time limit
+/// and how long it is waited for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Opening {
-    /// Nothing: the pipeline's first open and its fallbacks, or a reopen at
-    /// a new capture size, which the old session cannot encode.
+    /// Nothing: the pipeline's last resort, libx264, or a reopen at a new
+    /// capture size, which the old session cannot encode.
     First,
     /// As `First`, with another encoder to try if this one fails: every
     /// first open but libx264's. FFmpeg's errors while it opens are logged
-    /// as warnings (see [`crate::diagnostics::while_probing`]).
-    Probe,
+    /// as warnings (see [`crate::diagnostics::while_probing`]). One in the
+    /// lane is waited for only until the pipeline's first picture is due,
+    /// at the instant given (see [`FIRST_PICTURE_WAIT`]): then it goes on
+    /// opening in the background while libx264 streams. The instant holds
+    /// whatever came before the open: a fallback's earlier tries, a BGRA
+    /// open retried at YUV420, a call's thread that was slow to start.
+    Probe(Instant),
     /// The live session, which goes on if the reopen is given up on. The
     /// picture freezes until then, so the limit is shorter.
     Reopen,
+    /// A reopen in the lane while a session that needs none streams
+    /// (libx264): it opens in the background, and the stream goes on
+    /// meanwhile, so it has a first open's limits (see [`opens_behind`]).
+    Behind,
 }
+
+/// How long a pipeline may go without a picture, from its first try of an
+/// encoder in the lane. The iPad gives up on a session after 10 s without
+/// one. A hardware open that hung was waited for up to its 15 s limit, so
+/// libx264 took over too late, and the iPad showed no picture (field
+/// triage, Nov 2026). Past this, libx264 streams while the open goes on in
+/// the background, and the stream switches to it if it opens within its
+/// limit. Above the slowest NVENC and AMF opens in the field (2.6 s and
+/// 1.2 s) and Quick Sync's p99 (3.2 s): the few slower Quick Sync opens
+/// start on libx264 for a moment.
+const FIRST_PICTURE_WAIT: Duration = Duration::from_secs(3);
+
+/// An encoder open that returned, or one that goes on in the background.
+enum Opened {
+    Now(OpenResult),
+    Behind(PendingOpen),
+}
+
+type PendingOpen =
+    crate::stall::Pending<Result<ffmpeg_next::codec::encoder::video::Encoder, ffmpeg_next::Error>>;
 
 /// Open `encoder` with its options. An encoder that opens under FFmpeg's
 /// process-wide lock opens under its time limit (see [`crate::stall`]); one
@@ -986,7 +1465,7 @@ fn open_encoder(
     encoder_name: &str,
     opening: Opening,
     progress: &mut dyn FnMut(),
-) -> OpenResult {
+) -> Opened {
     open_encoder_on(
         crate::stall::lanes(),
         encoder,
@@ -1001,45 +1480,216 @@ fn open_encoder_on(
     encoder: ffmpeg_next::codec::encoder::video::Video,
     encoder_name: &str,
     opening: Opening,
-    progress: &mut dyn FnMut(),
-) -> OpenResult {
+    mut progress: &mut dyn FnMut(),
+) -> Opened {
     let name = encoder_name.to_string();
+    let probing = matches!(opening, Opening::Probe(_));
     // On the thread that makes the call, where FFmpeg logs.
     let open = move || {
         let open = || encoder.open_with(encoder_options(&name));
-        if opening == Opening::Probe {
+        if probing {
             crate::diagnostics::while_probing(open)
         } else {
             open()
         }
     };
     if !takes_codec_lock(encoder_name) {
-        return Ok(open());
+        return Opened::Now(Ok(open()));
     }
-    crate::stall::run_on(
-        lanes,
-        crate::stall::Call::EncoderOpen,
-        open_limits(encoder_name, opening),
-        open,
-        progress,
-    )
+    let limits = open_limits(encoder_name, opening);
+    match crate::stall::start_on(lanes, crate::stall::Call::EncoderOpen, limits, open) {
+        Ok(pending) => match wait_or_park(pending, opening, &mut progress) {
+            Ok(result) => Opened::Now(result),
+            Err(pending) => Opened::Behind(pending),
+        },
+        Err(stall) => Opened::Now(Err(stall)),
+    }
 }
 
-/// A pipeline's first open of `encoder_name`: anything but libx264 has
-/// another encoder after it.
-fn first_open(encoder_name: &str) -> Opening {
+/// Waits for an open in the lane as `opening` says: to its limit, until the
+/// first picture is due, or not at all. Err: it goes on, parked.
+fn wait_or_park<T, N: Fn() -> Instant>(
+    mut pending: crate::stall::Pending<T, N>,
+    opening: Opening,
+    progress: &mut impl FnMut(),
+) -> Result<Result<T, crate::stall::Stall>, crate::stall::Pending<T, N>> {
+    let waited = match opening {
+        Opening::Probe(by) => pending.wait_until(by, progress),
+        Opening::Behind => None,
+        Opening::First | Opening::Reopen => pending.wait_up_to(Duration::MAX, progress),
+    };
+    if let Some(result) = waited {
+        return Ok(result);
+    }
+    match pending.park() {
+        Some(result) => Ok(result),
+        None => Err(pending),
+    }
+}
+
+/// A pipeline's first open of `encoder_name`, whose first picture is due
+/// `by`: anything but libx264 has another encoder after it.
+fn first_open(encoder_name: &str, by: Instant) -> Opening {
     if encoder_name == "libx264" {
         Opening::First
     } else {
-        Opening::Probe
+        Opening::Probe(by)
     }
 }
 
 fn open_limits(encoder_name: &str, opening: Opening) -> crate::stall::Limits {
     match opening {
-        Opening::First | Opening::Probe => crate::stall::encoder_open_limits(encoder_name),
+        Opening::First | Opening::Probe(_) | Opening::Behind => {
+            crate::stall::encoder_open_limits(encoder_name)
+        }
         Opening::Reopen => crate::stall::encoder_reopen_limits(encoder_name),
     }
+}
+
+/// The encoder a frame prefers: the H.265 encoder for `encoder_name` when
+/// HEVC is wanted (the user's preference and the client's decoding) and has
+/// not failed, if FFmpeg has it; else `encoder_name`. `warned` says once
+/// that there is none.
+fn preferred_encoder(
+    encoder_name: &str,
+    hevc_wanted: bool,
+    hevc_open_failed: bool,
+    warned: &mut bool,
+) -> String {
+    if !hevc_wanted || hevc_open_failed {
+        return encoder_name.to_string();
+    }
+    match hevc_encoder_for(encoder_name) {
+        Some(hevc) if ffmpeg_next::encoder::find_by_name(hevc).is_some() => hevc.to_string(),
+        _ => {
+            if !*warned {
+                *warned = true;
+                warn!(
+                    encoder = %encoder_name,
+                    "HEVC requested but no H.265 encoder is available — staying on H.264"
+                );
+            }
+            encoder_name.to_string()
+        }
+    }
+}
+
+/// Drops an HEVC open going on in the background once the frame prefers
+/// H.264 (HEVC turned off, or a client that decodes only H.264): adopted,
+/// it would replace a session the client can decode with one it may not.
+/// The session that streams meanwhile goes on. True when one was dropped;
+/// its result is released when it returns.
+fn drop_obsolete_background(background: &mut Option<Behind>, preferred: &str) -> bool {
+    let obsolete = background.as_ref().is_some_and(|behind| {
+        is_hevc_encoder(behind.open.encoder()) && !is_hevc_encoder(preferred)
+    });
+    if let Some(behind) = background.take_if(|_| obsolete) {
+        info!(
+            encoder = behind.open.encoder(),
+            preferred,
+            "The codec changed while an encoder opened in the background; that session will not be used"
+        );
+    }
+    obsolete
+}
+
+/// Whether a reopen from the `current` session to `wanted` opens in the
+/// background: libx264 needs no lane, so it streams on while an encoder in
+/// the lane opens, instead of freezing for as long as the open takes.
+fn opens_behind(current: &str, wanted: &str) -> bool {
+    !takes_codec_lock(current) && takes_codec_lock(wanted)
+}
+
+/// What a session opens with, to finish an open that returns later.
+struct SessionArgs {
+    encoder_name: String,
+    size: (u32, u32),
+    bitrate_bps: u32,
+    target_fps: u32,
+    pixel_format: ffmpeg_next::format::Pixel,
+    legacy_pts: bool,
+}
+
+/// An encoder session that opens in the background while libx264 streams.
+struct BackgroundOpen {
+    pending: PendingOpen,
+    args: SessionArgs,
+    /// An Automatic BGRA open: if it fails, YUV420 is tried, as
+    /// [`open_at_input`] tries it for an open that fails while waited for.
+    yuv_retry: bool,
+}
+
+impl BackgroundOpen {
+    fn encoder(&self) -> &str {
+        &self.args.encoder_name
+    }
+
+    /// The session once its open returned, or the open's error; past its
+    /// limit, its stall. None while it opens within its limit. A BGRA open
+    /// that failed is tried again at YUV420 with `retry_yuv`, and `input`
+    /// keeps YUV420 for the pipeline's later opens: the error comes back only
+    /// if that fails too, so an encoder that works at YUV420 is not left for
+    /// the launch.
+    fn poll(
+        &mut self,
+        input: &mut EncoderInput,
+        retry_yuv: impl FnOnce(
+            &SessionArgs,
+        )
+            -> Result<EncoderState, Box<dyn std::error::Error + Send + Sync>>,
+    ) -> Option<Result<EncoderState, Box<dyn std::error::Error + Send + Sync>>> {
+        let result = self.pending.poll()?;
+        let opened = EncoderState::opened(result, &self.args);
+        let Err(error) = &opened else {
+            return Some(opened);
+        };
+        if !std::mem::take(&mut self.yuv_retry) || is_open_stall(error.as_ref()) {
+            return Some(opened);
+        }
+        warn!(
+            encoder = %self.args.encoder_name,
+            %error,
+            "Encoder did not open with BGRA input; using YUV420 for this stream"
+        );
+        *input = EncoderInput::Yuv420;
+        match retry_yuv(&self.args) {
+            Err(error) if is_still_opening(error.as_ref()) => {
+                *self = take_still_opening(error.as_ref()).expect("the open going on");
+                None
+            }
+            retried => Some(retried),
+        }
+    }
+}
+
+/// An open in the lane that had not returned when its wait ended and goes
+/// on in the background, carried out of [`EncoderState::new`] to the encode
+/// loop, which streams on libx264 meanwhile.
+struct StillOpening(String, parking_lot::Mutex<Option<BackgroundOpen>>);
+
+impl std::fmt::Debug for StillOpening {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_tuple("StillOpening").field(&self.0).finish()
+    }
+}
+
+impl std::fmt::Display for StillOpening {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} has not opened yet", self.0)
+    }
+}
+
+impl std::error::Error for StillOpening {}
+
+fn is_still_opening(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    error.is::<StillOpening>()
+}
+
+/// The open that goes on in the background, from the error that carries it.
+fn take_still_opening(
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+) -> Option<BackgroundOpen> {
+    error.downcast_ref::<StillOpening>()?.1.lock().take()
 }
 
 /// Encoders FFmpeg 7.1 opens under its one process-wide lock
@@ -1114,6 +1764,14 @@ fn open_remaining_encoders<T>(
         }
         match open(name) {
             Ok(state) => return Ok((name, state)),
+            // Every other open in the lane would wait behind it.
+            Err(error) if is_still_opening(error.as_ref()) => {
+                info!(
+                    encoder = name,
+                    "Hardware encoder is still opening; libx264 streams while it opens in the background"
+                );
+                break;
+            }
             Err(error) => {
                 warn!(encoder = name, %error, "Hardware encoder did not open");
                 note(&mut reasons, name, error.to_string());
@@ -1188,6 +1846,154 @@ fn note_nvidia_driver(
     PIPELINE_STATS.lock().nvidia_driver_outdated = true;
 }
 
+/// Hardware encoders that failed to open this launch, each at the encoded
+/// size it failed at. Each is not tried again at that size, so its FFmpeg
+/// errors are logged once instead of at every pipeline start and reopen
+/// (field triage, Nov 2026: 13-44 lines per PC, over and over, for an NVENC
+/// API too old, an AMF component or a Quick Sync session that could not be
+/// created). Forgotten when the user clicks Restart, as the fallback notice
+/// asks after a driver update. A stall is not a failure: the driver did not
+/// answer in time, which says nothing about the encoder.
+#[derive(Default)]
+pub(crate) struct LaunchFailures {
+    opens: Vec<(String, (u32, u32))>,
+    /// AMD and Intel cards whose encoder failed to open: the fallback
+    /// notice asks for their driver update.
+    vendors: Vec<GpuVendor>,
+}
+
+static LAUNCH_FAILURES: parking_lot::Mutex<LaunchFailures> =
+    parking_lot::Mutex::new(LaunchFailures {
+        opens: Vec::new(),
+        vendors: Vec::new(),
+    });
+
+impl LaunchFailures {
+    /// Why `encoder` is not opened at `size`: it failed there this launch.
+    fn earlier(&self, encoder: &str, size: (u32, u32)) -> Option<String> {
+        self.opens
+            .iter()
+            .any(|(name, at)| name == encoder && *at == size)
+            .then(|| {
+                format!(
+                    "{encoder} failed to open at {}x{} earlier in this launch; not tried again until Restart",
+                    size.0, size.1
+                )
+            })
+    }
+
+    /// Whether an encoder named with `suffix` failed this launch.
+    fn any(&self, suffix: &str) -> bool {
+        self.opens.iter().any(|(name, _)| name.ends_with(suffix))
+    }
+
+    /// `encoder` failed to open at `size`, for a reason of its own. When it
+    /// is AMD's or Intel's, and `vendors_present` (read only then) lists
+    /// that vendor's card, that card's driver could not start it.
+    fn failed(
+        &mut self,
+        encoder: &str,
+        size: (u32, u32),
+        vendors_present: impl FnOnce() -> Option<Vec<GpuVendor>>,
+    ) {
+        if !is_hardware_encoder(encoder) || self.earlier(encoder, size).is_some() {
+            return;
+        }
+        self.opens.push((encoder.to_string(), size));
+        let vendor = if encoder.ends_with("_amf") {
+            GpuVendor::Amd
+        } else if encoder.ends_with("_qsv") {
+            GpuVendor::Intel
+        } else {
+            return;
+        };
+        if self.vendors.contains(&vendor)
+            || !vendors_present().is_some_and(|present| present.contains(&vendor))
+        {
+            return;
+        }
+        warn!(
+            %vendor,
+            encoder,
+            "The graphics driver could not start video encoding on this card; video is encoded on the processor unless another graphics card can, and updating the driver may enable hardware encoding"
+        );
+        self.vendors.push(vendor);
+    }
+}
+
+fn is_hardware_encoder(encoder_name: &str) -> bool {
+    ["_nvenc", "_amf", "_qsv"]
+        .iter()
+        .any(|suffix| encoder_name.ends_with(suffix))
+}
+
+/// Forget this launch's failed opens and their driver notes, so the next
+/// pipeline tries every encoder again: the user clicked Restart, maybe
+/// after a driver update.
+pub fn forget_launch_failures() {
+    let forgotten = std::mem::take(&mut *LAUNCH_FAILURES.lock());
+    if !forgotten.opens.is_empty() {
+        info!(
+            encoders = forgotten.opens.len(),
+            "Trying the encoders that failed to open again"
+        );
+    }
+}
+
+/// Opens a session as [`EncoderState::new`] does, unless `encoder_name`
+/// failed to open at this size earlier in this launch, and remembers a
+/// hardware encoder's own failure in `failures`.
+#[allow(clippy::too_many_arguments)]
+fn open_session(
+    failures: &parking_lot::Mutex<LaunchFailures>,
+    encoder_name: &str,
+    capture_width: u32,
+    capture_height: u32,
+    bitrate_bps: u32,
+    target_fps: u32,
+    input_mode: &mut EncoderInput,
+    opening: Opening,
+    progress: &mut dyn FnMut(),
+) -> Result<EncoderState, Box<dyn std::error::Error + Send + Sync>> {
+    let size = encoded_size(capture_width, capture_height);
+    if let Some(why) = failures.lock().earlier(encoder_name, size) {
+        return Err(why.into());
+    }
+    let opened = EncoderState::new(
+        encoder_name,
+        capture_width,
+        capture_height,
+        bitrate_bps,
+        target_fps,
+        input_mode,
+        opening,
+        progress,
+    );
+    if let Err(error) = &opened {
+        note_open_failure(failures, encoder_name, size, error.as_ref());
+    }
+    opened
+}
+
+/// Remembers a hardware encoder's own failure to open at `size`, and shows
+/// its driver note on the Stream page.
+fn note_open_failure(
+    failures: &parking_lot::Mutex<LaunchFailures>,
+    encoder_name: &str,
+    size: (u32, u32),
+    error: &(dyn std::error::Error + Send + Sync + 'static),
+) {
+    if is_open_stall(error) {
+        return;
+    }
+    let vendors = {
+        let mut failures = failures.lock();
+        failures.failed(encoder_name, size, crate::gpu::vendors_present);
+        failures.vendors.clone()
+    };
+    PIPELINE_STATS.lock().driver_update_vendors = vendors;
+}
+
 /// An encoder open that its time limit gave up on, or refused while an
 /// earlier one was stuck. The driver did not answer in time, which says
 /// nothing about whether the encoder works.
@@ -1202,8 +2008,10 @@ impl std::fmt::Display for OpenStalled {
 
 impl std::error::Error for OpenStalled {}
 
+/// An open given up on or refused, or one still going on in the background:
+/// neither says the encoder does not work.
 fn is_open_stall(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
-    error.downcast_ref::<OpenStalled>().is_some()
+    error.downcast_ref::<OpenStalled>().is_some() || is_still_opening(error)
 }
 
 /// Opens at the pixel format `input` picks from `supported`. When nothing
@@ -1233,6 +2041,51 @@ fn open_at_input<T>(
             open(select_input(*input, encoder_name, supported)?)
         }
         result => result,
+    }
+}
+
+/// A reopen, for its log line and for what follows if it fails.
+struct Reopening {
+    encoder: String,
+    /// The bitrate of the session it replaces.
+    from: u32,
+    /// The session that streams until it opens.
+    current: String,
+    reason: &'static str,
+    size_changed: bool,
+    keyframe: bool,
+    bitrate: u32,
+    fps: u32,
+    /// The pipeline's first open, which went on past its first picture's
+    /// wait (see [`FIRST_PICTURE_WAIT`]).
+    first: bool,
+    in_background: bool,
+}
+
+/// An open going on in the background, and the reopen it makes once it
+/// returns.
+struct Behind {
+    open: BackgroundOpen,
+    reopen: Reopening,
+}
+
+impl Behind {
+    /// The pipeline's first open of `open`'s encoder, while libx264 streams
+    /// at `bitrate`.
+    fn first(open: BackgroundOpen, bitrate: u32) -> Self {
+        let reopen = Reopening {
+            encoder: open.encoder().to_string(),
+            from: bitrate,
+            current: "libx264".to_string(),
+            reason: "recovery",
+            size_changed: false,
+            keyframe: false,
+            bitrate: open.args.bitrate_bps,
+            fps: open.args.target_fps,
+            first: true,
+            in_background: true,
+        };
+        Self { open, reopen }
     }
 }
 
@@ -1380,6 +2233,20 @@ impl StallRecovery {
         true
     }
 
+    /// The pipeline's first open of `preferred` had not returned when its
+    /// first picture was due, and goes on in the background while `using`
+    /// streams. If it opens, [`Self::opened`] ends the recovery. If it is
+    /// given up on at its limit, the first try is due once the lane is
+    /// clear, as after an open that stalled while the stream waited.
+    fn outwaited(&mut self, preferred: &str, using: &str, now: Instant) {
+        self.trying = false;
+        self.owed = Some(Owed {
+            preferred: preferred.to_string(),
+            using: using.to_string(),
+            next_try: now + STALL_RETRY_WAITS[0],
+        });
+    }
+
     /// No more tries this generation.
     fn end(&mut self) {
         self.owed = None;
@@ -1415,14 +2282,21 @@ fn reopen_needed(
 /// ABR step just after an AMF keyframe reopen) reopens once.
 const BITRATE_DECREASE_GAP: Duration = Duration::from_secs(1);
 
-/// Paces reopens for a bitrate decrease alone. Hardware encoders (and
+/// How long after a Quick Sync session opened a bitrate change alone may
+/// wait, up or down, once Quick Sync refused to take one in place (see
+/// [`takes_bitrate_in_place`]): each of its reopens freezes the picture
+/// for about 0.6 s, and one PC in the field reopened 148 times.
+const QSV_BITRATE_REOPEN_GAP: Duration = Duration::from_secs(5);
+
+/// Paces reopens for a bitrate change alone. Hardware encoders (and
 /// libx265) take a new bitrate only by reopening, and each reopen costs an
 /// IDR and a visible stutter. A decrease takes effect at once, or 1 s after
 /// the session opened if that is later, so the stream never overruns a
 /// congested link more than 1 s longer than before, and a decrease right
 /// after another reopen does not make a second one at once. An increase
 /// takes effect at once, as do codec, frame rate, size, keyframe and
-/// recovery reopens, and every reopen opens at the newest target.
+/// recovery reopens, and every reopen opens at the newest target. Quick
+/// Sync, whose reopens are slowest, waits 5 s for either.
 #[derive(Default)]
 struct BitratePacer {
     /// When the open session opened, for any reason.
@@ -1432,14 +2306,21 @@ struct BitratePacer {
 impl BitratePacer {
     /// The bitrate this frame wants. `opened` and `wanted` are encoder,
     /// bitrate and frame rate. The newest target, unless only the bitrate
-    /// differs, downwards, within 1 s of the session's open: then the
-    /// session's own.
+    /// differs, downwards, within 1 s of the session's open, or either way
+    /// within 5 s of a Quick Sync session's: then the session's own.
     fn wanted(&self, opened: (&str, u32, u32), wanted: (&str, u32, u32), now: Instant) -> u32 {
+        let gap = if opened.0.ends_with("_qsv") {
+            QSV_BITRATE_REOPEN_GAP
+        } else if wanted.1 < opened.1 {
+            BITRATE_DECREASE_GAP
+        } else {
+            Duration::ZERO
+        };
         let waits = (opened.0, opened.2) == (wanted.0, wanted.2)
-            && wanted.1 < opened.1
+            && wanted.1 != opened.1
             && self
                 .opened_at
-                .is_some_and(|at| now.duration_since(at) < BITRATE_DECREASE_GAP);
+                .is_some_and(|at| now.duration_since(at) < gap);
         if waits {
             opened.1
         } else {
@@ -1625,6 +2506,161 @@ pub fn ignores_forced_keyframes(encoder_name: &str) -> bool {
     matches!(encoder_name, "h264_amf" | "hevc_amf")
 }
 
+/// True for encoders that keep each frame until they are given the next.
+/// FFmpeg 7.1's AMF wrapper asks AMF for output only when it submits a frame
+/// (8.0 can wait for it, with `query_timeout`). On a still desktop a new
+/// viewer's opening keyframe sat inside AMF until capture's next picture,
+/// the 750 ms keepalive: AMD PCs were slow on 39-56% of reconnects.
+pub fn holds_last_frame(encoder_name: &str) -> bool {
+    matches!(encoder_name, "h264_amf" | "hevc_amf")
+}
+
+/// The shortest wait for capture's next picture before an encoder that
+/// [holds its last frame](holds_last_frame) is given the last picture again,
+/// to bring out a session's first keyframe: longer than AMF takes to encode
+/// one. See [`keyframe_flush_wait`].
+const KEYFRAME_FLUSH_WAIT: Duration = Duration::from_millis(20);
+
+/// A gap between capture's real pictures shorter than this is the desktop's
+/// pace while it moves; a longer one is an idle spell, which says nothing
+/// about the pace (capture resends a still picture after 100 ms for a
+/// keyframe request, else at its 750 ms keepalive).
+const MOVING_GAP: Duration = Duration::from_millis(100);
+/// After an idle spell this long, the pace seen before it is forgotten.
+const PACE_FORGOTTEN: Duration = Duration::from_secs(10);
+
+/// How long the encode loop waits for capture's next picture, after encoding
+/// `cached` (see [`RawFrame::cached`]), before it gives that picture again.
+/// After a cached picture of a still desktop no picture is due, so the
+/// shortest wait brings the keyframe out soonest. After a real one, a frame
+/// and a half: of the target rate, or of capture's pace while the desktop
+/// moves (`pace`) when that is slower, as for a 50 Hz display streamed at
+/// 60 fps or 30 fps content. A flat 20 ms gave those pictures to AMF twice.
+fn keyframe_flush_wait(target_fps: u32, cached: bool, pace: Option<Duration>) -> Duration {
+    if cached {
+        return KEYFRAME_FLUSH_WAIT;
+    }
+    let frame = crate::capture::frame_budget_for(target_fps).max(pace.unwrap_or_default());
+    (frame * 3 / 2).max(KEYFRAME_FLUSH_WAIT)
+}
+
+/// The pace of capture's real pictures, measured only between real pictures
+/// and kept across idle spells: motion that resumes keeps its pace.
+#[derive(Default)]
+struct CaptureCadence {
+    last: Option<Instant>,
+    gaps: std::collections::VecDeque<Duration>,
+}
+
+impl CaptureCadence {
+    const KEPT: usize = 8;
+
+    /// A picture from capture (not one given again).
+    fn captured(&mut self, at: Instant, cached: bool) {
+        if cached {
+            return;
+        }
+        if let Some(last) = self.last.replace(at) {
+            let gap = at.saturating_duration_since(last);
+            if gap < MOVING_GAP {
+                if self.gaps.len() == Self::KEPT {
+                    self.gaps.pop_front();
+                }
+                self.gaps.push_back(gap);
+            } else if gap >= PACE_FORGOTTEN {
+                self.gaps.clear();
+            }
+        }
+    }
+
+    /// The longest recent gap between real pictures while the desktop moved,
+    /// if any were seen.
+    fn pace(&self) -> Option<Duration> {
+        self.gaps.iter().copied().max()
+    }
+}
+
+/// How long after the keyframe went in the last picture is given again,
+/// before the keyframe is left to capture's next picture: an AMD driver can
+/// take a few hundred ms to encode a fresh session's first frame, and
+/// capture's keepalive follows at 750 ms.
+const KEYFRAME_FLUSH_FOR: Duration = Duration::from_millis(500);
+
+/// A session's first keyframe still inside an encoder that holds its last
+/// frame, and the picture to give it again.
+struct OwedKeyframe {
+    /// The last picture encoded. It pins one of capture's few buffers.
+    picture: Option<RawFrame>,
+    /// When the picture stops being given again.
+    until: Instant,
+    /// How long to wait for capture's next picture first.
+    wait: Duration,
+    given: u32,
+}
+
+/// What the encode loop encodes next while a keyframe is owed.
+enum Next {
+    Frame(RawFrame),
+    /// The last picture, given again.
+    Again(RawFrame),
+    Closed,
+    /// The deadline passed: capture's next picture brings the keyframe out.
+    GaveUp,
+}
+
+impl OwedKeyframe {
+    fn until(until: Instant) -> Self {
+        Self {
+            picture: None,
+            until,
+            wait: KEYFRAME_FLUSH_WAIT,
+            given: 0,
+        }
+    }
+
+    /// What is owed after a frame was submitted at `submitted`: nothing once
+    /// the keyframe came out or the encoder holds no frame, else `picture`
+    /// to give again after `wait`, until [`KEYFRAME_FLUSH_FOR`] after the
+    /// first try.
+    fn after_encode(
+        owed: Option<Self>,
+        picture: Option<RawFrame>,
+        keyframe_out: bool,
+        submitted: Instant,
+        wait: Duration,
+    ) -> Option<Self> {
+        let picture = picture.filter(|_| !keyframe_out)?;
+        let mut owed = owed.unwrap_or_else(|| Self::until(submitted + KEYFRAME_FLUSH_FOR));
+        owed.picture = Some(picture);
+        owed.wait = wait;
+        Some(owed)
+    }
+
+    /// Capture's next picture if one arrives within the wait, else the last
+    /// picture again, until the deadline.
+    fn next(&mut self, frames: &FrameSlot) -> Next {
+        let wait = self
+            .wait
+            .min(self.until.saturating_duration_since(Instant::now()));
+        match frames.take_within(wait, &mut self.picture) {
+            Taken::Frame(frame) => Next::Frame(frame),
+            Taken::Closed => Next::Closed,
+            Taken::Nothing => match self.picture.take() {
+                Some(picture) if Instant::now() < self.until => {
+                    self.given += 1;
+                    debug!(
+                        frame = picture.frame_number,
+                        given = self.given,
+                        "Giving the encoder its last picture again to bring out the keyframe"
+                    );
+                    Next::Again(picture)
+                }
+                _ => Next::GaveUp,
+            },
+        }
+    }
+}
+
 /// Whether a pending keyframe request needs a session reopen: the encoder
 /// ignores per-frame requests, the session has already sent its opening IDR,
 /// and the last such reopen is older than the client's own request limit.
@@ -1667,7 +2703,8 @@ fn codec_display_name_for(encoder_name: &str) -> &str {
 
 /// After every successful encoder open: report the live codec on the wire
 /// (HELLO_ACK/heartbeat `StreamConfig.codec`) and in the GUI.
-fn note_encoder_opened(shared: &SharedControl, encoder_name: &str) {
+fn note_encoder_opened(shared: &SharedControl, encoder_name: &str, gpu: &GpuInfo) {
+    *shared.wake_adapter.lock() = crate::gpu_wake::wake_adapter_for(encoder_name, gpu);
     let codec = if is_hevc_encoder(encoder_name) {
         eternal_wire::v2::control::CODEC_HEVC
     } else {
@@ -1816,7 +2853,17 @@ fn prepare_frame_for_encode(
         } else {
             "period"
         };
-        if is_amf {
+        // The period runs all stream long, and FFmpeg 7.1's AMF ignores it
+        // (see `ignores_forced_keyframes`): debug only.
+        if !force_hit {
+            debug!(
+                encoder = encoder_name,
+                frame = frame_number,
+                period = AMF_FORCED_INTRA_PERIOD,
+                reason,
+                "[AMF] Forced IDR"
+            );
+        } else if is_amf {
             info!(
                 encoder = encoder_name,
                 frame = frame_number,
@@ -2323,6 +3370,204 @@ mod tests {
         assert_eq!(labels, (480..490).map(|n| (at(n), n)).collect::<Vec<_>>());
     }
 
+    fn libx264_at(width: u32, height: u32) -> EncoderState {
+        EncoderState::new(
+            "libx264",
+            width,
+            height,
+            8_000_000,
+            60,
+            &mut EncoderInput::Yuv420,
+            Opening::First,
+            &mut || {},
+        )
+        .unwrap_or_else(|error| panic!("{width}x{height}: {error}"))
+    }
+
+    /// swscale gets threads only where it converts every frame: with
+    /// Accelerate converting on macOS it is a fallback and runs on one.
+    #[test]
+    fn swscale_gets_threads_only_where_it_converts_every_frame() {
+        let state = libx264_at(96, 64);
+        let scaler = state.scaler.as_ref().expect("x264 takes YUV420P");
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            (state.native_converter.is_some(), scaler.threads()),
+            (true, 1)
+        );
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(scaler.threads(), input::scaler_threads());
+    }
+
+    /// A synthetic capture, in a buffer as capture hands it over.
+    fn synthetic_capture(width: u32, height: u32, frame_number: u64) -> Vec<u8> {
+        let frame_bytes = width as usize * 4 * height as usize;
+        let mut rows = crate::capture::frame_buffer(frame_bytes);
+        crate::capture::synthetic::render_synthetic_frame(
+            &mut rows[..frame_bytes],
+            width,
+            height,
+            frame_number,
+        );
+        rows
+    }
+
+    /// A screen with an odd height (1680x945, from a report) or width
+    /// streams: libx264 refused to open at those sizes, and the pipeline
+    /// gave up after six restarts. The encoder opens at the even size below,
+    /// takes the capture's frames, and they decode at that size with the
+    /// picture intact.
+    #[test]
+    fn odd_screen_sizes_encode_at_the_even_size_below() {
+        ffmpeg_next::init().unwrap();
+        for ((width, height), encoded) in [
+            ((1680, 945), (1680, 944)),
+            ((1365, 768), (1364, 768)),
+            ((641, 361), (640, 360)),
+            ((1366, 768), (1366, 768)),
+        ] {
+            let mut state = libx264_at(width, height);
+            assert_eq!((state.frame.width(), state.frame.height()), encoded);
+            // The same capture size never reopens the session; another does.
+            assert!(state.accepts_frame(width, height));
+            assert!(!state.accepts_frame(width + 2, height));
+            assert!(!state.accepts_frame(width, height + 2));
+            let codec = ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::H264).unwrap();
+            let mut decoder = ffmpeg_next::codec::Context::new_with_codec(codec)
+                .decoder()
+                .video()
+                .unwrap();
+            let mut decoded = ffmpeg_next::frame::Video::empty();
+            let mut counters = Vec::new();
+            let start = Instant::now();
+            for n in 1..=10u64 {
+                let rows = synthetic_capture(width, height, n);
+                state.convert(&rows, width as usize * 4).unwrap();
+                let captured = start + Duration::from_micros(n * 16_667);
+                let pts = state.next_pts(captured, n);
+                state.frame.set_pts(Some(pts));
+                state.send_frame(pts, captured, n).unwrap();
+                while state.encoder.receive_packet(&mut state.packet).is_ok() {
+                    if state.h264.needs_parameter_sets() {
+                        state
+                            .h264
+                            .refresh_parameter_sets_from_extradata(encoder_extradata(
+                                &state.encoder,
+                            ));
+                    }
+                    // What the transport sends: Annex B with parameter sets.
+                    let (annex_b, _) = normalize_h264_payload_with_info(
+                        state.packet.data().unwrap_or_default(),
+                        state.packet.is_key(),
+                        &mut state.h264,
+                        &state.opened_encoder,
+                    );
+                    decoder
+                        .send_packet(&ffmpeg_next::Packet::copy(&annex_b))
+                        .unwrap();
+                    while decoder.receive_frame(&mut decoded).is_ok() {
+                        assert_eq!((decoded.width(), decoded.height()), encoded);
+                        counters.push(crate::capture::synthetic::decode_frame_counter_from_luma(
+                            decoded.data(0),
+                            decoded.stride(0),
+                            encoded.0,
+                        ));
+                    }
+                }
+            }
+            assert_eq!(
+                counters,
+                (1..=counters.len() as u64).collect::<Vec<_>>(),
+                "{width}x{height}"
+            );
+            assert!(counters.len() >= 5, "{width}x{height}: {counters:?}");
+        }
+    }
+
+    /// The rows of each of `frame`'s planes that hold the picture.
+    fn picture(frame: &ffmpeg_next::frame::Video) -> Vec<Vec<u8>> {
+        use ffmpeg_next::format::Pixel;
+        let mut rows = Vec::new();
+        for plane in 0..frame.planes() {
+            let bytes = match (frame.format(), plane) {
+                (Pixel::BGRA | Pixel::BGRZ, _) => frame.width() as usize * 4,
+                (Pixel::NV12, 1) => frame.plane_width(1) as usize * 2,
+                _ => frame.plane_width(plane) as usize,
+            };
+            for y in 0..frame.plane_height(plane) as usize {
+                rows.push(frame.data(plane)[y * frame.stride(plane)..][..bytes].to_vec());
+            }
+        }
+        rows
+    }
+
+    /// A capture with an odd last column or row encodes exactly what the
+    /// rest of it, alone, does: the crop leaves that column and row out and
+    /// resamples nothing, on every input path (swscale to YUV420P and NV12,
+    /// Accelerate on macOS, the BGRA copy NVENC reads), with or without
+    /// padding after the capture's last row.
+    #[test]
+    fn cropping_changes_no_pixel_of_the_picture() {
+        use ffmpeg_next::format::Pixel;
+        ffmpeg_next::init().unwrap();
+        for (width, height) in [(1365u32, 945u32), (1365, 944), (1366, 945)] {
+            let (even_width, even_height) = encoded_size(width, height);
+            let capture = synthetic_capture(width, height, 77);
+            let row_bytes = width as usize * 4;
+            let unpadded = &capture[..row_bytes * height as usize];
+            // The capture's top-left even_width x even_height, alone.
+            let even_bytes = even_width as usize * 4;
+            let mut alone = crate::capture::frame_buffer(even_bytes * even_height as usize);
+            for y in 0..even_height as usize {
+                alone[y * even_bytes..][..even_bytes]
+                    .copy_from_slice(&capture[y * row_bytes..][..even_bytes]);
+            }
+            let mut paths = vec!["YUV420P", "NV12", "BGRA"];
+            if cfg!(target_os = "macos") {
+                paths.push("Accelerate");
+            }
+            for path in paths {
+                let label = format!("{width}x{height} {path}");
+                let mut state = libx264_at(width, height);
+                // The frame and conversion an encoder that takes `path` has.
+                #[cfg(target_os = "macos")]
+                if path != "Accelerate" {
+                    state.native_converter = None;
+                }
+                let format = match path {
+                    "NV12" => Pixel::NV12,
+                    "BGRA" => Pixel::BGRA,
+                    _ => Pixel::YUV420P,
+                };
+                state.frame = ffmpeg_next::frame::Video::new(format, even_width, even_height);
+                state.scaler = input::conversion_context(
+                    format,
+                    even_width,
+                    even_height,
+                    input::scaler_threads(),
+                )
+                .unwrap();
+                assert_eq!(state.scaler.is_some(), format != Pixel::BGRA);
+                state.convert(&alone, even_bytes).unwrap();
+                let expected = picture(&state.frame);
+                for rows in [&capture[..], unpadded] {
+                    state.frame = ffmpeg_next::frame::Video::new(format, even_width, even_height);
+                    state.convert(rows, row_bytes).unwrap();
+                    assert_eq!(picture(&state.frame), expected, "{label}");
+                }
+                // Accelerate converted each, with no fallback to swscale.
+                #[cfg(target_os = "macos")]
+                assert_eq!(state.native_converter.is_some(), path == "Accelerate");
+                if format == Pixel::BGRA {
+                    let rows = capture.chunks(row_bytes).take(even_height as usize);
+                    for (y, row) in rows.enumerate() {
+                        assert_eq!(expected[y], row[..even_bytes], "{label} row {y}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn nvenc_and_qsv_make_a_requested_keyframe_an_idr() {
         for (name, option) in [
@@ -2644,9 +3889,19 @@ mod tests {
             .with_ansi(false)
             .with_writer(move || Sink(Arc::clone(&writer)))
             .finish();
+        crate::logging::prepare_log_capture();
         let result = tracing::subscriber::with_default(subscriber, run);
         let lines = String::from_utf8(out.lock().clone()).unwrap();
         (result, lines.lines().map(str::to_string).collect())
+    }
+
+    /// An open that returned, as every open but a wait-limited one in the
+    /// lane does.
+    fn now(opened: Opened) -> OpenResult {
+        match opened {
+            Opened::Now(result) => result,
+            Opened::Behind(_) => panic!("the open went on in the background"),
+        }
     }
 
     /// A real FFmpeg open that fails with an FFmpeg error line: libx264,
@@ -2662,7 +3917,13 @@ mod tests {
         video.set_format(ffmpeg_next::format::Pixel::YUV420P);
         video.set_time_base(ffmpeg_next::Rational(1, 60));
         let (opened, lines) = logged(|| {
-            open_encoder_on(crate::stall::lanes(), video, "libx264", opening, &mut || {})
+            now(open_encoder_on(
+                crate::stall::lanes(),
+                video,
+                "libx264",
+                opening,
+                &mut || {},
+            ))
         });
         assert!(matches!(opened, Ok(Err(_))), "the open must fail");
         lines
@@ -2673,7 +3934,7 @@ mod tests {
 
     #[test]
     fn ffmpeg_errors_are_warnings_only_while_an_encoder_is_one_of_several() {
-        let probed = failing_open(Opening::Probe);
+        let probed = failing_open(Opening::Probe(Instant::now() + FIRST_PICTURE_WAIT));
         assert!(!probed.is_empty());
         assert!(
             probed
@@ -2696,14 +3957,15 @@ mod tests {
             );
         }
         // The pipeline's first open probes, except the last resort.
-        assert_eq!(first_open("h264_nvenc"), Opening::Probe);
-        assert_eq!(first_open("hevc_amf"), Opening::Probe);
-        assert_eq!(first_open("libx265"), Opening::Probe);
-        assert_eq!(first_open("h264_videotoolbox"), Opening::Probe);
-        assert_eq!(first_open("libx264"), Opening::First);
+        let by = Instant::now() + FIRST_PICTURE_WAIT;
+        assert_eq!(first_open("h264_nvenc", by), Opening::Probe(by));
+        assert_eq!(first_open("hevc_amf", by), Opening::Probe(by));
+        assert_eq!(first_open("libx265", by), Opening::Probe(by));
+        assert_eq!(first_open("h264_videotoolbox", by), Opening::Probe(by));
+        assert_eq!(first_open("libx264", by), Opening::First);
         // A probe has the first open's limits.
         assert_eq!(
-            open_limits("h264_qsv", Opening::Probe),
+            open_limits("h264_qsv", Opening::Probe(Instant::now())),
             open_limits("h264_qsv", Opening::First)
         );
     }
@@ -3002,8 +4264,19 @@ mod tests {
         /// Encoder, bitrate and frame rate of the open session.
         opened: (String, u32, u32),
         pacer: BitratePacer,
-        /// Bitrate changes the open libx264 session took in place.
+        /// Bitrate changes the open libx264 or Quick Sync session took in
+        /// place.
         in_place: usize,
+        /// A Quick Sync session refused a bitrate change in place.
+        qsv_refused: bool,
+        /// An NVENC session did: a card that cannot change its bitrate live.
+        nvenc_refused: bool,
+        /// Whether FFmpeg reconfigures an NVENC session for a change made
+        /// in place (see `nvenc_reconfigured`).
+        nvenc_reconfigures: bool,
+        /// The session was dropped after a refused change; the next frame
+        /// opens one, as the encode loop's first open does.
+        dropped: bool,
         /// The user's preference.
         hevc_wanted: bool,
         bitrate: u32,
@@ -3030,6 +4303,12 @@ mod tests {
                 opened: (opened.to_string(), 15_000_000, 60),
                 pacer: BitratePacer::default(),
                 in_place: 0,
+                qsv_refused: false,
+                // As on a card that cannot change its bitrate live: these
+                // tests reopen NVENC sessions with bitrate changes.
+                nvenc_refused: true,
+                nvenc_reconfigures: true,
+                dropped: false,
                 hevc_wanted: is_hevc_encoder(opened),
                 bitrate: 15_000_000,
                 fps: 60,
@@ -3064,11 +4343,28 @@ mod tests {
                 self.session.is_some() && !client_hevc && is_hevc_encoder(&self.opened.0);
             self.undecodable_retry
                 .frame(undecodable, &mut self.failed_reopen, self.now);
-            // As `update_bitrate_without_reopening`.
-            if (self.opened.0.as_str(), self.opened.2) == ("libx264", self.fps)
-                && desired == "libx264"
+            if std::mem::take(&mut self.dropped) {
+                self.opened = (desired.clone(), self.bitrate, self.fps);
+                self.pacer.opened(self.now);
+                self.failed_reopen = None;
+                return Some(desired);
+            }
+            // As `update_bitrate_without_reopening`, settled at the end of
+            // the frame: a refused NVENC change drops the session.
+            if takes_bitrate_in_place(&self.opened.0, |live| match live {
+                LiveBitrate::QsvReset => self.qsv_refused,
+                LiveBitrate::NvencReconfig => self.nvenc_refused,
+                LiveBitrate::X264 => false,
+            }) && (self.opened.0.as_str(), self.opened.2) == (desired.as_str(), self.fps)
                 && self.opened.1 != self.bitrate
             {
+                if LiveBitrate::of(&self.opened.0) == Some(LiveBitrate::NvencReconfig)
+                    && !self.nvenc_reconfigures
+                {
+                    self.nvenc_refused = true;
+                    self.dropped = true;
+                    return None;
+                }
                 self.opened.1 = self.bitrate;
                 self.failed_reopen = None;
                 self.in_place += 1;
@@ -3605,10 +4901,12 @@ mod tests {
 
     #[test]
     fn a_reopen_goes_ahead_as_soon_as_the_lane_clears_whenever_a_try_is_due() {
-        // QSV streams. ABR steps stall its reopen, twice: the next tries
+        // QSV streams, and reopens for a bitrate change since it refused
+        // one in place. ABR steps stall its reopen, twice: the next tries
         // are due 2 s and then 8 s later. Each time the lane clears 1 s
         // after the stall, and a bitrate change reopens on the next frame.
         let mut p = Pipeline::new("h264_qsv", "h264_qsv", Instant::now());
+        p.qsv_refused = true;
         for (bitrate, stalls) in [(10_000_000, true), (12_000_000, true), (14_000_000, false)] {
             p.bitrate = bitrate;
             let reopen = if stalls {
@@ -3719,13 +5017,9 @@ mod tests {
 
     #[test]
     fn a_drop_reopens_at_once_or_within_a_second_of_the_last_open() {
-        for name in [
-            "h264_nvenc",
-            "h264_amf",
-            "h264_qsv",
-            "hevc_nvenc",
-            "libx265",
-        ] {
+        // Quick Sync takes a new bitrate in place; see
+        // `quick_sync_takes_every_bitrate_change_in_place_until_it_refuses_one`.
+        for name in ["h264_nvenc", "h264_amf", "hevc_nvenc", "libx265"] {
             let h264 = match name {
                 "hevc_nvenc" => "h264_nvenc",
                 "libx265" => "libx264",
@@ -3910,6 +5204,711 @@ mod tests {
     }
 
     #[test]
+    fn quick_sync_takes_every_bitrate_change_in_place_until_it_refuses_one() {
+        for name in ["libx264", "h264_qsv", "hevc_qsv"] {
+            assert!(takes_bitrate_in_place(name, |_| false), "{name}");
+        }
+        for name in ["h264_amf", "hevc_amf", "libx265"] {
+            assert!(!takes_bitrate_in_place(name, |_| false), "{name}");
+        }
+        assert!(!takes_bitrate_in_place("h264_qsv", |_| true));
+        assert!(takes_bitrate_in_place("libx264", |_| true));
+        // As libx264: rises and drops, some within a second of each other,
+        // each on the frame it arrives, and no reopen. The field's worst PC
+        // reopened Quick Sync 148 times, about 0.6 s of frozen picture each.
+        let t0 = Instant::now();
+        let mut p = Pipeline::new("h264_qsv", "h264_qsv", t0);
+        for (at, bitrate) in [
+            (0, 12_000_000),
+            (100, 10_000_000),
+            (5_000, 15_000_000),
+            (5_100, 12_000_000),
+        ] {
+            p.now = t0 + Duration::from_millis(at);
+            p.bitrate = bitrate;
+            assert_eq!(p.frame(Reopen::Opens), None, "at {at} ms");
+            assert_eq!(p.opened.1, bitrate, "at {at} ms");
+        }
+        assert_eq!(p.in_place, 4);
+        // A frame rate change still reopens.
+        p.fps = 30;
+        assert_eq!(p.frame(Reopen::Opens).as_deref(), Some("h264_qsv"));
+        // Once a session refused a change, a change reopens, at most every
+        // 5 s, rises too: here 5 s after that frame rate reopen, and 5 s
+        // after the previous bitrate reopen.
+        p.qsv_refused = true;
+        let reopens = play(
+            &mut p,
+            &[
+                (0, Some(10_000_000)),
+                (1_000, Some(14_000_000)),
+                (6_000, Some(8_000_000)),
+                (6_500, Some(9_000_000)),
+            ],
+            15_000,
+        );
+        assert_eq!(reopens, [(5_008, 14_000_000), (10_016, 9_000_000)]);
+        assert_eq!(p.in_place, 4);
+    }
+
+    #[test]
+    fn a_quick_sync_bitrate_reopen_waits_5_s_for_either_direction() {
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut pacer = BitratePacer::default();
+        pacer.opened(t0);
+        let qsv = ("h264_qsv", 10_000_000, 60);
+        assert_eq!(
+            pacer.wanted(qsv, ("h264_qsv", 12_000_000, 60), at(1_000)),
+            10_000_000
+        );
+        assert_eq!(
+            pacer.wanted(qsv, ("h264_qsv", 8_000_000, 60), at(4_999)),
+            10_000_000
+        );
+        assert_eq!(
+            pacer.wanted(qsv, ("h264_qsv", 8_000_000, 60), at(5_000)),
+            8_000_000
+        );
+        assert_eq!(
+            pacer.wanted(qsv, ("h264_qsv", 12_000_000, 60), at(5_000)),
+            12_000_000
+        );
+        // A frame rate or codec change goes ahead at the newest target.
+        assert_eq!(
+            pacer.wanted(qsv, ("h264_qsv", 12_000_000, 30), at(10)),
+            12_000_000
+        );
+        assert_eq!(
+            pacer.wanted(qsv, ("hevc_qsv", 12_000_000, 60), at(10)),
+            12_000_000
+        );
+        // Other encoders keep #165's pacing: a rise at once, a drop 1 s on.
+        let nvenc = ("h264_nvenc", 10_000_000, 60);
+        assert_eq!(
+            pacer.wanted(nvenc, ("h264_nvenc", 12_000_000, 60), at(10)),
+            12_000_000
+        );
+        assert_eq!(
+            pacer.wanted(nvenc, ("h264_nvenc", 8_000_000, 60), at(999)),
+            10_000_000
+        );
+        assert_eq!(
+            pacer.wanted(nvenc, ("h264_nvenc", 8_000_000, 60), at(1_000)),
+            8_000_000
+        );
+    }
+
+    /// A clock that stands still until the test moves it: the ms since the
+    /// test began are in the returned atomic.
+    fn paused_clock() -> (
+        std::sync::Arc<std::sync::atomic::AtomicU64>,
+        impl Fn() -> Instant + Clone + Send + 'static,
+    ) {
+        let start = Instant::now();
+        let ms = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let read = std::sync::Arc::clone(&ms);
+        (ms, move || {
+            start + Duration::from_millis(read.load(Ordering::SeqCst))
+        })
+    }
+
+    /// A fake hardware open of `name` in `lanes`, on `clock`, that hangs
+    /// until the returned sender sends, then opens.
+    fn hung_open<N: Fn() -> Instant>(
+        lanes: &'static crate::stall::Lanes,
+        name: &'static str,
+        opening: Opening,
+        clock: N,
+    ) -> (
+        std::sync::mpsc::Sender<()>,
+        crate::stall::Pending<&'static str, N>,
+    ) {
+        let (release, hang) = stuck_open();
+        let pending = crate::stall::start_in(
+            lanes,
+            crate::stall::Call::EncoderOpen,
+            crate::stall::Wait {
+                limits: open_limits(name, opening),
+                slice: Duration::from_millis(1),
+                now: clock,
+            },
+            move || {
+                hang();
+                name
+            },
+            crate::stall::no_hooks(),
+        )
+        .unwrap();
+        (release, pending)
+    }
+
+    /// Waits for the pipeline's first open as the encode loop does, as
+    /// `opening` says, each 1 ms heartbeat moving the paused clock 100 ms on.
+    fn first_open_of<N: Fn() -> Instant>(
+        pending: crate::stall::Pending<&'static str, N>,
+        opening: Opening,
+        ms: &std::sync::atomic::AtomicU64,
+    ) -> Result<Result<&'static str, crate::stall::Stall>, crate::stall::Pending<&'static str, N>>
+    {
+        wait_or_park(pending, opening, &mut || {
+            ms.fetch_add(100, Ordering::SeqCst);
+        })
+    }
+
+    #[test]
+    fn time_before_the_open_starts_counts_against_the_first_pictures_wait() {
+        let lanes: &'static crate::stall::Lanes = Box::leak(Box::new(crate::stall::Lanes::new()));
+        let (ms, clock) = paused_clock();
+        let opening = Opening::Probe(clock() + FIRST_PICTURE_WAIT);
+        // 2.2 s go by before the open's thread is running, as Windows once
+        // took to start one on a loaded PC.
+        ms.store(2_200, Ordering::SeqCst);
+        let (release, pending) = hung_open(lanes, "h264_nvenc", opening, clock.clone());
+        let Err(parked) = first_open_of(pending, opening, &ms) else {
+            panic!("the hung open returned")
+        };
+        // Parked when the picture was due, 3 s after it was asked for, not
+        // 3 s after the thread began.
+        assert_eq!(ms.load(Ordering::SeqCst), 3_000);
+        assert_eq!(parked.running_for(), Duration::from_millis(800));
+        release.send(()).unwrap();
+        drop(parked);
+        wait_for_clear_lane(lanes);
+        // Due before the open even starts: parked at once.
+        ms.store(4_000, Ordering::SeqCst);
+        let (release, pending) = hung_open(lanes, "h264_amf", opening, clock);
+        let Err(parked) = wait_or_park(pending, opening, &mut || panic!("it waited")) else {
+            panic!("returned")
+        };
+        assert_eq!(parked.running_for(), Duration::ZERO);
+        release.send(()).unwrap();
+        drop(parked);
+        wait_for_clear_lane(lanes);
+    }
+
+    #[test]
+    fn a_hung_first_open_leaves_the_picture_to_libx264_when_it_is_due() {
+        let lanes: &'static crate::stall::Lanes = Box::leak(Box::new(crate::stall::Lanes::new()));
+        let (ms, clock) = paused_clock();
+        let ((parked, opened_late), lines) = logged(|| {
+            let opening = Opening::Probe(clock() + FIRST_PICTURE_WAIT);
+            let (release, pending) = hung_open(lanes, "h264_qsv", opening, clock.clone());
+            let Err(mut parked) = first_open_of(pending, opening, &ms) else {
+                panic!("the hung open returned")
+            };
+            // Given up waiting for when the first picture was due, 7 s
+            // before the iPad's timeout; not given up on.
+            let parked_at = parked.running_for();
+            // libx264 needs no lane and opens at once. Every hardware open
+            // is refused at once instead of waiting on FFmpeg's lock.
+            assert_eq!(
+                open_in(lanes, "libx264", Opening::First, || {}).unwrap(),
+                "libx264"
+            );
+            for name in ["h264_nvenc", "h264_amf", "hevc_qsv", "libx265"] {
+                let error = open_in(lanes, name, Opening::First, || {}).unwrap_err();
+                assert!(is_open_stall(error.as_ref()), "{name}: {error}");
+                assert!(error.to_string().contains("not started"), "{error}");
+            }
+            // The stream: libx264 while QSV opens.
+            let t0 = Instant::now();
+            let at = |ms: u64| t0 + Duration::from_millis(ms);
+            let mut recovery = StallRecovery::default();
+            recovery.outwaited("h264_qsv", "libx264", at(3_000));
+            for ms in [3_000, 4_000, 5_000, 14_000] {
+                assert_eq!(
+                    recovery.encoder_for_frame("h264_qsv", at(ms), lane_clear(lanes)),
+                    "libx264",
+                    "at {ms} ms"
+                );
+            }
+            // QSV opens at 4.4 s, the slowest open in the field, within
+            // its 15 s limit: the stream takes that very session.
+            ms.store(4_400, Ordering::SeqCst);
+            assert!(parked.poll().is_none());
+            release.send(()).unwrap();
+            wait_for_clear_lane(lanes);
+            let opened = parked.poll();
+            assert!(recovery.opened("h264_qsv", "h264_qsv"));
+            assert!(recovery.owed.is_none());
+            assert_eq!(recovery.tries, 0);
+            (parked_at, opened)
+        });
+        assert_eq!(parked, FIRST_PICTURE_WAIT);
+        assert_eq!(opened_late, Some(Ok("h264_qsv")));
+        assert!(
+            !lines.iter().any(|line| line.contains("stall=encoder_open")),
+            "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn an_open_that_returns_before_the_first_picture_is_due_is_not_parked() {
+        let lanes: &'static crate::stall::Lanes = Box::leak(Box::new(crate::stall::Lanes::new()));
+        let (ms, clock) = paused_clock();
+        let opening = Opening::Probe(clock() + FIRST_PICTURE_WAIT);
+        let (release, pending) = hung_open(lanes, "h264_nvenc", opening, clock);
+        // NVENC's slowest open in the field: 2.6 s. The clock stops there,
+        // however long the hand-over takes on a loaded machine.
+        let mut beats = 0;
+        let mut released = false;
+        let opened = wait_or_park(pending, opening, &mut || {
+            beats += 1;
+            if !released && ms.fetch_add(100, Ordering::SeqCst) + 100 >= 2_600 {
+                release.send(()).unwrap();
+                released = true;
+            }
+        });
+        assert!(matches!(opened, Ok(Ok("h264_nvenc"))));
+        assert!(lane_clear(lanes));
+        // The watchdog's heartbeat ran meanwhile.
+        assert!(beats >= 26, "{beats}");
+        // A deadline already past (an earlier encoder of the fallback used
+        // the wait up) parks at once; so does a background reopen.
+        for behind in [false, true] {
+            let (_ms, clock) = paused_clock();
+            let opening = if behind {
+                Opening::Behind
+            } else {
+                Opening::Probe(clock())
+            };
+            let (release, pending) = hung_open(lanes, "h264_amf", opening, clock);
+            let Err(parked) = wait_or_park(pending, opening, &mut || panic!("it waited")) else {
+                panic!("returned")
+            };
+            assert_eq!(parked.running_for(), Duration::ZERO);
+            release.send(()).unwrap();
+            drop(parked);
+            wait_for_clear_lane(lanes);
+        }
+        // A reopen of a live session still waits, to its 9 s limit.
+        let (ms, clock) = paused_clock();
+        let (release, pending) = hung_open(lanes, "h264_qsv", Opening::Reopen, clock);
+        let gave_up = wait_or_park(pending, Opening::Reopen, &mut || {
+            ms.fetch_add(100, Ordering::SeqCst);
+        });
+        let Ok(Err(crate::stall::Stall::TimedOut { after, .. })) = gave_up else {
+            panic!("not given up on at the reopen limit")
+        };
+        assert_eq!(after, Duration::from_secs(9));
+        release.send(()).unwrap();
+        wait_for_clear_lane(lanes);
+    }
+
+    #[test]
+    fn a_first_open_hung_past_its_limit_is_tried_again_in_the_background() {
+        let lanes: &'static crate::stall::Lanes = Box::leak(Box::new(crate::stall::Lanes::new()));
+        let (ms, clock) = paused_clock();
+        let t0 = Instant::now();
+        let at = |ms: u64| t0 + Duration::from_millis(ms);
+        let mut recovery = StallRecovery::default();
+        let opening = Opening::Probe(clock() + FIRST_PICTURE_WAIT);
+        let (release, pending) = hung_open(lanes, "h264_nvenc", opening, clock.clone());
+        let Err(mut parked) = first_open_of(pending, opening, &ms) else {
+            panic!("the hung open returned")
+        };
+        recovery.outwaited("h264_nvenc", "libx264", at(3_000));
+        // Given up on at NVENC's 15 s limit, with the one stall line; the
+        // lane stays taken until the driver returns.
+        ms.store(15_000, Ordering::SeqCst);
+        let (result, lines) = logged(|| parked.poll());
+        assert!(matches!(
+            result,
+            Some(Err(crate::stall::Stall::TimedOut { .. }))
+        ));
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("stall=encoder_open after_ms=15000")),
+            "{lines:?}"
+        );
+        assert!(!lane_clear(lanes));
+        assert_eq!(
+            recovery.encoder_for_frame("h264_nvenc", at(20_000), false),
+            "libx264"
+        );
+        // The driver returns at 30 s. The try is due: it opens in the
+        // background, so libx264 streams on instead of freezing for it.
+        release.send(()).unwrap();
+        wait_for_clear_lane(lanes);
+        let desired = recovery.encoder_for_frame("h264_nvenc", at(30_000), true);
+        assert_eq!(desired, "h264_nvenc");
+        assert!(opens_behind("libx264", &desired));
+        assert_eq!(
+            open_limits("h264_nvenc", Opening::Behind),
+            crate::stall::encoder_open_limits("h264_nvenc")
+        );
+        recovery.starting(&desired);
+        ms.store(30_000, Ordering::SeqCst);
+        let (release, pending) = hung_open(lanes, "h264_nvenc", Opening::Behind, clock);
+        let Err(mut trying) = wait_or_park(pending, Opening::Behind, &mut || {
+            panic!("a background open waited")
+        }) else {
+            panic!("returned")
+        };
+        assert_eq!(
+            recovery.encoder_for_frame("h264_nvenc", at(30_016), lane_clear(lanes)),
+            "libx264"
+        );
+        ms.store(30_200, Ordering::SeqCst);
+        release.send(()).unwrap();
+        wait_for_clear_lane(lanes);
+        assert_eq!(trying.poll(), Some(Ok("h264_nvenc")));
+        assert!(recovery.opened("h264_nvenc", "h264_nvenc"));
+        assert!(recovery.owed.is_none());
+    }
+
+    #[test]
+    fn only_a_switch_from_libx264_into_the_lane_opens_in_the_background() {
+        for (current, wanted, behind) in [
+            ("libx264", "h264_nvenc", true),
+            ("libx264", "hevc_amf", true),
+            ("libx264", "h264_qsv", true),
+            ("libx264", "libx265", true),
+            ("libx264", "libx264", false),
+            ("h264_nvenc", "hevc_nvenc", false),
+            ("h264_qsv", "h264_qsv", false),
+            ("hevc_amf", "libx264", false),
+            ("h264_videotoolbox", "hevc_videotoolbox", false),
+        ] {
+            assert_eq!(
+                opens_behind(current, wanted),
+                behind,
+                "{current} -> {wanted}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_hardware_encoder_that_failed_is_remembered_at_its_size_for_the_launch() {
+        use GpuVendor::{Amd, Intel, Nvidia};
+        let hd = (1920, 1080);
+        let mut failures = LaunchFailures::default();
+        failures.failed("h264_nvenc", hd, || panic!("NVENC never reads the cards"));
+        assert!(failures.earlier("h264_nvenc", hd).is_some());
+        // Another size, another encoder: tried.
+        assert!(failures.earlier("h264_nvenc", (2732, 2048)).is_none());
+        assert!(failures.earlier("hevc_nvenc", hd).is_none());
+        assert!(failures.any("_nvenc"));
+        assert!(!failures.any("_amf"));
+        // Software encoders are never left out.
+        failures.failed("libx264", hd, || panic!("read"));
+        failures.failed("libx265", hd, || panic!("read"));
+        assert!(failures.earlier("libx264", hd).is_none());
+        assert!(failures.earlier("libx265", hd).is_none());
+        // AMF on a PC with an AMD card: its driver gets the note.
+        failures.failed("h264_amf", hd, || Some(vec![Nvidia, Amd]));
+        assert_eq!(failures.vendors, [Amd]);
+        // Quick Sync on a PC without an Intel card: no note, as that
+        // failure is expected there. Still remembered.
+        failures.failed("h264_qsv", hd, || Some(vec![Nvidia, Amd]));
+        assert_eq!(failures.vendors, [Amd]);
+        assert!(failures.earlier("h264_qsv", hd).is_some());
+        // Unknown cards (DXGI listed some, not all): no note.
+        failures.failed("hevc_qsv", hd, || None);
+        assert_eq!(failures.vendors, [Amd]);
+        failures.failed("h264_qsv", (1280, 720), || Some(vec![Intel]));
+        assert_eq!(failures.vendors, [Amd, Intel]);
+        // Each failure is kept once, and the cards are read once a vendor.
+        failures.failed("hevc_amf", hd, || panic!("read again"));
+        failures.failed("h264_nvenc", hd, || panic!("read"));
+        assert_eq!(
+            failures
+                .opens
+                .iter()
+                .filter(|(name, size)| name == "h264_nvenc" && *size == hd)
+                .count(),
+            1
+        );
+        let why = failures.earlier("h264_amf", hd).unwrap();
+        assert!(
+            why.contains("h264_amf failed to open at 1920x1080 earlier in this launch"),
+            "{why}"
+        );
+        assert!(why.contains("Restart"), "{why}");
+    }
+
+    #[test]
+    fn an_encoder_that_failed_to_open_is_not_opened_again_or_logged_again() {
+        ffmpeg_next::init().unwrap();
+        crate::diagnostics::install_ffmpeg_logging();
+        let failures = parking_lot::Mutex::new(LaunchFailures::default());
+        // A real open that fails: Quick Sync on a PC without an Intel card
+        // ("Error creating a MFX session"), or not in this FFmpeg build
+        // (macOS). Both are the encoder's own failure.
+        let open = |failures: &parking_lot::Mutex<LaunchFailures>| {
+            logged(|| {
+                open_session(
+                    failures,
+                    "h264_qsv",
+                    1280,
+                    720,
+                    8_000_000,
+                    60,
+                    &mut EncoderInput::Yuv420,
+                    Opening::First,
+                    &mut || {},
+                )
+                .err()
+                .map(|error| error.to_string())
+            })
+        };
+        let (Some(first), first_lines) = open(&failures) else {
+            eprintln!("Quick Sync opens on this PC; nothing to remember");
+            return;
+        };
+        eprintln!("first open: {first}");
+        assert!(failures.lock().earlier("h264_qsv", (1280, 720)).is_some());
+        // Every pipeline after it: no open, no FFmpeg line, and the reason.
+        for _ in 0..3 {
+            let (again, lines) = open(&failures);
+            let again = again.expect("opened");
+            assert!(again.contains("earlier in this launch"), "{again}");
+            assert!(
+                !lines
+                    .iter()
+                    .any(|line| line.contains("ffmpeg") || line.contains("Opening encoder session")),
+                "{lines:?}"
+            );
+        }
+        eprintln!(
+            "first open logged {} FFmpeg lines",
+            first_lines
+                .iter()
+                .filter(|line| line.contains("ffmpeg"))
+                .count()
+        );
+        // libx264 is never held back, and a Restart tries Quick Sync again.
+        assert!(open_session(
+            &failures,
+            "libx264",
+            1280,
+            720,
+            8_000_000,
+            60,
+            &mut EncoderInput::Yuv420,
+            Opening::First,
+            &mut || {},
+        )
+        .is_ok());
+        *failures.lock() = LaunchFailures::default();
+        let (retried, _) = open(&failures);
+        let retried = retried.expect("opened");
+        assert!(!retried.contains("earlier in this launch"), "{retried}");
+    }
+
+    /// A background open in `lanes` of `name` at `pixel_format`, parked
+    /// already, that hangs until the returned sender sends, then gives `open`.
+    fn parked_background_open(
+        lanes: &'static crate::stall::Lanes,
+        name: &str,
+        pixel_format: ffmpeg_next::format::Pixel,
+        open: impl FnOnce() -> Result<ffmpeg_next::codec::encoder::video::Encoder, ffmpeg_next::Error>
+            + Send
+            + 'static,
+    ) -> (std::sync::mpsc::Sender<()>, BackgroundOpen) {
+        let (release, hang) = stuck_open();
+        let mut pending = crate::stall::start_in(
+            lanes,
+            crate::stall::Call::EncoderOpen,
+            crate::stall::Wait {
+                limits: open_limits(name, Opening::Behind),
+                slice: Duration::from_millis(1),
+                now: Instant::now as fn() -> Instant,
+            },
+            move || {
+                hang();
+                open()
+            },
+            crate::stall::no_hooks(),
+        )
+        .unwrap();
+        assert!(pending.park().is_none());
+        let args = SessionArgs {
+            encoder_name: name.to_string(),
+            size: (64, 64),
+            bitrate_bps: 8_000_000,
+            target_fps: 60,
+            pixel_format,
+            legacy_pts: false,
+        };
+        (
+            release,
+            BackgroundOpen {
+                pending,
+                args,
+                yuv_retry: false,
+            },
+        )
+    }
+
+    /// A real libx264 session at 64x64 YUV420P, opened on the call's thread
+    /// as a hardware encoder would be.
+    fn real_yuv_encoder() -> Result<ffmpeg_next::codec::encoder::video::Encoder, ffmpeg_next::Error>
+    {
+        let codec = ffmpeg_next::encoder::find_by_name("libx264").expect("libx264");
+        let mut video = ffmpeg_next::codec::Context::new_with_codec(codec)
+            .encoder()
+            .video()?;
+        video.set_width(64);
+        video.set_height(64);
+        video.set_format(ffmpeg_next::format::Pixel::YUV420P);
+        video.set_time_base(ffmpeg_next::Rational(1, 60));
+        video.open_with(encoder_options("libx264"))
+    }
+
+    #[test]
+    fn a_bgra_open_that_fails_in_the_background_is_tried_again_at_yuv420_there() {
+        use ffmpeg_next::format::Pixel;
+        ffmpeg_next::init().unwrap();
+        let lanes: &'static crate::stall::Lanes = Box::leak(Box::new(crate::stall::Lanes::new()));
+        let refused = || {
+            Err(ffmpeg_next::Error::Other {
+                errno: libc::EINVAL,
+            })
+        };
+        // NVENC's Automatic BGRA open outlived the first picture's wait, and
+        // fails after it, as an NVENC that takes only YUV420 does.
+        let (release, mut open) = parked_background_open(lanes, "h264_nvenc", Pixel::BGRA, refused);
+        open.yuv_retry = true;
+        let mut input = EncoderInput::Automatic;
+        assert!(open
+            .poll(&mut input, |_| panic!("tried again before it failed"))
+            .is_none());
+        release.send(()).unwrap();
+        wait_for_clear_lane(lanes);
+        // YUV420 is tried at once, in the background too, and the pipeline
+        // keeps it; the BGRA failure is not handed back to be remembered.
+        let mut retried_at = None;
+        let mut yuv_release = None;
+        let polled = open.poll(&mut input, |args| {
+            retried_at = Some((args.encoder_name.clone(), args.size, args.bitrate_bps));
+            let (release, yuv) =
+                parked_background_open(lanes, &args.encoder_name, Pixel::YUV420P, real_yuv_encoder);
+            yuv_release = Some(release);
+            Err(Box::new(StillOpening(
+                args.encoder_name.clone(),
+                parking_lot::Mutex::new(Some(yuv)),
+            )))
+        });
+        assert!(polled.is_none(), "the BGRA failure was handed back");
+        assert_eq!(
+            retried_at,
+            Some(("h264_nvenc".to_string(), (64, 64), 8_000_000))
+        );
+        assert_eq!(input, EncoderInput::Yuv420);
+        assert_eq!(open.args.pixel_format, Pixel::YUV420P);
+        assert!(open
+            .poll(&mut input, |_| panic!("tried again while YUV420 opens"))
+            .is_none());
+        // It opens: the stream takes that session.
+        yuv_release.unwrap().send(()).unwrap();
+        wait_for_clear_lane(lanes);
+        let state = open
+            .poll(&mut input, |_| panic!("YUV420 is tried once"))
+            .expect("returned")
+            .expect("the YUV420 open failed");
+        assert_eq!(state.opened_encoder, "h264_nvenc");
+        assert_eq!(state.frame.format(), Pixel::YUV420P);
+
+        // When YUV420 fails too, that failure is handed back, to be
+        // remembered for the launch.
+        let (release, mut open) = parked_background_open(lanes, "h264_nvenc", Pixel::BGRA, refused);
+        open.yuv_retry = true;
+        let mut input = EncoderInput::Automatic;
+        release.send(()).unwrap();
+        wait_for_clear_lane(lanes);
+        let failed = open.poll(&mut input, |_| {
+            Err("h264_nvenc open failed at YUV420".into())
+        });
+        let error = failed.expect("returned").err().expect("it opened");
+        assert!(error.to_string().contains("at YUV420"), "{error}");
+        assert!(!is_open_stall(error.as_ref()));
+        assert_eq!(input, EncoderInput::Yuv420);
+
+        // A YUV420 open, or a picked BGRA, is not tried again; nor is a
+        // stall, which says nothing about BGRA.
+        let (release, mut open) = parked_background_open(lanes, "h264_nvenc", Pixel::BGRA, refused);
+        let mut input = EncoderInput::Bgra;
+        release.send(()).unwrap();
+        wait_for_clear_lane(lanes);
+        let failed = open.poll(&mut input, |_| panic!("a picked BGRA was tried again"));
+        assert!(failed.expect("returned").is_err());
+        assert_eq!(input, EncoderInput::Bgra);
+    }
+
+    #[test]
+    fn an_hevc_open_in_the_background_is_dropped_once_the_frame_wants_h264() {
+        use ffmpeg_next::format::Pixel;
+        ffmpeg_next::init().unwrap();
+        let lanes: &'static crate::stall::Lanes = Box::leak(Box::new(crate::stall::Lanes::new()));
+        // An H.264 encoder whose H.265 sibling this FFmpeg build has.
+        let Some(h264) = ["libx264", "h264_nvenc", "h264_videotoolbox"]
+            .into_iter()
+            .find(|name| {
+                ffmpeg_next::encoder::find_by_name(hevc_variant_of(name).unwrap()).is_some()
+            })
+        else {
+            eprintln!("no H.265 encoder in this FFmpeg build");
+            return;
+        };
+        // The encode loop's negotiation, from the user's preference and the
+        // client's decoding.
+        let preferred = |hevc_enabled: bool, client_hevc: bool| {
+            preferred_encoder(h264, hevc_enabled && client_hevc, false, &mut true)
+        };
+        let hevc = preferred(true, true);
+        assert!(is_hevc_encoder(&hevc), "{hevc}");
+        for change in ["an H.264-only client connected", "HEVC was turned off"] {
+            let (release, open) =
+                parked_background_open(lanes, &hevc, Pixel::YUV420P, real_yuv_encoder);
+            let mut background = Some(Behind::first(open, 8_000_000));
+            assert!(!drop_obsolete_background(
+                &mut background,
+                &preferred(true, true)
+            ));
+            assert!(background.is_some(), "{change}: dropped while wanted");
+            let now = match change {
+                "an H.264-only client connected" => preferred(true, false),
+                _ => preferred(false, true),
+            };
+            assert_eq!(now, h264, "{change}");
+            // The HEVC session opens meanwhile, ready to be taken.
+            release.send(()).unwrap();
+            wait_for_clear_lane(lanes);
+            assert!(
+                drop_obsolete_background(&mut background, &now),
+                "{change}: the HEVC session would replace one the client decodes"
+            );
+            assert!(background.is_none(), "{change}");
+        }
+        // Still wanted, it is taken once it opens.
+        let (release, open) =
+            parked_background_open(lanes, &hevc, Pixel::YUV420P, real_yuv_encoder);
+        let mut background = Some(Behind::first(open, 8_000_000));
+        release.send(()).unwrap();
+        wait_for_clear_lane(lanes);
+        assert!(!drop_obsolete_background(&mut background, &hevc));
+        let state = background
+            .as_mut()
+            .unwrap()
+            .open
+            .poll(&mut EncoderInput::Yuv420, |_| panic!("tried again"))
+            .expect("returned")
+            .expect("opened");
+        assert_eq!(state.opened_encoder, hevc);
+        // An H.264 open is kept when HEVC is turned on: the client decodes
+        // it, and the stream reopens to HEVC from there.
+        let (release, open) = parked_background_open(lanes, h264, Pixel::YUV420P, real_yuv_encoder);
+        let mut background = Some(Behind::first(open, 8_000_000));
+        assert!(!drop_obsolete_background(&mut background, &hevc));
+        assert!(background.is_some());
+        release.send(()).unwrap();
+        wait_for_clear_lane(lanes);
+    }
+
+    #[test]
     fn the_reopen_line_says_why() {
         let nvenc = ("h264_nvenc", 60);
         let x264 = ("libx264", 60);
@@ -3965,6 +5964,7 @@ mod tests {
         let start = Instant::now();
         let reads = Arc::new(AtomicU64::new(0));
         let clock_reads = Arc::clone(&reads);
+        crate::logging::prepare_log_capture();
         let opened = tracing::subscriber::with_default(subscriber, || {
             run_in(
                 lanes,
@@ -4048,7 +6048,13 @@ mod tests {
         // stays on H.264.
         if let Some(video) = context("libx265") {
             let started = Instant::now();
-            let opened = open_encoder_on(lanes, video, "libx265", Opening::First, &mut || {});
+            let opened = now(open_encoder_on(
+                lanes,
+                video,
+                "libx265",
+                Opening::First,
+                &mut || {},
+            ));
             assert!(
                 matches!(
                     opened,
@@ -4064,7 +6070,13 @@ mod tests {
         // libx264 opens meanwhile.
         let video = context("libx264").expect("libx264 is in every build");
         assert!(matches!(
-            open_encoder_on(lanes, video, "libx264", Opening::First, &mut || {}),
+            now(open_encoder_on(
+                lanes,
+                video,
+                "libx264",
+                Opening::First,
+                &mut || {}
+            )),
             Ok(Ok(_))
         ));
         let _ = release.send(());
@@ -4107,6 +6119,276 @@ mod tests {
             .unwrap();
         assert_eq!(selected, "libx264");
         assert_eq!(attempts, ["libx264"]);
+    }
+
+    #[test]
+    fn nvenc_and_quick_sync_take_a_bitrate_in_place_and_amf_and_x265_reopen() {
+        use LiveBitrate::{NvencReconfig, QsvReset, X264};
+        for (name, live) in [
+            ("libx264", Some(X264)),
+            ("h264_qsv", Some(QsvReset)),
+            ("hevc_qsv", Some(QsvReset)),
+            ("h264_nvenc", Some(NvencReconfig)),
+            ("hevc_nvenc", Some(NvencReconfig)),
+            ("h264_amf", None),
+            ("hevc_amf", None),
+            ("libx265", None),
+            ("h264_videotoolbox", None),
+        ] {
+            assert_eq!(LiveBitrate::of(name), live, "{name}");
+            assert_eq!(
+                takes_bitrate_in_place(name, |_| false),
+                live.is_some(),
+                "{name}"
+            );
+        }
+        // A refusal stops one kind only, and libx264 never refuses.
+        let nvenc_refused = |live| live == NvencReconfig;
+        assert!(!takes_bitrate_in_place("h264_nvenc", nvenc_refused));
+        assert!(takes_bitrate_in_place("h264_qsv", nvenc_refused));
+        assert!(takes_bitrate_in_place("libx264", |_| true));
+        // The harness's NVENC: in place on a card that changes it live.
+        let t0 = Instant::now();
+        let mut p = Pipeline::new("h264_nvenc", "h264_nvenc", t0);
+        p.nvenc_refused = false;
+        assert_eq!(
+            play(
+                &mut p,
+                &[
+                    (0, Some(12_000_000)),
+                    (100, Some(20_000_000)),
+                    (200, Some(8_000_000))
+                ],
+                5_000
+            ),
+            []
+        );
+        assert_eq!((p.in_place, p.opened.1), (3, 8_000_000));
+    }
+
+    #[test]
+    fn an_nvenc_change_is_settled_by_its_reconfigure_and_never_by_an_idr() {
+        let lines = |lines: &[&str]| {
+            lines
+                .iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+        };
+        // What FFmpeg 7.1.1's nvenc.c prints while it takes the change's
+        // frame. A reconfigure that ran:
+        assert!(nvenc_reconfigured(&lines(&[
+            "[h264_nvenc @ 0x1] avg bitrate change: 8000000 -> 6000000",
+            "[h264_nvenc @ 0x1] vbv buffer size change: 16000000 -> 12000000",
+        ])));
+        // One that failed: FFmpeg returns no error, so the line decides.
+        assert!(!nvenc_reconfigured(&lines(&[
+            "[h264_nvenc @ 0x1] avg bitrate change: 8000000 -> 6000000",
+            "[h264_nvenc @ 0x1] failed to reconfigure nvenc: invalid param (8): ",
+        ])));
+        // A card that cannot change its bitrate live: FFmpeg skips it and
+        // prints nothing, though the frame may come out as an IDR anyway,
+        // forced or the GOP's own. Before, that IDR confirmed it.
+        assert!(!nvenc_reconfigured(&[]));
+        assert!(!nvenc_reconfigured(&lines(&[
+            "[h264_nvenc @ 0x1] aspect ratio change (DAR): 16:9 -> 16:9"
+        ])));
+    }
+
+    #[test]
+    fn ffmpeg_verbose_lines_reach_only_the_watching_thread_and_are_not_logged() {
+        ffmpeg_next::init().unwrap();
+        crate::diagnostics::install_ffmpeg_logging();
+        let say = |level: i32, text: &str| {
+            let message = std::ffi::CString::new(format!("{text}\n")).unwrap();
+            unsafe { ffmpeg_next::ffi::av_log(std::ptr::null_mut(), level, message.as_ptr()) };
+        };
+        let (kept, logged_lines) = logged(|| {
+            let watch = crate::diagnostics::FfmpegWatch::start();
+            say(
+                ffmpeg_next::ffi::AV_LOG_VERBOSE,
+                "avg bitrate change: 1 -> 2",
+            );
+            say(ffmpeg_next::ffi::AV_LOG_WARNING, "a warning while watching");
+            // Another thread's verbose line meanwhile is not kept here.
+            let other = std::thread::spawn(move || {
+                say(
+                    ffmpeg_next::ffi::AV_LOG_VERBOSE,
+                    "another thread's verbose line",
+                );
+            });
+            other.join().unwrap();
+            let kept = watch.finish();
+            // After the watch, verbose lines are dropped again.
+            say(ffmpeg_next::ffi::AV_LOG_VERBOSE, "verbose after the watch");
+            kept
+        });
+        assert_eq!(kept.len(), 2, "{kept:?}");
+        assert!(kept[0].contains("avg bitrate change: 1 -> 2"), "{kept:?}");
+        assert!(kept[1].contains("a warning while watching"), "{kept:?}");
+        // The warning is logged as always; no verbose line ever is.
+        assert!(
+            logged_lines
+                .iter()
+                .any(|line| line.contains("a warning while watching")),
+            "{logged_lines:?}"
+        );
+        assert!(
+            !logged_lines
+                .iter()
+                .any(|line| line.contains("verbose") || line.contains("avg bitrate change")),
+            "{logged_lines:?}"
+        );
+        // A watch never touches FFmpeg's own level, which other threads
+        // read as they log.
+        assert_eq!(
+            unsafe { ffmpeg_next::ffi::av_log_get_level() },
+            ffmpeg_next::ffi::AV_LOG_VERBOSE
+        );
+    }
+
+    #[test]
+    fn a_refused_nvenc_change_reopens_at_the_new_bitrate_even_with_abr_off() {
+        // ETERNAL_ABR=0: the target is the user's Max bitrate, and nothing
+        // changes it again for as long as the user leaves it. A change NVENC
+        // did not take must not leave the session on the old bitrate.
+        let mut abr = crate::transport::abr::AbrController::new(8_000_000, false);
+        let mut p = Pipeline::new("h264_nvenc", "h264_nvenc", Instant::now());
+        p.nvenc_refused = false;
+        p.nvenc_reconfigures = false;
+        p.opened.1 = abr.current_bps();
+        p.bitrate = abr.current_bps();
+        let raised = abr.set_ceiling(20_000_000);
+        assert!(raised.changed);
+        p.bitrate = raised.target_bps;
+        // The frame it went in with: refused, the session is dropped.
+        assert_eq!(p.frame(Reopen::Opens), None);
+        assert!(p.nvenc_refused && p.dropped);
+        // The next frame opens one at the new bitrate.
+        p.later(16);
+        assert_eq!(p.frame(Reopen::Opens).as_deref(), Some("h264_nvenc"));
+        assert_eq!(p.opened.1, 20_000_000);
+        assert_eq!(p.in_place, 0);
+        // From then on its changes reopen, as after a Quick Sync refusal.
+        let lowered = abr.set_ceiling(10_000_000);
+        p.later(2_000);
+        p.bitrate = lowered.target_bps;
+        assert_eq!(p.frame(Reopen::Opens).as_deref(), Some("h264_nvenc"));
+        assert_eq!(p.opened.1, 10_000_000);
+        // A card that reconfigures takes the same changes in place.
+        let mut p = Pipeline::new("h264_nvenc", "h264_nvenc", Instant::now());
+        p.nvenc_refused = false;
+        for bitrate in [20_000_000, 10_000_000] {
+            p.bitrate = bitrate;
+            assert_eq!(p.frame(Reopen::Opens), None);
+            assert_eq!(p.opened.1, bitrate);
+        }
+        assert_eq!(p.in_place, 2);
+    }
+
+    /// Native, where NVENC opens: a bitrate change on the open session takes
+    /// effect with no new session, FFmpeg's reconfigure confirms each one,
+    /// including on a GOP's own IDR (frames 120 and 240) and on a frame that
+    /// forces an IDR (250), and the stream decodes throughout. Skips
+    /// elsewhere.
+    #[test]
+    fn nvenc_changes_its_bitrate_on_the_open_session() {
+        ffmpeg_next::init().unwrap();
+        let Ok(mut state) = EncoderState::new(
+            "h264_nvenc",
+            1280,
+            720,
+            8_000_000,
+            60,
+            &mut EncoderInput::Yuv420,
+            Opening::First,
+            &mut || {},
+        ) else {
+            eprintln!("skipping: h264_nvenc does not open here");
+            return;
+        };
+        let context = unsafe { state.encoder.as_ptr() };
+        let codec = ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::H264).unwrap();
+        let mut decoder = ffmpeg_next::codec::Context::new_with_codec(codec)
+            .decoder()
+            .video()
+            .unwrap();
+        let mut decoded = ffmpeg_next::frame::Video::empty();
+        let mut decoded_frames = 0;
+        let mut sizes = [0usize; 3];
+        let mut keyframes = Vec::new();
+        let mut random = 1u32;
+        let mut confirmed = Vec::new();
+        for number in 0..360u64 {
+            let change = match number {
+                120 => Some(1_000_000),
+                240 => Some(8_000_000),
+                250 => Some(6_000_000),
+                _ => None,
+            };
+            if let Some(bitrate) = change {
+                assert!(state.update_bitrate_without_reopening("h264_nvenc", bitrate, 60));
+                assert_eq!(
+                    state.bitrate_change.take(),
+                    Some(Unconfirmed {
+                        live: LiveBitrate::NvencReconfig
+                    })
+                );
+            }
+            for value in state.frame.data_mut(0) {
+                random = random.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *value = (random >> 24) as u8;
+            }
+            state.frame.data_mut(1).fill(128);
+            state.frame.data_mut(2).fill(128);
+            state.frame.set_pts(Some(number as i64 * 1_000_000 / 60));
+            state.frame.set_kind(if number == 250 {
+                ffmpeg_next::picture::Type::I
+            } else {
+                ffmpeg_next::picture::Type::None
+            });
+            let watch = change.map(|_| crate::diagnostics::FfmpegWatch::start());
+            state.encoder.send_frame(&state.frame).unwrap();
+            loop {
+                match state.encoder.receive_packet(&mut state.packet) {
+                    Ok(()) => {
+                        let out = state.packet.pts().unwrap();
+                        if state.packet.is_key() {
+                            keyframes.push(out * 60 / 1_000_000);
+                        }
+                        if number % 120 >= 60 {
+                            sizes[(number / 120) as usize] += state.packet.size();
+                        }
+                        decoder.send_packet(&state.packet).unwrap();
+                        loop {
+                            match decoder.receive_frame(&mut decoded) {
+                                Ok(()) => decoded_frames += 1,
+                                Err(error) if is_eagain(&error) => break,
+                                Err(error) => panic!("decode failed: {error}"),
+                            }
+                        }
+                    }
+                    Err(error) if is_eagain(&error) => break,
+                    Err(error) => panic!("encode failed: {error}"),
+                }
+            }
+            if let Some(watch) = watch {
+                let lines = watch.finish();
+                assert!(nvenc_reconfigured(&lines), "frame {number}: {lines:?}");
+                confirmed.push(number);
+            }
+        }
+        eprintln!("NVENC sizes {sizes:?}, keyframes at {keyframes:?}, confirmed {confirmed:?}");
+        assert_eq!(confirmed, [120, 240, 250]);
+        assert_eq!(decoded_frames, 360);
+        assert_eq!(unsafe { state.encoder.as_ptr() }, context);
+        assert!(
+            sizes[1] * 2 < sizes[0],
+            "lower bitrate was not applied: {sizes:?}"
+        );
+        assert!(
+            sizes[2] > sizes[1] * 2,
+            "higher bitrate was not applied: {sizes:?}"
+        );
     }
 
     #[test]
@@ -4187,10 +6469,38 @@ mod tests {
         // FPS and codec changes must still use the existing reopen path.
         assert!(!state.update_bitrate_without_reopening("libx264", 4_000_000, 120));
         assert!(!state.update_bitrate_without_reopening("libx265", 4_000_000, 60));
-        for name in ["h264_nvenc", "h264_amf", "h264_qsv", "libx265"] {
+        for name in ["h264_amf", "hevc_amf", "libx265"] {
             state.opened_encoder = name.to_string();
             assert!(!state.update_bitrate_without_reopening(name, 4_000_000, 60));
         }
+        // NVENC takes it in place, with the two-second VBV a session opened
+        // at it gets, to be confirmed by the IDR its reconfigure forces.
+        state.opened_encoder = "h264_nvenc".to_string();
+        assert!(state.update_bitrate_without_reopening("h264_nvenc", 5_000_000, 60));
+        assert_eq!(state.opened_bitrate, 5_000_000);
+        assert_eq!(
+            unsafe { (*state.encoder.as_ptr()).rc_buffer_size },
+            10_000_000
+        );
+        assert_eq!(
+            state.bitrate_change,
+            Some(Unconfirmed {
+                live: LiveBitrate::NvencReconfig
+            })
+        );
+        state.bitrate_change = None;
+        // Quick Sync takes it in place, to be confirmed by its next frame.
+        state.opened_encoder = "h264_qsv".to_string();
+        assert!(state.bitrate_change.is_none());
+        assert!(state.update_bitrate_without_reopening("h264_qsv", 4_000_000, 60));
+        assert_eq!(state.opened_bitrate, 4_000_000);
+        assert_eq!(
+            state.bitrate_change,
+            Some(Unconfirmed {
+                live: LiveBitrate::QsvReset
+            })
+        );
+        assert!(!state.update_bitrate_without_reopening("h264_qsv", 4_000_000, 60));
     }
 
     #[test]
@@ -4209,6 +6519,26 @@ mod tests {
     /// Automatic's BGRA open failing on NVENC opens YUV420P at once and keeps
     /// it for later opens; a picked input, a stall, or a YUV420P open that
     /// fails is not tried again.
+    /// NVENC failing over to Quick Sync streams from the Intel card: the
+    /// NVIDIA card detection chose is unused and is not woken for iPads.
+    #[test]
+    fn an_encoder_open_publishes_the_card_to_wake() {
+        let shared = SharedControl::new(0, 8_000_000);
+        let gpu = GpuInfo {
+            encoder_name: "h264_nvenc".to_string(),
+            adapter_index: 1,
+            ..GpuInfo::software_fallback()
+        };
+        note_encoder_opened(&shared, "h264_nvenc", &gpu);
+        assert_eq!(*shared.wake_adapter.lock(), Some(1));
+        note_encoder_opened(&shared, "h264_qsv", &gpu);
+        assert_eq!(*shared.wake_adapter.lock(), None, "a cross-vendor fallback");
+        note_encoder_opened(&shared, "libx264", &gpu);
+        assert_eq!(*shared.wake_adapter.lock(), None, "the CPU");
+        note_encoder_opened(&shared, "hevc_nvenc", &gpu);
+        assert_eq!(*shared.wake_adapter.lock(), Some(1), "back on the card");
+    }
+
     #[test]
     fn a_failed_automatic_bgra_open_falls_back_to_yuv420_and_stays_there() {
         use ffmpeg_next::format::Pixel;
@@ -4389,6 +6719,287 @@ mod tests {
         assert!(!pending);
     }
 
+    fn raw(frame_number: u64, data: &std::sync::Arc<Vec<u8>>) -> RawFrame {
+        RawFrame {
+            frame_number,
+            timestamp: Instant::now(),
+            data: std::sync::Arc::clone(data),
+            width: 2,
+            height: 2,
+            cached: false,
+        }
+    }
+
+    /// A picture given again to bring out a keyframe keeps its capture time
+    /// and number, but is a separate frame to the encoder: it must not share
+    /// the PTS of the frame before it, under ETERNAL_LEGACY_PTS too.
+    #[test]
+    fn a_picture_given_again_gets_its_own_pts_in_both_pts_modes() {
+        ffmpeg_next::init().unwrap();
+        for legacy in [false, true] {
+            let mut state = libx264_at(640, 360);
+            state.legacy_pts = legacy;
+            let captured = Instant::now();
+            // Frame 7, given again twice, then capture's next frame.
+            let frames = [(captured, 7), (captured, 7), (captured, 7)]
+                .into_iter()
+                .chain([(captured + Duration::from_millis(16), 8)]);
+            let mut pts = Vec::new();
+            for (at, n) in frames {
+                let next = state.next_pts(at, n);
+                state.frame.set_pts(Some(next));
+                state.send_frame(next, at, n).unwrap();
+                while state.encoder.receive_packet(&mut state.packet).is_ok() {}
+                pts.push(next);
+            }
+            assert!(
+                pts.windows(2).all(|pair| pair[0] < pair[1]),
+                "legacy={legacy}: PTS {pts:?}"
+            );
+        }
+    }
+
+    /// Capture recycles three buffers, and the mailbox may hold one while the
+    /// encoder works on another. A kept picture that outlived a newer capture
+    /// took the third: the synthetic source found no free buffer and panicked.
+    #[test]
+    fn a_newer_capture_releases_the_kept_picture_before_it_is_encoded() {
+        let (producer, consumer) = crate::capture::frame_slot();
+        let kept = std::sync::Arc::new(vec![0u8; 16]);
+        let newer = std::sync::Arc::new(vec![0u8; 16]);
+        let mut owed = OwedKeyframe::until(Instant::now() + Duration::from_secs(5));
+        owed.picture = Some(raw(1, &kept));
+        producer.publish(raw(2, &newer));
+        let Next::Frame(frame) = owed.next(&consumer) else {
+            panic!("no frame");
+        };
+        assert_eq!(frame.frame_number, 2);
+        assert_eq!(
+            std::sync::Arc::strong_count(&kept),
+            1,
+            "the kept picture still pins a capture buffer while the newer one is encoded"
+        );
+    }
+
+    #[test]
+    fn the_deadline_counts_from_the_first_keyframe_submission() {
+        let kept = std::sync::Arc::new(vec![0u8; 16]);
+        let submitted = Instant::now()
+            .checked_sub(Duration::from_millis(200))
+            .unwrap();
+        // The keyframe went in 200 ms ago; sending and receiving took that long.
+        let owed = OwedKeyframe::after_encode(
+            None,
+            Some(raw(1, &kept)),
+            false,
+            submitted,
+            KEYFRAME_FLUSH_WAIT,
+        )
+        .expect("the keyframe is owed");
+        assert_eq!(owed.until, submitted + KEYFRAME_FLUSH_FOR);
+        // A retry submitted later keeps the first deadline.
+        let owed = OwedKeyframe::after_encode(
+            Some(owed),
+            Some(raw(1, &kept)),
+            false,
+            Instant::now(),
+            KEYFRAME_FLUSH_WAIT,
+        )
+        .expect("still owed");
+        assert_eq!(owed.until, submitted + KEYFRAME_FLUSH_FOR);
+        assert!(
+            OwedKeyframe::after_encode(
+                Some(owed),
+                Some(raw(1, &kept)),
+                true,
+                Instant::now(),
+                KEYFRAME_FLUSH_WAIT
+            )
+            .is_none(),
+            "the keyframe came out"
+        );
+        assert!(
+            OwedKeyframe::after_encode(None, None, false, submitted, KEYFRAME_FLUSH_WAIT).is_none()
+        );
+    }
+
+    const ENCODE: Duration = Duration::from_millis(2);
+
+    /// Replays capture on a fake clock through the rule the encode loop
+    /// uses, as if a keyframe were owed after every picture: encoding ends
+    /// [`ENCODE`] after a picture is captured, and the picture is given
+    /// again if capture's next one has not come by then plus the wait.
+    /// `pictures` are capture times, each marked cached or real. Returns the
+    /// indices of the pictures that would have been given again.
+    fn given_again(target_fps: u32, pictures: &[(Instant, bool)]) -> Vec<usize> {
+        let mut cadence = CaptureCadence::default();
+        let mut again = Vec::new();
+        for (n, pair) in pictures.windows(2).enumerate() {
+            let (at, cached) = pair[0];
+            cadence.captured(at, cached);
+            let wait = keyframe_flush_wait(target_fps, cached, cadence.pace());
+            if pair[1].0 > at + ENCODE + wait {
+                again.push(n);
+            }
+        }
+        again
+    }
+
+    /// Real pictures every `frame`, off by up to a quarter frame (offsets in
+    /// eighths of a frame). Gaps run from 0.75 to 1.5 frames. The 1.25- and
+    /// 1.5-frame gaps come once per 12 pictures, rarer than the 8 gaps the
+    /// pace remembers, so the 1.5-frame gap is longer than the pace when it
+    /// comes: the wait needs its half frame of margin (1.0x fails here).
+    fn moving(start: Instant, frame: Duration, count: u32) -> Vec<(Instant, bool)> {
+        let eighth = frame / 8;
+        let offsets = [0i32, 0, 2, 0, 0, -1, 0, 0, 0, 0, -2, 2];
+        (0..count)
+            .map(|n| {
+                let at = start + frame * n;
+                let at = match offsets[n as usize % offsets.len()] {
+                    k if k >= 0 => at + eighth * k as u32,
+                    k => at - eighth * (-k) as u32,
+                };
+                (at, false)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_moving_desktop_never_has_its_picture_given_again_at_60_50_or_30_fps() {
+        let start = Instant::now() + Duration::from_secs(1);
+        let us = Duration::from_micros;
+        for (target_fps, frame, what) in [
+            (60, us(16_667), "60 fps"),
+            (60, us(20_000), "a 50 Hz display streamed at 60 fps"),
+            (50, us(20_000), "50 fps"),
+            (30, us(33_333), "30 fps"),
+            (60, us(33_333), "30 fps content streamed at 60 fps"),
+        ] {
+            let pictures = moving(start, frame, 240);
+            // The pipeline's first picture has no pace to go by. It is
+            // encoded before any viewer arrives (see capture's IdleGate).
+            let again: Vec<usize> = given_again(target_fps, &pictures)
+                .into_iter()
+                .filter(|&n| n > 0)
+                .collect();
+            assert!(again.is_empty(), "{what}: pictures {again:?} given again");
+        }
+    }
+
+    #[test]
+    fn motion_that_resumes_after_an_idle_spell_keeps_its_pace() {
+        let start = Instant::now() + Duration::from_secs(1);
+        for (target_fps, frame) in [
+            (60, Duration::from_micros(16_667)),
+            (60, Duration::from_micros(20_000)),
+            (60, Duration::from_micros(33_333)),
+            (30, Duration::from_micros(33_333)),
+        ] {
+            let mut pictures = moving(start, frame, 20);
+            let last = pictures.last().unwrap().0;
+            // Still for 750 ms, with the keepalive's cached resend, then
+            // moving again at the same pace.
+            pictures.push((last + Duration::from_millis(750), true));
+            let resumed = last + Duration::from_millis(1500);
+            pictures.extend(moving(resumed, frame, 20));
+            // Judged from the first picture after the resend: the last one
+            // before the idle spell is given again, as the desktop went
+            // still after it.
+            let resent = 20;
+            let again: Vec<usize> = given_again(target_fps, &pictures)
+                .into_iter()
+                .filter(|&n| n > resent)
+                .collect();
+            assert!(
+                again.is_empty(),
+                "{target_fps} fps, {frame:?} frames: real pictures {again:?} given again"
+            );
+        }
+        // Past a long idle spell the pace is forgotten: the target's again.
+        let mut cadence = CaptureCadence::default();
+        for (at, cached) in moving(start, Duration::from_micros(33_333), 10) {
+            cadence.captured(at, cached);
+        }
+        cadence.captured(start + PACE_FORGOTTEN * 2, false);
+        assert_eq!(cadence.pace(), None);
+        assert_eq!(
+            keyframe_flush_wait(60, false, cadence.pace()),
+            crate::capture::frame_budget_for(60) * 3 / 2
+        );
+    }
+
+    #[test]
+    fn a_cached_picture_is_given_again_after_the_shortest_wait() {
+        let start = Instant::now() + Duration::from_secs(1);
+        for target_fps in [60, 50, 30] {
+            let frame = crate::capture::frame_budget_for(target_fps);
+            let mut pictures = moving(start, frame, 10);
+            let last = pictures.last().unwrap().0;
+            // A pointer redraw resends the cached picture after only 50 ms,
+            // then the desktop stays still.
+            pictures.push((last + Duration::from_millis(50), true));
+            pictures.push((last + Duration::from_millis(800), true));
+            let mut cadence = CaptureCadence::default();
+            for &(at, cached) in &pictures[..pictures.len() - 1] {
+                cadence.captured(at, cached);
+            }
+            assert_eq!(
+                keyframe_flush_wait(target_fps, true, cadence.pace()),
+                KEYFRAME_FLUSH_WAIT,
+                "{target_fps} fps: a cached picture"
+            );
+            assert!(
+                given_again(target_fps, &pictures).contains(&10),
+                "{target_fps} fps: the redrawn picture was not given again"
+            );
+            // A real picture waits a frame and a half of the pace.
+            assert_eq!(
+                keyframe_flush_wait(target_fps, false, cadence.pace()),
+                frame.max(cadence.pace().unwrap()) * 3 / 2,
+                "{target_fps} fps: a real picture"
+            );
+        }
+        // Past 75 fps a frame and a half is shorter than AMF's encode.
+        assert_eq!(keyframe_flush_wait(120, false, None), KEYFRAME_FLUSH_WAIT);
+    }
+
+    #[test]
+    fn the_kept_picture_is_given_again_before_the_deadline() {
+        let (_producer, consumer) = crate::capture::frame_slot();
+        let kept = std::sync::Arc::new(vec![0u8; 16]);
+        let mut owed = OwedKeyframe::until(Instant::now() + Duration::from_secs(60));
+        owed.picture = Some(raw(1, &kept));
+        let started = Instant::now();
+        let Next::Again(frame) = owed.next(&consumer) else {
+            panic!("the picture was not given again");
+        };
+        assert_eq!(frame.frame_number, 1);
+        assert_eq!(owed.given, 1);
+        assert!(
+            started.elapsed() >= KEYFRAME_FLUSH_WAIT,
+            "it did not wait for capture first"
+        );
+    }
+
+    #[test]
+    fn the_kept_picture_is_not_given_again_after_the_deadline() {
+        let (_producer, consumer) = crate::capture::frame_slot();
+        let kept = std::sync::Arc::new(vec![0u8; 16]);
+        let passed = Instant::now()
+            .checked_sub(Duration::from_millis(1))
+            .unwrap();
+        let mut owed = OwedKeyframe::until(passed);
+        owed.picture = Some(raw(1, &kept));
+        assert!(matches!(owed.next(&consumer), Next::GaveUp));
+        assert_eq!(owed.given, 0);
+        assert_eq!(
+            std::sync::Arc::strong_count(&kept),
+            1,
+            "the picture is let go"
+        );
+    }
+
     #[test]
     fn amf_options_keep_the_settings_the_ipad_decoder_needs() {
         let h264 = encoder_options("h264_amf");
@@ -4434,6 +7045,8 @@ mod tests {
         collector: std::thread::JoinHandle<()>,
         /// When each packet arrived, from `started`.
         packets: std::sync::Arc<parking_lot::Mutex<Vec<std::time::Duration>>>,
+        /// When each keyframe arrived, from `started`.
+        keyframes: std::sync::Arc<parking_lot::Mutex<Vec<std::time::Duration>>>,
         started: Instant,
         number: u64,
     }
@@ -4441,6 +7054,10 @@ mod tests {
     #[cfg(windows)]
     impl NativeStage {
         fn start() -> Self {
+            Self::start_with("h264_nvenc")
+        }
+
+        fn start_with(encoder: &str) -> Self {
             use std::sync::Arc;
             let lines = Arc::new(parking_lot::Mutex::new(Vec::<u8>::new()));
             struct Sink(Arc<parking_lot::Mutex<Vec<u8>>>);
@@ -4469,8 +7086,8 @@ mod tests {
             let shared = SharedControl::new(0, 8_000_000);
             shared.running.store(true, Ordering::SeqCst);
             let gpu = GpuInfo {
-                encoder_name: "h264_nvenc".to_string(),
-                codec_display_name: "H.264 (NVENC)".to_string(),
+                encoder_name: encoder.to_string(),
+                codec_display_name: codec_display_name_for(encoder).to_string(),
                 ..GpuInfo::software_fallback()
             };
             let generation = crate::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
@@ -4481,11 +7098,17 @@ mod tests {
             });
             let started = Instant::now();
             let packets = Arc::new(parking_lot::Mutex::new(Vec::new()));
+            let keyframes = Arc::new(parking_lot::Mutex::new(Vec::new()));
             let collector = {
                 let packets = Arc::clone(&packets);
+                let keyframes = Arc::clone(&keyframes);
                 std::thread::spawn(move || {
-                    while rx.blocking_recv().is_some() {
-                        packets.lock().push(started.elapsed());
+                    while let Some(nal) = rx.blocking_recv() {
+                        let at = started.elapsed();
+                        packets.lock().push(at);
+                        if nal.is_keyframe {
+                            keyframes.lock().push(at);
+                        }
                     }
                 })
             };
@@ -4496,6 +7119,7 @@ mod tests {
                 stage,
                 collector,
                 packets,
+                keyframes,
                 started,
                 number: 0,
             }
@@ -4514,6 +7138,7 @@ mod tests {
                 data: std::sync::Arc::new(data),
                 width: 1280,
                 height: 720,
+                cached: false,
             });
             self.number += 1;
             std::thread::sleep(std::time::Duration::from_millis(33));
@@ -4558,10 +7183,124 @@ mod tests {
         }
     }
 
+    /// Native, for measurements: the real encode stage on
+    /// `ETERNAL_MEASURE_ENCODER` (h264_nvenc unless set), steered by the real
+    /// ABR controller for `ETERNAL_MEASURE_MINUTES` (4) on a link that loses
+    /// whatever the encoder sends above 11 Mbps: 10 Mbps holds, and each
+    /// probe to 12 is lost. One receiver report a second.
+    /// Prints a MEASURE line: steps, reopens and in-place changes a minute,
+    /// and for each change the longest gap between packets in the next 2 s
+    /// (the hitch) and the time to the next keyframe.
+    /// `cargo test -p eternal-host --lib bitrate_steps_on_a_lossy_link -- --ignored --nocapture`
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "native: measures a real encoder for minutes"]
+    fn bitrate_steps_on_a_lossy_link() {
+        use std::time::Duration;
+        let encoder =
+            std::env::var("ETERNAL_MEASURE_ENCODER").unwrap_or_else(|_| "h264_nvenc".to_string());
+        let minutes: u64 = std::env::var("ETERNAL_MEASURE_MINUTES")
+            .ok()
+            .and_then(|m| m.parse().ok())
+            .unwrap_or(4);
+        const CAPACITY: u32 = 11_000_000;
+        let mut stage = NativeStage::start_with(&encoder);
+        let mut abr = crate::transport::abr::AbrController::new(50_000_000, true);
+        stage
+            .shared
+            .abr_current_bps
+            .store(abr.current_bps(), Ordering::SeqCst);
+        let (mut received, mut lost) = (0u32, 0u32);
+        let mut changes = Vec::new();
+        let end = stage.started + Duration::from_secs(minutes * 60);
+        let mut next_report = stage.started + Duration::from_secs(1);
+        while Instant::now() < end {
+            stage.publish();
+            if Instant::now() < next_report {
+                continue;
+            }
+            next_report += Duration::from_secs(1);
+            // What the open session sends, as the encode loop records it.
+            let rate = PIPELINE_STATS.lock().bitrate_bps.max(1);
+            let over = rate.saturating_sub(CAPACITY) / 1_000;
+            received += rate / 1_000 - over;
+            lost += over;
+            let report = eternal_wire::v2::control::ReceiverReport {
+                frags_received: received,
+                frags_lost: lost,
+                ..Default::default()
+            };
+            // AFTER-ONLY begin: the encoder's cost of a step, which ABR reads.
+            abr.encoder_reopens(
+                stage
+                    .shared
+                    .encoder_reopens_for_bitrate
+                    .load(Ordering::Relaxed),
+            );
+            // AFTER-ONLY end
+            let decision = abr.on_report(&report, None, Instant::now());
+            if decision.changed {
+                stage
+                    .shared
+                    .abr_current_bps
+                    .store(decision.target_bps, Ordering::SeqCst);
+                changes.push(stage.started.elapsed());
+            }
+        }
+        for _ in 0..30 {
+            stage.publish();
+        }
+        let packets = stage.packets.lock().clone();
+        let keyframes = stage.keyframes.lock().clone();
+        let text = stage.finish();
+        let reopens = text.matches("Reopened encoder session").count();
+        let in_place = text.matches("bitrate without reopening").count()
+            + text.matches("Updated software encoder bitrate").count();
+        let mut hitches: Vec<u128> = Vec::new();
+        let mut to_keyframe: Vec<u128> = Vec::new();
+        for &change in &changes {
+            let window: Vec<Duration> = packets
+                .iter()
+                .copied()
+                .filter(|&at| {
+                    at + Duration::from_millis(100) >= change
+                        && at <= change + Duration::from_secs(2)
+                })
+                .collect();
+            if let Some(gap) = window.windows(2).map(|pair| pair[1] - pair[0]).max() {
+                hitches.push(gap.as_millis());
+            }
+            if let Some(key) = keyframes.iter().find(|&&at| at >= change) {
+                to_keyframe.push((*key - change).as_millis());
+            }
+        }
+        let summary = |values: &mut Vec<u128>| {
+            values.sort();
+            let at = |q: f64| {
+                values
+                    .get(((values.len() as f64 - 1.0) * q).round() as usize)
+                    .copied()
+            };
+            (at(0.5), at(0.9), values.last().copied())
+        };
+        let per_minute = |count: usize| count as f64 / minutes as f64;
+        eprintln!(
+            "MEASURE encoder={encoder} minutes={minutes} steps={} steps_per_min={:.2} reopens={reopens} reopens_per_min={:.2} in_place={in_place} hitch_ms_p50_p90_max={:?} keyframe_after_change_ms_p50_p90_max={:?} packets={}",
+            changes.len(),
+            per_minute(changes.len()),
+            per_minute(reopens),
+            summary(&mut hitches),
+            summary(&mut to_keyframe),
+            packets.len(),
+        );
+        assert!(!changes.is_empty(), "ABR never stepped");
+    }
+
     /// Native, on a PC with NVENC: the encode stage's first NVENC open is
-    /// held for twice its limit (`ETERNAL_SIMULATE_STALL`). The stage falls
-    /// through to software at once and streams, the late NVENC session is
-    /// closed on its own thread, and the stage then goes back to NVENC.
+    /// held for twice its limit (`ETERNAL_SIMULATE_STALL`). The stage streams
+    /// on software once the first picture is due, gives the open up at its
+    /// limit, closes the late NVENC session on its own thread, and then goes
+    /// back to NVENC through an open in the background.
     /// `cargo test -p eternal-host --lib a_real_nvenc_open -- --ignored --nocapture`
     #[cfg(windows)]
     #[test]
@@ -4573,8 +7312,8 @@ mod tests {
         let started = stage.started;
         // When each step's line first shows, to within a frame.
         let steps = [
+            "streaming on libx264 while it opens in the background",
             "stall=encoder_open",
-            "streaming on the fallback",
             "stall_ended=encoder_open",
             "Back on the preferred encoder",
         ];
@@ -4596,9 +7335,10 @@ mod tests {
         for _ in 0..30 {
             stage.publish();
         }
-        let [stalled, _, ended, back] = seen.map(Option::unwrap);
+        let [outwaited, stalled, ended, back] = seen.map(Option::unwrap);
+        let first_packet = stage.packets.lock().first().copied().expect("no packet");
         // A picture throughout: x264 while the open was stuck, NVENC after.
-        let on_x264 = stage.packets_between(stalled + Duration::from_secs(1), ended);
+        let on_x264 = stage.packets_between(outwaited + Duration::from_secs(1), ended);
         let on_nvenc = stage.packets_between(back, Duration::MAX);
         let text = stage.finish();
         let at = |needle: &str| {
@@ -4609,7 +7349,21 @@ mod tests {
         assert!(order.windows(2).all(|pair| pair[0] < pair[1]), "{order:?}");
         let back_line = text[order[3]..].lines().next().unwrap();
         assert!(back_line.contains("h264_nvenc"), "{back_line}");
-        eprintln!("stalled at {stalled:?}, stall ended at {ended:?}, back on NVENC at {back:?}");
+        assert!(
+            text.contains("Opening the encoder in the background"),
+            "the try froze the stream:\n{text}"
+        );
+        eprintln!(
+            "first picture at {first_packet:?}, x264 from {outwaited:?}, stalled at {stalled:?}, \
+             stall ended at {ended:?}, back on NVENC at {back:?}"
+        );
+        // The first picture well before the iPad's 10 s timeout: 3 s, then
+        // libx264's open and first frame.
+        assert!(
+            outwaited >= Duration::from_secs(3) && outwaited < Duration::from_secs(5),
+            "{outwaited:?}"
+        );
+        assert!(first_packet < Duration::from_secs(5), "{first_packet:?}");
         // Given up on at NVENC's 15 s limit; the held open returns at 30 s.
         assert!(
             stalled >= Duration::from_secs(15) && stalled < Duration::from_secs(18),
@@ -4620,6 +7374,62 @@ mod tests {
         eprintln!("packets: {on_x264} on x264 during the stall, {on_nvenc} on NVENC after");
         assert!(on_x264 >= 100, "{on_x264} packets while the open was stuck");
         assert!(on_nvenc >= 20, "{on_nvenc} packets after NVENC came back");
+        let stats = PIPELINE_STATS.lock();
+        assert_eq!(stats.codec_name, "H.264 (NVENC)");
+        assert!(!stats.using_software_fallback);
+    }
+
+    /// Native, on a PC with NVENC: the first NVENC open takes 6 s, past the
+    /// first picture's 3 s but within its 15 s limit. The stage streams on
+    /// software from 3 s and switches to that same NVENC session when it
+    /// opens, with no stall and no second open.
+    /// `cargo test -p eternal-host --lib a_slow_real_nvenc_open -- --ignored --nocapture`
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "native: needs an NVIDIA GPU"]
+    fn a_slow_real_nvenc_open_is_taken_once_it_opens() {
+        use std::time::Duration;
+        std::env::set_var("ETERNAL_SIMULATE_STALL", "encoder_open");
+        std::env::set_var("ETERNAL_SIMULATE_STALL_MS", "6000");
+        let mut stage = NativeStage::start();
+        let (outwaited, from) = stage.publish_until(
+            "streaming on libx264 while it opens in the background",
+            0,
+            Duration::from_secs(20),
+        );
+        let (switched, _) =
+            stage.publish_until("in_background=true", from, Duration::from_secs(20));
+        for _ in 0..30 {
+            stage.publish();
+        }
+        let first_packet = stage.packets.lock().first().copied().expect("no packet");
+        let on_x264 = stage.packets_between(outwaited + Duration::from_millis(500), switched);
+        let after = stage.packets_between(switched, Duration::MAX);
+        let text = stage.finish();
+        eprintln!(
+            "first picture at {first_packet:?}, x264 from {outwaited:?}, NVENC from {switched:?}; \
+             {on_x264} packets on x264, {after} after"
+        );
+        assert!(first_packet < Duration::from_secs(5), "{first_packet:?}");
+        assert!(
+            switched >= Duration::from_secs(6) && switched < Duration::from_secs(8),
+            "{switched:?}"
+        );
+        assert!(on_x264 >= 30, "{on_x264} packets on x264");
+        assert!(after >= 20, "{after} packets on NVENC");
+        let line = text
+            .lines()
+            .find(|line| line.contains("in_background=true"))
+            .unwrap();
+        assert!(line.contains("Reopened encoder session"), "{line}");
+        assert!(line.contains("h264_nvenc"), "{line}");
+        assert!(!text.contains("stall=encoder_open"), "{text}");
+        // NVENC opened once: the session that went on in the background.
+        assert_eq!(
+            text.matches("Encoder opened").count(),
+            2,
+            "x264 and NVENC, once each:\n{text}"
+        );
         let stats = PIPELINE_STATS.lock();
         assert_eq!(stats.codec_name, "H.264 (NVENC)");
         assert!(!stats.using_software_fallback);
@@ -4636,8 +7446,28 @@ mod tests {
     #[ignore = "native: needs an NVIDIA GPU"]
     fn a_bitrate_change_after_a_stalled_nvenc_reopen_clears_is_prompt() {
         use std::time::Duration;
+        // As on an NVIDIA card that cannot change its bitrate live: there an
+        // ABR step reopens NVENC, the reopen this test holds.
+        LiveBitrate::NvencReconfig
+            .refused()
+            .store(true, Ordering::Relaxed);
         let mut stage = NativeStage::start();
-        let (_, opened) = stage.publish_until("Encoder opened", 0, Duration::from_secs(20));
+        // NVENC streams before the ABR step. A first open slower than the
+        // first picture's wait streams libx264 until NVENC's session, opened
+        // in the background, takes over.
+        let mut from = 0;
+        let opened = loop {
+            let (_, at) = stage.publish_until("Encoder opened", from, Duration::from_secs(20));
+            if stage.text()[at..]
+                .lines()
+                .next()
+                .unwrap()
+                .contains("h264_nvenc")
+            {
+                break at;
+            }
+            from = at + 1;
+        };
         for _ in 0..30 {
             stage.publish();
         }

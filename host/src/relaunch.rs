@@ -122,14 +122,15 @@ pub fn event_name(nonce: &str) -> String {
 }
 
 /// The user's own arguments (a custom port is the first one), without the
-/// ones a restart adds.
+/// ones a restart adds. Without the sign-in one too: a copy the user asked
+/// for (a restart or an update) opens its window.
 pub fn own_args<T: PartialEq<str>>(args: impl IntoIterator<Item = T>) -> Vec<T> {
     let mut kept = Vec::new();
     let mut args = args.into_iter();
     while let Some(arg) = args.next() {
         if arg == *WAIT_ARG || arg == *REASON_ARG {
             args.next();
-        } else {
+        } else if arg != *crate::autostart::SIGN_IN_ARG {
             kept.push(arg);
         }
     }

@@ -29,7 +29,11 @@ enum Wire {
         case pong = 0x17
         case streamConfig = 0x18
         case nack = 0x19
+        case pointerShape = 0x1C
+        case pointerState = 0x1D
         case inputEvent = 0x20
+        case identify = 0x1A
+        case identity = 0x1B
         case error = 0x7F
     }
 
@@ -253,8 +257,25 @@ struct Hello2: Equatable {
     static let featureWantsInput: UInt16 = 1 << 0
     static let featureWantsAudio: UInt16 = 1 << 1
     static let featureSupportsNack: UInt16 = 1 << 2
+    /// This app understands the stopped, restarting and failed statuses. A PC
+    /// sends them only to an iPad that sets it.
+    static let featureStandbyStatus: UInt16 = 1 << 3
+    /// A HELLO2 that sets `featureStandbyStatus` is padded with zeros to at
+    /// least this many bytes: the longest HELLO_ACK there is. A PC answers
+    /// while it isn't streaming only with no more bytes than it was sent.
+    static let standbyLength = 164
     /// This app checks for its own updates, so the PC need not tell the user. 0.3.1 and older never set it.
     static let featureChecksUpdates: UInt16 = 1 << 4
+    /// This app draws the pointer from POINTER_SHAPE and POINTER_STATE, so
+    /// a PC with `HelloAck.hostCapPointer` leaves it out of the video.
+    static let featureDrawsPointer: UInt16 = 1 << 5
+    /// This iPad may ask for smaller media datagrams in a keyframe request,
+    /// and wants heartbeats to count the frames the PC sent. Bit 5 is
+    /// `featureDrawsPointer`.
+    static let featureMediaSize: UInt16 = 1 << 6
+    /// This app understands the goodbyes a PC sends as it goes to sleep or
+    /// shuts down. Older apps drop a goodbye they can't read.
+    static let featurePowerBye: UInt16 = 1 << 7
     static let maxNameLength = 64
 
     var protoMin: UInt8 = 2
@@ -282,6 +303,15 @@ enum HelloStatus: UInt8 {
     case error = 3
     case unauthorized = 4
     case rateLimited = 5
+    /// The PC answered but isn't streaming: someone clicked Stop on it,
+    case stopped = 6
+    /// it is restarting its stream,
+    case restarting = 7
+    /// or it stopped after repeated errors (`HelloAck.reason` says why).
+    case failed = 8
+
+    /// The PC is there and may stream again: keep asking.
+    var pcNotStreaming: Bool { self == .stopped || self == .restarting || self == .failed }
 }
 
 struct HelloAck: Equatable {
@@ -292,7 +322,19 @@ struct HelloAck: Equatable {
     static let hostCapPen: UInt16 = 1 << 4
     /// Media frame_seq counts the frames sent in a stream epoch without gaps,
     /// so a forward gap is a frame lost in transit. Older iPads ignore it.
+    /// Every 0.3.4 and later PC sets it in replies that accept a session;
+    /// see `OldPC`.
     static let hostCapContiguousFrameSeq: UInt16 = 1 << 5
+    /// The PC sends the pointer apart from the video to an iPad that said
+    /// it draws it. Older iPads ignore it.
+    static let hostCapPointer: UInt16 = 1 << 6
+    /// The PC takes `KeyframeRequest.maxMediaDgram` for the rest of the
+    /// session, and its heartbeats carry `framesSent`. Only an iPad that
+    /// sets `Hello2.featureMediaSize` hears it.
+    static let hostCapMediaSize: UInt16 = 1 << 7
+    /// The PC answers a GapLoss request at once when it names a frame from
+    /// the PC's last recovery keyframe on (`ControlChannel.sendKeyframeRequest`).
+    static let hostCapKeyframePerLoss: UInt16 = 1 << 8
     var status: HelloStatus
     var acceptedVersion: UInt8
     var clientNonce: UInt32
@@ -304,11 +346,41 @@ struct HelloAck: Equatable {
     var hostName: String
     var authToken = Data(repeating: 0, count: 16)
     var hostCaps: UInt16 = 0
+    /// Why the PC isn't streaming, for `.failed`: a token such as
+    /// "display_changing". Empty otherwise.
+    var reason = ""
+    static let maxReasonLength = 32
 }
 
 struct Heartbeat: Equatable {
     var hostTimeUs: UInt64
     var streamConfig: StreamConfig
+    /// What to say over the picture, for as long as it lasts. PCs older than
+    /// the field leave it off: `noticeNone`. Unknown values are ignored.
+    var notice: UInt8 = Heartbeat.noticeNone
+
+    static let noticeNone: UInt8 = 0
+    /// The PC is locked or shows a permission prompt, so it can't capture.
+    static let noticePCLocked: UInt8 = 1
+    /// No display is on at the PC (a closed lid, screens off or unplugged).
+    static let noticeNoDisplay: UInt8 = 2
+    /// Windows won't let EternalMonitor capture the PC's screen from the
+    /// graphics card it runs on. The PC's window says how to switch.
+    static let noticeUnsupportedGPU: UInt8 = 3
+    /// The same in Second screen mode, after the second screen failed to
+    /// start: the main screen it fell back to can't be captured either.
+    static let noticeSecondScreenUnsupportedGPU: UInt8 = 4
+    /// The PC is restarting its stream and keeps this session: the picture
+    /// comes back by itself. Sent only to an iPad that sets
+    /// `Hello2.featureStandbyStatus`. (3 and 4 are the graphics card notices.)
+    static let noticeRestarting: UInt8 = 5
+    /// Second screen needs Windows 11, so the PC shows its main screen
+    /// instead. Sent for a few seconds, over a picture that works.
+    static let noticeSecondScreenNeedsWindows11: UInt8 = 6
+    /// The video frames the PC sent this session, from a PC that offered
+    /// `HelloAck.hostCapMediaSize`; nil from others. Appended after
+    /// `notice`, which is then always written.
+    var framesSent: UInt32?
 }
 
 enum ByeReason: UInt8 {
@@ -317,6 +389,11 @@ enum ByeReason: UInt8 {
     case hostShuttingDown = 2
     case error = 3
     case superseded = 4
+    /// The PC is going to sleep. Only to an iPad that sets `featurePowerBye`.
+    case hostSleeping = 5
+    /// The PC is shutting down, restarting or signing out. Only to an iPad
+    /// that sets `featurePowerBye`.
+    case hostPoweringOff = 6
 }
 
 enum KeyframeReason: UInt8 {
@@ -330,6 +407,11 @@ struct KeyframeRequest: Equatable {
     var streamEpoch: UInt32
     var lastCompleteSeq: UInt32
     var reason: KeyframeReason
+    /// The largest media datagram to send from now on in this session; 0
+    /// asks nothing. Appended: only for a PC with `HelloAck.hostCapMediaSize`.
+    var maxMediaDgram: UInt16 = 0
+    /// The smallest a request may ask for, as the PC's own setting.
+    static let minMediaDgram: UInt16 = 576
 }
 
 struct Nack: Equatable {
@@ -362,6 +444,47 @@ struct ReceiverReport: Equatable {
     var nacksSent: UInt32 = 0
     var audioPacketsLost: UInt32 = 0
     var audioBufferMs: UInt16 = 0
+    /// The last pointer image held complete, 0 for none.
+    var pointerShapeId: UInt32 = 0
+}
+
+/// One chunk of a pointer image (see the Rust `PointerShapeChunk`). The
+/// image is `height` rows of `width` premultiplied BGRA pixels, then, with
+/// `invertFlag`, `height` rows of `(width + 7) / 8` mask bytes, most
+/// significant bit first: a set bit inverts the picture under that pixel.
+struct PointerShapeChunk: Equatable {
+    static let version: UInt8 = 1
+    static let invertFlag: UInt8 = 1 << 0
+    static let maxSide: UInt16 = 512
+
+    var shapeId: UInt32
+    var sourceType: UInt8
+    var flags: UInt8
+    var width: UInt16
+    var height: UInt16
+    var hotX: UInt16
+    var hotY: UInt16
+    var totalLen: UInt32
+    var offset: UInt32
+    var data: Data
+
+    static func imageLength(width: UInt16, height: UInt16, flags: UInt8) -> Int {
+        let (w, h) = (Int(width), Int(height))
+        return w * h * 4 + (flags & invertFlag != 0 ? (w + 7) / 8 * h : 0)
+    }
+}
+
+/// Where the PC's pointer is: the image's top-left corner in video pixels.
+struct PointerState: Equatable {
+    static let visibleFlag: UInt8 = 1 << 0
+
+    var flags: UInt8
+    var shapeId: UInt32
+    var x: Int32
+    var y: Int32
+    var hostTimeUs: UInt64
+
+    var visible: Bool { flags & Self.visibleFlag != 0 }
 }
 
 struct WirePing: Equatable {
@@ -372,6 +495,42 @@ struct WirePong: Equatable {
     var t1Us: UInt64
     var t2Us: UInt64
     var t3Us: UInt64
+}
+
+/// iPad → PC, session 0: before reconnecting to a PC it found at a new
+/// address, the iPad checks that it is the same PC, at that address. The PC
+/// answers with a `WireIdentity`. Reserved bytes keep the request as long as
+/// the answer.
+struct WireIdentify: Equatable {
+    static let version: UInt8 = 1
+    /// What the proof signs after the nonce.
+    static let context = Data("EternalMonitor identify v1".utf8)
+    /// Addresses an answer carries at most.
+    static let maxAddresses = 4
+    /// Both bodies: version, nonce, port, count, address slots and proof.
+    static let bodySize = 1 + 16 + 2 + 1 + 4 * maxAddresses + 32
+    var version = WireIdentify.version
+    var nonce: Data
+}
+
+/// PC → iPad, session 0: the port the PC receives the stream on, its home
+/// network IPv4 addresses (4 bytes each), and HMAC-SHA256 keyed with the
+/// pairing token over `message`.
+struct WireIdentity: Equatable {
+    var version = WireIdentify.version
+    var nonce: Data
+    var port: UInt16
+    var addresses: [Data]
+    var proof: Data
+
+    /// What the proof signs: `nonce ‖ context ‖ port (LE) ‖ count ‖ addresses`.
+    static func message(nonce: Data, port: UInt16, addresses: [Data]) -> Data {
+        var message = nonce + WireIdentify.context
+        message.appendLE(port)
+        message.append(UInt8(addresses.count))
+        for address in addresses { message.append(address) }
+        return message
+    }
 }
 
 struct WireInputEvent: Equatable {
@@ -404,6 +563,10 @@ enum ControlMessage: Equatable {
     case pong(WirePong)
     case streamConfig(StreamConfig)
     case inputEvent(WireInputEvent)
+    case pointerShape(PointerShapeChunk)
+    case pointerState(PointerState)
+    case identify(WireIdentify)
+    case identity(WireIdentity)
 
     var packetType: Wire.PacketType {
         switch self {
@@ -418,6 +581,10 @@ enum ControlMessage: Equatable {
         case .pong: return .pong
         case .streamConfig: return .streamConfig
         case .inputEvent: return .inputEvent
+        case .pointerShape: return .pointerShape
+        case .pointerState: return .pointerState
+        case .identify: return .identify
+        case .identity: return .identity
         }
     }
 }
@@ -449,6 +616,10 @@ extension Wire {
                 body.append(h.authToken)
                 body.appendLE(h.pairingCode)
             }
+            let padded = Hello2.standbyLength - ControlHeader.size
+            if h.featureCaps & Hello2.featureStandbyStatus != 0, body.count < padded {
+                body.append(Data(count: padded - body.count))
+            }
         case .helloAck(let a):
             let name = Data(a.hostName.utf8).prefixOnCharBoundary(a.hostName, max: Hello2.maxNameLength)
             body.append(a.status.rawValue)
@@ -462,19 +633,27 @@ extension Wire {
             body.append(UInt8(name.count))
             body.append(name)
             precondition(a.authToken.count == 16)
-            if a.hostCaps != 0 || a.authToken.contains(where: { $0 != 0 }) {
+            let reason = Data(a.reason.utf8).prefixOnCharBoundary(a.reason, max: HelloAck.maxReasonLength)
+            if a.hostCaps != 0 || a.authToken.contains(where: { $0 != 0 }) || !reason.isEmpty {
                 body.append(a.authToken)
                 body.appendLE(a.hostCaps)
+            }
+            if !reason.isEmpty {
+                body.append(UInt8(reason.count))
+                body.append(reason)
             }
         case .heartbeat(let hb):
             body.appendLE(hb.hostTimeUs)
             hb.streamConfig.encode(into: &body)
+            if hb.notice != Heartbeat.noticeNone || hb.framesSent != nil { body.append(hb.notice) }
+            if let frames = hb.framesSent { body.appendLE(frames) }
         case .bye(let reason):
             body.append(reason.rawValue)
         case .keyframeRequest(let k):
             body.appendLE(k.streamEpoch)
             body.appendLE(k.lastCompleteSeq)
             body.append(k.reason.rawValue)
+            if k.maxMediaDgram != 0 { body.appendLE(k.maxMediaDgram) }
         case .nack(let n):
             precondition(n.isValid)
             body.appendLE(n.streamEpoch)
@@ -496,11 +675,14 @@ extension Wire {
             body.appendLE(r.e2eLatencyMsX10)
             body.appendLE(r.rttMsX10)
             if r.fragsRepaired != 0 || r.nacksSent != 0
-                || r.audioPacketsLost != 0 || r.audioBufferMs != 0 {
+                || r.audioPacketsLost != 0 || r.audioBufferMs != 0 || r.pointerShapeId != 0 {
                 body.appendLE(r.fragsRepaired)
                 body.appendLE(r.nacksSent)
                 body.appendLE(r.audioPacketsLost)
                 body.appendLE(r.audioBufferMs)
+            }
+            if r.pointerShapeId != 0 {
+                body.appendLE(r.pointerShapeId)
             }
         case .ping(let p):
             body.appendLE(p.t1Us)
@@ -510,6 +692,22 @@ extension Wire {
             body.appendLE(p.t3Us)
         case .streamConfig(let cfg):
             cfg.encode(into: &body)
+        case .identify(let i):
+            precondition(i.nonce.count == 16)
+            body.append(i.version)
+            body.append(i.nonce)
+            body.append(Data(repeating: 0, count: WireIdentify.bodySize - 17))
+        case .identity(let i):
+            precondition(i.nonce.count == 16 && i.proof.count == 32 && i.addresses.count <= WireIdentify.maxAddresses
+                         && i.addresses.allSatisfy { $0.count == 4 })
+            body.append(i.version)
+            body.append(i.nonce)
+            body.appendLE(i.port)
+            body.append(UInt8(i.addresses.count))
+            for slot in 0..<WireIdentify.maxAddresses {
+                body.append(slot < i.addresses.count ? i.addresses[slot] : Data(count: 4))
+            }
+            body.append(i.proof)
         case .inputEvent(let e):
             body.append(e.inputVer)
             body.append(e.kind)
@@ -529,6 +727,28 @@ extension Wire {
                 body.appendLE(UInt16(bitPattern: e.tiltX))
                 body.appendLE(UInt16(bitPattern: e.tiltY))
             }
+        case .pointerShape(let c):
+            body.append(PointerShapeChunk.version)
+            body.append(c.sourceType)
+            body.append(c.flags)
+            body.append(0)  // reserved
+            body.appendLE(c.shapeId)
+            body.appendLE(c.width)
+            body.appendLE(c.height)
+            body.appendLE(c.hotX)
+            body.appendLE(c.hotY)
+            body.appendLE(c.totalLen)
+            body.appendLE(c.offset)
+            body.appendLE(UInt16(c.data.count))
+            body.append(c.data)
+        case .pointerState(let p):
+            body.append(PointerShapeChunk.version)
+            body.append(p.flags)
+            body.appendLE(UInt16(0))  // reserved
+            body.appendLE(p.shapeId)
+            body.appendLE(UInt32(bitPattern: p.x))
+            body.appendLE(UInt32(bitPattern: p.y))
+            body.appendLE(p.hostTimeUs)
         }
 
         var out = Data(capacity: ControlHeader.size + body.count)
@@ -573,7 +793,9 @@ extension Wire {
         case .heartbeat:
             guard let hostTimeUs = r.readU64(),
                   let cfg = StreamConfig.decode(&r) else { return nil }
-            message = .heartbeat(Heartbeat(hostTimeUs: hostTimeUs, streamConfig: cfg))
+            message = .heartbeat(Heartbeat(hostTimeUs: hostTimeUs, streamConfig: cfg,
+                                           notice: r.readU8() ?? Heartbeat.noticeNone,
+                                           framesSent: r.remaining >= 4 ? r.readU32() : nil))
         case .bye:
             guard let raw = r.readU8(), let reason = ByeReason(rawValue: raw) else { return nil }
             message = .bye(reason)
@@ -582,8 +804,8 @@ extension Wire {
                   let last: UInt32 = r.readU32(),
                   let raw = r.readU8(),
                   let reason = KeyframeReason(rawValue: raw) else { return nil }
-            message = .keyframeRequest(
-                KeyframeRequest(streamEpoch: epoch, lastCompleteSeq: last, reason: reason))
+            message = .keyframeRequest(KeyframeRequest(streamEpoch: epoch, lastCompleteSeq: last, reason: reason,
+                                                       maxMediaDgram: r.remaining >= 2 ? r.readU16() ?? 0 : 0))
         case .receiverReport:
             message = parseReceiverReport(&r)
         case .nack:
@@ -609,6 +831,26 @@ extension Wire {
             message = .streamConfig(cfg)
         case .inputEvent:
             message = parseInputEvent(&r)
+        case .pointerShape:
+            message = parsePointerShape(&r)
+        case .pointerState:
+            guard r.readU8() == PointerShapeChunk.version,
+                  let flags = r.readU8(), let _ = r.readU16(),
+                  let shapeId = r.readU32(), let x = r.readU32(), let y = r.readU32(),
+                  let time = r.readU64() else { return nil }
+            message = .pointerState(PointerState(
+                flags: flags, shapeId: shapeId, x: Int32(bitPattern: x), y: Int32(bitPattern: y),
+                hostTimeUs: time))
+        case .identify:
+            guard let version = r.readU8(), let nonce = r.take(16), r.take(WireIdentify.bodySize - 17) != nil else { return nil }
+            message = .identify(WireIdentify(version: version, nonce: Data(nonce)))
+        case .identity:
+            guard let version = r.readU8(), let nonce = r.take(16), let port = r.readU16(), let count = r.readU8(),
+                  Int(count) <= WireIdentify.maxAddresses, let slots = r.take(4 * WireIdentify.maxAddresses),
+                  let proof = r.take(32) else { return nil }
+            let addresses = (0..<Int(count)).map { Data(slots.dropFirst($0 * 4).prefix(4)) }
+            message = .identity(WireIdentity(version: version, nonce: Data(nonce), port: port, addresses: addresses,
+                                             proof: Data(proof)))
         case .media, .mediaFec, .audio, .error:
             return nil
         }
@@ -668,6 +910,11 @@ extension Wire {
             ack.authToken = Data(token)
             ack.hostCaps = caps
         }
+        if r.remaining > 0 {
+            guard let length = r.readU8(), Int(length) <= HelloAck.maxReasonLength, let bytes = r.take(Int(length)),
+                  let reason = String(bytes: bytes, encoding: .utf8) else { return nil }
+            ack.reason = reason
+        }
         return .helloAck(ack)
     }
 
@@ -699,7 +946,32 @@ extension Wire {
             report.audioPacketsLost = audioLost
             report.audioBufferMs = audioBuffer
         }
+        if r.remaining >= 4, let shape = r.readU32() {
+            report.pointerShapeId = shape
+        }
         return .receiverReport(report)
+    }
+
+    /// Enforces what the Rust parser does: a nonzero id, a size within the
+    /// cap, the length that size implies, and a chunk inside it.
+    private static func parsePointerShape(_ r: inout WireReader) -> ControlMessage? {
+        guard r.readU8() == PointerShapeChunk.version,
+              let sourceType = r.readU8(), let flags = r.readU8(), let _ = r.readU8(),
+              let shapeId = r.readU32(), shapeId != 0,
+              let width = r.readU16(), let height = r.readU16(),
+              (1...PointerShapeChunk.maxSide).contains(width),
+              (1...PointerShapeChunk.maxSide).contains(height),
+              let hotX = r.readU16(), let hotY = r.readU16(),
+              let totalLen = r.readU32(),
+              Int(totalLen) == PointerShapeChunk.imageLength(width: width, height: height, flags: flags),
+              let offset = r.readU32(),
+              let dataLen = r.readU16(), dataLen > 0,
+              Int(offset) + Int(dataLen) <= Int(totalLen),
+              let data = r.take(Int(dataLen))
+        else { return nil }
+        return .pointerShape(PointerShapeChunk(
+            shapeId: shapeId, sourceType: sourceType, flags: flags, width: width, height: height,
+            hotX: hotX, hotY: hotY, totalLen: totalLen, offset: offset, data: Data(data)))
     }
 
     private static func parseInputEvent(_ r: inout WireReader) -> ControlMessage? {

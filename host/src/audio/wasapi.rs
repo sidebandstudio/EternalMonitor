@@ -17,7 +17,7 @@ use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 
 use super::pcm::SampleEncoding;
 use super::resample::{PcmBlock, PcmFormat};
-use super::AudioResult;
+use super::{AudioResult, DeviceInUse};
 
 const PCM_GUID: GUID = GUID::from_u128(0x00000001_0000_0010_8000_00aa00389b71);
 const FLOAT_GUID: GUID = GUID::from_u128(0x00000003_0000_0010_8000_00aa00389b71);
@@ -120,6 +120,21 @@ fn parse_format(mix: &MixFormat) -> AudioResult<(PcmFormat, SampleEncoding)> {
         return Err("invalid WASAPI mix geometry".into());
     }
     Ok((format, encoding))
+}
+
+/// Another app took the output in exclusive mode: shared-mode loopback
+/// can't open until it lets go, which the audio stage waits out.
+fn in_use(
+    error: Box<dyn std::error::Error + Send + Sync>,
+) -> Box<dyn std::error::Error + Send + Sync> {
+    if error
+        .downcast_ref::<windows::core::Error>()
+        .is_some_and(|error| error.code() == AUDCLNT_E_DEVICE_IN_USE)
+    {
+        Box::new(DeviceInUse)
+    } else {
+        error
+    }
 }
 
 struct Loopback {
@@ -297,7 +312,7 @@ impl WasapiSource {
     pub fn new() -> AudioResult<Self> {
         let apartment = ComApartment::new()?;
         let enumerator = unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
-        let stream = Loopback::open(&enumerator)?;
+        let stream = Loopback::open(&enumerator).map_err(in_use)?;
         Ok(Self {
             stream: Some(stream),
             enumerator,
@@ -325,11 +340,15 @@ impl WasapiSource {
                     self.stream = Some(stream);
                 }
                 Err(error) => {
-                    if self
-                        .unavailable_since
-                        .get_or_insert_with(Instant::now)
-                        .elapsed()
-                        >= Duration::from_secs(5)
+                    // An app holding the output to itself is waited out by
+                    // the audio stage, which shows why.
+                    let error = in_use(error);
+                    if super::is_device_in_use(error.as_ref())
+                        || self
+                            .unavailable_since
+                            .get_or_insert_with(Instant::now)
+                            .elapsed()
+                            >= Duration::from_secs(5)
                     {
                         return Err(error);
                     }
@@ -373,7 +392,7 @@ impl WasapiSource {
                     self.reopen();
                     Ok(None)
                 } else {
-                    Err(error)
+                    Err(in_use(error))
                 }
             }
         }
@@ -384,5 +403,36 @@ impl WasapiSource {
         self.unavailable_since.get_or_insert_with(Instant::now);
         self.retry_at = Instant::now();
         tracing::info!("Default PC audio endpoint changed; reopening loopback");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_an_output_in_use_waits_for_the_other_app() {
+        let busy = in_use(windows::core::Error::from(AUDCLNT_E_DEVICE_IN_USE).into());
+        assert!(super::super::is_device_in_use(busy.as_ref()));
+        // Reopened in place, or not something waiting fixes: unchanged.
+        for code in [
+            AUDCLNT_E_DEVICE_INVALIDATED,
+            AUDCLNT_E_RESOURCES_INVALIDATED,
+            AUDCLNT_E_SERVICE_NOT_RUNNING,
+            AUDCLNT_E_ENDPOINT_CREATE_FAILED,
+            AUDCLNT_E_UNSUPPORTED_FORMAT,
+            AUDCLNT_E_EXCLUSIVE_MODE_NOT_ALLOWED,
+        ] {
+            let other = in_use(windows::core::Error::from(code).into());
+            assert!(!super::super::is_device_in_use(other.as_ref()), "{code:?}");
+            assert_eq!(
+                other
+                    .downcast_ref::<windows::core::Error>()
+                    .map(|error| error.code()),
+                Some(code)
+            );
+        }
+        let text = in_use("invalid WASAPI mix geometry".into());
+        assert_eq!(text.to_string(), "invalid WASAPI mix geometry");
     }
 }

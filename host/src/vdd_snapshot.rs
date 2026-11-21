@@ -18,6 +18,18 @@ const MAX_NAME: usize = 48;
 /// The virtual display's monitor reports the driver's EDID ID in its path.
 const VDD_MONITOR: &str = "MTT1337";
 
+/// A target on the active desktop and the GDI source DXGI opens for it.
+#[cfg(any(windows, test, debug_assertions))]
+#[derive(Clone)]
+pub(crate) struct ActivePath {
+    pub source: String,
+    pub virtual_display: bool,
+    pub position: (i32, i32),
+}
+
+#[cfg(windows)]
+pub(crate) use windows_impl::active_paths;
+
 /// A DXGI adapter.
 #[derive(Debug, Clone)]
 pub struct Adapter {
@@ -49,6 +61,9 @@ impl Target {
 }
 
 /// Whether a monitor device path is the virtual display's.
+/// The guard and capture both match the driver's stock EDID marker in the
+/// monitor path. This cannot distinguish a custom EDID or prove a PnP node.
+/// The same driver installed by another app is the device our tasks control.
 pub fn is_vdd_monitor(monitor_path: &str) -> bool {
     monitor_path.to_ascii_uppercase().contains(VDD_MONITOR)
 }
@@ -99,6 +114,7 @@ pub fn driver_render_card<'a>(
 pub struct Snapshot {
     /// The device state, or why there is none.
     pub device: Result<DeviceState, &'static str>,
+    pub power_source: &'static str,
     /// The graphics card the host asked the driver for, or why it asked for none.
     pub pin: Result<String, &'static str>,
     /// The card the driver renders on (`driver_render_card`).
@@ -160,6 +176,7 @@ pub fn line(snapshot: &Snapshot) -> String {
         Some(false) => " settings_path=other",
         None => " settings_path=unknown",
     };
+    out += &format!(" power_source={}", snapshot.power_source);
 
     let adapters: Vec<String> = snapshot
         .adapters
@@ -233,6 +250,7 @@ pub fn collect(
     let (adapters, targets) = (adapters(), targets());
     Snapshot {
         device,
+        power_source: crate::power::power_source(),
         pin,
         render: driver_render_card(&adapters, &targets, before).map(str::to_string),
         hags: crate::diagnostics::registry_dword(
@@ -369,6 +387,46 @@ mod windows_impl {
         }
     }
 
+    pub(crate) fn active_paths() -> Option<Vec<super::ActivePath>> {
+        use windows::Win32::Devices::Display::{
+            DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE, QDC_ONLY_ACTIVE_PATHS,
+        };
+        let (paths, modes) = display_config(QDC_ONLY_ACTIVE_PATHS)?;
+        paths
+            .iter()
+            .map(|path| {
+                let monitor = monitor_path(path);
+                if monitor.is_empty() || !path.targetInfo.targetAvailable.as_bool() {
+                    return None;
+                }
+                // In the virtual-mode layout the low half is the clone group
+                // and the high half is the source mode index.
+                let raw = unsafe { path.sourceInfo.Anonymous.modeInfoIdx };
+                let index = if path.flags
+                    & windows::Win32::Graphics::Gdi::DISPLAYCONFIG_PATH_SUPPORT_VIRTUAL_MODE
+                    != 0
+                {
+                    raw >> 16
+                } else {
+                    raw
+                };
+                let mode = modes.get(index as usize)?;
+                if mode.infoType != DISPLAYCONFIG_MODE_INFO_TYPE_SOURCE
+                    || mode.id != path.sourceInfo.id
+                    || mode.adapterId != path.sourceInfo.adapterId
+                {
+                    return None;
+                }
+                let pos = unsafe { mode.Anonymous.sourceMode.position };
+                Some(super::ActivePath {
+                    source: crate::gpu_preference::source_name(path)?,
+                    virtual_display: super::is_vdd_monitor(&monitor),
+                    position: (pos.x, pos.y),
+                })
+            })
+            .collect()
+    }
+
     /// Every active path, then each available target no active path uses.
     pub fn targets() -> Vec<Target> {
         let Some((path_info, _)) = display_config(QDC_ALL_PATHS) else {
@@ -415,6 +473,7 @@ mod tests {
     fn snapshot() -> Snapshot {
         Snapshot {
             device: Ok(DeviceState::NoMonitor),
+            power_source: "battery",
             pin: Ok("Intel(R) Iris(R) Xe Graphics".into()),
             render: None,
             hags: Some(2),
@@ -463,7 +522,7 @@ mod tests {
         assert_eq!(
             line(&snapshot()),
             "device=no_monitor pin=\"Intel(R) Iris(R) Xe Graphics\" pin_matched=true render=unknown hags=on \
-             settings_path=default adapters=[d2c1 \"Intel(R) Iris(R) Xe Graphics\" 8086:46a6 \
+             settings_path=default power_source=battery adapters=[d2c1 \"Intel(R) Iris(R) Xe Graphics\" 8086:46a6 \
              driver=32.0.101.7092 outputs=1 | 10000e5f0 \"NVIDIA GeForce RTX 3050 Ti Laptop GPU\" \
              10de:25a0 driver=32.0.16.1742 outputs=0] paths=[active src=d2c1/0 tgt=d2c1/4352 \
              tech=-2147483648 vdd=no | inactive available tgt=200000101/256 tech=5 vdd=yes]"

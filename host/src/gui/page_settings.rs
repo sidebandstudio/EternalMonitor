@@ -24,10 +24,11 @@ impl AnalyzerApp {
         widgets::list_card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             let mut refresh = false;
+            let windows_10 = crate::capture::second_screen::windows_unsupported(&self.control.shared);
             widgets::setting_row(
                 ui,
                 tr("How the iPad shows your PC"),
-                "Mirror my screen shows your main screen. Second screen adds the iPad as an extra screen while it is connected. You can also mirror one particular monitor.",
+                display_description(windows_10),
                 300.0,
                 |ui| {
                     refresh = widgets::icon_button(ui, super::icons::Icon::Refresh, tr("Refresh displays")).clicked();
@@ -52,6 +53,8 @@ impl AnalyzerApp {
             if vdd_match != self.settings_vdd_match {
                 self.set_vdd_match(vdd_match);
             }
+            widgets::divider(ui);
+            self.resolution_row(ui, vdd_match);
             widgets::divider(ui);
             let fps_env = self.overrides.target_fps.env();
             let mut fps = match fps_env {
@@ -229,7 +232,7 @@ impl AnalyzerApp {
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 14.0;
                 let (rect, _) = ui.allocate_exact_size(vec2(44.0, 44.0), Sense::hover());
-                if let Some((_, texture)) = &self.logo {
+                if let Some((_, _, texture)) = &self.logo {
                     ui.painter().image(
                         texture.id(),
                         rect,
@@ -328,6 +331,92 @@ pub(super) fn env_or(env: Option<&str>, description: &str) -> String {
 /// What "Match the iPad's resolution" does, and when a change applies: the
 /// driver reads the modes when the second screen starts, and restarting
 /// the stream keeps the second screen that is already there.
+/// What the display choice does, and on Windows 10 that Second screen
+/// can't run there.
+pub(super) fn display_description(windows_10: bool) -> &'static str {
+    if windows_10 {
+        "Mirror my screen shows your main screen. You can also mirror one particular monitor. Second screen needs Windows 11, so on this PC the iPad shows your main screen instead."
+    } else {
+        "Mirror my screen shows your main screen. Second screen adds the iPad as an extra screen while it is connected. You can also mirror one particular monitor."
+    }
+}
+
+impl AnalyzerApp {
+    /// The second screen's size for the connected iPad: its own, a smaller
+    /// one at the same shape, or a common one in another shape.
+    fn resolution_row(&mut self, ui: &mut Ui, matching: bool) {
+        let shared = &self.control.shared;
+        let menu = crate::capture::vdd_resolution_menu(shared);
+        let connected = menu.is_some();
+        let (sizes, current, odd) = menu.as_ref().map_or((Vec::new(), None, None), |menu| {
+            (menu.sizes.clone(), Some(menu.current), menu.odd)
+        });
+        let selected_text = current.map_or_else(
+            || tr("Native").to_string(),
+            |size| resolution_label(size, sizes.first() == Some(&size)),
+        );
+        let mut clicked = None;
+        widgets::setting_row(
+            ui,
+            tr("Resolution"),
+            resolution_description(matching, connected),
+            220.0,
+            |ui| {
+                ui.add_enabled_ui(matching && !sizes.is_empty(), |ui| {
+                    let combo =
+                        widgets::combo(ui.id().with("vdd-resolution"), &selected_text, 200.0)
+                            // Ten sizes and the display's own all in view,
+                            // where the window has the room.
+                            .height(460.0)
+                            .show_ui(ui, |ui| {
+                                ui.set_min_width(200.0);
+                                for (index, &size) in sizes.iter().enumerate() {
+                                    let label = resolution_label(size, index == 0);
+                                    // The size the display is at, outside the
+                                    // list: shown, not offered.
+                                    let entry = ui.add_enabled_ui(odd != Some(size), |ui| {
+                                        ui.selectable_label(current == Some(size), label)
+                                    });
+                                    if entry.inner.clicked() {
+                                        clicked = Some(size);
+                                    }
+                                }
+                            });
+                    widgets::name_combo(ui, &combo.response, &selected_text);
+                });
+            },
+        );
+        if let Some(size) = clicked {
+            crate::capture::click_vdd_resolution(shared, size);
+        }
+    }
+}
+
+/// `2266 × 1488 (native)`, or a common shape's name after its size.
+fn resolution_label((width, height): (u32, u32), native: bool) -> String {
+    let size = format!("{width} × {height}");
+    if native {
+        return trf("{size} (native)", &[("size", &size)]);
+    }
+    let shape = [(16, 9, "16:9"), (16, 10, "16:10"), (4, 3, "4:3")]
+        .into_iter()
+        .find(|&(w, h, _)| width * h == height * w);
+    match shape {
+        Some((_, _, name)) => format!("{size} ({name})"),
+        None => size,
+    }
+}
+
+pub(super) fn resolution_description(matching: bool, connected: bool) -> &'static str {
+    if !matching {
+        "Used by Second screen. Turn on Match the iPad's resolution to choose one."
+    } else if !connected {
+        "Used by Second screen. Connect the iPad to choose its size. Each iPad keeps its own."
+    } else {
+        "Used by Second screen. A smaller size makes everything larger at the same Windows scale, and a little less sharp. Other shapes show with bars. Each iPad keeps the size picked here. One set in Windows lasts for that session."
+    }
+}
+
 pub(super) fn vdd_match_description(extending: bool) -> &'static str {
     if extending {
         "Makes the second screen exactly as sharp and smooth as the iPad's display. A change applies the next time the second screen starts, when the iPad connects again."

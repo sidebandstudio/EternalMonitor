@@ -72,6 +72,8 @@ struct PendingFrame {
     deadline: Option<Instant>,
     retry_at: Option<Instant>,
     requested_at: Option<Instant>,
+    /// The latest request for this frame (see `FrameAssembler.PendingFrame.askedAt`).
+    asked_at: Option<Instant>,
     completed_at: Option<Instant>,
     stall_used: Duration,
     stall_counted_until: Option<Instant>,
@@ -313,7 +315,7 @@ impl Reassembler {
             // once a complete frame waits.
             let latest = now + self.repair_window();
             for frame in self.pending.values_mut() {
-                if !frame.hold_retry.is_zero() {
+                if !frame.hold_retry.is_zero() && !frame.header.is_keyframe {
                     frame.drop_by = Some(frame.drop_by.map_or(latest, |by| by.min(latest)));
                 }
             }
@@ -331,6 +333,7 @@ impl Reassembler {
             deadline: None,
             retry_at: None,
             requested_at: None,
+            asked_at: None,
             completed_at: None,
             stall_used: Duration::ZERO,
             stall_counted_until: None,
@@ -438,7 +441,10 @@ impl Reassembler {
                     .is_some_and(|deadline| now >= deadline + self.stall(frame, now))
                 {
                     if self.pending.first_key_value().map(|(&s, _)| s) == Some(seq) {
-                        let blocking = self.pending.values().any(PendingFrame::complete);
+                        // The frames behind a keyframe need it, so they never
+                        // make it go (see `FrameAssembler.tick(at:)`).
+                        let blocking = !frame.header.is_keyframe
+                            && self.pending.values().any(PendingFrame::complete);
                         if !blocking && frame.gap_at.is_some_and(|gap| now < gap + MAX_HOLD) {
                             self.hold(seq, now);
                         } else if blocking {
@@ -474,12 +480,16 @@ impl Reassembler {
                 {
                     let through = frame.header.frag_count - 1;
                     self.begin_gap(seq, through, now);
-                } else if !frame.retried && frame.retry_at.is_some_and(|retry| now >= retry) {
-                    let through = frame.header.frag_count - 1;
-                    if let Some(frame) = self.pending.get_mut(&seq) {
-                        frame.retried = true;
-                    }
-                    self.request(seq, through, true, now);
+                } else if !frame.header.is_keyframe
+                    && !frame.retried
+                    && frame.retry_at.is_some_and(|retry| now >= retry)
+                {
+                    self.retry(seq, now);
+                }
+                // A keyframe's requests follow their own schedule, apart
+                // from its hold (see `FrameAssembler.tick(at:)`).
+                if self.keyframe_retry_due(seq, now) {
+                    self.retry(seq, now);
                 }
             } else if now.saturating_duration_since(frame.last_fragment_at) >= STALE_FRAME_TIMEOUT {
                 // Timed from the latest fragment: over a slow USB tunnel a
@@ -511,6 +521,34 @@ impl Reassembler {
         self.request(seq, through, false, now);
     }
 
+    /// A keyframe asks again every RTT + 5 ms; after its first retry, only
+    /// once something arrived since it last asked (see
+    /// `FrameAssembler.keyframeRetryDue(_:at:)`).
+    fn keyframe_retry_due(&self, seq: u32, now: Instant) -> bool {
+        let Some(frame) = self.pending.get(&seq) else {
+            return false;
+        };
+        frame.header.is_keyframe
+            && !frame.complete()
+            && frame.retry_at.is_some_and(|retry| now >= retry)
+            && (!frame.retried
+                || self.last_arrival.is_some_and(|arrival| {
+                    arrival < now && frame.asked_at.is_some_and(|asked| arrival > asked)
+                }))
+    }
+
+    /// Asks again for every missing fragment and schedules the next retry.
+    fn retry(&mut self, seq: u32, now: Instant) {
+        let next = now + self.rtt + Duration::from_millis(5);
+        let Some(frame) = self.pending.get_mut(&seq) else {
+            return;
+        };
+        frame.retried = true;
+        frame.retry_at = Some(next);
+        let through = frame.header.frag_count - 1;
+        self.request(seq, through, true, now);
+    }
+
     fn repair_window(&self) -> Duration {
         let window_us =
             (2 * self.rtt.as_micros() + self.frame_period.as_micros() * 3 / 2).clamp(8_000, 25_000);
@@ -519,7 +557,7 @@ impl Reassembler {
 
     /// No complete frame waits behind this frame, so dropping it gains
     /// nothing (see `FrameAssembler.hold(_:now:)`): ask again, less often
-    /// each time.
+    /// each time. A keyframe's hold only moves its deadline.
     fn hold(&mut self, seq: u32, now: Instant) {
         let window = self.repair_window();
         let newer_waiting = self.pending.len() > 1;
@@ -533,10 +571,13 @@ impl Reassembler {
         };
         frame.hold_retry = wait;
         frame.deadline = Some(now + wait);
-        if newer_waiting {
+        if newer_waiting && !frame.header.is_keyframe {
             frame.drop_by = Some(frame.drop_by.map_or(now, |by| by.min(now)));
         }
         frame.stall_used = MAX_STALL_ALLOWANCE;
+        if frame.header.is_keyframe {
+            return;
+        }
         frame.retried = true;
         let through = frame.header.frag_count - 1;
         self.request(seq, through, true, now);
@@ -602,6 +643,7 @@ impl Reassembler {
         }
         frame.requested.extend(&missing);
         frame.requested_at.get_or_insert(now);
+        frame.asked_at = Some(now);
         let frag_count = frame.header.frag_count;
         for chunk in missing.chunks(64) {
             self.counters.nacks_sent += 1;

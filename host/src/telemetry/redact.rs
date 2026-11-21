@@ -124,6 +124,8 @@ const DIAGNOSTIC_KEYS: &[&str] = &[
     "avoided",
     "attached",
     "advertised_formats",
+    "capture_size",
+    "encoded_size",
     "usb_state",
     "wire_stream",
     "running",
@@ -136,6 +138,7 @@ const DIAGNOSTIC_KEYS: &[&str] = &[
     "ss_rule",
     // A silent client's session held, kept or ended.
     "silent_ms",
+    "stalled_ms",
     "held_ms",
     "last_heard",
     "heard",
@@ -164,6 +167,16 @@ const DIAGNOSTIC_KEYS: &[&str] = &[
     "choice",
     // The startup network line.
     "route",
+    "lan_adapters",
+    // The Windows Firewall line.
+    "profiles",
+    "allow_rules",
+    "block_rules",
+    "all_programs_block_rules",
+    "scoped_block_rules",
+    "bypass_rules",
+    "lan",
+    "verdict",
     // The virtual display snapshot.
     "driver",
     "tech",
@@ -1308,6 +1321,7 @@ mod tests {
                 .with_ansi(false)
                 .with_writer(move || Captured(writer.clone())),
         );
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(subscriber, log);
         let line = String::from_utf8(out.lock().clone()).unwrap();
         line.trim_end().to_owned()
@@ -1882,6 +1896,44 @@ mod tests {
         );
     }
 
+    #[test]
+    fn power_source_can_contain_a_name_in_free_form_output() {
+        let names = Names::new(None, None, Some("ExamplePC"));
+        assert_cases(
+            &names,
+            &[
+                ("power_source=ExamplePC", "power_source=%COMPUTERNAME%"),
+                (
+                    "power_source=battery ExamplePC",
+                    "power_source=battery %COMPUTERNAME%",
+                ),
+            ],
+        );
+        let names = Names::new(None, None, Some("battery-laptop"));
+        assert_cases(
+            &names,
+            &[("power_source=battery-laptop", "power_source=%COMPUTERNAME%")],
+        );
+        let names = Names::new(None, Some("battery backup"), None);
+        assert_cases(
+            &names,
+            &[("power_source=battery backup", "power_source=%USERNAME%")],
+        );
+    }
+
+    #[test]
+    fn ordinary_power_source_values_survive_redaction() {
+        let names = Names::new(None, Some("example-user"), Some("ExamplePC"));
+        for source in ["ac", "battery", "unknown"] {
+            for line in [
+                format!(r#"{STAMP}  INFO Support system information details="Windows build=26100.1 power_source={source}""#),
+                format!("{STAMP}  WARN Virtual display failure snapshot device=no_monitor power_source={source} pin=none"),
+            ] {
+                assert_eq!(redact(&line, &names), line);
+            }
+        }
+    }
+
     /// Every enumerated field the host logs keeps its value when the user or
     /// the PC has that name.
     #[test]
@@ -1899,6 +1951,7 @@ mod tests {
             ("none", "INFO remote_config=applied rollout=none ss_rule=none attach_s=6"),
             ("defaults", "INFO remote_config=defaults reason=offline rollout=7d"),
             ("NotInstalled", "vdd_device=missing problem=NotInstalled"),
+            ("task_queued", "WARN Virtual display could not be enabled second_screen_fallback=enable_failed reason=task_queued device=unknown"),
             (
                 "unknown",
                 r#"WARN Virtual display failure snapshot vdd_device=no_monitor pin=none pin_reason="unknown" render=unknown hags=unset settings_path=unknown"#,
@@ -1940,6 +1993,11 @@ mod tests {
                 "modes",
                 "INFO Second screen mode mode=2732x2048 requested=the driver's modes",
             ),
+            (
+                "1680x945",
+                "INFO Encoding without the capture's odd last column or row \
+                 capture_size=1680x945 encoded_size=1680x944",
+            ),
             ("arm64", "INFO EternalMonitor host 0.3.4 revision=x | OS=Windows arch=arm64 logical_cpus=8"),
             (
                 "Client",
@@ -1976,6 +2034,10 @@ mod tests {
                 "input",
                 "WARN Client liveness expired — tearing session down peer=192.0.2.7:50000 silent_ms=10000 \
                  held_ms=7000 last_heard=input late_input=0 device=iPad",
+            ),
+            (
+                "2750",
+                "INFO The stream's transport loop moved again phase=input stalled_ms=2750",
             ),
         ];
         for (name, message) in cases {

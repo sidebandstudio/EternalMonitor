@@ -76,9 +76,11 @@ impl PopupGate {
 }
 
 impl AnalyzerApp {
-    pub(super) fn update_banner(
+    /// A queued update starts once streaming stops; the window closes for
+    /// Setup.
+    pub(super) fn tick_updates(
         &mut self,
-        ui: &mut Ui,
+        ctx: &egui::Context,
         snap: &StatsSnapshot,
         client: &ClientSnapshot,
     ) {
@@ -87,8 +89,17 @@ impl AnalyzerApp {
             // Setup is waiting for this process to exit. Close the normal way
             // so the stream, virtual display and mDNS shut down cleanly.
             update_toast::hide();
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
+    }
+
+    pub(super) fn update_banner(
+        &mut self,
+        ui: &mut Ui,
+        snap: &StatsSnapshot,
+        client: &ClientSnapshot,
+    ) {
+        let streaming = StreamState::of(snap, client) == StreamState::Streaming;
         if streaming {
             // A connected iPad means the versions work together.
             crate::updates::clear_mismatch();
@@ -457,6 +468,22 @@ impl AnalyzerApp {
             self.set_check_updates(automatic);
         }
         widgets::divider(ui);
+        if crate::updates::is_beta(env!("CARGO_PKG_VERSION")) {
+            let mut beta = self.settings_beta_updates;
+            widgets::setting_row(
+                ui,
+                "Get Beta updates",
+                "This is a Beta build. Turn this off to be offered only stable releases.",
+                64.0,
+                |ui| {
+                    widgets::toggle(ui, &mut beta, "Get Beta updates");
+                },
+            );
+            if beta != self.settings_beta_updates {
+                self.set_beta_updates(beta);
+            }
+            widgets::divider(ui);
+        }
         let status = self.updates.check_status();
         let available = self.updates.available_version();
         let description = match (status, &available) {

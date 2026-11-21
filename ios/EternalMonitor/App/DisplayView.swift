@@ -51,6 +51,26 @@ struct DisplayView: View {
                 reconnectingCard
                     .transition(.opacity.combined(with: .scale(scale: 0.96)))
                     .allowsHitTesting(false)
+            } else if connectionManager.pcLocked {
+                pcLockedPill
+                    .transition(.opacity)
+                    .allowsHitTesting(false)
+            } else if connectionManager.pcNoDisplay {
+                noDisplayPill
+                    .transition(.opacity)
+                    .allowsHitTesting(false)
+            } else if let card = connectionManager.pcGraphicsCard {
+                graphicsCardPill(card)
+                    .transition(.opacity)
+                    .allowsHitTesting(false)
+            } else if connectionManager.pcRestarting {
+                pcRestartingPill
+                    .transition(.opacity)
+                    .allowsHitTesting(false)
+            } else if connectionManager.secondScreenNeedsWindows11 {
+                needsWindows11Pill
+                    .transition(.opacity)
+                    .allowsHitTesting(false)
             } else if connectionManager.pictureRestoring {
                 restoringPill
                     .transition(.opacity)
@@ -113,6 +133,11 @@ struct DisplayView: View {
         .persistentSystemOverlays(.hidden)
         .animation(.easeInOut(duration: 0.25), value: connectionManager.signalLost)
         .animation(.easeInOut(duration: 0.25), value: connectionManager.pictureRestoring)
+        .animation(.easeInOut(duration: 0.25), value: connectionManager.pcLocked)
+        .animation(.easeInOut(duration: 0.25), value: connectionManager.pcNoDisplay)
+        .animation(.easeInOut(duration: 0.25), value: connectionManager.pcGraphicsCard)
+        .animation(.easeInOut(duration: 0.25), value: connectionManager.pcRestarting)
+        .animation(.easeInOut(duration: 0.25), value: connectionManager.secondScreenNeedsWindows11)
         .animation(reduceMotion ? nil : .easeInOut(duration: 0.35), value: appeared)
         .onAppear {
             appeared = true
@@ -408,6 +433,108 @@ struct DisplayView: View {
         .padding(.vertical, 24)
         .frame(maxWidth: 360)
         .background(glass(RoundedRectangle(cornerRadius: 22, style: .continuous)))
+    }
+
+    /// Over the held picture while the PC is locked or shows a permission
+    /// prompt, until it captures again.
+    private var pcLockedPill: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "lock.fill")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Theme.text)
+                .accessibilityHidden(true)
+            Text(L("Your PC is locked. Unlock it to continue."))
+                .font(.app(15, .semibold, relativeTo: .subheadline))
+                .foregroundStyle(Theme.text)
+        }
+        .padding(.horizontal, 18)
+        .frame(minHeight: 44)
+        .background(glass(Capsule()))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(L("Your PC is locked. Unlock it to continue."))
+        .accessibilityIdentifier("display.pcLocked")
+    }
+
+    /// Over the held picture while the PC has no display turned on, until
+    /// one comes back.
+    private var noDisplayPill: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "display")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Theme.text)
+                .accessibilityHidden(true)
+            Text(L("Your PC has no active display. Turn on a screen to continue."))
+                .font(.app(15, .semibold, relativeTo: .subheadline))
+                .foregroundStyle(Theme.text)
+        }
+        .padding(.horizontal, 18)
+        .frame(minHeight: 44)
+        .background(glass(Capsule()))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(L("Your PC has no active display. Turn on a screen to continue."))
+        .accessibilityIdentifier("display.pcNoDisplay")
+    }
+
+    /// Over the mirrored picture for a few seconds, when the PC chose Second
+    /// screen but its Windows can't run it.
+    private var needsWindows11Pill: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "rectangle.on.rectangle")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Theme.text)
+                .accessibilityHidden(true)
+            Text(L("Second screen needs Windows 11. Showing your PC's screen instead."))
+                .font(.app(15, .semibold, relativeTo: .subheadline))
+                .foregroundStyle(Theme.text)
+        }
+        .padding(.horizontal, 18)
+        .frame(minHeight: 44)
+        .background(glass(Capsule()))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(L("Second screen needs Windows 11. Showing your PC's screen instead."))
+        .accessibilityIdentifier("display.needsWindows11")
+    }
+
+    /// Over the held picture while Windows won't let the PC capture from its
+    /// graphics card, until it can again.
+    private func graphicsCardPill(_ card: PCGraphicsCard) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: "display")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundStyle(Theme.text)
+                .accessibilityHidden(true)
+            Text(card.short)
+                .font(.app(15, .semibold, relativeTo: .subheadline))
+                .foregroundStyle(Theme.text)
+                .multilineTextAlignment(.center)
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 8)
+        .frame(minHeight: 44)
+        .background(glass(Capsule()))
+        .padding(.horizontal, 24)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(card.short)
+        .accessibilityIdentifier("display.pcGraphicsCard")
+    }
+
+    /// Over the held picture while the PC restarts its stream, until the
+    /// first new frame.
+    private var pcRestartingPill: some View {
+        HStack(spacing: 10) {
+            ProgressView()
+                .tint(Theme.text)
+                .accessibilityHidden(true)
+            Text(L("Your PC is restarting the stream…"))
+                .font(.app(15, .semibold, relativeTo: .subheadline))
+                .foregroundStyle(Theme.text)
+        }
+        .padding(.horizontal, 18)
+        .frame(minHeight: 44)
+        .background(glass(Capsule()))
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(L("Your PC is restarting the stream…"))
+        .accessibilityIdentifier("display.pcRestarting")
     }
 
     /// The PC is still connected but a lost frame left the picture waiting

@@ -8,7 +8,13 @@ final class PairingFlowTests: UITestCase {
         let host = try XCTUnwrap(environment["EM_PAIRING_HOST"])
         XCTAssertEqual(code.count, 6)
         let app = XCUIApplication()
-        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "NO", "-playPCaudio", "NO", "-pictureFit", "fit"]
+        // VoiceOver keeps the HUD up, so Disconnect is there from the first
+        // frame until the test acts. Otherwise the HUD hides five seconds
+        // after the stream opens, and reading the closed sheet's field back
+        // can take that long on a starved runner (6.6 s twice on CI).
+        // HUDHideTests covers the HUD hiding by itself.
+        app.launchArguments = ["-didSeeOnboarding", "YES", "-allowUSB", "NO", "-controlPC", "NO", "-playPCaudio", "NO",
+                               "-pictureFit", "fit", "-assumeVoiceOver", "YES"]
         app.launchEnvironment["EM_AUTOCONNECT"] = host
         app.launchEnvironment["EM_E2E_LOG"] = "1"
         launchCleanly(app)

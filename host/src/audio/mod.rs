@@ -50,6 +50,31 @@ pub fn wanted_session(shared: &SharedControl) -> Option<u32> {
     }
 }
 
+/// Tests that replace the global audio stats run one at a time.
+#[cfg(test)]
+pub(crate) static STATS_TEST_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
+/// The audio status while another app has the PC's output to itself.
+pub const DEVICE_IN_USE_STATUS: &str = "Output in use by another app";
+
+/// Another app has the PC's output device to itself (exclusive mode), so
+/// loopback capture can't open it. Not the session's failure: the audio
+/// stage tries again until the app lets go.
+#[derive(Debug)]
+pub struct DeviceInUse;
+
+impl std::fmt::Display for DeviceInUse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AUDCLNT_E_DEVICE_IN_USE: another app has exclusive use of the output device")
+    }
+}
+
+impl std::error::Error for DeviceInUse {}
+
+pub fn is_device_in_use(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    error.downcast_ref::<DeviceInUse>().is_some()
+}
+
 pub fn codec_available() -> bool {
     ffmpeg_next::encoder::find_by_name("libopus").is_some()
 }

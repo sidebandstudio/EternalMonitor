@@ -97,6 +97,9 @@ jobs:
       - name: Verify Setup hands its language to the app
         shell: powershell
         run: ./installer/tests/Test-InstallerLanguages.ps1
+      - name: Verify Setup installs the virtual display driver on Windows 10
+        shell: powershell
+        run: ./installer/tests/Test-InstallerWindows10.ps1
 
   rust-macos:
     name: Rust (macOS, full workspace + E2E)
@@ -133,7 +136,7 @@ jobs:
   ios-build:
     name: iOS (simulator build)
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 45
     env:
       DEVELOPER_DIR: /Applications/Xcode_16.4.app/Contents/Developer
     steps:

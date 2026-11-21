@@ -68,7 +68,7 @@ final class FeedbackTests: XCTestCase {
         }
         let failures: [ConnectionProblem] = [
             .noReply(usb: false), .noReply(usb: true), .noPicture, .receiverNotReady, .badAddress("pc"),
-            .routerAddress, .noNetwork, .localNetworkBlocked, .couldNotConnect, .usbFailed,
+            .routerAddress, .noNetwork, .wifiOff, .localNetworkBlocked, .couldNotConnect, .usbFailed,
             .lost(.pcStoppedResponding), .reconnectFailed, .pcEndedSession, .pcEndedSessionOnError,
             .pcUpdating(.notBack),
         ]

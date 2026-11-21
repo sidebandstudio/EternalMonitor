@@ -52,6 +52,13 @@ struct Outcome {
     nacks: u64,
     latency_p50_ms: f64,
     latency_p90_ms: f64,
+    /// Keyframes that reached the decoder whole.
+    keyframes_complete: u64,
+    /// The longest time the picture stood still between decodable frames.
+    longest_freeze_ms: f64,
+    /// Freezes the user notices: over 250 ms, and over a second.
+    freezes_over_250ms: u64,
+    freezes_over_1s: u64,
 }
 
 struct Rng(u64);
@@ -181,6 +188,7 @@ fn simulate(s: Scenario) -> Outcome {
     let mut resends: HashMap<(u32, u16), u64> = HashMap::new();
     let mut previous_sent: HashMap<u32, u32> = HashMap::new();
     let mut nacks_sent: HashMap<u32, u64> = HashMap::new();
+    let mut last_decoded = 0u64;
 
     while let Some(((now, _), event)) = events.pop_first() {
         if now > end {
@@ -268,7 +276,13 @@ fn simulate(s: Scenario) -> Outcome {
             let decodes =
                 frame.is_keyframe || decodes_from == previous_sent.get(&frame.seq).copied();
             decodes_from = decodes.then_some(frame.seq);
+            outcome.keyframes_complete += u64::from(frame.is_keyframe);
             if decodes {
+                let freeze = (now - last_decoded) as f64 / 1000.0;
+                last_decoded = now;
+                outcome.longest_freeze_ms = outcome.longest_freeze_ms.max(freeze);
+                outcome.freezes_over_250ms += u64::from(freeze > 250.0);
+                outcome.freezes_over_1s += u64::from(freeze > 1000.0);
                 outcome.decodable += 1;
                 latencies.push((now - sent_at[&frame.seq].0) as f64 / 1000.0);
             } else {
@@ -368,6 +382,68 @@ fn wifi_repair_table() {
                 "contiguous"
             };
             eprintln!("WIFI_SIM {} {numbering} {outcome:?}", scenario.name);
+        }
+    }
+}
+
+/// A 1080p desktop at the bitrate ABR falls to on lossy WiFi: a keyframe is
+/// about 200 KB, a delta about 16 KB. iPads in the field froze for 1-4 s at
+/// 4-22% loss: every replacement keyframe arrived incomplete, and was dropped
+/// as soon as the small frames behind it completed.
+const LOSSY: Scenario = Scenario {
+    name: "lossy WiFi, 60 fps",
+    fps: 60,
+    delta_fragments: 12,
+    keyframe_fragments: 150,
+    loss: 0.10,
+    late_uplink: 0.3,
+    stall_every_s: 5,
+    seconds: 120,
+    capture_skips: false,
+};
+
+/// At 10% loss each way, recovery keyframes complete and the picture never
+/// stands still for a second. 0.3.4's assembler completed 148 of 390
+/// keyframes here and froze 35 times for over a second, up to 3.4 s.
+#[test]
+fn keyframes_recover_the_picture_at_ten_percent_loss() {
+    let outcome = simulate(LOSSY);
+    eprintln!("WIFI_SIM {} {outcome:?}", LOSSY.name);
+    assert!(
+        outcome.keyframes_complete * 100 >= outcome.keyframes_sent * 95,
+        "{outcome:?}"
+    );
+    assert_eq!(outcome.freezes_over_1s, 0, "{outcome:?}");
+    assert!(outcome.longest_freeze_ms < 1_000.0, "{outcome:?}");
+}
+
+/// Prints the loss table used in the PR: 5-20% loss, keyframes of 80, 150
+/// and 300 fragments.
+#[test]
+fn lossy_wifi_table() {
+    for loss in [0.05, 0.10, 0.15, 0.20] {
+        for keyframe_fragments in [80, 150, 300] {
+            let outcome = simulate(Scenario {
+                loss,
+                keyframe_fragments,
+                ..LOSSY
+            });
+            eprintln!(
+                "LOSSY loss={loss} kf={keyframe_fragments} keyframes={}/{} drops={} keyframe_requests={} \
+                 longest_freeze_ms={:.0} freezes_over_250ms={} freezes_over_1s={} decodable={}/{} \
+                 latency_p50_ms={:.1} latency_p90_ms={:.1}",
+                outcome.keyframes_complete,
+                outcome.keyframes_sent,
+                outcome.dropped,
+                outcome.keyframe_requests,
+                outcome.longest_freeze_ms,
+                outcome.freezes_over_250ms,
+                outcome.freezes_over_1s,
+                outcome.decodable,
+                outcome.frames,
+                outcome.latency_p50_ms,
+                outcome.latency_p90_ms
+            );
         }
     }
 }

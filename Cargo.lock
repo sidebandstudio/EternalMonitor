@@ -998,10 +998,9 @@ dependencies = [
 [[package]]
 name = "egui-wgpu"
 version = "0.36.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5cef1f6d1bba40b09a4d0d62cb822b81030922cfbf65c5373398c3a3caafc5bd"
 dependencies = [
  "ahash",
+ "ash",
  "bytemuck",
  "document-features",
  "egui",
@@ -1169,7 +1168,7 @@ checksum = "dea2df4cf52843e0452895c455a1a2cfbb842a1e7329671acf418fdc53ed4c59"
 
 [[package]]
 name = "eternal-host"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "cc",
  "eframe",
@@ -1216,7 +1215,7 @@ dependencies = [
 
 [[package]]
 name = "eternal-wire"
-version = "0.3.4"
+version = "0.3.5"
 dependencies = [
  "tracing",
 ]

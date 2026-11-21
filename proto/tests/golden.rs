@@ -111,6 +111,7 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
                     host_name: "ALI-PC".into(),
                     auth_token: [0; 16],
                     host_caps: 0,
+                    reason: String::new(),
                 }),
             ),
         ));
@@ -218,6 +219,7 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
                 host_name: "ALI-PC".to_string(),
                 auth_token: [0; 16],
                 host_caps: 0,
+                reason: String::new(),
             }),
         ),
         (
@@ -236,6 +238,7 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
                 host_name: "ALI-PC".to_string(),
                 auth_token: [0; 16],
                 host_caps: 0,
+                reason: String::new(),
             }),
         ),
         (
@@ -245,6 +248,19 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
             ControlMessage::Heartbeat(Heartbeat {
                 host_time_us: 987_654_321,
                 stream_config: stream_config(),
+                notice: NOTICE_NONE,
+                frames_sent: None,
+            }),
+        ),
+        (
+            "heartbeat_pc_locked",
+            0x1234_5678,
+            42,
+            ControlMessage::Heartbeat(Heartbeat {
+                host_time_us: 987_654_321,
+                stream_config: stream_config(),
+                notice: NOTICE_PC_LOCKED,
+                frames_sent: None,
             }),
         ),
         (
@@ -254,6 +270,18 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
             ControlMessage::Bye(ByeReason::AppBackground),
         ),
         (
+            "bye_host_sleeping",
+            0x1234_5678,
+            55,
+            ControlMessage::Bye(ByeReason::HostSleeping),
+        ),
+        (
+            "bye_host_powering_off",
+            0x1234_5678,
+            56,
+            ControlMessage::Bye(ByeReason::HostPoweringOff),
+        ),
+        (
             "keyframe_request",
             0x1234_5678,
             44,
@@ -261,6 +289,40 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
                 stream_epoch: 3,
                 last_complete_seq: 4111,
                 reason: KeyframeReason::GapLoss,
+                max_media_dgram: 0,
+            }),
+        ),
+        (
+            "keyframe_request_media_size",
+            0x1234_5678,
+            51,
+            ControlMessage::KeyframeRequest(KeyframeRequest {
+                stream_epoch: 3,
+                last_complete_seq: 0,
+                reason: KeyframeReason::Startup,
+                max_media_dgram: 1200,
+            }),
+        ),
+        (
+            "heartbeat_frames_sent",
+            0x1234_5678,
+            52,
+            ControlMessage::Heartbeat(Heartbeat {
+                host_time_us: 987_654_321,
+                stream_config: stream_config(),
+                notice: NOTICE_NONE,
+                frames_sent: Some(1234),
+            }),
+        ),
+        (
+            "heartbeat_no_display_frames_sent",
+            0x1234_5678,
+            53,
+            ControlMessage::Heartbeat(Heartbeat {
+                host_time_us: 987_654_321,
+                stream_config: stream_config(),
+                notice: NOTICE_NO_DISPLAY,
+                frames_sent: Some(77),
             }),
         ),
         (
@@ -384,7 +446,12 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
     ack.host_caps = HOSTCAP_NACK | HOSTCAP_CONTIGUOUS_FRAME_SEQ;
     vectors.push((
         "hello_ack_contiguous_seq",
-        encode_control(0, 5, &ControlMessage::HelloAck(ack)),
+        encode_control(0, 5, &ControlMessage::HelloAck(ack.clone())),
+    ));
+    ack.host_caps = HOSTCAP_NACK | HOSTCAP_CONTIGUOUS_FRAME_SEQ | HOSTCAP_MEDIA_SIZE;
+    vectors.push((
+        "hello_ack_media_size",
+        encode_control(0, 6, &ControlMessage::HelloAck(ack)),
     ));
     let (_, ControlMessage::Hello2(mut hello)) = parse_control(
         &vectors
@@ -402,10 +469,213 @@ fn canonical_vectors() -> Vec<(&'static str, Vec<u8>)> {
     hello.pairing_code = 123_456;
     vectors.push((
         "hello2_v030",
+        encode_control(0, 4, &ControlMessage::Hello2(hello.clone())),
+    ));
+    // 0.3.5: an iPad that asks for standby answers pads its HELLO2, so an
+    // answer is never larger than the question.
+    hello.feature_caps |= FEATURE_STANDBY_STATUS;
+    vectors.push((
+        "hello2_standby_padded",
         encode_control(0, 4, &ControlMessage::Hello2(hello)),
+    ));
+    let nonce = std::array::from_fn(|index| 0xA0 + index as u8);
+    vectors.push((
+        "identify",
+        encode_control(
+            0,
+            1,
+            &ControlMessage::Identify(Identify {
+                version: IDENTIFY_VERSION,
+                nonce,
+            }),
+        ),
+    ));
+    // The proof for pairing token 01..10, port 9876 and two addresses: the
+    // same known answer the host's pairing tests and the iPad's identity
+    // tests check.
+    vectors.push((
+        "identity",
+        encode_control(
+            0,
+            1,
+            &ControlMessage::Identity(Identity {
+                version: IDENTIFY_VERSION,
+                nonce,
+                port: 9876,
+                addresses: IDENTITY_ADDRESSES.to_vec(),
+                proof: IDENTITY_PROOF,
+            }),
+        ),
+    ));
+    // 0.3.5: answers while the PC isn't streaming, a Failed one with its
+    // reason token appended.
+    for (name, status, reason) in [
+        ("hello_ack_stopped", HelloStatus::Stopped, ""),
+        ("hello_ack_restarting", HelloStatus::Restarting, ""),
+        (
+            "hello_ack_failed",
+            HelloStatus::Failed,
+            FailedReason::DisplayChanging.token(),
+        ),
+    ] {
+        vectors.push((
+            name,
+            encode_control(
+                0,
+                5,
+                &ControlMessage::HelloAck(HelloAck {
+                    status,
+                    accepted_version: 2,
+                    client_nonce: 0xDEAD_BEEF,
+                    session_id: 0,
+                    heartbeat_interval_ms: 1000,
+                    report_interval_ms: 500,
+                    liveness_timeout_ms: 3000,
+                    stream_config: StreamConfig::default(),
+                    host_name: "ALI-PC".into(),
+                    auth_token: [0; 16],
+                    host_caps: HOSTCAP_NACK,
+                    reason: reason.into(),
+                }),
+            ),
+        ));
+    }
+    // A refusal without the PC name and host caps, as a HELLO2 too small
+    // for the whole answer gets: every iPad reads only its status.
+    vectors.push((
+        "hello_ack_busy_bare",
+        encode_control(
+            0,
+            2,
+            &ControlMessage::HelloAck(HelloAck {
+                status: HelloStatus::Busy,
+                accepted_version: 2,
+                client_nonce: 0xDEAD_BEEF,
+                session_id: 0,
+                heartbeat_interval_ms: 1000,
+                report_interval_ms: 500,
+                liveness_timeout_ms: 3000,
+                stream_config: StreamConfig::default(),
+                host_name: String::new(),
+                auth_token: [0; 16],
+                host_caps: 0,
+                reason: String::new(),
+            }),
+        ),
+    ));
+    let (_, ControlMessage::Hello2(mut hello)) = parse_control(
+        &vectors
+            .iter()
+            .find(|(name, _)| *name == "hello2_v030")
+            .unwrap()
+            .1,
+    )
+    .unwrap() else {
+        unreachable!()
+    };
+    hello.feature_caps |= FEATURE_DRAWS_POINTER;
+    vectors.push((
+        "hello2_draws_pointer",
+        encode_control(0, 6, &ControlMessage::Hello2(hello)),
+    ));
+    // A 3x2 image: opaque black, opaque white, two clear pixels the mask
+    // after the image inverts, a half-covered pixel and opaque black.
+    let image: Vec<u8> = [
+        [0, 0, 0, 255],
+        [255, 255, 255, 255],
+        [0, 0, 0, 0],
+        [0, 0, 0, 0],
+        [0x10, 0x20, 0x30, 0x80],
+        [0, 0, 0, 255],
+    ]
+    .concat();
+    let mut shape = image.clone();
+    shape.extend_from_slice(&[0b0010_0000, 0b1000_0000]);
+    vectors.push((
+        "pointer_shape",
+        encode_control(
+            0x1234_5678,
+            51,
+            &ControlMessage::PointerShape(PointerShapeChunk {
+                shape_id: 0x0A0B_0C0D,
+                source_type: 1,
+                flags: POINTER_SHAPE_INVERT,
+                width: 3,
+                height: 2,
+                hot_x: 1,
+                hot_y: 1,
+                total_len: shape.len() as u32,
+                offset: 0,
+                data: shape,
+            }),
+        ),
+    ));
+    vectors.push((
+        "pointer_state",
+        encode_control(
+            0x1234_5678,
+            52,
+            &ControlMessage::PointerState(PointerState {
+                flags: POINTER_VISIBLE,
+                shape_id: 0x0A0B_0C0D,
+                x: -5,
+                y: 1_234,
+                host_time_us: 0x0000_0123_4567_89AB,
+            }),
+        ),
+    ));
+    vectors.push((
+        "pointer_hidden",
+        encode_control(
+            0x1234_5678,
+            53,
+            &ControlMessage::PointerState(PointerState {
+                flags: 0,
+                shape_id: 0x0A0B_0C0D,
+                x: 3_000,
+                y: 7,
+                host_time_us: 0x0000_0123_4567_89AC,
+            }),
+        ),
+    ));
+    let (_, ControlMessage::ReceiverReport(mut report)) = parse_control(
+        &vectors
+            .iter()
+            .find(|(name, _)| *name == "receiver_report_v030")
+            .unwrap()
+            .1,
+    )
+    .unwrap() else {
+        unreachable!()
+    };
+    report.pointer_shape_id = 0x0A0B_0C0D;
+    vectors.push((
+        "receiver_report_pointer",
+        encode_control(0x1234_5678, 54, &ControlMessage::ReceiverReport(report)),
+    ));
+    let (_, ControlMessage::HelloAck(mut ack)) = parse_control(
+        &vectors
+            .iter()
+            .find(|(name, _)| *name == "hello_ack_contiguous_seq")
+            .unwrap()
+            .1,
+    )
+    .unwrap() else {
+        unreachable!()
+    };
+    ack.host_caps |= HOSTCAP_POINTER;
+    vectors.push((
+        "hello_ack_pointer",
+        encode_control(0, 7, &ControlMessage::HelloAck(ack)),
     ));
     vectors
 }
+
+const IDENTITY_ADDRESSES: [[u8; 4]; 2] = [[192, 0, 2, 10], [198, 51, 100, 10]];
+const IDENTITY_PROOF: [u8; 32] = [
+    0x18, 0xfb, 0x81, 0xd7, 0x6b, 0xbb, 0x96, 0xe9, 0x11, 0x01, 0x11, 0x97, 0x75, 0xad, 0x97, 0x66,
+    0xb0, 0xc3, 0x32, 0xb2, 0xc4, 0x94, 0x41, 0xe6, 0xf0, 0x7e, 0xc3, 0x3b, 0xe1, 0xc6, 0xd9, 0x4e,
+];
 
 fn render(vectors: &[(&'static str, Vec<u8>)]) -> String {
     let mut out = String::new();
@@ -537,7 +807,84 @@ fn packet_type_registry_is_stable() {
     assert_eq!(PacketType::Pong as u8, 0x17);
     assert_eq!(PacketType::StreamConfig as u8, 0x18);
     assert_eq!(PacketType::Nack as u8, 0x19);
+    assert_eq!(PacketType::PointerShape as u8, 0x1C);
+    assert_eq!(PacketType::PointerState as u8, 0x1D);
     assert_eq!(PacketType::InputEvent as u8, 0x20);
+    assert_eq!(PacketType::Identify as u8, 0x1A);
+    assert_eq!(PacketType::Identity as u8, 0x1B);
+}
+
+/// The request is as long as the answer, so answering never sends more
+/// bytes than arrived; a request cut short of its reserved bytes is refused.
+#[test]
+fn identify_request_is_as_long_as_its_answer() {
+    let vectors: BTreeMap<_, _> = canonical_vectors().into_iter().collect();
+    assert_eq!(vectors["identify"].len(), vectors["identity"].len());
+    assert_eq!(vectors["identify"].len(), 16 + IDENTIFY_BODY_SIZE);
+    match parse_control(&vectors["identity"]).unwrap().1 {
+        ControlMessage::Identity(identity) => {
+            assert_eq!(identity.proof, IDENTITY_PROOF);
+            assert_eq!(identity.port, 9876);
+            assert_eq!(identity.addresses, IDENTITY_ADDRESSES);
+        }
+        other => panic!("{other:?}"),
+    }
+    // Five addresses don't fit: the answer is refused, never longer.
+    let mut five = vectors["identity"].clone();
+    five[16 + 1 + 16 + 2] = 5;
+    assert!(parse_control(&five).is_err());
+    // Only the addresses counted are read and signed.
+    let mut one = vectors["identity"].clone();
+    one[16 + 1 + 16 + 2] = 1;
+    match parse_control(&one).unwrap().1 {
+        ControlMessage::Identity(identity) => {
+            assert_eq!(identity.addresses, [IDENTITY_ADDRESSES[0]])
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_ne!(
+        identity_message(&[0xA0; 16], 9876, &IDENTITY_ADDRESSES),
+        identity_message(&[0xA0; 16], 9876, &IDENTITY_ADDRESSES[..1])
+    );
+}
+
+/// The pointer bits, and the fields their vectors carry.
+#[test]
+fn pointer_vectors_round_trip_with_their_capabilities() {
+    let vectors: BTreeMap<_, _> = canonical_vectors().into_iter().collect();
+    assert_eq!(FEATURE_DRAWS_POINTER, 0x0020);
+    assert_eq!(HOSTCAP_POINTER, 0x0040);
+    let ControlMessage::Hello2(hello) = parse_control(&vectors["hello2_draws_pointer"]).unwrap().1
+    else {
+        panic!()
+    };
+    assert_ne!(hello.feature_caps & FEATURE_DRAWS_POINTER, 0);
+    let ControlMessage::HelloAck(ack) = parse_control(&vectors["hello_ack_pointer"]).unwrap().1
+    else {
+        panic!()
+    };
+    assert_ne!(ack.host_caps & HOSTCAP_POINTER, 0);
+    let ControlMessage::PointerShape(shape) = parse_control(&vectors["pointer_shape"]).unwrap().1
+    else {
+        panic!()
+    };
+    assert_eq!((shape.width, shape.height, shape.total_len), (3, 2, 26));
+    let ControlMessage::PointerState(state) = parse_control(&vectors["pointer_state"]).unwrap().1
+    else {
+        panic!()
+    };
+    assert_eq!(
+        (state.x, state.y, state.flags),
+        (-5, 1_234, POINTER_VISIBLE)
+    );
+    let ControlMessage::ReceiverReport(report) = parse_control(&vectors["receiver_report_pointer"])
+        .unwrap()
+        .1
+    else {
+        panic!()
+    };
+    assert_eq!(report.pointer_shape_id, 0x0A0B_0C0D);
+    assert_eq!(report.frags_repaired, 1234);
 }
 
 /// A host that numbers frames contiguously says so in HELLO_ACK; one that
@@ -555,4 +902,52 @@ fn contiguous_frame_seq_capability_round_trips() {
     );
     assert_eq!(caps("hello_ack_paired") & HOSTCAP_CONTIGUOUS_FRAME_SEQ, 0);
     assert_eq!(HOSTCAP_CONTIGUOUS_FRAME_SEQ, 0x0020);
+}
+
+/// A host that takes smaller media datagrams says so; the request and the
+/// heartbeat count are appended to the bodies earlier versions read.
+#[test]
+fn media_size_vectors_round_trip_and_extend_the_old_bodies() {
+    let vectors: BTreeMap<_, _> = canonical_vectors().into_iter().collect();
+    let message = |name: &str| parse_control(&vectors[name]).unwrap().1;
+    let ControlMessage::HelloAck(ack) = message("hello_ack_media_size") else {
+        panic!("hello_ack_media_size")
+    };
+    assert_eq!(
+        ack.host_caps,
+        HOSTCAP_NACK | HOSTCAP_CONTIGUOUS_FRAME_SEQ | HOSTCAP_MEDIA_SIZE
+    );
+    assert_eq!(HOSTCAP_MEDIA_SIZE, 0x0080);
+    assert_eq!(HOSTCAP_KEYFRAME_PER_LOSS, 0x0100);
+    assert_eq!(FEATURE_MEDIA_SIZE, 0x0040);
+    assert_eq!(MIN_MEDIA_DGRAM, 576);
+
+    let ControlMessage::KeyframeRequest(request) = message("keyframe_request_media_size") else {
+        panic!("keyframe_request_media_size")
+    };
+    assert_eq!(request.max_media_dgram, 1200);
+    assert_eq!(request.reason, KeyframeReason::Startup);
+    let sized = &vectors["keyframe_request_media_size"];
+    let plain = &vectors["keyframe_request"];
+    assert_eq!(sized.len(), plain.len() + 2);
+
+    let ControlMessage::Heartbeat(heartbeat) = message("heartbeat_frames_sent") else {
+        panic!("heartbeat_frames_sent")
+    };
+    assert_eq!(heartbeat.frames_sent, Some(1234));
+    assert_eq!(heartbeat.notice, NOTICE_NONE);
+    let counted = &vectors["heartbeat_frames_sent"];
+    let plain = &vectors["heartbeat"];
+    assert_eq!(counted.len(), plain.len() + 5);
+    // Past the msg_seq, the old heartbeat is a prefix of the new one.
+    assert_eq!(counted[16..plain.len()], plain[16..]);
+
+    // A notice and the count together: the notice byte, then the count.
+    let ControlMessage::Heartbeat(both) = message("heartbeat_no_display_frames_sent") else {
+        panic!("heartbeat_no_display_frames_sent")
+    };
+    assert_eq!(both.notice, NOTICE_NO_DISPLAY);
+    assert_eq!(both.frames_sent, Some(77));
+    let bytes = &vectors["heartbeat_no_display_frames_sent"];
+    assert_eq!(&bytes[plain.len()..], &[NOTICE_NO_DISPLAY, 77, 0, 0, 0]);
 }

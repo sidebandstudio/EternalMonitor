@@ -84,6 +84,42 @@ final class VideoDecoder {
         var reportedStall = false
     }
     private let hold = OSAllocatedUnfairLock<Hold?>(initialState: nil)
+    /// When the decoder last put out a picture.
+    private let lastDecodedUs = OSAllocatedUnfairLock<UInt64?>(initialState: nil)
+
+    /// What started a hold, for the one line it logs.
+    private enum HoldCause {
+        /// The reference-continuity check turned a picture down.
+        case continuity(ReferenceContinuity.Loss?)
+        /// VideoToolbox refused a picture, at submission or in its output.
+        case decodeError(stage: String, status: OSStatus, keyframe: Bool)
+        /// A decoder session for new parameter sets didn't open.
+        case sessionFailed(OSStatus)
+        /// A new decoder session opened mid-stream, for new parameter sets,
+        /// and waits for its keyframe.
+        case sessionReplaced
+
+        var fields: String {
+            switch self {
+            case .continuity(.frameSeqGap(let previous, _)?):
+                return "reason=frame_seq_gap previous_seq=\(previous)"
+            case .continuity(.streamRestarted(let previousEpoch, let epoch, let previousSeq, _)?):
+                return "reason=stream_restarted previous_epoch=\(previousEpoch) epoch=\(epoch) previous_seq=\(previousSeq)"
+            case .continuity(.frameNumJump(let expected, let got)?):
+                return "reason=frame_num_jump expected_frame_num=\(expected) frame_num=\(got)"
+            case .continuity(.pocStep(let expected, let got)?):
+                return "reason=poc_step expected_step=\(expected) step=\(got)"
+            case .continuity(nil):
+                return "reason=continuity"
+            case .decodeError(let stage, let status, let keyframe):
+                return "reason=decode_error stage=\(stage) status=\(status) keyframe=\(keyframe)"
+            case .sessionFailed(let status):
+                return "reason=decoder_session_failed status=\(status)"
+            case .sessionReplaced:
+                return "reason=decoder_session_replaced"
+            }
+        }
+    }
     private var recoveryTimer: DispatchSourceTimer?
     private let nowUs: () -> UInt64
     /// Whether each picture follows a lost reference picture.
@@ -174,14 +210,22 @@ final class VideoDecoder {
         decodeQueue.async { [weak self] in self?.continuity.frameSeqContiguous = contiguous }
     }
 
-    private func beginWaitingForKeyframe() {
+    /// `seq`: the wire frame number of the picture that started it, when one did.
+    private func beginWaitingForKeyframe(_ cause: HoldCause, seq: UInt32? = nil) {
         guard !waitingForSyncSample else { return }
         waitingForSyncSample = true
         let now = nowUs()
         // A keyframe that failed to decode continues the same hold.
-        hold.withLock { current in
-            if current == nil { current = Hold(start: now) } else { current?.resumeGeneration = nil }
+        let started = hold.withLock { current -> Bool in
+            if current == nil { current = Hold(start: now); return true }
+            current?.resumeGeneration = nil
+            return false
         }
+        guard started else { return }
+        // Once per hold: which check started it, whatever the hold then does.
+        let frame = seq.map { " frame_seq=\($0)" } ?? ""
+        let since = lastDecodedUs.withLock { $0 }.map { String((now &- $0) / 1000) } ?? "-"
+        onEvent?("Picture hold started \(cause.fields)\(frame) since_decoded_ms=\(since)")
     }
 
     /// One timer tick, queued behind the frames already given to `decode`.
@@ -630,7 +674,7 @@ final class VideoDecoder {
             // only those) try again instead of matching it and being ignored.
             // Until then the last picture stays, with keyframe requests.
             self.formatDescription = nil
-            beginWaitingForKeyframe()
+            beginWaitingForKeyframe(.sessionFailed(status))
             failedSessionAttempts += 1
             if failedSessionAttempts == 1 {
                 reportFailure("Failed to create VideoToolbox session status=\(status); retrying on the next keyframe")
@@ -652,7 +696,7 @@ final class VideoDecoder {
         let hardwareKind = hardwareStatus == noErr ? (hardware ? "hardware" : "software") : "unknown"
         decompressionSession = session
         recoveryGeneration &+= 1
-        beginWaitingForKeyframe()
+        beginWaitingForKeyframe(.sessionReplaced)
         if notReadyDrops > 0 {
             onEvent?("Dropped \(notReadyDrops) more access units because decoder was not ready")
         }
@@ -697,7 +741,7 @@ final class VideoDecoder {
         if !admitted(nalUnits, isSyncSample: isSyncSample, seq: seq, epoch: epoch) {
             // A reference picture before this one never arrived (lost whole,
             // or dropped unfinished). Hold and ask for a keyframe now.
-            beginWaitingForKeyframe()
+            beginWaitingForKeyframe(.continuity(continuity.lastLoss), seq: seq)
             requestKeyframe(at: nowUs())
             return
         }
@@ -823,12 +867,13 @@ final class VideoDecoder {
             guard status == noErr else {
                 self.decodeQueue.async {
                     self.recoverFromDecodeFailure(
-                        status, generation: generation, source: "Decoder callback", onSyncSample: isSyncSample
+                        status, generation: generation, source: "Decoder callback", onSyncSample: isSyncSample, seq: seq
                     )
                 }
                 return
             }
             guard let pixelBuffer = imageBuffer else { return }
+            self.lastDecodedUs.withLock { $0 = self.nowUs() }
             let ended = self.hold.withLock { current -> UInt64? in
                 guard let held = current, held.resumeGeneration == generation else { return nil }
                 current = nil
@@ -848,7 +893,7 @@ final class VideoDecoder {
 
         if status != noErr || infoFlags.contains(.frameDropped) { finish() }
         if status != noErr {
-            recoverFromDecodeFailure(status, generation: generation, source: "VTDecodeFrame", onSyncSample: isSyncSample)
+            recoverFromDecodeFailure(status, generation: generation, source: "VTDecodeFrame", onSyncSample: isSyncSample, seq: seq)
         }
     }
 
@@ -872,9 +917,10 @@ final class VideoDecoder {
     /// Hold dependent frames until a replacement sync sample, and coalesce errors
     /// already in flight so one damaged frame cannot cause a request storm.
     private func recoverFromDecodeFailure(_ status: OSStatus, generation: UInt64, source: String,
-                                          onSyncSample: Bool) {
+                                          onSyncSample: Bool, seq: UInt32) {
         guard !isShutdown, generation == recoveryGeneration, !waitingForSyncSample else { return }
-        beginWaitingForKeyframe()
+        let stage = source == "VTDecodeFrame" ? "submit" : "output"
+        beginWaitingForKeyframe(.decodeError(stage: stage, status: status, keyframe: onSyncSample), seq: seq)
         reportFailure("\(source) status=\(status) codec=\(codec) depth=\(decodeDepth) generation=\(generation) sync=\(onSyncSample); waiting for a keyframe")
         if status == kVTInvalidSessionErr || onSyncSample {
             // The session died underneath us (typical after app backgrounding),

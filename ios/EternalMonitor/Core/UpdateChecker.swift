@@ -53,6 +53,20 @@ struct UpdateManifest: Decodable, Equatable {
         else { return nil }
         return note
     }
+
+    /// The Windows app's version, read on its own so that a malformed
+    /// Windows entry never hides the iPad's update, or the other way round.
+    static func windowsVersion(_ data: Data) -> String? {
+        struct Manifest: Decodable {
+            struct Windows: Decodable { let version: String }
+            let schema: Int
+            let windows: Windows?
+        }
+        guard let manifest = try? JSONDecoder().decode(Manifest.self, from: data), manifest.schema == 1,
+              let version = manifest.windows?.version, AppVersion(version) != nil
+        else { return nil }
+        return version
+    }
 }
 
 extension UpdateManifest.IPad {
@@ -212,6 +226,7 @@ final class UpdateChecker: ObservableObject {
         static let rolloutDays = "updateAvailableRolloutDays"
         /// The staged build whose prompt this iPad has reached.
         static let rolloutReached = "updateRolloutReachedBuild"
+        static let windowsVersion = "updateWindowsVersion"
         static let saved = [version, build, testflight, recommended, note, rolloutStart, rolloutDays]
     }
 
@@ -224,6 +239,8 @@ final class UpdateChecker: ObservableObject {
     @Published private(set) var available: UpdateManifest.IPad?
     @Published private(set) var dismissed: (build: Int, at: Date)?
     @Published private(set) var popupClosed: (build: Int, at: Date)?
+    /// The newest EternalMonitor for Windows, from the same manifest.
+    @Published private(set) var windowsVersion: String?
     @Published var automatic: Bool {
         didSet {
             defaults.set(automatic, forKey: Key.automatic)
@@ -245,6 +262,7 @@ final class UpdateChecker: ObservableObject {
         self.installed = installed
         self.installationID = installationID
         automatic = defaults.object(forKey: Key.automatic) as? Bool ?? true
+        windowsVersion = defaults.string(forKey: Key.windowsVersion)
         if let version = defaults.string(forKey: Key.version) {
             let found = UpdateManifest.IPad(
                 version: version,
@@ -322,6 +340,13 @@ final class UpdateChecker: ObservableObject {
         defaults.set(now, forKey: Key.popupAt)
     }
 
+    /// A PC that announced `pcVersion` should update EternalMonitor. Only
+    /// plain release versions compare; a beta or an unknown version never does.
+    func pcNeedsUpdate(_ pcVersion: String?) -> Bool {
+        guard let pc = pcVersion.flatMap(AppVersion.init), let newest = windowsVersion.flatMap(AppVersion.init) else { return false }
+        return pc < newest
+    }
+
     /// The TestFlight invite named by the manifest, or the public link.
     var joinURL: URL {
         if let link = available?.testflight, let url = URL(string: link),
@@ -366,6 +391,8 @@ final class UpdateChecker: ObservableObject {
         defaults.set(now, forKey: Key.checkedAt)
         // The first-picture wait applies from the next launch.
         RemoteConfig.save(RemoteConfig.parse(data), to: defaults, now: now)
+        windowsVersion = UpdateManifest.windowsVersion(data)
+        defaults.set(windowsVersion, forKey: Key.windowsVersion)
         guard let found = UpdateManifest.parse(data), installed.isOlder(than: found) else {
             available = nil
             for key in Key.saved { defaults.removeObject(forKey: key) }

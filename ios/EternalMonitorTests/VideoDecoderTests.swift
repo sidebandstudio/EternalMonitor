@@ -701,3 +701,169 @@ final class VideoDecoderTests: XCTestCase {
         XCTAssertNil(decoder.keyframeWaitUs)
     }
 }
+
+// MARK: - Why a hold started
+
+/// Each hold logs one line saying which check started it, beside the hold's
+/// own lines, which keep their wording. In the field a still, lossless stream
+/// (no drops, no NACKs) was held and reconnected over and over, and nothing
+/// said what started the hold.
+extension VideoDecoderTests {
+    private func holdLines(_ events: [String]) -> [String] {
+        events.filter { $0.hasPrefix("Picture hold started ") }
+    }
+
+    /// The lines without their time since the last picture, which the real
+    /// clock and VideoToolbox's asynchronous output decide (see
+    /// `testTheLineSaysHowLongAgoThePictureWasDecoded`).
+    private func holdReasons(_ events: [String]) -> [String] {
+        holdLines(events).map { line in
+            line.range(of: " since_decoded_ms=").map { String(line[..<$0.lowerBound]) } ?? line
+        }
+    }
+
+    func testAFrameNumberJumpOrPOCStepStartsOneHoldThatSaysSo() throws {
+        // seq 3 lost whole on a PC that doesn't number contiguously: only the
+        // codec's own count shows it.
+        let (h264, _) = try run("h264", [(1, 0), (2, 1), (4, 3), (5, 3), (6, 4), (7, 5)])
+        XCTAssertEqual(holdReasons(h264.events),
+                       ["Picture hold started reason=frame_num_jump expected_frame_num=2 frame_num=3 frame_seq=4"])
+        let (hevc, _) = try run("h265", [(1, 0), (2, 1), (4, 3), (5, 3), (6, 4), (7, 5)])
+        let line = try XCTUnwrap(holdLines(hevc.events).first)
+        XCTAssertEqual(holdLines(hevc.events).count, 1, "\(hevc.events)")
+        XCTAssertTrue(line.hasPrefix("Picture hold started reason=poc_step expected_step="), line)
+        XCTAssertTrue(line.contains(" frame_seq=4 since_decoded_ms="), line)
+    }
+
+    func testAFrameNumberGapOrStreamRestartStartsOneHoldThatSaysSo() throws {
+        let numbered = VideoDecoder()
+        numbered.setFrameSeqContiguous(true)
+        let (gap, _) = try run("h264", [(1, 0), (3, 5), (4, 5), (5, 4), (6, 5)], decoder: numbered)
+        XCTAssertEqual(holdReasons(gap.events),
+                       ["Picture hold started reason=frame_seq_gap previous_seq=1 frame_seq=3"])
+        let (restart, _) = try run("h264", [(7, 0), (8, 1), (1, 1), (2, 2), (3, 4), (4, 5)])
+        XCTAssertEqual(holdReasons(restart.events),
+                       ["Picture hold started reason=stream_restarted previous_epoch=0 epoch=0 previous_seq=8 frame_seq=1"])
+        let (epoch, _) = try run("h264", [(1, 0, 1), (2, 5, 2), (3, 4, 2), (4, 5, 2)])
+        XCTAssertEqual(holdReasons(epoch.events),
+                       ["Picture hold started reason=stream_restarted previous_epoch=1 epoch=2 previous_seq=1 frame_seq=2"])
+    }
+
+    func testEachHoldSaysWhyOnceAndALosslessStreamNever() throws {
+        // Two holds, each with frames held behind it: one line each.
+        let (twice, _) = try run("h264", [(1, 0), (2, 1), (4, 3), (5, 3), (6, 4), (7, 5), (9, 7), (10, 7), (11, 0)])
+        XCTAssertEqual(holdLines(twice.events).count, 2, "\(twice.events)")
+        XCTAssertTrue(holdLines(twice.events).allSatisfy { $0.contains("reason=frame_num_jump") })
+        let (clean, _) = try run("h264", (0..<8).map { (UInt32($0 + 1), $0) })
+        XCTAssertEqual(holdLines(clean.events), [])
+        // The first session waits for its keyframe without a hold.
+        let (start, _) = try run("h264", [(1, 1), (2, 0), (3, 1)])
+        XCTAssertEqual(holdLines(start.events), [])
+    }
+
+    func testTheLineSaysHowLongAgoThePictureWasDecoded() throws {
+        let units = try twoGOPs("h264")
+        let clock = OSAllocatedUnfairLock<UInt64>(initialState: 5_000_000)
+        let decoder = VideoDecoder(nowUs: { clock.withLock { $0 } }, runsRecoveryTimer: false)
+        defer { decoder.shutdown() }
+        let events = OSAllocatedUnfairLock(initialState: [String]())
+        decoder.onEvent = { message in events.withLock { $0.append(message) } }
+        let decoded = OSAllocatedUnfairLock(initialState: 0)
+        decoder.onFrameDecoded = { _, _, _ in decoded.withLock { $0 += 1 } }
+        decoder.decode(packet: packet(seq: 1, data: units[0], keyframe: true))
+        decoder.decode(packet: packet(seq: 2, data: units[1], keyframe: false))
+        let both = expectation(for: NSPredicate { _, _ in decoded.withLock { $0 } == 2 }, evaluatedWith: nil)
+        wait(for: [both], timeout: 10)
+        clock.withLock { $0 = 5_750_000 }
+        decoder.decode(packet: packet(seq: 4, data: units[3], keyframe: false))
+        let held = expectation(for: NSPredicate { _, _ in decoder.keyframeWaitUs != nil }, evaluatedWith: nil)
+        wait(for: [held], timeout: 10)
+        XCTAssertEqual(holdLines(events.withLock { $0 }),
+                       ["Picture hold started reason=frame_num_jump expected_frame_num=2 frame_num=3 frame_seq=4 since_decoded_ms=750"])
+    }
+
+    func testADecodeErrorStartsOneHoldAndAFailedKeyframeContinuesIt() throws {
+        let data = try fixtureData()
+        let decoder = VideoDecoder()
+        defer { decoder.shutdown() }
+        let events = OSAllocatedUnfairLock(initialState: [String]())
+        decoder.onEvent = { message in events.withLock { $0.append(message) } }
+        let first = expectation(description: "first picture")
+        let recovered = expectation(description: "recovered")
+        decoder.onFrameDecoded = { _, timestamp, _ in
+            if timestamp == 16_667 { first.fulfill() }
+            if timestamp == 20 * 16_667 { recovered.fulfill() }
+        }
+        let failures = OSAllocatedUnfairLock(initialState: 0)
+        decoder.onFailure = { message in
+            if message.hasPrefix("Decoder callback") || message.hasPrefix("VTDecodeFrame") { failures.withLock { $0 += 1 } }
+        }
+        func failed(_ count: Int) {
+            let met = expectation(for: NSPredicate { _, _ in failures.withLock { $0 } == count }, evaluatedWith: nil)
+            wait(for: [met], timeout: 10)
+        }
+        decoder.decode(packet: packet(seq: 1, data: data, keyframe: true))
+        wait(for: [first], timeout: 10)
+        // VideoToolbox reports the error asynchronously: each step waits for it.
+        let corrupt = Data([0, 0, 0, 1, 0x41, 0x80])
+        decoder.decode(packet: packet(seq: 2, data: corrupt, keyframe: false))
+        failed(1)
+        for seq in 3...5 { decoder.decode(packet: packet(seq: UInt32(seq), data: corrupt, keyframe: false)) }
+        // A keyframe VideoToolbox rejects continues the same hold.
+        decoder.decode(packet: packet(seq: 6, data: Data([0, 0, 0, 1, 0x65, 0x80]), keyframe: true))
+        failed(2)
+        decoder.decode(packet: packet(seq: 20, data: data, keyframe: true))
+        wait(for: [recovered], timeout: 10)
+        let lines = holdLines(events.withLock { $0 })
+        XCTAssertEqual(lines.count, 1, "\(lines)")
+        let line = try XCTUnwrap(lines.first)
+        XCTAssertTrue(line.hasPrefix("Picture hold started reason=decode_error stage="), line)
+        XCTAssertTrue(line.contains(" keyframe=false frame_seq=2 since_decoded_ms="), line)
+    }
+
+    func testANewDecoderSessionMidStreamStartsOneHoldThatSaysWhetherItOpened() throws {
+        let first = try gopFixture()
+        let bigger = try fixture("idr_96x64", "h264")
+        // It opened: the new size's keyframe is shown at once.
+        let replaced = VideoDecoder()
+        defer { replaced.shutdown() }
+        let replacedEvents = OSAllocatedUnfairLock(initialState: [String]())
+        replaced.onEvent = { message in replacedEvents.withLock { $0.append(message) } }
+        let shownBigger = expectation(description: "new size shown")
+        replaced.onFrameDecoded = { buffer, _, _ in if CVPixelBufferGetWidth(buffer) == 96 { shownBigger.fulfill() } }
+        replaced.decode(packet: packet(seq: 1, data: first.idr, keyframe: true))
+        replaced.decode(packet: packet(seq: 2, data: bigger, keyframe: true))
+        wait(for: [shownBigger], timeout: 10)
+        let lines = holdLines(replacedEvents.withLock { $0 })
+        XCTAssertEqual(lines.count, 1, "\(lines)")
+        XCTAssertTrue(lines.first?.hasPrefix("Picture hold started reason=decoder_session_replaced since_decoded_ms=") == true,
+                      "\(lines)")
+        // It didn't open; the next keyframe's session does, in the same hold.
+        let attempts = OSAllocatedUnfairLock(initialState: 0)
+        let failing = VideoDecoder(makeSession: { format, specification, attributes in
+            let attempt = attempts.withLock { value -> Int in value += 1; return value }
+            if attempt == 2 { return (kVTVideoDecoderMalfunctionErr, nil) }
+            var session: VTDecompressionSession?
+            let status = VTDecompressionSessionCreate(allocator: kCFAllocatorDefault, formatDescription: format,
+                decoderSpecification: specification, imageBufferAttributes: attributes,
+                outputCallback: nil, decompressionSessionOut: &session)
+            return (status, session)
+        })
+        defer { failing.shutdown() }
+        let failingEvents = OSAllocatedUnfairLock(initialState: [String]())
+        failing.onEvent = { message in failingEvents.withLock { $0.append(message) } }
+        let retried = expectation(description: "picture after the retry")
+        failing.onFrameDecoded = { buffer, timestamp, _ in
+            if timestamp == 9 * 16_667, CVPixelBufferGetWidth(buffer) == 96 { retried.fulfill() }
+        }
+        failing.decode(packet: packet(seq: 1, data: first.idr, keyframe: true))
+        failing.decode(packet: packet(seq: 2, data: bigger, keyframe: true))
+        failing.decode(packet: packet(seq: 3, data: first.p, keyframe: false))
+        failing.decode(packet: packet(seq: 9, data: bigger, keyframe: true))
+        wait(for: [retried], timeout: 10)
+        let failed = try XCTUnwrap(holdLines(failingEvents.withLock { $0 }).first)
+        XCTAssertEqual(holdLines(failingEvents.withLock { $0 }).count, 1)
+        XCTAssertTrue(failed.hasPrefix("Picture hold started reason=decoder_session_failed status=\(kVTVideoDecoderMalfunctionErr) since_decoded_ms="),
+                      failed)
+    }
+}

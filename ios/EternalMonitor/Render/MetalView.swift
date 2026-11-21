@@ -31,6 +31,7 @@ struct MetalView: UIViewRepresentable {
         renderer.pictureFit = settings.pictureFit
         context.coordinator.renderer = renderer
         context.coordinator.frameSlot = connectionManager.frameSlot
+        context.coordinator.pointer = connectionManager.pointerOverlay
         context.coordinator.attach(view: view)
         view.delegate = context.coordinator
 
@@ -59,6 +60,8 @@ struct MetalView: UIViewRepresentable {
         var renderer: MetalRenderer?
         /// Direct reference to the shared FrameSlot — avoids crossing @MainActor boundary on the render thread.
         var frameSlot: FrameSlot?
+        /// The PC's pointer when this app draws it; each move redraws.
+        var pointer: PointerOverlay?
 
         private weak var view: MTKView?
         private var memoryWarning: NSObjectProtocol?
@@ -69,6 +72,9 @@ struct MetalView: UIViewRepresentable {
         func attach(view: MTKView) {
             self.view = view
             frameSlot?.onFrameStored = { [weak self] in
+                self?.scheduleRedraw()
+            }
+            pointer?.onChange = { [weak self] in
                 self?.scheduleRedraw()
             }
             // The next decoded frame redraws within a frame period, or the
@@ -83,6 +89,7 @@ struct MetalView: UIViewRepresentable {
 
         func detach() {
             frameSlot?.onFrameStored = nil
+            pointer?.onChange = nil
             view = nil
             if let memoryWarning { NotificationCenter.default.removeObserver(memoryWarning) }
             memoryWarning = nil
@@ -111,7 +118,7 @@ struct MetalView: UIViewRepresentable {
         func draw(in view: MTKView) {
             guard let renderer else { return }
             let pixelBuffer = frameSlot?.take()
-            renderer.draw(in: view, pixelBuffer: pixelBuffer)
+            renderer.draw(in: view, pixelBuffer: pixelBuffer, pointer: pointer)
         }
     }
 }
@@ -152,6 +159,17 @@ private final class InFlightFrame {
     deinit { frame = nil }
 }
 
+private struct PointerUniforms {
+    var rect: SIMD4<Float>
+}
+
+/// The current pointer image's textures, made once per image.
+private struct PointerTextures {
+    let id: UInt32
+    let image: MTLTexture
+    let invertMask: MTLTexture?
+}
+
 private struct DisplayUniforms {
     var scale: SIMD2<Float>
     var matrixIndex: UInt32
@@ -163,6 +181,9 @@ final class MetalRenderer {
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
     private let pipelineState: MTLRenderPipelineState
+    private let pointerPipeline: MTLRenderPipelineState
+    private let pointerInvertPipeline: MTLRenderPipelineState
+    private var pointerTextures: PointerTextures?
     private(set) var textureCache: CVMetalTextureCache?
     private var currentFrame: FrameTextures?
     /// Read on the main thread, where the paused MTKView draws.
@@ -196,6 +217,10 @@ final class MetalRenderer {
 
         do {
             pipelineState = try device.makeRenderPipelineState(descriptor: pipelineDescriptor)
+            pointerPipeline = try device.makeRenderPipelineState(
+                descriptor: Self.pointerDescriptor(library, fragment: "pointer_fragment", view: view, invert: false))
+            pointerInvertPipeline = try device.makeRenderPipelineState(
+                descriptor: Self.pointerDescriptor(library, fragment: "pointer_invert_fragment", view: view, invert: true))
         } catch {
             fatalError("Failed to create pipeline state: \(error)")
         }
@@ -209,7 +234,27 @@ final class MetalRenderer {
     // The held frame's textures go before the cache that made them.
     deinit { currentFrame = nil }
 
-    func draw(in view: MTKView, pixelBuffer: CVPixelBuffer?) {
+    /// Over: source + destination x (1 - source alpha). Invert: source
+    /// x (1 - destination) + destination x (1 - source), so white inverts
+    /// and black leaves the picture alone.
+    private static func pointerDescriptor(_ library: MTLLibrary, fragment: String, view: MTKView,
+                                          invert: Bool) -> MTLRenderPipelineDescriptor {
+        let descriptor = MTLRenderPipelineDescriptor()
+        descriptor.vertexFunction = library.makeFunction(name: "pointer_vertex")
+        descriptor.fragmentFunction = library.makeFunction(name: fragment)
+        let color = descriptor.colorAttachments[0]!
+        color.pixelFormat = view.colorPixelFormat
+        color.isBlendingEnabled = true
+        color.rgbBlendOperation = .add
+        color.alphaBlendOperation = .add
+        color.sourceRGBBlendFactor = invert ? .oneMinusDestinationColor : .one
+        color.destinationRGBBlendFactor = invert ? .oneMinusSourceColor : .oneMinusSourceAlpha
+        color.sourceAlphaBlendFactor = .zero
+        color.destinationAlphaBlendFactor = .one
+        return descriptor
+    }
+
+    func draw(in view: MTKView, pixelBuffer: CVPixelBuffer?, pointer: PointerOverlay? = nil) {
         if let pixelBuffer, let frame = makeFrameTextures(from: pixelBuffer) {
             currentFrame = frame
             // Let the cache recycle textures released by completed draws.
@@ -243,6 +288,10 @@ final class MetalRenderer {
         encoder.setFragmentTexture(frame.luma, index: 0)
         encoder.setFragmentTexture(frame.chroma, index: 1)
         encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        if let pointer {
+            drawPointer(pointer, encoder: encoder, video: CGSize(width: frame.width, height: frame.height),
+                        drawable: view.drawableSize)
+        }
         encoder.endEncoding()
 
         // Keep the pixel buffer + texture wrappers alive until the GPU is done
@@ -260,6 +309,48 @@ final class MetalRenderer {
 
         commandBuffer.present(drawable)
         commandBuffer.commit()
+    }
+
+    private func drawPointer(_ pointer: PointerOverlay, encoder: MTLRenderCommandEncoder, video: CGSize,
+                             drawable: CGSize) {
+        let snapshot = pointer.snapshot()
+        guard snapshot.visible, let image = snapshot.image, let textures = textures(for: image),
+              let clip = PointerGeometry.clip(video: video, view: drawable, fit: pictureFit)
+        else { return }
+        let rect = PointerGeometry.rect(x: snapshot.x, y: snapshot.y, width: image.width, height: image.height,
+                                        video: video, view: drawable, fit: pictureFit)
+        var uniforms = PointerUniforms(rect: PointerGeometry.ndc(rect, view: drawable))
+        // Both passes stay on the picture, out of the letterbox bars.
+        encoder.setScissorRect(MTLScissorRect(x: clip.x, y: clip.y, width: clip.width, height: clip.height))
+        encoder.setRenderPipelineState(pointerPipeline)
+        encoder.setVertexBytes(&uniforms, length: MemoryLayout<PointerUniforms>.stride, index: 0)
+        encoder.setFragmentTexture(textures.image, index: 0)
+        encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        if let mask = textures.invertMask {
+            encoder.setRenderPipelineState(pointerInvertPipeline)
+            encoder.setFragmentTexture(mask, index: 0)
+            encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        }
+        pointer.noteDrawn(x: snapshot.x, y: snapshot.y)
+    }
+
+    private func textures(for image: PointerOverlay.Image) -> PointerTextures? {
+        if let cached = pointerTextures, cached.id == image.id { return cached }
+        func texture(_ format: MTLPixelFormat, bytes: Data, bytesPerPixel: Int) -> MTLTexture? {
+            let descriptor = MTLTextureDescriptor.texture2DDescriptor(
+                pixelFormat: format, width: image.width, height: image.height, mipmapped: false)
+            descriptor.usage = .shaderRead
+            guard let texture = device.makeTexture(descriptor: descriptor) else { return nil }
+            bytes.withUnsafeBytes { raw in
+                texture.replace(region: MTLRegionMake2D(0, 0, image.width, image.height), mipmapLevel: 0,
+                                withBytes: raw.baseAddress!, bytesPerRow: image.width * bytesPerPixel)
+            }
+            return texture
+        }
+        guard let color = texture(.bgra8Unorm, bytes: image.pixels, bytesPerPixel: 4) else { return nil }
+        let mask = image.invertMask.flatMap { texture(.r8Unorm, bytes: $0, bytesPerPixel: 1) }
+        pointerTextures = PointerTextures(id: image.id, image: color, invertMask: mask)
+        return pointerTextures
     }
 
     /// Whether a decoded frame is held for redraws (resize, rotation).

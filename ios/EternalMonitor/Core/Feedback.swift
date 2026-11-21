@@ -191,6 +191,13 @@ enum PCVersions {
         address.flatMap { byKey[$0] } ?? name.flatMap { byKey[$0] }
     }
 
+    #if DEBUG
+    static func forget(name: String, address: String?) {
+        byKey[name] = nil
+        if let address { byKey[address] = nil }
+    }
+    #endif
+
     /// The `version` entry of a Bonjour TXT record.
     nonisolated static func version(fromTXT data: Data?) -> String? {
         guard let data else { return nil }

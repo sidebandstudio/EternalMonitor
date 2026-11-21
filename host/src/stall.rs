@@ -40,9 +40,22 @@ pub enum Call {
     /// Reading the graphics cards and the screens' wiring for the second
     /// screen's decisions (`capture::second_screen::facts`).
     GpuFacts,
+    /// After a lost duplication: asking the duplicated output whether it is
+    /// still on the desktop, and listing the outputs when it is not.
+    ListOutputs,
+    /// The graphics calls before the window's first paint: finding the
+    /// graphics cards (`gpu::GpuInfo::detect`), listing the screens and the
+    /// window renderer's adapter list. They share one lane: they wait on the
+    /// same driver, so after one hangs the others are refused at once
+    /// instead of each waiting out its own limit.
+    GpuDetect,
+    /// The window's adapters listed through wgpu on another thread before
+    /// the window's thread makes its first graphics call
+    /// (`gui::renderer::adapter_probe`).
+    GpuProbe,
 }
 
-const CALLS: usize = 6;
+const CALLS: usize = 9;
 
 /// When a call is slow enough to log, and when it is given up on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +83,9 @@ impl Call {
             Self::VddEnable => "vdd_enable",
             Self::VddDisable => "vdd_disable",
             Self::GpuFacts => "gpu_facts",
+            Self::ListOutputs => "list_outputs",
+            Self::GpuDetect => "gpu_detect",
+            Self::GpuProbe => "gpu_probe",
         }
     }
 
@@ -99,6 +115,20 @@ impl Call {
             // adapters, as device creation begins, then asks DXCore and reads
             // the display configuration; it keeps device creation's limits.
             Self::GpuFacts => Limits::ms(1_000, 4_000),
+            // Not timed in the field. Listing creates a DXGI factory and asks
+            // every adapter for its outputs, which is how device creation
+            // begins; it keeps device creation's limits.
+            Self::ListOutputs => Limits::ms(1_000, 4_000),
+            // 34 startups on 3 PCs (two test PCs, one field PC's uploads):
+            // median 10 ms, slowest 44 ms, from "Support system information"
+            // to "Selected encoder". It makes the same DXGI calls as
+            // GpuFacts and keeps its limits. One AMD laptop's dxgkrnl
+            // deadlock held it 62 s, and the window with it.
+            Self::GpuDetect => Limits::ms(1_000, 4_000),
+            // Not timed in the field yet: on a test PC (RTX 5080) 340-440 ms
+            // in debug builds, which run wgpu's validation. It makes the
+            // window's own first calls, and keeps detection's limits.
+            Self::GpuProbe => Limits::ms(1_000, 4_000),
         }
     }
 }
@@ -205,7 +235,8 @@ impl std::fmt::Display for Stall {
 
 impl std::error::Error for Stall {}
 
-/// Calls of each kind that were abandoned and still run.
+/// Calls of each kind that still run with no caller waiting for them:
+/// abandoned, or parked (see [`Pending::park`]).
 pub(crate) struct Lanes([AtomicUsize; CALLS]);
 
 impl Lanes {
@@ -225,8 +256,8 @@ pub(crate) fn lanes() -> &'static Lanes {
     &LANES
 }
 
-/// Abandoned calls of this kind still running, process-wide: while one
-/// runs, the next of its kind is refused.
+/// Abandoned or parked calls of this kind still running, process-wide:
+/// while one runs, the next of its kind is refused.
 pub fn abandoned(call: Call) -> usize {
     LANES.abandoned(call)
 }
@@ -255,8 +286,26 @@ pub(crate) fn run_on<T, F>(
     call: Call,
     limits: Limits,
     f: F,
-    progress: impl FnMut(),
+    mut progress: impl FnMut(),
 ) -> Result<T, Stall>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+{
+    start_on(lanes, call, limits, f)?
+        .wait_up_to(limits.limit, &mut progress)
+        .expect("the limit ends the wait")
+}
+
+/// Start `f` on its own thread under `limits`, to wait for it with
+/// [`Pending::wait_up_to`]. Refused, as by [`run`], while an earlier call of
+/// its kind is stuck.
+pub(crate) fn start_on<T, F>(
+    lanes: &'static Lanes,
+    call: Call,
+    limits: Limits,
+    f: F,
+) -> Result<Pending<T>, Stall>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
@@ -264,7 +313,7 @@ where
     let wait = Wait {
         limits,
         slice: WAIT_SLICE,
-        now: Instant::now,
+        now: Instant::now as fn() -> Instant,
     };
     let delay = simulated_delay(call, limits);
     let hooks = Hooks {
@@ -275,7 +324,7 @@ where
         },
         handoff: || {},
     };
-    run_in(lanes, call, wait, f, progress, hooks)
+    start_in(lanes, call, wait, f, hooks)
 }
 
 /// Points on the call's thread: `before` the call (a simulated stall), and
@@ -298,6 +347,7 @@ pub(crate) fn no_hooks() -> Hooks<fn(), fn()> {
 type Outcome<T> = std::thread::Result<T>;
 
 /// [`run`] with its lanes, clock and hooks given.
+#[cfg(test)]
 pub(crate) fn run_in<T, F>(
     lanes: &'static Lanes,
     call: Call,
@@ -310,7 +360,57 @@ where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
+    let limit = wait.limits.limit;
+    start_in(lanes, call, wait, f, hooks)?
+        .wait_up_to(limit, &mut progress)
+        .expect("the limit ends the wait")
+}
+
+/// Who takes a call's result. Decided under one lock that the call's thread
+/// holds from reading it until its result is in the channel, and that the
+/// caller holds while it looks in the channel before changing it, so exactly
+/// one of them owns the result, and the lane is freed whenever it was taken.
+/// Never held across the call itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Owner {
+    /// The caller waits for it.
+    Waiting,
+    /// The caller stopped waiting before the limit and takes the result
+    /// later (see [`Pending::park`]). The lane counts the call meanwhile.
+    Parked,
+    /// The caller gave up on it: its thread releases the result.
+    Nobody,
+}
+
+/// A time-limited call that runs on its own thread, from [`start_in`].
+pub(crate) struct Pending<T, N = fn() -> Instant> {
+    call: Call,
+    limits: Limits,
+    slice: Duration,
+    now: N,
+    lanes: &'static Lanes,
+    owner: Arc<Mutex<Owner>>,
+    rx: mpsc::Receiver<Outcome<T>>,
+    started: Instant,
+    /// Its result was returned, or it was given up on.
+    done: bool,
+}
+
+/// Start `f` on its own thread under `wait`'s limits, or refuse it while an
+/// earlier call of its kind still runs with nobody waiting.
+pub(crate) fn start_in<T, F, N>(
+    lanes: &'static Lanes,
+    call: Call,
+    wait: Wait<N>,
+    f: F,
+    hooks: Hooks<impl FnOnce() + Send + 'static, impl FnOnce() + Send + 'static>,
+) -> Result<Pending<T, N>, Stall>
+where
+    T: Send + 'static,
+    F: FnOnce() -> T + Send + 'static,
+    N: Fn() -> Instant,
+{
+    use std::panic::{catch_unwind, AssertUnwindSafe};
     let lane = &lanes.0[call as usize];
     let abandoned = lane.load(SeqCst);
     if abandoned >= MAX_ABANDONED {
@@ -321,14 +421,9 @@ where
         );
         return Err(Stall::Refused { call });
     }
-    // Set by the caller when it gives up. The call's thread holds the same
-    // lock from reading it until its result is in the channel, and the
-    // caller looks in the channel under it before giving up, so exactly one
-    // of them owns the result, and the lane is freed whenever it was taken.
-    // Never held across the call itself.
-    let gave_up = Arc::new(Mutex::new(false));
+    let owner = Arc::new(Mutex::new(Owner::Waiting));
     let (tx, rx) = mpsc::channel::<Outcome<T>>();
-    let thread_gave_up = Arc::clone(&gave_up);
+    let thread_owner = Arc::clone(&owner);
     let real_start = Instant::now();
     let Hooks { before, handoff } = hooks;
     let spawned = std::thread::Builder::new()
@@ -340,13 +435,23 @@ where
                 before();
                 f()
             }));
-            let given_up = thread_gave_up.lock();
+            let owner = thread_owner.lock();
             handoff();
-            if !*given_up {
-                let _ = tx.send(outcome);
-                return;
+            match *owner {
+                Owner::Waiting => {
+                    let _ = tx.send(outcome);
+                    return;
+                }
+                // The caller takes it from the channel. The call no longer
+                // holds anything up.
+                Owner::Parked => {
+                    let _ = tx.send(outcome);
+                    lanes.0[call as usize].fetch_sub(1, SeqCst);
+                    return;
+                }
+                Owner::Nobody => {}
             }
-            drop(given_up);
+            drop(owner);
             let panicked = outcome.is_err();
             // Released here, before the lane lets a new call start. A drop
             // that panics must not keep the lane taken either.
@@ -364,38 +469,154 @@ where
         return Err(Stall::Refused { call });
     }
     let started = (wait.now)();
-    let finish = |outcome: Outcome<T>, took: Duration| match outcome {
-        Ok(value) => {
-            note_finished(call, wait.limits, took);
-            Ok(value)
-        }
-        Err(panic) => resume_unwind(panic),
-    };
-    loop {
-        match rx.recv_timeout(wait.slice) {
-            Ok(outcome) => {
-                return finish(outcome, (wait.now)().saturating_duration_since(started));
+    Ok(Pending {
+        call,
+        limits: wait.limits,
+        slice: wait.slice,
+        now: wait.now,
+        lanes,
+        owner,
+        rx,
+        started,
+        done: false,
+    })
+}
+
+impl<T, N: Fn() -> Instant> Pending<T, N> {
+    /// Wait until the call returns, until `up_to` after it started, or until
+    /// its limit, calling `progress` every slice meanwhile. Past its limit it
+    /// is given up on. None: it still runs, after `up_to`.
+    pub(crate) fn wait_up_to(
+        &mut self,
+        up_to: Duration,
+        progress: &mut impl FnMut(),
+    ) -> Option<Result<T, Stall>> {
+        loop {
+            match self.rx.recv_timeout(self.slice) {
+                Ok(outcome) => {
+                    let took = (self.now)().saturating_duration_since(self.started);
+                    return Some(self.finish(outcome, took));
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    panic!("{} ended without a result", self.call.name())
+                }
             }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                panic!("{} ended without a result", call.name())
+            let after = (self.now)().saturating_duration_since(self.started);
+            if after >= self.limits.limit {
+                return Some(self.give_up(after));
+            }
+            if after >= up_to {
+                return None;
+            }
+            progress();
+        }
+    }
+
+    /// Stop waiting for a call that still runs, to take its result later
+    /// with [`Self::poll`]. Until it returns, the lane counts it as it counts
+    /// an abandoned call, so the next of its kind is refused instead of
+    /// waiting behind it. Its result, if it already returned.
+    pub(crate) fn park(&mut self) -> Option<Result<T, Stall>> {
+        let mut owner = self.owner.lock();
+        if let Ok(outcome) = self.rx.try_recv() {
+            drop(owner);
+            let took = (self.now)().saturating_duration_since(self.started);
+            return Some(self.finish(outcome, took));
+        }
+        if *owner == Owner::Waiting {
+            *owner = Owner::Parked;
+            self.lanes.0[self.call as usize].fetch_add(1, SeqCst);
+        }
+        None
+    }
+
+    /// A parked call's result once it returned. Past its limit it is given
+    /// up on, as when waited for. None while it runs within its limit.
+    pub(crate) fn poll(&mut self) -> Option<Result<T, Stall>> {
+        let after = (self.now)().saturating_duration_since(self.started);
+        match self.rx.try_recv() {
+            Ok(outcome) => Some(self.finish(outcome, after)),
+            Err(mpsc::TryRecvError::Empty) if after >= self.limits.limit => {
+                Some(self.give_up(after))
+            }
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                panic!("{} ended without a result", self.call.name())
             }
         }
-        let after = (wait.now)().saturating_duration_since(started);
-        if after >= wait.limits.limit {
-            let mut gave_up = gave_up.lock();
-            // It may have returned since the last look.
-            if let Ok(outcome) = rx.try_recv() {
-                drop(gave_up);
-                return finish(outcome, after);
-            }
-            *gave_up = true;
-            lane.fetch_add(1, SeqCst);
-            drop(gave_up);
-            log_timed_out(call, wait.limits, after);
-            return Err(Stall::TimedOut { call, after });
+    }
+
+    /// [`Self::wait_up_to`] until `by` on the caller's clock, however long
+    /// the call took to start. None at once if `by` has passed.
+    pub(crate) fn wait_until(
+        &mut self,
+        by: Instant,
+        progress: &mut impl FnMut(),
+    ) -> Option<Result<T, Stall>> {
+        let up_to = by.saturating_duration_since(self.started);
+        if (self.now)() >= by {
+            return None;
         }
-        progress();
+        self.wait_up_to(up_to, progress)
+    }
+
+    /// How long the call has run, by its caller's clock.
+    pub(crate) fn running_for(&self) -> Duration {
+        (self.now)().saturating_duration_since(self.started)
+    }
+
+    fn finish(&mut self, outcome: Outcome<T>, took: Duration) -> Result<T, Stall> {
+        self.done = true;
+        match outcome {
+            Ok(value) => {
+                note_finished(self.call, self.limits, took);
+                Ok(value)
+            }
+            Err(panic) => std::panic::resume_unwind(panic),
+        }
+    }
+
+    fn give_up(&mut self, after: Duration) -> Result<T, Stall> {
+        let mut owner = self.owner.lock();
+        // It may have returned since the last look.
+        if let Ok(outcome) = self.rx.try_recv() {
+            drop(owner);
+            return self.finish(outcome, after);
+        }
+        // A parked call is counted already.
+        if *owner == Owner::Waiting {
+            self.lanes.0[self.call as usize].fetch_add(1, SeqCst);
+        }
+        *owner = Owner::Nobody;
+        drop(owner);
+        self.done = true;
+        log_timed_out(self.call, self.limits, after);
+        Err(Stall::TimedOut {
+            call: self.call,
+            after,
+        })
+    }
+}
+
+/// Dropped before its result was taken (a pipeline that ends while an
+/// encoder opens in the background): the call's thread releases the result
+/// when it returns, and the lane counts the call until then.
+impl<T, N> Drop for Pending<T, N> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        let mut owner = self.owner.lock();
+        // Returned already: its result is released here, and a parked
+        // call's thread freed the lane when it handed it over.
+        if self.rx.try_recv().is_ok() {
+            return;
+        }
+        if *owner == Owner::Waiting {
+            self.lanes.0[self.call as usize].fetch_add(1, SeqCst);
+        }
+        *owner = Owner::Nobody;
     }
 }
 
@@ -781,6 +1002,9 @@ mod tests {
             Call::VddEnable,
             Call::VddDisable,
             Call::GpuFacts,
+            Call::ListOutputs,
+            Call::GpuDetect,
+            Call::GpuProbe,
         ]
         .map(Call::name)
         .into();
@@ -798,6 +1022,9 @@ mod tests {
             Call::EncoderOpen,
             Call::VddEnable,
             Call::GpuFacts,
+            Call::ListOutputs,
+            Call::GpuDetect,
+            Call::GpuProbe,
         ] {
             let limits = call.limits();
             assert!(limits.limit >= Duration::from_secs(3), "{call:?}");
@@ -922,6 +1149,182 @@ mod tests {
         });
     }
 
+    /// A clock that stands still until the test moves it: the time since
+    /// the test began, in ms, is the returned atomic.
+    fn paused_clock() -> (Arc<AtomicU64>, impl Fn() -> Instant + Clone) {
+        let start = Instant::now();
+        let ms = Arc::new(AtomicU64::new(0));
+        let read = Arc::clone(&ms);
+        (ms, move || start + Duration::from_millis(read.load(SeqCst)))
+    }
+
+    #[test]
+    fn a_parked_call_holds_its_lane_and_is_taken_once_it_returns() {
+        let lanes = lanes();
+        let (ms, now) = paused_clock();
+        let dropped_on = Arc::new(Mutex::new(None));
+        let (release, call) = hang(Device(Arc::clone(&dropped_on)));
+        let wait = || Wait {
+            limits: encoder_open_limits("h264_qsv"),
+            slice: Duration::from_millis(1),
+            now: now.clone(),
+        };
+        let mut pending = start_in(lanes, Call::EncoderOpen, wait(), call, no_hooks()).unwrap();
+        // Waited for until 3 s, then parked: no stall line, and the lane
+        // counts it.
+        ms.store(3_000, SeqCst);
+        assert!(pending
+            .wait_up_to(Duration::from_secs(3), &mut || {})
+            .is_none());
+        assert!(pending.park().is_none());
+        assert_eq!(lanes.abandoned(Call::EncoderOpen), 1);
+        assert_eq!(pending.running_for(), Duration::from_secs(3));
+        // The next open in the lane is refused at once, as behind a stuck
+        // one, instead of waiting on FFmpeg's lock behind it.
+        let refused = run_in(
+            lanes,
+            Call::EncoderOpen,
+            wait(),
+            || (),
+            || panic!("a refused call waited"),
+            no_hooks(),
+        );
+        assert_eq!(
+            refused,
+            Err(Stall::Refused {
+                call: Call::EncoderOpen
+            })
+        );
+        ms.store(14_000, SeqCst);
+        assert!(pending.poll().is_none());
+        // It returns within its limit: the lane frees as it hands over, and
+        // the caller takes the result on its own thread.
+        release.send(()).unwrap();
+        wait_until("the parked call's lane did not free", || {
+            lanes.abandoned(Call::EncoderOpen) == 0
+        });
+        let device = pending.poll().expect("returned").expect("not a stall");
+        drop(device);
+        assert_eq!(*dropped_on.lock(), Some(std::thread::current().id()));
+        drop(pending);
+        assert_eq!(lanes.abandoned(Call::EncoderOpen), 0);
+    }
+
+    #[test]
+    fn a_parked_call_past_its_limit_is_given_up_on_as_one_waited_for() {
+        let lanes = lanes();
+        let (ms, now) = paused_clock();
+        let dropped_on = Arc::new(Mutex::new(None));
+        let (release, call) = hang(Device(Arc::clone(&dropped_on)));
+        let mut pending = start_in(
+            lanes,
+            Call::EncoderOpen,
+            Wait {
+                limits: encoder_open_limits("h264_nvenc"),
+                slice: Duration::from_millis(1),
+                now,
+            },
+            call,
+            no_hooks(),
+        )
+        .unwrap();
+        assert!(pending.park().is_none());
+        ms.store(14_999, SeqCst);
+        assert!(pending.poll().is_none());
+        ms.store(15_000, SeqCst);
+        let Some(Err(Stall::TimedOut { call, after })) = pending.poll() else {
+            panic!("not given up on at the limit")
+        };
+        assert_eq!((call, after), (Call::EncoderOpen, Duration::from_secs(15)));
+        // Counted once, from the park, until it returns; then released on
+        // its own thread.
+        assert_eq!(lanes.abandoned(Call::EncoderOpen), 1);
+        release.send(()).unwrap();
+        wait_until("the given-up call's lane did not free", || {
+            lanes.abandoned(Call::EncoderOpen) == 0
+        });
+        wait_until("the late result was not released", || {
+            dropped_on.lock().is_some()
+        });
+        assert_ne!(*dropped_on.lock(), Some(std::thread::current().id()));
+    }
+
+    #[test]
+    fn a_result_in_before_the_park_or_the_look_is_taken() {
+        let lanes = lanes();
+        let (ms, now) = paused_clock();
+        let wait = || Wait {
+            limits: encoder_open_limits("h264_amf"),
+            slice: Duration::from_millis(1),
+            now: now.clone(),
+        };
+        // It returned while the caller was about to park it: the park finds
+        // the result, once the call's thread has let go of the hand-over.
+        let (inside_tx, inside_rx) = mpsc::channel::<()>();
+        let mut pending = start_in(
+            lanes,
+            Call::EncoderOpen,
+            wait(),
+            || 5,
+            Hooks {
+                before: || {},
+                handoff: move || {
+                    let _ = inside_tx.send(());
+                },
+            },
+        )
+        .unwrap();
+        inside_rx.recv_timeout(Duration::from_secs(60)).unwrap();
+        assert_eq!(pending.park(), Some(Ok(5)));
+        assert_eq!(lanes.abandoned(Call::EncoderOpen), 0);
+        // A parked call that returned before the limit is taken even when
+        // the caller looks only after the limit.
+        let (release, call) = hang(6);
+        let mut pending = start_in(lanes, Call::EncoderOpen, wait(), call, no_hooks()).unwrap();
+        assert!(pending.park().is_none());
+        release.send(()).unwrap();
+        wait_until("the parked call's lane did not free", || {
+            lanes.abandoned(Call::EncoderOpen) == 0
+        });
+        ms.store(60_000, SeqCst);
+        assert_eq!(pending.poll(), Some(Ok(6)));
+    }
+
+    #[test]
+    fn a_pending_call_dropped_before_its_result_frees_its_lane_when_it_returns() {
+        for park in [true, false] {
+            let lanes = lanes();
+            let (_ms, now) = paused_clock();
+            let dropped_on = Arc::new(Mutex::new(None));
+            let (release, call) = hang(Device(Arc::clone(&dropped_on)));
+            let mut pending = start_in(
+                lanes,
+                Call::EncoderOpen,
+                Wait {
+                    limits: encoder_open_limits("h264_nvenc"),
+                    slice: Duration::from_millis(1),
+                    now,
+                },
+                call,
+                no_hooks(),
+            )
+            .unwrap();
+            if park {
+                assert!(pending.park().is_none());
+            }
+            drop(pending);
+            assert_eq!(lanes.abandoned(Call::EncoderOpen), 1, "park={park}");
+            release.send(()).unwrap();
+            wait_until("a dropped call kept its lane", || {
+                lanes.abandoned(Call::EncoderOpen) == 0
+            });
+            wait_until("the dropped call's result was not released", || {
+                dropped_on.lock().is_some()
+            });
+            assert_ne!(*dropped_on.lock(), Some(std::thread::current().id()));
+        }
+    }
+
     #[test]
     fn the_stall_line_is_unquoted_for_counting() {
         let out = Arc::new(Mutex::new(Vec::<u8>::new()));
@@ -940,6 +1343,7 @@ mod tests {
             .with_ansi(false)
             .with_writer(move || Sink(Arc::clone(&writer)))
             .finish();
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(subscriber, || {
             log_timed_out(
                 Call::D3d11CreateDevice,
@@ -954,6 +1358,7 @@ mod tests {
         );
         // An encoder's line gives that encoder's own limit.
         out.lock().clear();
+        crate::logging::prepare_log_capture();
         tracing::subscriber::with_default(
             tracing_subscriber::fmt()
                 .with_ansi(false)

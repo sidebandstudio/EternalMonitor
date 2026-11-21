@@ -73,6 +73,68 @@ final class NoPictureTimeoutTests: XCTestCase {
         XCTAssertNil(logged(manager, "Disconnect state=connecting reason=userDisconnect"))
     }
 
+    /// The hybrid laptops: the PC accepted, then its heartbeats said
+    /// Windows won't let it capture from its graphics card. The iPad showed
+    /// "Connecting…" for 10 s, then "no picture". Now it says why while it
+    /// waits, its card says what to do on the PC when the wait runs out, and
+    /// its summary names a capture failure, as the PC's does.
+    func testAPCThatCantCaptureFromItsGraphicsCardSaysWhyInsteadOfNoPicture() async throws {
+        let host = FakeUDPHost()
+        var timing = fast
+        timing.connectTimeoutSeconds = 3
+        let manager = ConnectionManager(timing: timing)
+        defer { manager.cancel() }
+        manager.connect(host: "127.0.0.1", port: host.port)
+        let accepted = await Task.detached { host.acceptSession() }.value
+        XCTAssertTrue(accepted, "the iPad never sent HELLO2")
+        host.sendHeartbeat(notice: Heartbeat.noticeUnsupportedGPU)
+        try await until("the PC says why") { manager.pcGraphicsCard == .screen }
+        XCTAssertEqual(manager.state, .connecting, "still waiting for a picture")
+        try await until("timed out", seconds: 15) { manager.state == .disconnected }
+        XCTAssertEqual(manager.problem, .pcGraphicsCard(.screen))
+        XCTAssertEqual(manager.problem?.actions, [.retry])
+        let summary = logged(manager, "session_summary v=1 role=ipad") ?? ""
+        XCTAssertTrue(summary.contains(" stage=accepted outcome=no_picture failure=capture_failed "), summary)
+        XCTAssertNil(manager.pcGraphicsCard, "the next attempt starts without it")
+    }
+
+    /// The PC counted video it sent before Windows refused its card, and no
+    /// picture came: the card still says why, and the summary keeps the
+    /// lost video, as the PC's does.
+    func testVideoSentBeforeTheRefusalIsStillCountedAsLost() async throws {
+        let host = FakeUDPHost()
+        var timing = fast
+        timing.connectTimeoutSeconds = 3
+        let manager = ConnectionManager(timing: timing)
+        defer { manager.cancel() }
+        manager.connect(host: "127.0.0.1", port: host.port)
+        let accepted = await Task.detached { host.acceptSession() }.value
+        XCTAssertTrue(accepted, "the iPad never sent HELLO2")
+        host.sendHeartbeat(framesSent: 5)
+        host.sendHeartbeat(notice: Heartbeat.noticeUnsupportedGPU, framesSent: 5)
+        try await until("the PC says why") { manager.pcGraphicsCard == .screen }
+        try await until("timed out", seconds: 15) { manager.state == .disconnected }
+        XCTAssertEqual(manager.problem, .pcGraphicsCard(.screen))
+        let summary = logged(manager, "session_summary v=1 role=ipad") ?? ""
+        XCTAssertTrue(summary.contains(" outcome=no_picture failure=no_video "), summary)
+    }
+
+    /// The same in Second screen mode, after the second screen failed.
+    func testThePCsSecondScreenModeKeepsItsOwnCard() async throws {
+        let host = FakeUDPHost()
+        var timing = fast
+        timing.connectTimeoutSeconds = 3
+        let manager = ConnectionManager(timing: timing)
+        defer { manager.cancel() }
+        manager.connect(host: "127.0.0.1", port: host.port)
+        let accepted = await Task.detached { host.acceptSession() }.value
+        XCTAssertTrue(accepted, "the iPad never sent HELLO2")
+        host.sendHeartbeat(notice: Heartbeat.noticeSecondScreenUnsupportedGPU)
+        try await until("the PC says why") { manager.pcGraphicsCard == .secondScreen }
+        try await until("timed out", seconds: 15) { manager.state == .disconnected }
+        XCTAssertEqual(manager.problem, .pcGraphicsCard(.secondScreen))
+    }
+
     func testTheFirstFrameLineNamesTheSessionAndTheWait() async throws {
         let host = FakeUDPHost()
         let manager = try await streaming(host)

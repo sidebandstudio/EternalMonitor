@@ -1,0 +1,2 @@
+# Signatures are raw bytes; a CRLF checkout must not touch them.
+*.sig binary

@@ -223,6 +223,47 @@ final class UpdateCheckerTests: XCTestCase {
         XCTAssertFalse(UpdateChecker(defaults: defaults, source: .disabled, installed: installed).automatic)
     }
 
+    func testManifestGivesTheWindowsVersionOnItsOwn() {
+        XCTAssertEqual(UpdateManifest.windowsVersion(manifest("0.3.4", 698)), "0.3.4")
+        XCTAssertEqual(UpdateManifest.windowsVersion(Data(#"{"schema":1,"windows":{"version":"0.3.5"}}"#.utf8)), "0.3.5")
+        XCTAssertNil(UpdateManifest.windowsVersion(manifest("0.3.4", 698, schema: 2)))
+        XCTAssertNil(UpdateManifest.windowsVersion(Data(#"{"schema":1,"windows":{"version":"0.3.5-beta.1"}}"#.utf8)))
+        XCTAssertNil(UpdateManifest.windowsVersion(Data(#"{"schema":1,"windows":{}}"#.utf8)))
+        XCTAssertNil(UpdateManifest.windowsVersion(Data(#"{"schema":1,"ipad":{"version":"0.3.4","build":698}}"#.utf8)))
+        // A broken Windows entry doesn't hide the iPad's update.
+        XCTAssertNotNil(UpdateManifest.parse(Data(#"{"schema":1,"windows":{"version":3},"ipad":{"version":"0.3.4","build":698}}"#.utf8)))
+    }
+
+    /// A PC older than the manifest's Windows version gets the note, also
+    /// when this iPad is up to date and after a relaunch offline. Betas,
+    /// unknown versions and newer PCs don't.
+    @MainActor
+    func testAnOlderPCIsToldToUpdate() throws {
+        let suite = "UpdateCheckerTests-\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let current = InstalledApp(version: "0.3.4", build: 698)
+
+        let checker = UpdateChecker(defaults: defaults, source: .injected(manifest("0.3.4", 698)), installed: current)
+        XCTAssertFalse(checker.pcNeedsUpdate("0.3.2"), "before any check")
+        checker.checkIfDue()
+        XCTAssertNil(checker.available)
+        XCTAssertEqual(checker.windowsVersion, "0.3.4")
+        for old in ["0.3.3", "0.3.2", "0.2.9"] { XCTAssertTrue(checker.pcNeedsUpdate(old), old) }
+        for fine in ["0.3.4", "0.3.5", "0.3.3-beta.1", "", "unknown", nil] as [String?] {
+            XCTAssertFalse(checker.pcNeedsUpdate(fine), fine ?? "nil")
+        }
+
+        let relaunched = UpdateChecker(defaults: defaults, source: .disabled, installed: current)
+        XCTAssertTrue(relaunched.pcNeedsUpdate("0.3.3"))
+
+        // A manifest without a Windows entry forgets it.
+        let without = UpdateChecker(defaults: defaults, source: .injected(Data(#"{"schema":1}"#.utf8)), installed: current)
+        without.checkIfDue()
+        XCTAssertNil(without.windowsVersion)
+        XCTAssertFalse(UpdateChecker(defaults: defaults, source: .disabled, installed: current).pcNeedsUpdate("0.3.3"))
+    }
+
     @MainActor
     func testUntrustedTestFlightLinkFallsBackToTheInvite() throws {
         let suite = "UpdateCheckerTests-\(UUID().uuidString)"

@@ -7,14 +7,17 @@ name: Beta builds
 # https://github.com/sidebandstudio/EternalMonitor/releases/download/beta/EternalMonitor-Setup-beta.exe
 # never changes (docs/download.html?channel=beta links it). No tag here starts
 # with v, so release.yml and testflight.yml never run for a beta build, and
-# docs/latest.json, /releases/latest and the apps' update checks never see
-# one. scripts/nightly.py has the version, branch and retention rules.
+# docs/latest.json, /releases/latest and stable installs never see one. A
+# Beta install reads the beta release's body for the newest Beta
+# (host/src/updates.rs). scripts/nightly.py has the version, branch and
+# retention rules.
 #
 # Only a run on main publishes. A manual run with dry_run, on any other
-# branch or for a pull request that changes this pipeline, builds and scans
-# the installer and uploads it as a run artifact. The build itself is
-# beta-installer.yml; a pull request runs its own code, so its build gets no
-# secrets (scripts/test_workflow_secrets.py).
+# branch or for a pull request that changes this pipeline or Setup, builds and
+# scans the installer and uploads it as a run artifact. A pull request builds
+# its own commit, so a change to Setup is compiled before it lands. The build
+# itself is beta-installer.yml; a pull request runs its own code, so its build
+# gets no secrets (scripts/test_workflow_secrets.py).
 on:
   schedule:
     - cron: "41 7 * * *"
@@ -29,6 +32,7 @@ on:
       - .github/workflows/nightly.yml
       - .github/workflows/beta-installer.yml
       - scripts/nightly.py
+      - installer/**
 
 permissions: {}
 
@@ -112,7 +116,9 @@ jobs:
     secrets: inherit
 
   # The same build for a pull request, which runs its own code: no secrets,
-  # so no diagnostics credentials and no signing, and no OIDC token.
+  # so no diagnostics credentials and no signing, and no OIDC token. It builds
+  # the pull request's own commit (merged with its base), not the nightly
+  # branch, so the installer it compiles has the pull request's changes.
   check:
     name: Windows installer (pull request, no secrets)
     needs: plan
@@ -121,9 +127,9 @@ jobs:
       contents: read
     uses: ./.github/workflows/beta-installer.yml
     with:
-      sha: ${{ needs.plan.outputs.sha }}
+      sha: ${{ github.sha }}
       version: ${{ needs.plan.outputs.version }}
-      revision: ${{ needs.plan.outputs.revision }}
+      revision: ${{ github.sha }}
 
   publish:
     name: Publish
@@ -162,6 +168,19 @@ jobs:
           mv dist/EternalMonitor-Setup.exe "dist/$ASSET"
           python3 scripts/nightly.py notes --version "$VERSION" --branch "$BRANCH" \
             --sha "$SHA" --stable "$STABLE" --sha256 "$SHA256" > notes.md
+
+      # What scripts/sign_beta_manifest.py --sha256/--version must be given:
+      # the hash the build computed, which the step above checked.
+      - name: Summarize the build to sign
+        run: |
+          {
+            echo "### Beta build to sign"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Version | $VERSION |"
+            echo "| Installer SHA-256 | \`$SHA256\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
       # The dated release first, checked anonymously; then the fixed beta link,
       # swapped by renames and checked byte for byte before the old asset goes;

@@ -11,20 +11,23 @@ struct DiscoveredHost: Identifiable, Equatable {
     let port: UInt16
     /// Still resolving. False once resolution gave up without IPv4.
     var finding = false
+    /// The `version` this service's own TXT record announced.
+    var version: String?
 
-    init(name: String, address: String?, port: UInt16, finding: Bool = false) {
+    init(name: String, address: String?, port: UInt16, finding: Bool = false, version: String? = nil) {
         self.name = name
         self.address = address
         self.port = port
         self.finding = finding
+        self.version = version
     }
 
     /// The service as far as it has resolved: its first IPv4 address, or a
     /// PC still being found when only IPv6 (or nothing usable) came back.
-    static func resolved(name: String, port: Int, addresses: [Data]) -> DiscoveredHost {
+    static func resolved(name: String, port: Int, addresses: [Data], version: String? = nil) -> DiscoveredHost {
         let port = port > 0 ? UInt16(clamping: port) : 9876
         let ipv4 = addresses.lazy.compactMap { NetworkScanner.ipAddress(from: $0, family: AF_INET) }.first
-        return DiscoveredHost(name: name, address: ipv4, port: port, finding: ipv4 == nil)
+        return DiscoveredHost(name: name, address: ipv4, port: port, finding: ipv4 == nil, version: version)
     }
 }
 
@@ -75,6 +78,8 @@ final class NetworkScanner: NSObject, ObservableObject {
 
     private let browser = NetServiceBrowser()
     private var resolvingServices: [String: NetService] = [:]
+    /// Every service name this search heard of, until it leaves.
+    private var serviceNames = Set<String>()
     /// Services whose IPv4 address is being looked up by host name, each
     /// with the lookup whose answer still counts. A removed service, a new
     /// scan or a newer address drops its entry, so a late answer can't list
@@ -86,6 +91,11 @@ final class NetworkScanner: NSObject, ObservableObject {
     private var scanTask: Task<Void, Never>?
     // track auto-retry state so we don't bounce forever when discovery is broken.
     private var didAutoRetry = false
+    /// Search once more when a search finds nothing. Off for a one-off
+    /// lookup that stops the search itself.
+    var retriesWhenEmpty = true
+    /// Keep searching until `stopScan`, for a watch rather than a lookup.
+    var searchesUntilStopped = false
 
     override init() {
         super.init()
@@ -103,6 +113,7 @@ final class NetworkScanner: NSObject, ObservableObject {
         searchProblem = nil
         hosts = []
         resolvingServices.removeAll()
+        serviceNames.removeAll()
         ipv4Lookups.removeAll()
         status = .looking
 
@@ -113,6 +124,7 @@ final class NetworkScanner: NSObject, ObservableObject {
         }
         #endif
         browser.searchForServices(ofType: "_eternaldisplay._udp.", inDomain: "local.")
+        guard !searchesUntilStopped else { return }
 
         scanTask = Task { @MainActor in
             // 10s timeout — many routers are slow to forward the first mDNS
@@ -122,6 +134,14 @@ final class NetworkScanner: NSObject, ObservableObject {
                 stopScan()
             }
         }
+    }
+
+    /// Every PC this search heard of: those listed, and those whose address
+    /// never came or is still coming, without one. A lookup that must not
+    /// mistake one PC for another counts them all.
+    var claims: [DiscoveredHost] {
+        hosts + serviceNames.filter { name in !hosts.contains { $0.name == name } }.sorted()
+            .map { DiscoveredHost(name: $0, address: nil, port: 0, finding: true) }
     }
 
     func stopScan() {
@@ -139,7 +159,7 @@ final class NetworkScanner: NSObject, ObservableObject {
         }
 
         if hosts.isEmpty {
-            if !didAutoRetry {
+            if !didAutoRetry && retriesWhenEmpty {
                 // auto-retry once after 2s. Bonjour browse occasionally
                 // misses the first multicast burst.
                 didAutoRetry = true
@@ -167,6 +187,7 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
     ) {
         Task { @MainActor in
             let key = Self.serviceKey(service)
+            serviceNames.insert(service.name)
             guard resolvingServices[key] == nil else { return }
 
             service.delegate = self
@@ -192,6 +213,7 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
                 resolving.stop()
             }
             ipv4Lookups.removeValue(forKey: service.name)
+            serviceNames.remove(service.name)
             hosts.removeAll { $0.name == service.name }
 
             if !moreComing {
@@ -216,11 +238,13 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
         Task { @MainActor in
             let key = Self.serviceKey(sender)
             guard isCurrent(sender), sender.addresses?.isEmpty == false else { return }
-            let host = DiscoveredHost.resolved(name: sender.name, port: sender.port, addresses: sender.addresses ?? [])
+            let version = PCVersions.version(fromTXT: sender.txtRecordData())
+            let host = DiscoveredHost.resolved(name: sender.name, port: sender.port, addresses: sender.addresses ?? [],
+                                               version: version)
             // discovery diagnostic — surface every resolved host so we
             // can tell whether mDNS is finding the right machine.
             print("[mDNS] Found: \(host.name) at \(host.address ?? "no IPv4 yet"):\(host.port)")
-            if let version = PCVersions.version(fromTXT: sender.txtRecordData()) {
+            if let version {
                 PCVersions.record(version, name: host.name, address: host.address)
             }
             merge(host)
@@ -261,7 +285,7 @@ extension NetworkScanner: NetServiceBrowserDelegate, NetServiceDelegate {
                 guard self.ipv4Lookups[service.name] == lookup else { return }
                 self.ipv4Lookups.removeValue(forKey: service.name)
                 if let address {
-                    self.merge(DiscoveredHost(name: service.name, address: address, port: service.port))
+                    self.merge(DiscoveredHost(name: service.name, address: address, port: service.port, version: service.version))
                 } else if !self.isScanning, let index = self.hosts.firstIndex(where: { $0.name == service.name && $0.address == nil }) {
                     self.hosts[index].finding = false
                 }

@@ -72,3 +72,43 @@ fragment half4 display_fragment(VertexOut in [[stage_in]],
 
     return half4(half3(saturate(rgb)), 1.0h);
 }
+
+// The PC's pointer, drawn over the video (PointerOverlay.swift). `rect` is
+// the image's quad in normalized device coordinates: minX, minY, maxX, maxY.
+struct PointerUniforms {
+    float4 rect;
+};
+
+vertex VertexOut pointer_vertex(uint vid [[vertex_id]],
+                                constant PointerUniforms &uniforms [[buffer(0)]]) {
+    // Texture coordinates of the strip's corners: bottom-left, bottom-right,
+    // top-left, top-right (texture rows run downward).
+    const float2 corners[4] = {
+        float2(0.0, 1.0),
+        float2(1.0, 1.0),
+        float2(0.0, 0.0),
+        float2(1.0, 0.0),
+    };
+    float2 t = corners[vid];
+    VertexOut out;
+    out.position = float4(mix(uniforms.rect.x, uniforms.rect.z, t.x),
+                          mix(uniforms.rect.w, uniforms.rect.y, t.y), 0.0, 1.0);
+    out.texCoord = t;
+    return out;
+}
+
+// Premultiplied BGRA, blended "over" the picture.
+fragment half4 pointer_fragment(VertexOut in [[stage_in]],
+                                texture2d<float> image [[texture(0)]]) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    return half4(image.sample(s, in.texCoord));
+}
+
+// The invert mask as white: the pipeline's blend (1 - destination) * source
+// + destination * (1 - source) turns it into "invert the picture here".
+fragment half4 pointer_invert_fragment(VertexOut in [[stage_in]],
+                                       texture2d<float> mask [[texture(0)]]) {
+    constexpr sampler s(filter::linear, address::clamp_to_edge);
+    float m = mask.sample(s, in.texCoord).r;
+    return half4(m, m, m, m);
+}

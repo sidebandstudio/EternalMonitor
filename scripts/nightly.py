@@ -20,12 +20,15 @@
 
 Users see these builds as the Beta channel. Each is a semver pre-release,
 <next>-beta.<YYYYMMDD>.<run>, which semver orders below <next> and above a
-hand-made <next>-beta.1. The apps never offer a pre-release, and a Beta user
-is offered the next stable release as usual (host/src/updates.rs).
+hand-made <next>-beta.1. A stable install is never offered one. A Beta
+install reads the beta release's body (beta_body()) and is offered the newer
+of that Beta and the next stable release (host/src/updates.rs), once
+scripts/sign_beta_manifest.py has signed the build; this script never signs.
 """
 import argparse
 import datetime
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -121,6 +124,8 @@ def stamp(cargo_toml, cargo_lock, version):
 
 
 def notes(version, branch, sha, stable, sha256, repo=REPO):
+    """A Beta install reads the first line's "Version <version>, from the Beta
+    channel" and the hash after "SHA-256 of <ASSET>:" (scripts/fixtures/beta-release-body.md)."""
     if not re.fullmatch(r"[0-9a-f]{40}", sha) or not re.fullmatch(r"[0-9A-Fa-f]{64}", sha256):
         raise ValueError("notes need the full commit and the installer's SHA-256")
     return (
@@ -157,6 +162,11 @@ def download_url(tag, name=ASSET, repo=REPO):
 def marker(sha):
     """The beta release body's last line once a build has finished publishing."""
     return f"<!-- beta-commit: {sha} -->"
+
+
+def beta_body(notes, sha):
+    """The beta release's body once sha's build has finished publishing."""
+    return f"{notes.rstrip()}\n\n{marker(sha)}\n"
 
 
 def published_commit(body):
@@ -232,13 +242,27 @@ def assets(release, name):
     return [a for a in (release or {}).get("assets", []) if a["name"] == name]
 
 
-def verify(github, url, size, sha256=None, tries=6, wait=10, sleep=time.sleep):
+def transient(status):
+    """An HTTP status GitHub's download servers give while briefly unwell, which says
+    nothing about the file."""
+    return status == 429 or 500 <= status <= 599
+
+
+def verify(github, url, size, sha256=None, tries=6, wait=10, transient_tries=12, sleep=time.sleep):
     """url serves size bytes (with sha256, those exact bytes) to an anonymous visitor.
-    A new or renamed asset can take a few seconds to show, so it retries."""
-    for attempt in range(tries):
+
+    A new or renamed asset can take a few seconds to show, so a missing or different
+    file is checked again: tries times, wait seconds apart. A server error (HTTP 429 or
+    5xx) or a dropped connection, also one cut off partway through a download, says
+    nothing about the file, so those have a longer window of their own:
+    transient_tries, each wait 5 s longer up to 30 s (about four minutes). Either way
+    the size and SHA-256 must match exactly."""
+    misses = errors = 0
+    while True:
         try:
             status, length = github.head(url)
             seen = f"HTTP {status}, {length} bytes"
+            flaky = transient(status)
             if status == 200 and length == size:
                 if sha256 is None:
                     return
@@ -246,9 +270,23 @@ def verify(github, url, size, sha256=None, tries=6, wait=10, sleep=time.sleep):
                 if got == sha256:
                     return
                 seen = f"SHA-256 {got}"
-        except OSError as error:
-            seen = str(error)
-        if attempt + 1 < tries:
+        except urllib.error.HTTPError as error:
+            seen = f"HTTP {error.code}"
+            flaky = transient(error.code)
+        except (OSError, http.client.HTTPException) as error:
+            # A dropped connection, also one cut off partway through the download
+            # (http.client.IncompleteRead, which is no OSError).
+            seen = f"{type(error).__name__}: {error}"
+            flaky = True
+        if flaky:
+            errors += 1
+            if errors >= transient_tries:
+                break
+            sleep(min(5 * errors, 30))
+        else:
+            misses += 1
+            if misses >= tries:
+                break
             sleep(wait)
     raise PublishError(f"{url}: {seen}; expected {size} bytes" + (f", SHA-256 {sha256}" if sha256 else ""))
 
@@ -344,7 +382,7 @@ def publish(github, tag, sha, title, notes, path, sleep=time.sleep):
 
     # 3. The tag, then the marker that says this commit is done.
     github.move_tag(MOVING_TAG, sha)
-    github.edit(MOVING_TAG, title, f"{notes.rstrip()}\n\n{marker(sha)}\n")
+    github.edit(MOVING_TAG, title, beta_body(notes, sha))
 
 
 def git(*args):

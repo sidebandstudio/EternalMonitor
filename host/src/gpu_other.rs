@@ -33,6 +33,8 @@ pub struct GpuInfo {
     pub dedicated_vram_mb: u64,
     pub encoder_name: String,
     pub codec_display_name: String,
+    /// Always false: detection here only asks FFmpeg.
+    pub detection_stalled: bool,
 }
 
 impl GpuInfo {
@@ -53,6 +55,7 @@ impl GpuInfo {
                     dedicated_vram_mb: 0,
                     encoder_name: name.to_string(),
                     codec_display_name: display_name.to_string(),
+                    detection_stalled: false,
                 };
             }
             info!(encoder = name, "Encoder not available, trying next");
@@ -70,8 +73,14 @@ impl GpuInfo {
             dedicated_vram_mb: 0,
             encoder_name: "libx264".to_string(),
             codec_display_name: "H.264 (x264)".to_string(),
+            detection_stalled: false,
         }
     }
+}
+
+/// Detection here never stalls, so there is never a late one.
+pub fn take_late_detection() -> Option<GpuInfo> {
+    None
 }
 
 /// No NVIDIA drivers to read outside Windows.

@@ -129,7 +129,7 @@ const NOT_READY_WINDOW: Duration = Duration::from_millis(2);
 /// Retries ERROR_NOT_READY briefly while Windows is accepting frames. A frame
 /// still refused after that means Windows' input queue is stuck; later
 /// frames get one attempt each until one is accepted, so a stuck queue costs
-/// one call per sample or refresh tick rather than stalling the transport.
+/// one call per sample or refresh tick rather than stalling the input thread.
 #[derive(Debug, Default)]
 pub struct NotReadyRetry {
     stalled: bool,
@@ -173,8 +173,7 @@ pub(super) const FRAME_SPACING: Duration = Duration::from_micros(250);
 pub(super) const FRAME_BURST: u32 = 6;
 
 /// The most frames one `flush` sends before it yields. Injection runs on the
-/// transport loop, so a backlog goes out in chunks with NACK answers, input
-/// and video pacing in between.
+/// input thread, so a backlog goes out in chunks with newer input in between.
 const PASS_FRAMES: u32 = FRAME_BURST;
 
 /// The most time one `flush` spends sending frames before it yields, should
@@ -385,9 +384,8 @@ impl PenContact {
             self.abandoned.push((mapped(sample, output), now));
             return;
         }
-        // Behind frames held back, the sample waits for the flush at the
-        // top of the next transport pass, so one pass never sends more than
-        // one budget.
+        // Behind frames held back, the sample waits for the input thread's
+        // next flush, so one pass never sends more than one budget.
         let held = self.spaced_until().is_some();
         self.enqueue(sample, now);
         if !held {

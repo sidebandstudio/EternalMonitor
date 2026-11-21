@@ -9,6 +9,7 @@ struct ConnectView: View {
     @ObservedObject private var pairings = PairingStore.shared
     @ObservedObject private var language = LanguageStore.shared
     @ObservedObject private var updates = UpdateChecker.shared
+    @ObservedObject private var oldPC = OldPCPrompt.shared
 
     @State private var hostIP: String = ""
     @State private var port: String = "9876"
@@ -94,6 +95,10 @@ struct ConnectView: View {
                                     },
                                     notNow: { withAnimation(Motion.fade) { connectionManager.finishFeedbackAsk() } }
                                 )
+                            }
+
+                            if let card = oldPC.card {
+                                OldPCCard(card: card, close: { withAnimation(Motion.fade) { oldPC.close() } })
                             }
 
                             if isConnecting {
@@ -229,6 +234,12 @@ struct ConnectView: View {
             .onChange(of: scenePhase) { _, phase in
                 if phase == .active && scanner.searchProblem == .localNetworkOff { scanner.startScan() }
             }
+            // The old-PC card shows only here, never over a stream.
+            .onAppear(perform: offerOldPC)
+            .onChange(of: connectionManager.state) { _, _ in offerOldPC() }
+            .onChange(of: scanner.hosts) { _, _ in offerOldPC() }
+            .onChange(of: showSetup) { _, _ in offerOldPC() }
+            .onDisappear { oldPC.close() }
             .animation(.easeInOut(duration: 0.2), value: isConnecting)
             .animation(.easeInOut(duration: 0.2), value: connectionManager.connectionError)
             .animation(.easeInOut(duration: 0.2), value: connectionManager.problem)
@@ -275,7 +286,8 @@ struct ConnectView: View {
         case .connect(let host, let port):
             hostIP = host
             self.port = String(port)
-            connectionManager.connect(host: host, port: port)
+            // Setup offers only the PCs Bonjour found.
+            connectionManager.connect(host: host, port: port, found: true)
             return
         case .scanQR:
             showQRScanner = true
@@ -340,6 +352,14 @@ struct ConnectView: View {
                     .foregroundStyle(Theme.textMuted)
                     .fixedSize(horizontal: false, vertical: true)
                     .accessibilityIdentifier("connect.problemDetail")
+                if connectionManager.watchingForPC {
+                    // Problem cards stay English.
+                    Text(verbatim: "Waiting for your PC: this iPad connects by itself when EternalMonitor opens there.")
+                        .font(.app(14, .medium, relativeTo: .callout))
+                        .foregroundStyle(Theme.text)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .accessibilityIdentifier("connect.problemWaiting")
+                }
                 if !problem.actions.isEmpty {
                     HStack(spacing: 10) {
                         ForEach(problem.actions, id: \.self) { action in
@@ -559,10 +579,19 @@ struct ConnectView: View {
                     Text(L("Connecting…"))
                         .font(.app(18, .semibold, relativeTo: .headline))
                         .foregroundStyle(Theme.text)
-                    Text(normalizedHostIP.isEmpty ? L("Waiting for your PC") : L("Reaching \(normalizedHostIP)"))
-                        .font(.app(14, relativeTo: .callout))
-                        .foregroundStyle(Theme.textMuted)
-                        .lineLimit(1)
+                    // The PC answered and said why no picture comes yet.
+                    if let card = connectionManager.pcGraphicsCard {
+                        Text(card.short)
+                            .font(.app(14, relativeTo: .callout))
+                            .foregroundStyle(Theme.text)
+                            .fixedSize(horizontal: false, vertical: true)
+                            .accessibilityIdentifier("connect.pcGraphicsCard")
+                    } else {
+                        Text(normalizedHostIP.isEmpty ? L("Waiting for your PC") : L("Reaching \(normalizedHostIP)"))
+                            .font(.app(14, relativeTo: .callout))
+                            .foregroundStyle(Theme.textMuted)
+                            .lineLimit(1)
+                    }
                 }
                 Spacer(minLength: 0)
             }
@@ -596,7 +625,8 @@ struct ConnectView: View {
                 Text(L("USB cable"))
                     .font(.app(15, .medium, relativeTo: .subheadline))
                     .foregroundStyle(Theme.text)
-                Text(USBStatusText.describe(connectionManager.usbStatus))
+                Text(USBStatusText.describe(connectionManager.usbStatus,
+                    appleDevicesUnreachable: connectionManager.appleDevicesUnreachable != nil))
                     .font(.app(13.5, relativeTo: .footnote))
                     .foregroundStyle(Theme.textMuted)
                     .fixedSize(horizontal: false, vertical: true)
@@ -699,14 +729,17 @@ struct ConnectView: View {
                         guard let address = host.address else { return }
                         hostIP = address
                         port = "\(host.port)"
-                        connectionManager.connect(host: address, port: host.port)
+                        oldPC.connecting(service: host.name, address: address)
+                        connectionManager.connect(host: address, port: host.port, found: true)
                     } label: {
                         hostRow(
                             icon: "desktopcomputer",
                             title: host.name,
                             subtitle: Self.discoveredSubtitle(host),
                             badge: nil,
-                            paired: false
+                            paired: false,
+                            note: updates.pcNeedsUpdate(PCVersions.version(address: host.address, name: host.name))
+                                ? Self.pcUpdateNote : nil
                         )
                     }
                     .buttonStyle(RowButtonStyle())
@@ -720,11 +753,23 @@ struct ConnectView: View {
         .transition(.opacity.combined(with: .move(edge: .bottom)))
     }
 
+    /// Under a found PC whose EternalMonitor is older than the newest for
+    /// Windows. Update text stays English, like the other update text.
+    static let pcUpdateNote = "Update EternalMonitor on your PC"
+
     static func discoveredSubtitle(_ host: DiscoveredHost) -> String {
         if let address = host.address { return L("Tap to connect · \(address)") }
         return host.finding
             ? L("Finding…")
             : "Couldn't get its address. Type the Address shown on the PC."
+    }
+
+    /// Notes the PCs the search lists, each with its own TXT version, and
+    /// shows a waiting old-PC card while nothing is streaming and setup is
+    /// closed.
+    private func offerOldPC() {
+        oldPC.discovered(scanner.hosts)
+        if connectionManager.state == .disconnected && !showSetup { oldPC.show() }
     }
 
     private var unlistedRecents: [RecentConnection] {
@@ -772,7 +817,8 @@ struct ConnectView: View {
             .padding(.leading, 70)
     }
 
-    private func hostRow(icon: String, title: String, subtitle: String, badge: String?, paired: Bool) -> some View {
+    private func hostRow(icon: String, title: String, subtitle: String, badge: String?, paired: Bool,
+                         note: String? = nil) -> some View {
         HStack(spacing: 14) {
             Image(systemName: icon)
                 .font(.system(size: 16, weight: .medium))
@@ -791,6 +837,13 @@ struct ConnectView: View {
                     .font(.app(13, relativeTo: .footnote))
                     .foregroundStyle(Theme.textMuted)
                     .lineLimit(1)
+                if let note {
+                    Label(note, systemImage: "arrow.up.circle")
+                        .font(.app(12.5, relativeTo: .caption))
+                        .foregroundStyle(Theme.textMuted)
+                        .lineLimit(2)
+                        .accessibilityIdentifier("discovered.pcUpdate")
+                }
             }
             Spacer(minLength: 8)
             if paired {

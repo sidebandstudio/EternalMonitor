@@ -34,6 +34,23 @@ struct ReferenceContinuity {
     /// Set from the session's host caps: a forward gap in `frame_seq` is a loss.
     var frameSeqContiguous = false
 
+    /// Why a picture was turned down, for the log line of the hold it starts.
+    enum Loss: Equatable {
+        /// `frame_seq` skipped from `previous` to `seq` on a PC that numbers
+        /// contiguously.
+        case frameSeqGap(previous: UInt32, seq: UInt32)
+        /// Another epoch, or a lower `frame_seq` in this one, and this picture
+        /// is not its keyframe.
+        case streamRestarted(previousEpoch: UInt32, epoch: UInt32, previousSeq: UInt32, seq: UInt32)
+        /// H.264: `frame_num` is not the one after the latest reference picture.
+        case frameNumJump(expected: UInt32, got: UInt32)
+        /// HEVC: the POC moved by other than the learned step.
+        case pocStep(expected: UInt32, got: UInt32)
+    }
+
+    /// Why the latest picture turned down was, until another is.
+    private(set) var lastLoss: Loss?
+
     struct H264Parameters: Equatable {
         var log2MaxFrameNum: Int
         var separateColourPlane: Bool
@@ -91,17 +108,21 @@ struct ReferenceContinuity {
     /// frame number, `epoch` its stream epoch; a lower `seq` or another epoch
     /// means the host restarted its stream.
     mutating func admitH264(firstSlice nal: Data, isKeyframe: Bool, seq: UInt32, epoch: UInt32) -> Bool {
-        let (restarted, gap) = noteStream(seq: seq, epoch: epoch)
+        let stream = noteStream(seq: seq, epoch: epoch)
         guard let params = h264, let frameNum = Self.h264FrameNum(nal, params) else {
             previousReferenceFrameNum = nil
-            return isKeyframe || !(restarted || gap)
+            return isKeyframe || admitStream(stream, seq: seq, epoch: epoch)
         }
         let isReference = (nal[nal.startIndex] >> 5) & 0x03 != 0
         if !isKeyframe {
-            if restarted || gap { return false }
+            if !admitStream(stream, seq: seq, epoch: epoch) { return false }
             if let previous = previousReferenceFrameNum, !params.gapsAllowed {
                 let maxFrameNum = UInt32(1) << params.log2MaxFrameNum
-                guard frameNum == (previous + 1) % maxFrameNum else { return false }
+                let expected = (previous + 1) % maxFrameNum
+                guard frameNum == expected else {
+                    lastLoss = .frameNumJump(expected: expected, got: frameNum)
+                    return false
+                }
             }
         }
         if isReference { previousReferenceFrameNum = frameNum }
@@ -110,18 +131,19 @@ struct ReferenceContinuity {
 
     mutating func admitHEVC(firstSlice nal: Data, isKeyframe: Bool, seq: UInt32, epoch: UInt32) -> Bool {
         let contiguous = previousSeq.map { seq == $0 &+ 1 } ?? false
-        let (restarted, gap) = noteStream(seq: seq, epoch: epoch)
+        let stream = noteStream(seq: seq, epoch: epoch)
         guard let params = hevc, let poc = Self.hevcPocLsb(nal, params) else {
             previousPoc = nil
-            return isKeyframe || !(restarted || gap)
+            return isKeyframe || admitStream(stream, seq: seq, epoch: epoch)
         }
         if !isKeyframe {
-            if restarted || gap { return false }
+            if !admitStream(stream, seq: seq, epoch: epoch) { return false }
             if let previous = previousPoc, !pocUnreliable {
                 let delta = (poc &- previous) & ((UInt32(1) << params.log2MaxPocLsb) - 1)
                 if contiguous {
                     if pocStep == nil { pocStep = delta } else if delta != pocStep { pocUnreliable = true }
                 } else if let step = pocStep, delta != step {
+                    lastLoss = .pocStep(expected: step, got: delta)
                     return false
                 }
             }
@@ -130,21 +152,47 @@ struct ReferenceContinuity {
         return true
     }
 
+    /// What [`noteStream`] found, with the frame number and epoch before.
+    private struct StreamStep {
+        var restarted = false
+        var gap = false
+        var previousSeq: UInt32 = 0
+        var previousEpoch: UInt32 = 0
+    }
+
     /// Records the wire frame number and epoch. `restarted`: another epoch,
     /// or a lower number in this one, so a new encoder whose counts, POC step
     /// and reliability start over. `gap`: a number skipped on a PC that
     /// numbers contiguously.
-    private mutating func noteStream(seq: UInt32, epoch: UInt32) -> (restarted: Bool, gap: Bool) {
+    private mutating func noteStream(seq: UInt32, epoch: UInt32) -> StreamStep {
         defer { previousSeq = seq; previousEpoch = epoch }
-        guard let previous = previousSeq else { return (false, false) }
+        guard let previous = previousSeq else { return StreamStep() }
+        var step = StreamStep(previousSeq: previous, previousEpoch: previousEpoch ?? epoch)
         guard previousEpoch == epoch, seq >= previous else {
             previousReferenceFrameNum = nil
             previousPoc = nil
             pocStep = nil
             pocUnreliable = false
-            return (true, false)
+            step.restarted = true
+            return step
         }
-        return (false, frameSeqContiguous && seq > previous &+ 1)
+        step.gap = frameSeqContiguous && seq > previous &+ 1
+        return step
+    }
+
+    /// Whether a picture that isn't a keyframe may follow `step`; when not,
+    /// [`lastLoss`] says why.
+    private mutating func admitStream(_ step: StreamStep, seq: UInt32, epoch: UInt32) -> Bool {
+        if step.restarted {
+            lastLoss = .streamRestarted(previousEpoch: step.previousEpoch, epoch: epoch,
+                                        previousSeq: step.previousSeq, seq: seq)
+            return false
+        }
+        if step.gap {
+            lastLoss = .frameSeqGap(previous: step.previousSeq, seq: seq)
+            return false
+        }
+        return true
     }
 
     // MARK: - Parsing

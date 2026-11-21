@@ -206,6 +206,10 @@ Name: "{autodesktop}\EternalMonitor";      Filename: "{app}\EternalMonitor-host.
 ; listens only on UDP; the TCP rule older versions added is removed and not re-added.
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""EternalMonitor Host UDP"""; Flags: runhidden waituntilterminated
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=""EternalMonitor Host TCP"""; Flags: runhidden waituntilterminated
+; Every other inbound rule for the host goes too. Windows adds Block rules for it when its
+; "allow access" prompt is dismissed, and a Block rule beats the Allow rule below: iPads then
+; get no answer. Running Setup again is the fix the PC and the iPad offer for that.
+Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall delete rule name=all dir=in program=""{app}\EternalMonitor-host.exe"""; Flags: runhidden waituntilterminated
 Filename: "{sys}\netsh.exe"; Parameters: "advfirewall firewall add rule name=""EternalMonitor Host UDP"" dir=in action=allow program=""{app}\EternalMonitor-host.exe"" protocol=UDP profile=domain,private,public enable=yes"; StatusMsg: "{cm:FirewallStatus}"; Flags: runhidden waituntilterminated
 #ifdef IncludeDriver
 ; Save the screens before the driver steps: starting the virtual display can leave a PC with no
@@ -217,8 +221,9 @@ Filename: "{app}\driver\vdd-setup-x64.exe"; Parameters: "/VERYSILENT /SUPPRESSMS
 ; Register the enable/disable scheduled tasks and leave the virtual display OFF by default —
 ; EternalMonitor turns it on only while streaming to it, so there's no phantom monitor.
 ; A preserved driver whose device was removed or broke is repaired first.
-Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\vdd-tasks-setup.ps1"""; StatusMsg: "{cm:DisplayStatus}"; Flags: runhidden waituntilterminated; Check: VddInstallSucceeded; BeforeInstall: RepairVddDriver; AfterInstall: VerifyVddDriver
-; After the Disable above, and also when a failed driver step skipped it.
+; Even after a driver failure, replace the task definitions for future runs.
+Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\vdd-tasks-setup.ps1"" -ResultMarker ""{tmp}\vdd-tasks-verified"""; StatusMsg: "{cm:DisplayStatus}"; Flags: runhidden waituntilterminated logoutput; BeforeInstall: PrepareVddTasks; AfterInstall: FinishVddTasks
+; Check the screens after the display steps, including after a failure.
 Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -File ""{app}\scripts\display-guard.ps1"" -Action check -Path ""{tmp}\display-layout.json"""; Flags: runhidden waituntilterminated logoutput
 #endif
 ; Launch the app at the end.
@@ -245,6 +250,10 @@ Type: files; Name: "{app}\driver\installed-by-eternalmonitor.txt"
 [Code]
 var
   VddInstallFailed: Boolean;
+  VddTasksFailed: Boolean;
+#ifdef IncludeDriver
+  VddFailedBeforeTasks: Boolean;
+#endif
 
 function VddInstallSucceeded: Boolean;
 begin
@@ -252,13 +261,14 @@ begin
 end;
 
 { Inno Setup's own exit codes are 1 to 8 (1: Setup failed to initialize).
-  The update helper reports Setup's code to the relaunched app, so this one
-  stays clear of them. }
+  The update helper reports these codes to the relaunched app. }
 function GetCustomSetupExitCode: Integer;
 begin
   Result := 0;
   if VddInstallFailed then
-    Result := 20;
+    Result := 20
+  else if VddTasksFailed and WizardSilent then
+    Result := 21;
 end;
 
 const
@@ -302,6 +312,21 @@ begin
   Result := Result and (Directory <> '') and (Version <> '');
 end;
 
+const
+  FirstWindows11Build = 22000;
+
+{ Setup installs the bundled driver on Windows 10 and 11. Windows 11 adds its
+  screen. On Windows 10 Windows adds it on some PCs only, and not every time:
+  the app tries Second screen there and shows the mirror when it doesn't start
+  (second_screen in the host). }
+function IsWindows11: Boolean;
+var
+  Windows: TWindowsVersion;
+begin
+  GetWindowsVersionEx(Windows);
+  Result := Windows.Build >= FirstWindows11Build;
+end;
+
 function NeedsVddInstall: Boolean;
 var
   Directory, Version: String;
@@ -309,6 +334,19 @@ begin
   Result := not ReadVddRegistration(Directory, Version);
   if not Result then
     Log('Preserving existing Virtual Display Driver package ' + Version);
+end;
+
+{ A driver repair or check failed. On Windows 11 Setup fails with Message. On
+  Windows 10 a driver that Windows installs but doesn't bind or start must not
+  fail Setup: it is logged, and the app mirrors when Second screen fails. }
+procedure FailVddStep(const Message: String);
+begin
+  if not IsWindows11 then begin
+    Log('Virtual Display Driver step failed on Windows 10, Setup goes on: ' + Message);
+    exit;
+  end;
+  VddInstallFailed := True;
+  RaiseException(Message);
 end;
 
 procedure VerifyVddDriver;
@@ -319,10 +357,8 @@ begin
     explicitly, including upgrades that preserve an existing registration. }
   if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
       '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\scripts\vdd-driver-verify.ps1') + '"',
-      '', SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then begin
-    VddInstallFailed := True;
-    RaiseException('Windows did not finish installing the virtual display driver. Run setup while signed into Windows and approve its publisher prompt. If the driver already exists, repair it before trying again.');
-  end;
+      '', SW_HIDE, ewWaitUntilTerminated, ExitCode) or (ExitCode <> 0) then
+    FailVddStep('Windows did not finish installing the virtual display driver. Run setup while signed into Windows and approve its publisher prompt. If the driver already exists, repair it before trying again.');
 end;
 
 procedure RepairVddDriver;
@@ -345,8 +381,54 @@ begin
   else
     Message := 'Setup could not repair the virtual display driver. Restart the PC and run this setup again. If it still fails, uninstall "Virtual Display Driver" in Windows Settings > Apps > Installed apps, then run this setup again.';
   end;
-  VddInstallFailed := True;
-  RaiseException(Message);
+  FailVddStep(Message);
+end;
+
+procedure PrepareVddTasks;
+begin
+  VddFailedBeforeTasks := VddInstallFailed;
+  if not VddFailedBeforeTasks then
+    RepairVddDriver;
+end;
+
+procedure RunVddTaskStep(const Script, Args, Step: String);
+var
+  ExitCode: Integer;
+begin
+  try
+    if ExecAndLogOutput(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+        '-NoProfile -ExecutionPolicy Bypass -File "' + ExpandConstant('{app}\scripts\') +
+        Script + '" ' + Args, '', SW_SHOWNORMAL, ewWaitUntilTerminated, ExitCode, nil) then
+      Log(Step + ' exited with code ' + IntToStr(ExitCode))
+    else
+      Log('Could not start ' + Step + ': ' + IntToStr(ExitCode));
+  except
+    Log(Step + ' failed: ' + GetExceptionMessage);
+  end;
+end;
+
+procedure FinishVddTasks;
+var
+  Marker: String;
+begin
+  { Inno logs the [Run] exit code but doesn't act on it. Verify the marker
+    the script writes after reading back both tasks. }
+  Marker := ExpandConstant('{tmp}\vdd-tasks-verified');
+  if not FileExists(Marker) then begin
+    Log('Virtual display task registration was not verified. Retrying.');
+    RunVddTaskStep('vdd-tasks-setup.ps1', '-ResultMarker "' + Marker + '"',
+      'Virtual display task registration retry');
+  end;
+  VddTasksFailed := not FileExists(Marker);
+  if VddTasksFailed then
+    Log('Virtual display task registration could not be verified after two attempts.')
+  else
+    Log('Both virtual display tasks were verified.');
+  { Stopping an old toggle can leave the device enabled. Disable it once
+    after the registration attempts, even if neither succeeded. }
+  RunVddTaskStep('vdd-toggle.ps1', '-Action disable', 'Virtual display device disable');
+  if not VddFailedBeforeTasks then
+    VerifyVddDriver;
 end;
 
 procedure RecordVddOwnership;
