@@ -32,10 +32,10 @@ EternalMonitor は iPad を Windows PC のモニターにします。無料で�
 
 ## クイックスタート
 
-[![Windows 版をダウンロード](https://img.shields.io/badge/Download_for_Windows-v0.3.3-e8ff47?style=for-the-badge&labelColor=111)](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.3/EternalMonitor-Setup.exe)
+[![Windows 版をダウンロード](https://img.shields.io/badge/Download_for_Windows-v0.3.4-e8ff47?style=for-the-badge&labelColor=111)](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.4/EternalMonitor-Setup.exe)
 [![TestFlight で iPad アプリを入手](https://img.shields.io/badge/iPad_app-TestFlight-e8ff47?style=for-the-badge&labelColor=111)](https://testflight.apple.com/join/ppc9QfXc)
 
-1. **Windows アプリをインストール。** NVIDIA、AMD、Intel のグラフィックスを搭載した 64 ビットの Windows 10（バージョン 1809 以降）または Windows 11 で [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.3/EternalMonitor-Setup.exe) を実行します。Windows SmartScreen が表示されたら、**詳細情報**、**実行**の順に選びます。ファイルの SHA-256 は[リリースページ](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.3)に記載されています。
+1. **Windows アプリをインストール。** NVIDIA、AMD、Intel のグラフィックスを搭載した 64 ビットの Windows 10（バージョン 1809 以降）または Windows 11 で [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.4/EternalMonitor-Setup.exe) を実行します。Windows SmartScreen が表示されたら、**詳細情報**、**実行**の順に選びます。ファイルの SHA-256 は[リリースページ](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.4)に記載されています。
 2. **iPad アプリをインストール。** iPadOS 17 以降の iPad に App Store から **TestFlight** をインストールします。iPad で [EternalMonitor の TestFlight リンク](https://testflight.apple.com/join/ppc9QfXc)を開き、**インストール**をタップします。
 3. **接続。** 両アプリを同じネットワークで開き、iPad で PC をタップするか、PC に表示された QR コードをスキャンします。Windows 10 22H2 または Windows 11 で USB を使う場合はケーブルを接続し、Apple の無料アプリ [Apple Devices](https://apps.microsoft.com/detail/9np83lwlpz9k) を PC で開いたままにします。
 
@@ -74,9 +74,9 @@ EternalMonitor が役に立ったら、スターを付けると他の人が見�
 
 ## 状況
 
-現在のリリースは Windows 版 v0.3.3 と iPad 版 v0.3.3 (build 364) です。Intel と NVIDIA のグラフィックスを搭載したより多くのノート PC で **セカンドスクリーン** (Second screen) が使えます。iPad はまず PC のメイン画面を表示し、Windows がセカンドスクリーンを追加すると切り替わります。[RELEASE_NOTES.md](../RELEASE_NOTES.md) は各バージョンを、[ROADMAP.md](../ROADMAP.md) は今後の予定を説明します。
+現在のリリースは Windows 版 v0.3.4 と iPad 版 v0.3.4 (build 698) です。0.3.3 で報告された問題を修正します。AMD と Intel のグラフィックスでの起動時のクラッシュ、低速な PC での USB 使用時のフリーズ、Wi-Fi でのフレームの乱れです。両アプリは 11 言語に対応しました。[RELEASE_NOTES.md](../RELEASE_NOTES.md) は各バージョンを、[ROADMAP.md](../ROADMAP.md) は今後の予定を説明します。
 
-v0.3.3 のリリースチェックは Windows、macOS、iPad シミュレーターで合格しました。[docs/hardware-verification.md](../docs/hardware-verification.md) には v0.3.0 からの実際の PC と iPad での検証結果を記録しています。
+v0.3.4 のリリースチェックは Windows、macOS、iPad シミュレーターで合格しました。[docs/hardware-verification.md](../docs/hardware-verification.md) には v0.3.0 からの実際の PC と iPad での検証結果を記録しています。
 
 Windows と iPad の診断情報には、デバイスの詳細、アプリのエラー、配信の統計が含まれます。レポートにはグラフィックカードとディスプレイの名前、ネットワークアドレスが含まれますが、画面の内容、音声、ペアリングの認証情報は含まれません。0.3.4 から、Windows の送信データから PC の名前、ユーザー名、ユーザーフォルダー、iPad の名前、オーディオデバイス名が取り除かれ、各オーディオデバイスの種類だけが残ります。iPad の送信データからは PC の名前が取り除かれます。自動共有は **設定** (Settings) で無効にできます。診断情報は最大 30 日間保存され、それより早く削除される場合もあります。削除済みまたは期限切れの診断情報は、日次バックアップにさらに最大 7 日間残る場合があります。[自動診断](../SETUP.md#automatic-diagnostics)と[プライバシー通知](https://eternalmonitor.dev/privacy.html)を参照してください。iPad では **設定** (Settings) > **サポート** (Support) > **診断** (Diagnostics) を開き、レポートをコピーまたは書き出せます。
 

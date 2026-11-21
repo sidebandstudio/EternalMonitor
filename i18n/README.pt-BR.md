@@ -32,10 +32,10 @@ O EternalMonitor transforma um iPad em monitor para seu PC com Windows. É gratu
 
 ## Início rápido
 
-[![Baixar para Windows](https://img.shields.io/badge/Download_for_Windows-v0.3.3-e8ff47?style=for-the-badge&labelColor=111)](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.3/EternalMonitor-Setup.exe)
+[![Baixar para Windows](https://img.shields.io/badge/Download_for_Windows-v0.3.4-e8ff47?style=for-the-badge&labelColor=111)](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.4/EternalMonitor-Setup.exe)
 [![Obter o aplicativo para iPad no TestFlight](https://img.shields.io/badge/iPad_app-TestFlight-e8ff47?style=for-the-badge&labelColor=111)](https://testflight.apple.com/join/ppc9QfXc)
 
-1. **Instale o aplicativo para Windows.** Execute [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.3/EternalMonitor-Setup.exe) no Windows 10 (versão 1809 ou posterior) ou Windows 11, 64 bits, com gráficos NVIDIA, AMD ou Intel. Se o Windows SmartScreen perguntar, escolha **Mais informações** e depois **Executar assim mesmo**. A [página da versão](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.3) informa o SHA-256 do arquivo.
+1. **Instale o aplicativo para Windows.** Execute [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.4/EternalMonitor-Setup.exe) no Windows 10 (versão 1809 ou posterior) ou Windows 11, 64 bits, com gráficos NVIDIA, AMD ou Intel. Se o Windows SmartScreen perguntar, escolha **Mais informações** e depois **Executar assim mesmo**. A [página da versão](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.4) informa o SHA-256 do arquivo.
 2. **Instale o aplicativo para iPad.** Em um iPad com iPadOS 17 ou posterior, instale o **TestFlight** pela App Store. Depois, abra o [link do EternalMonitor no TestFlight](https://testflight.apple.com/join/ppc9QfXc) no iPad e toque em **Instalar**.
 3. **Conecte.** Com os dois aplicativos abertos na mesma rede, toque no seu PC no iPad ou escaneie o código QR mostrado pelo PC. Para usar USB no Windows 10 22H2 ou Windows 11, conecte o cabo e mantenha aberto no PC o aplicativo gratuito [Apple Devices](https://apps.microsoft.com/detail/9np83lwlpz9k), da Apple.
 
@@ -74,9 +74,9 @@ Este README e o [site](https://eternalmonitor.dev) estão disponíveis em 11 idi
 
 ## Status
 
-A versão atual é v0.3.3 para Windows e v0.3.3 (build 364) para iPad. Ela leva **Segunda tela** (Second screen) a mais notebooks com gráficos Intel e NVIDIA: o iPad mostra a tela principal do PC imediatamente e muda para a segunda tela quando o Windows a adiciona. [RELEASE_NOTES.md](../RELEASE_NOTES.md) descreve cada versão, e [ROADMAP.md](../ROADMAP.md), o que vem a seguir.
+A versão atual é v0.3.4 para Windows e v0.3.4 (build 698) para iPad. Ela corrige os problemas relatados na versão 0.3.3: falhas na inicialização com gráficos AMD e Intel, travamentos via USB em PCs mais lentos e quadros corrompidos no Wi-Fi. Os dois aplicativos agora estão disponíveis em 11 idiomas. [RELEASE_NOTES.md](../RELEASE_NOTES.md) descreve cada versão, e [ROADMAP.md](../ROADMAP.md), o que vem a seguir.
 
-As verificações da versão v0.3.3 passaram no Windows, macOS e simuladores de iPad. [docs/hardware-verification.md](../docs/hardware-verification.md) registra os resultados práticos em um PC e um iPad reais desde a v0.3.0.
+As verificações da versão v0.3.4 passaram no Windows, macOS e simuladores de iPad. [docs/hardware-verification.md](../docs/hardware-verification.md) registra os resultados práticos em um PC e um iPad reais desde a v0.3.0.
 
 Os diagnósticos do Windows e do iPad incluem detalhes do dispositivo, erros do aplicativo e estatísticas da transmissão. Os relatórios incluem nomes de placas de vídeo e monitores e endereços de rede, mas não incluem conteúdo da tela, áudio nem credenciais de pareamento. A partir da versão 0.3.4, os dados enviados pelo Windows têm removidos o nome do PC, o nome de usuário, a pasta do usuário, o nome do iPad e os nomes dos dispositivos de áudio, mantendo apenas o tipo de cada dispositivo de áudio; os dados enviados pelo iPad têm removido o nome do PC. Desative o compartilhamento automático em **Configurações** (Settings). Os diagnósticos são mantidos por até 30 dias e podem ser removidos antes. Diagnósticos excluídos ou expirados podem permanecer nos backups diários por até mais 7 dias. Consulte [Diagnósticos automáticos](../SETUP.md#automatic-diagnostics) e o [aviso de privacidade](https://eternalmonitor.dev/privacy.html). No iPad, abra **Configurações** (Settings) > **Suporte** (Support) > **Diagnósticos** (Diagnostics) para copiar ou exportar um relatório.
 

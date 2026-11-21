@@ -32,10 +32,10 @@ EternalMonitor macht ein iPad zum Monitor für deinen Windows-PC. Die Software i
 
 ## Schnellstart
 
-[![Für Windows herunterladen](https://img.shields.io/badge/Download_for_Windows-v0.3.3-e8ff47?style=for-the-badge&labelColor=111)](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.3/EternalMonitor-Setup.exe)
+[![Für Windows herunterladen](https://img.shields.io/badge/Download_for_Windows-v0.3.4-e8ff47?style=for-the-badge&labelColor=111)](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.4/EternalMonitor-Setup.exe)
 [![iPad-App über TestFlight laden](https://img.shields.io/badge/iPad_app-TestFlight-e8ff47?style=for-the-badge&labelColor=111)](https://testflight.apple.com/join/ppc9QfXc)
 
-1. **Installiere die Windows-App.** Starte [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.3/EternalMonitor-Setup.exe) auf Windows 10 (Version 1809 oder neuer) oder Windows 11, 64 Bit, mit NVIDIA-, AMD- oder Intel-Grafik. Falls Windows SmartScreen nachfragt, wähle **Weitere Informationen** und dann **Trotzdem ausführen**. Die [Release-Seite](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.3) nennt den SHA-256-Wert der Datei.
+1. **Installiere die Windows-App.** Starte [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.4/EternalMonitor-Setup.exe) auf Windows 10 (Version 1809 oder neuer) oder Windows 11, 64 Bit, mit NVIDIA-, AMD- oder Intel-Grafik. Falls Windows SmartScreen nachfragt, wähle **Weitere Informationen** und dann **Trotzdem ausführen**. Die [Release-Seite](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.4) nennt den SHA-256-Wert der Datei.
 2. **Installiere die iPad-App.** Installiere auf einem iPad mit iPadOS 17 oder neuer **TestFlight** aus dem App Store. Öffne dann den [EternalMonitor-TestFlight-Link](https://testflight.apple.com/join/ppc9QfXc) auf dem iPad und tippe auf **Installieren**.
 3. **Verbinde die Geräte.** Öffne beide Apps im selben Netzwerk und tippe auf dem iPad auf deinen PC oder scanne den QR-Code, den der PC anzeigt. Für USB unter Windows 10 22H2 oder Windows 11 schließe das Kabel an und lasse Apples kostenlose App [Apple Devices](https://apps.microsoft.com/detail/9np83lwlpz9k) auf dem PC geöffnet.
 
@@ -74,9 +74,9 @@ Diese README und die [Website](https://eternalmonitor.dev) sind in 11 Sprachen v
 
 ## Status
 
-Die aktuelle Version ist v0.3.3 für Windows und v0.3.3 (build 364) für das iPad. Sie bringt **Zweiter Bildschirm** (Second screen) auf mehr Laptops mit Intel- und NVIDIA-Grafik: Das iPad zeigt sofort den Hauptbildschirm des PCs und wechselt zum zweiten Bildschirm, sobald Windows ihn hinzufügt. [RELEASE_NOTES.md](../RELEASE_NOTES.md) beschreibt jede Version und [ROADMAP.md](../ROADMAP.md), was als Nächstes kommt.
+Die aktuelle Version ist v0.3.4 für Windows und v0.3.4 (build 698) für das iPad. Sie behebt die für 0.3.3 gemeldeten Probleme: Abstürze beim Start mit AMD- und Intel-Grafik, Einfrieren bei USB-Verbindungen auf langsameren PCs und verschmierte Bilder über Wi-Fi. Beide Apps sind jetzt in 11 Sprachen verfügbar. [RELEASE_NOTES.md](../RELEASE_NOTES.md) beschreibt jede Version und [ROADMAP.md](../ROADMAP.md), was als Nächstes kommt.
 
-Die Release-Prüfungen für v0.3.3 waren auf Windows, macOS und iPad-Simulatoren erfolgreich. [docs/hardware-verification.md](../docs/hardware-verification.md) dokumentiert praktische Ergebnisse auf einem echten PC und iPad seit v0.3.0.
+Die Release-Prüfungen für v0.3.4 waren auf Windows, macOS und iPad-Simulatoren erfolgreich. [docs/hardware-verification.md](../docs/hardware-verification.md) dokumentiert praktische Ergebnisse auf einem echten PC und iPad seit v0.3.0.
 
 Die Diagnosedaten von Windows und iPad enthalten Gerätedetails, App-Fehler und Streaming-Statistiken. Berichte enthalten Namen von Grafikkarten und Bildschirmen sowie Netzwerkadressen, aber keine Bildschirminhalte, Audiodaten oder Kopplungsdaten. Ab Version 0.3.4 werden aus den von Windows gesendeten Daten der Name des PCs, der Benutzername, der Benutzerordner, der Name des iPad und die Namen der Audiogeräte entfernt, wobei nur die Art jedes Audiogeräts erhalten bleibt; aus den vom iPad gesendeten Daten wird der Name des PCs entfernt. Deaktiviere die automatische Freigabe in **Einstellungen** (Settings). Diagnosedaten werden bis zu 30 Tage gespeichert und können früher gelöscht werden. Gelöschte oder abgelaufene Diagnosedaten können bis zu weitere 7 Tage in täglichen Backups verbleiben. Siehe [Automatische Diagnose](../SETUP.md#automatic-diagnostics) und den [Datenschutzhinweis](https://eternalmonitor.dev/privacy.html). Öffne auf dem iPad **Einstellungen** (Settings) > **Support** > **Diagnose** (Diagnostics), um einen Bericht zu kopieren oder zu exportieren.
 
