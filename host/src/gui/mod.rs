@@ -56,6 +56,7 @@ use crate::i18n::{self, tr, trf, Lang};
 use crate::relaunch::Reason;
 use crate::settings::SettingsFile;
 use crate::stats::PIPELINE_STATS;
+use crate::supervisor::StreamStatus;
 use crate::transport::link::{LinkId, PeerId};
 use crate::transport::session::ClientInfo;
 use crate::troubleshooting::{Overrides, WindowDrawing};
@@ -107,6 +108,8 @@ struct StatsSnapshot {
     bandwidth_mbps: f64,
     encode_time_history: Vec<f64>,
     pipeline_running: bool,
+    stream_status: Option<StreamStatus>,
+    stream_start_attempt: u64,
     uptime_secs: f64,
     mdns_active: bool,
 }
@@ -149,6 +152,8 @@ impl StatsSnapshot {
             bandwidth_mbps: s.bandwidth_mbps,
             encode_time_history: s.encode_time_history.iter().copied().collect(),
             pipeline_running: s.pipeline_running,
+            stream_status: s.stream_status,
+            stream_start_attempt: s.stream_start_attempt,
             uptime_secs: s.uptime_secs(),
             mdns_active: s.mdns_active,
         }
@@ -193,9 +198,13 @@ impl ClientSnapshot {
 }
 
 /// What the header says about the stream as a whole.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StreamState {
     Off,
+    Starting,
+    Recovering,
+    WaitingForPort,
+    ShuttingDown,
     Ready,
     Streaming,
     /// An iPad is connected, but Windows withholds the screen, so its
@@ -205,28 +214,47 @@ enum StreamState {
 
 impl StreamState {
     fn of(snap: &StatsSnapshot, client: &ClientSnapshot) -> Self {
-        if !snap.pipeline_running {
-            StreamState::Off
-        } else if client.info.is_none() {
-            StreamState::Ready
-        } else if client.capture_block.is_some() {
-            StreamState::Paused
+        let status = snap.stream_status.unwrap_or(if snap.pipeline_running {
+            StreamStatus::Running
         } else {
-            StreamState::Streaming
+            StreamStatus::Stopped
+        });
+        Self::from_status(
+            status,
+            client.info.is_some(),
+            client.capture_block.is_some(),
+        )
+    }
+
+    fn from_status(status: StreamStatus, connected: bool, capture_blocked: bool) -> Self {
+        match status {
+            StreamStatus::Stopped => Self::Off,
+            StreamStatus::Starting => Self::Starting,
+            StreamStatus::Recovering => Self::Recovering,
+            StreamStatus::WaitingForPort => Self::WaitingForPort,
+            StreamStatus::ShuttingDown => Self::ShuttingDown,
+            StreamStatus::Running if !connected => Self::Ready,
+            StreamStatus::Running if capture_blocked => Self::Paused,
+            StreamStatus::Running => Self::Streaming,
         }
     }
 
     fn color(self) -> Color32 {
         match self {
-            StreamState::Off => TEXT_FAINT,
+            Self::Off | Self::WaitingForPort | Self::ShuttingDown => TEXT_FAINT,
             StreamState::Ready | StreamState::Streaming => ACCENT,
-            StreamState::Paused => WARNING,
+            Self::Paused | Self::Recovering | Self::Starting => WARNING,
         }
     }
 
     fn dot(self) -> widgets::Dot {
         match self {
-            StreamState::Off | StreamState::Paused => widgets::Dot::Idle,
+            Self::Off
+            | Self::Paused
+            | Self::Starting
+            | Self::Recovering
+            | Self::WaitingForPort
+            | Self::ShuttingDown => widgets::Dot::Idle,
             StreamState::Ready => widgets::Dot::Ready,
             StreamState::Streaming => widgets::Dot::Live,
         }
@@ -852,10 +880,14 @@ impl AnalyzerApp {
     }
 
     fn restart_stream(&mut self) {
+        self.prepare_stream_restart();
+        self.control.request_restart();
+    }
+
+    fn prepare_stream_restart(&mut self) {
         self.restart_pending = false;
         // The user may have updated a driver, as the fallback notice asks.
         crate::encoder::forget_launch_failures();
-        self.control.request_restart();
     }
 
     /// The Stream page notice: move EternalMonitor onto the card the screen
@@ -1502,9 +1534,18 @@ impl AnalyzerApp {
 fn sidebar_status(ui: &mut egui::Ui, snap: &StatsSnapshot, client: &ClientSnapshot) {
     let state = StreamState::of(snap, client);
     let (title, detail) = match state {
-        StreamState::Off => (
+        StreamState::Off | StreamState::ShuttingDown => (
             tr("Stopped").to_string(),
             tr("Streaming is off").to_string(),
+        ),
+        StreamState::Starting => ("Starting stream…".to_string(), String::new()),
+        StreamState::Recovering => (
+            "Restarting stream…".to_string(),
+            "Trying again automatically.".to_string(),
+        ),
+        StreamState::WaitingForPort => (
+            "Waiting".to_string(),
+            "Waiting for the stream port…".to_string(),
         ),
         StreamState::Ready => (
             tr("Ready").to_string(),

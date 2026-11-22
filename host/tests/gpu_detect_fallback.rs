@@ -25,6 +25,7 @@ fn notice_after_stage(gpu: GpuInfo, chosen: Option<&str>) -> (bool, bool) {
     let (tx, mut rx) = tokio::sync::mpsc::channel(NAL_CHANNEL_CAPACITY);
     let shared = SharedControl::new(0, 8_000_000);
     shared.running.store(true, Ordering::SeqCst);
+    PIPELINE_STATS.lock().mark_pipeline_started();
     *shared.encoder_override.lock() = chosen.map(str::to_string);
     let generation = eternal_host::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
     let stage = std::thread::spawn(move || {

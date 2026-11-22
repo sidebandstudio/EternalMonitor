@@ -33,7 +33,7 @@ pub async fn run_pipeline_supervised(
             Stage::Encoder,
             StageOutcome::Failed(format!("ffmpeg init: {e}")),
         );
-        stats::PIPELINE_STATS.lock().mark_pipeline_stopped();
+        note_pipeline_stopped(&stats::PIPELINE_STATS, generation);
         return;
     }
 
@@ -113,8 +113,16 @@ pub async fn run_pipeline_supervised(
     };
     reporter.stage_exited(Stage::Transport, transport_outcome);
 
-    stats::PIPELINE_STATS.lock().mark_pipeline_stopped();
+    note_pipeline_stopped(&stats::PIPELINE_STATS, generation);
     info!(generation, "Pipeline ended");
+}
+
+/// Marks the pipeline stopped if the generation that ended is still current.
+fn note_pipeline_stopped(stats: &parking_lot::Mutex<stats::PipelineStats>, generation: u64) {
+    let mut stats = stats.lock();
+    if crate::supervisor::generation_is_current(generation) {
+        stats.mark_pipeline_stopped();
+    }
 }
 
 /// A transport that could not bind the stream port waits for it (see
@@ -134,6 +142,29 @@ fn transport_failure(error: &(dyn std::error::Error + 'static)) -> StageOutcome 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_current_generation_can_mark_the_pipeline_stopped() {
+        use std::sync::atomic::Ordering;
+
+        let generation = crate::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
+        let mut running = stats::PipelineStats::default();
+        running.mark_pipeline_started();
+        running.note_encoder_opened("h264_qsv", true);
+        let stats = parking_lot::Mutex::new(running);
+
+        note_pipeline_stopped(&stats, generation.wrapping_sub(1));
+        {
+            let stats = stats.lock();
+            assert!(stats.pipeline_running);
+            assert_eq!(stats.active_encoder, "h264_qsv");
+        }
+
+        note_pipeline_stopped(&stats, generation);
+        let stats = stats.lock();
+        assert!(!stats.pipeline_running);
+        assert!(stats.active_encoder.is_empty());
+    }
 
     /// The stream's bind error, as `start_sender` returns it.
     #[test]

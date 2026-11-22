@@ -273,7 +273,7 @@ fn cable_notice_stays_hidden_while_an_ipad_streams_over_usb() {
 #[test]
 fn a_connected_ipad_without_a_picture_is_not_shown_as_streaming() {
     let mut snap = StatsSnapshot::take();
-    snap.pipeline_running = true;
+    snap.stream_status = Some(StreamStatus::Running);
     let mut client = ClientSnapshot {
         info: Some(ClientInfo {
             device_name: "iPad".into(),

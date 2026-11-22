@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 
 use crate::control::{SharedControl, SupervisorCommand};
 use crate::gpu::GpuInfo;
-use crate::stats::PIPELINE_STATS;
+use crate::stats::{PipelineStats, PIPELINE_STATS};
 use crate::transport::session::{NotStreaming, StageFailure, StreamStop};
 use crate::transport::standby::Standby;
 
@@ -35,6 +35,12 @@ pub static CURRENT_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// noticed.
 pub fn generation_is_current(generation: u64) -> bool {
     CURRENT_GENERATION.load(Ordering::SeqCst) == generation
+}
+
+fn advance_generation() -> u64 {
+    // Pipeline and encoder state writes check the generation under this lock.
+    let _stats = PIPELINE_STATS.lock();
+    CURRENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +95,11 @@ const WAKE_GRACE_MS: u64 = 10_000;
 #[cfg(feature = "test-hooks")]
 pub static TEST_BACKOFF_BASE_MS: AtomicU64 = AtomicU64::new(BACKOFF_BASE.as_millis() as u64);
 
+/// Runs once after a restart command is accepted, before retiring its pipeline.
+#[cfg(feature = "test-hooks")]
+pub static TEST_BEFORE_RESTART: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    parking_lot::Mutex::new(None);
+
 #[cfg(feature = "test-hooks")]
 fn backoff_base() -> Duration {
     Duration::from_millis(TEST_BACKOFF_BASE_MS.load(Ordering::SeqCst))
@@ -122,6 +133,29 @@ pub enum SupervisorState {
     },
     Stopped,
     ShutDown,
+}
+
+/// The supervisor's status for the Stream page.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StreamStatus {
+    Running,
+    Starting,
+    Recovering,
+    WaitingForPort,
+    Stopped,
+    ShuttingDown,
+}
+
+impl From<&SupervisorState> for StreamStatus {
+    fn from(state: &SupervisorState) -> Self {
+        match state {
+            SupervisorState::Running { .. } => Self::Running,
+            SupervisorState::BackingOff { .. } => Self::Recovering,
+            SupervisorState::WaitingForPort { .. } => Self::WaitingForPort,
+            SupervisorState::Stopped | SupervisorState::Failed { .. } => Self::Stopped,
+            SupervisorState::ShutDown => Self::ShuttingDown,
+        }
+    }
 }
 
 /// What the runtime loop must do after an event.
@@ -167,9 +201,7 @@ impl Machine {
             SupervisorCommand::Restart => match self.state {
                 SupervisorState::ShutDown => Effect::None,
                 _ => {
-                    // User/receiver-driven restarts reset the failure budget.
-                    self.attempt = 0;
-                    self.restarts.clear();
+                    self.reset_restart_budget();
                     Effect::Restart
                 }
             },
@@ -177,8 +209,7 @@ impl Machine {
                 SupervisorState::Running {
                     generation: live_generation,
                 } if live_generation == *generation => {
-                    self.attempt = 0;
-                    self.restarts.clear();
+                    self.reset_restart_budget();
                     Effect::Restart
                 }
                 _ => {
@@ -202,17 +233,47 @@ impl Machine {
                 SupervisorState::Stopped
                 | SupervisorState::Failed { .. }
                 | SupervisorState::WaitingForPort { .. } => {
-                    self.attempt = 0;
-                    self.restarts.clear();
+                    self.reset_restart_budget();
                     Effect::Start
                 }
                 _ => Effect::None,
             },
+            SupervisorCommand::StartFromHeader { .. } => Effect::None,
             SupervisorCommand::Shutdown => {
                 self.state = SupervisorState::ShutDown;
                 Effect::Shutdown
             }
         }
+    }
+
+    pub(crate) fn on_queued_command(
+        &mut self,
+        command: SupervisorCommand,
+        stats: &parking_lot::Mutex<PipelineStats>,
+    ) -> Effect {
+        let command = match command {
+            SupervisorCommand::StartFromHeader { restart, attempt } => {
+                if stats.lock().stream_start_attempt != attempt {
+                    // A superseded Restart still resets the failure budget.
+                    if restart && self.state != SupervisorState::ShutDown {
+                        self.reset_restart_budget();
+                    }
+                    return Effect::None;
+                }
+                if restart {
+                    SupervisorCommand::Restart
+                } else {
+                    SupervisorCommand::Start
+                }
+            }
+            command => command,
+        };
+        self.on_command(&command)
+    }
+
+    fn reset_restart_budget(&mut self) {
+        self.attempt = 0;
+        self.restarts.clear();
     }
 
     /// A stage from the LIVE generation ended.
@@ -375,7 +436,7 @@ pub fn run(
             .expect("spawn command forwarder");
     }
 
-    let mut generation = CURRENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    let mut generation = advance_generation();
     let mut machine = Machine::new(generation);
     let mut pipeline = None;
     if crate::startup::port::check(listen_port) {
@@ -411,7 +472,7 @@ pub fn run(
         }
 
         let effect = match message {
-            Ok(SupMsg::Command(command)) => machine.on_command(&command),
+            Ok(SupMsg::Command(command)) => machine.on_queued_command(command, &PIPELINE_STATS),
             Ok(SupMsg::Health {
                 generation: g,
                 stage,
@@ -430,26 +491,17 @@ pub fn run(
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         };
 
+        finish_pipeline_effect(
+            &effect,
+            &machine.state,
+            &shared,
+            &PIPELINE_STATS,
+            &mut pipeline,
+            generation,
+        );
         match effect {
-            Effect::None => {}
-            Effect::StopPipeline => {
-                // Before the join: a HELLO2 the stopping transport still
-                // takes hears why.
-                shared
-                    .session
-                    .lock()
-                    .set_not_streaming(not_streaming(&machine.state, &shared));
-                stop_pipeline(&shared, &machine.state);
-                bounded_join(&mut pipeline, generation);
-            }
+            Effect::None | Effect::StopPipeline => {}
             Effect::Restart | Effect::Start => {
-                // A HELLO2 meanwhile is told to ask again in a moment.
-                shared
-                    .session
-                    .lock()
-                    .set_not_streaming(Some(NotStreaming::Restarting));
-                shared.stop();
-                bounded_join(&mut pipeline, generation);
                 // The check below binds the port: the standby lets go first.
                 if let Some(standby) = standby.take() {
                     standby.stop();
@@ -467,7 +519,7 @@ pub fn run(
                     stats.set_target_addr(shared.target_addr.lock().to_string());
                     stats.set_bitrate(shared.abr_current_bps.load(Ordering::SeqCst));
                 });
-                generation = CURRENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+                generation = advance_generation();
                 machine.note_started(generation);
                 settle(&machine, &shared, &mut standby, listen_port);
                 healthy_since = Instant::now();
@@ -486,8 +538,6 @@ pub fn run(
                 ));
             }
             Effect::Shutdown => {
-                shared.stop();
-                bounded_join(&mut pipeline, generation);
                 // The port closes as the stream ends, as it always did: a
                 // copy that takes over after this one quits binds it.
                 shared.stream_socket.lock().take();
@@ -549,6 +599,10 @@ fn settle(
     standby: &mut Option<Standby>,
     listen_port: u16,
 ) {
+    // Running is published when the generation starts.
+    if !matches!(machine.state, SupervisorState::Running { .. }) {
+        PIPELINE_STATS.lock().stream_status = Some(StreamStatus::from(&machine.state));
+    }
     if !standby_answers(&machine.state) {
         if let Some(standby) = standby.take() {
             standby.stop();
@@ -599,14 +653,56 @@ fn not_streaming(state: &SupervisorState, shared: &SharedControl) -> Option<NotS
     }
 }
 
-/// Stops the pipeline that the machine stopped in `state`, first ending the
-/// session as [`stop_when_stopped`] says: its goodbye goes out with the
-/// transport, which runs until it sees `running` false.
-fn stop_pipeline(shared: &SharedControl, state: &SupervisorState) {
-    if let Some(why) = stop_when_stopped(state) {
-        crate::diagnostics::stop_session(shared, why);
+/// Retires the pipeline before waiting on the session or the transport.
+pub(crate) fn finish_pipeline_effect(
+    effect: &Effect,
+    state: &SupervisorState,
+    shared: &SharedControl,
+    stats: &parking_lot::Mutex<PipelineStats>,
+    pipeline: &mut Option<std::thread::JoinHandle<()>>,
+    generation: u64,
+) {
+    #[cfg(feature = "test-hooks")]
+    if *effect == Effect::Restart {
+        let before_restart = TEST_BEFORE_RESTART.lock().take();
+        if let Some(before_restart) = before_restart {
+            before_restart();
+        }
+    }
+
+    let status = match effect {
+        Effect::None => return,
+        Effect::StopPipeline | Effect::Shutdown => StreamStatus::from(state),
+        // Keep Stop available during the automatic recheck of a held port.
+        Effect::Start if matches!(state, SupervisorState::WaitingForPort { .. }) => {
+            StreamStatus::WaitingForPort
+        }
+        Effect::Restart | Effect::Start => StreamStatus::Starting,
+    };
+    {
+        let mut stats = stats.lock();
+        stats.mark_pipeline_stopped();
+        stats.stream_status = Some(status);
+        if matches!(effect, Effect::Start | Effect::Restart) {
+            stats.stream_start_attempt += 1;
+        }
+    }
+    if *effect != Effect::Shutdown {
+        // A HELLO2 the stopping transport still takes hears why.
+        let notice = match effect {
+            Effect::StopPipeline => not_streaming(state, shared),
+            _ => Some(NotStreaming::Restarting),
+        };
+        shared.session.lock().set_not_streaming(notice);
+    }
+    if *effect == Effect::StopPipeline {
+        if let Some(why) = stop_when_stopped(state) {
+            // Queue the goodbye before the transport sees running turn false.
+            crate::diagnostics::stop_session(shared, why);
+        }
     }
     shared.stop();
+    bounded_join(pipeline, generation);
 }
 
 /// How a session ends when the pipeline stops in `state`. Stopped and
@@ -760,6 +856,7 @@ fn spawn_generation(
     {
         let mut stats = PIPELINE_STATS.lock();
         stats.mark_pipeline_started();
+        stats.stream_status = Some(StreamStatus::Running);
         stats.set_bitrate(shared.abr_current_bps.load(Ordering::SeqCst));
         stats.set_target_addr(shared.target_addr.lock().to_string());
     }
@@ -873,6 +970,128 @@ mod tests {
         };
         assert!(adopt_late_detection(&mut gpu, &shared, late));
         assert_eq!(*shared.wake_adapter.lock(), Some(1));
+    }
+
+    #[test]
+    fn a_late_fallback_cannot_publish_while_the_supervisor_waits_for_the_session() {
+        use crate::encoder::{note_encoder_opened, run_delayed_fallback};
+        use crate::transport::test_stream_config;
+        use eternal_wire::v2::control::{CODEC_HEVC, STREAM_FLAG_SOFTWARE_ENCODER};
+
+        let generation = CURRENT_GENERATION.load(Ordering::SeqCst);
+        let stats = &*PIPELINE_STATS;
+        let previous = stats.lock().clone();
+        for (stop, preferred_open_pending) in [
+            Some(SupervisorCommand::Stop),
+            None,
+            Some(SupervisorCommand::RestartStream { generation }),
+        ]
+        .into_iter()
+        .flat_map(|stop| [false, true].map(|pending| (stop, pending)))
+        {
+            let shared = SharedControl::new(0, 8_000_000);
+            let mut machine = Machine::new(generation);
+            let gpu = GpuInfo {
+                encoder_name: "h264_nvenc".into(),
+                adapter_index: 1,
+                ..GpuInfo::software_fallback()
+            };
+            shared.running.store(true, Ordering::SeqCst);
+            stats.lock().mark_pipeline_started();
+
+            std::thread::scope(|scope| {
+                let (opened, opening) = mpsc::channel();
+                let (release, pending) = mpsc::channel();
+                let worker_shared = shared.clone();
+                let worker = scope.spawn(move || {
+                    run_delayed_fallback(worker_shared, generation, preferred_open_pending, || {
+                        opened.send(()).unwrap();
+                        pending.recv_timeout(Duration::from_secs(10)).unwrap();
+                    })
+                });
+                opening.recv_timeout(Duration::from_secs(5)).unwrap();
+                note_encoder_opened(
+                    stats,
+                    &shared,
+                    "hevc_nvenc",
+                    &gpu,
+                    || generation_is_current(generation),
+                    Some(false),
+                );
+                let expected_status = match stop {
+                    Some(SupervisorCommand::Stop) => StreamStatus::Stopped,
+                    Some(_) => StreamStatus::Starting,
+                    None => StreamStatus::Recovering,
+                };
+                let effect = match &stop {
+                    Some(command) => machine.on_command(command),
+                    None => machine.on_stage_exit(
+                        generation,
+                        Stage::Capture,
+                        &failed("capture crashed"),
+                        Instant::now(),
+                    ),
+                };
+                let session = shared.session.lock();
+                let effect_shared = &shared;
+                let supervisor = scope.spawn(move || {
+                    finish_pipeline_effect(
+                        &effect,
+                        &machine.state,
+                        effect_shared,
+                        stats,
+                        &mut None,
+                        generation,
+                    );
+                });
+
+                // The supervisor cannot change the session yet. The encoder
+                // completes while the old transport still sees running.
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while stats.lock().pipeline_running && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                assert!(
+                    !stats.lock().pipeline_running,
+                    "{stop:?} still allows publication"
+                );
+                assert_eq!(stats.lock().stream_status, Some(expected_status));
+                assert!(shared.running.load(Ordering::SeqCst));
+                release.send(()).unwrap();
+                while !worker.is_finished() && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                assert!(worker.is_finished(), "the late fallback did not finish");
+
+                // HELLO_ACK and heartbeat config take the locks in this order.
+                let config = test_stream_config(&shared);
+                assert_eq!(config.codec, CODEC_HEVC, "{stop:?}");
+                assert_eq!(config.flags & STREAM_FLAG_SOFTWARE_ENCODER, 0, "{stop:?}");
+                assert_eq!(*shared.wake_adapter.lock(), Some(1), "{stop:?}");
+                {
+                    let stats = stats.lock();
+                    assert_eq!(stats.codec_name, "HEVC (NVENC)", "{stop:?}");
+                    assert!(!stats.using_software_fallback, "{stop:?}");
+                    assert!(stats.active_encoder.is_empty(), "{stop:?}");
+                }
+                drop(session);
+                assert!(!worker.join().unwrap(), "{stop:?} queued fallback video");
+                supervisor.join().unwrap();
+                assert!(!shared.running.load(Ordering::SeqCst));
+            });
+        }
+        let mut stats = stats.lock();
+        stats.pipeline_running = previous.pipeline_running;
+        stats.stream_status = previous.stream_status;
+        stats.stream_start_attempt = previous.stream_start_attempt;
+        stats.start_time = previous.start_time;
+        stats.codec_name = previous.codec_name;
+        stats.active_encoder = previous.active_encoder;
+        stats.encoder_override = previous.encoder_override;
+        stats.using_software_fallback = previous.using_software_fallback;
+        stats.gpu_detection_stalled = previous.gpu_detection_stalled;
+        stats.nvidia_driver_outdated = previous.nvidia_driver_outdated;
+        stats.driver_update_vendors = previous.driver_update_vendors;
     }
 
     #[test]
@@ -999,7 +1218,14 @@ mod tests {
                 .session
                 .lock()
                 .handle_control(peer, 0, hello, &Config, Instant::now());
-            stop_pipeline(&shared, state);
+            finish_pipeline_effect(
+                &Effect::StopPipeline,
+                state,
+                &shared,
+                &parking_lot::Mutex::new(PipelineStats::default()),
+                &mut None,
+                1,
+            );
             assert!(!shared.running.load(Ordering::SeqCst));
             let goodbye = shared.session.lock().take_goodbye();
             let ended = !shared.client_connected();
@@ -1077,6 +1303,51 @@ mod tests {
             machine.state,
             SupervisorState::Running { generation: 2 }
         ));
+    }
+
+    #[test]
+    fn a_restart_queued_at_backoff_expiry_resets_the_budget_without_starting_again() {
+        let shared = SharedControl::new(0, 8_000_000);
+        let stats = parking_lot::Mutex::new(PipelineStats::new());
+        let mut machine = Machine::new(1);
+        let failure = failed("encoder failed");
+        let mut now = Instant::now();
+
+        for generation in 1..=STORM_LIMIT as u64 {
+            machine.note_started(generation);
+            machine.on_stage_exit(generation, Stage::Encoder, &failure, now);
+            let SupervisorState::BackingOff { until, .. } = machine.state else {
+                panic!("expected backoff after failure {generation}");
+            };
+            now = until;
+        }
+
+        let restart = SupervisorCommand::StartFromHeader {
+            restart: true,
+            attempt: stats.lock().stream_start_attempt,
+        };
+        let effect = machine.on_tick(now);
+        assert_eq!(effect, Effect::Start);
+        let generation = STORM_LIMIT as u64;
+        finish_pipeline_effect(
+            &effect,
+            &machine.state,
+            &shared,
+            &stats,
+            &mut None,
+            generation,
+        );
+        machine.note_started(generation + 1);
+        assert_eq!(machine.on_queued_command(restart, &stats), Effect::None);
+
+        machine.on_stage_exit(generation + 1, Stage::Encoder, &failure, now);
+        assert_eq!(
+            machine.state,
+            SupervisorState::BackingOff {
+                until: now + backoff_base(),
+                attempt: 1,
+            }
+        );
     }
 
     #[test]
@@ -1259,6 +1530,25 @@ mod tests {
         let effect = machine.on_wedged("no frames for 5s", Instant::now());
         assert_eq!(effect, Effect::StopPipeline);
         assert!(matches!(machine.state, SupervisorState::BackingOff { .. }));
+    }
+
+    #[test]
+    fn an_automatic_port_check_keeps_the_stream_waiting() {
+        let shared = SharedControl::new(0, 8_000_000);
+        let now = Instant::now();
+        let mut machine = Machine::new(1);
+        machine.wait_for_port(now);
+        let stats = parking_lot::Mutex::new(PipelineStats::new());
+        stats.lock().stream_status = Some(StreamStatus::WaitingForPort);
+
+        let effect = machine.on_tick(now);
+        assert_eq!(effect, Effect::Start);
+        finish_pipeline_effect(&effect, &machine.state, &shared, &stats, &mut None, 1);
+
+        // The port check is next. The header still offers only Stop.
+        let stats = stats.lock();
+        assert_eq!(stats.stream_status, Some(StreamStatus::WaitingForPort));
+        assert!(!stats.pipeline_running);
     }
 
     /// A port another program holds for an hour: checked every 2 s, never

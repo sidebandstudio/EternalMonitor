@@ -15,6 +15,7 @@ use eternal_host::control::{SharedControl, SupervisorCommand};
 use eternal_host::gpu::GpuInfo;
 use eternal_host::pipeline;
 use eternal_host::stats::PIPELINE_STATS;
+use eternal_host::supervisor::{StreamStatus, CURRENT_GENERATION, TEST_BEFORE_RESTART};
 use eternal_host::transport::session::NotStreaming;
 use eternal_wire::v2::control::{
     encode_control, parse_control, ControlMessage, Hello2, HelloAck, HelloStatus, CAP_DECODE_H264,
@@ -500,6 +501,73 @@ fn no_hello_is_lost_across_a_restart() {
             .all(|status| matches!(status, HelloStatus::Ok | HelloStatus::Restarting)),
         "{answers:?}"
     );
+}
+
+#[test]
+fn a_stream_restart_retires_publication_before_waiting_for_the_session() {
+    let host = Host::start(GpuInfo::software_fallback(), false);
+    let ipad = FakeIpad::new(&host, 1, NEW);
+    let id = ipad.connect(1).session_id;
+    let first = ipad.stream(id, Duration::from_secs(5), |heard| !heard.media.is_empty());
+    let first_epoch = first.media.first().expect("video before restart").1;
+    let generation = CURRENT_GENERATION.load(Ordering::SeqCst);
+
+    // Pause after the supervisor accepts the command, so its idle watchdog
+    // cannot get to the session lock before it processes the restart.
+    let (accepted, wait_for_acceptance) = mpsc::channel();
+    let (resume, wait_for_resume) = mpsc::channel();
+    *TEST_BEFORE_RESTART.lock() = Some(Box::new(move || {
+        let _ = accepted.send(());
+        let _ = wait_for_resume.recv_timeout(Duration::from_secs(5));
+    }));
+    host.send(SupervisorCommand::RestartStream { generation });
+    let accepted = wait_for_acceptance.recv_timeout(Duration::from_secs(5));
+    TEST_BEFORE_RESTART.lock().take();
+    accepted.expect("the supervisor accepted the stream restart");
+
+    let session = host.shared.session.lock();
+    assert_eq!(session.session_id(), Some(id));
+    assert!(!PIPELINE_STATS.lock().active_encoder.is_empty());
+    resume.send(()).unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while host.streaming() {
+        assert!(Instant::now() < deadline, "publication was never retired");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    {
+        let stats = PIPELINE_STATS.lock();
+        assert_eq!(stats.stream_status, Some(StreamStatus::Starting));
+        assert!(stats.active_encoder.is_empty());
+    }
+    assert!(host.shared.running.load(Ordering::SeqCst));
+    assert_eq!(CURRENT_GENERATION.load(Ordering::SeqCst), generation);
+    drop(session);
+
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let stats = PIPELINE_STATS.lock();
+        if stats.pipeline_running {
+            assert_eq!(stats.stream_status, Some(StreamStatus::Running));
+            assert_eq!(CURRENT_GENERATION.load(Ordering::SeqCst), generation + 1);
+            break;
+        }
+        drop(stats);
+        assert!(Instant::now() < deadline, "the replacement never started");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let replacement_video = |heard: &Heard| {
+        heard
+            .media
+            .iter()
+            .any(|(_, epoch, _)| *epoch != first_epoch)
+    };
+    let heard = ipad.stream(id, Duration::from_secs(5), replacement_video);
+    assert!(
+        replacement_video(&heard),
+        "the retained session did not resume"
+    );
+    assert_eq!(CURRENT_GENERATION.load(Ordering::SeqCst), generation + 1);
 }
 
 /// After repeated failures the storm brake stops the stream until someone

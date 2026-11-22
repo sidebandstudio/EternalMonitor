@@ -101,6 +101,11 @@ fn the_address_row_shows_a_chosen_network_that_came_back() {
             generation: GENERATION
         }
     );
+    assert!(
+        shared.running.load(Ordering::SeqCst),
+        "the transport stays running until the supervisor stops it"
+    );
+    shared.stop();
     transport.join().unwrap();
 
     // The supervisor starts the stream again, now on the network's address.

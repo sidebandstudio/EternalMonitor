@@ -10,7 +10,7 @@ use super::{
     CAPTURE_AUTO_LABEL, CAPTURE_VIRTUAL_LABEL, CAPTURE_VIRTUAL_SENTINEL, ENCODER_AUTO_LABEL,
 };
 use crate::capture::recovery::CaptureBlock;
-use crate::control::VddStatus;
+use crate::control::{SupervisorCommand, VddStatus};
 use crate::i18n::{tr, trf};
 use crate::vdd::VddTaskHealth;
 use crate::vdd_device::VddProblem;
@@ -401,6 +401,16 @@ impl AnalyzerApp {
 
     fn status_header(&mut self, ui: &mut Ui, snap: &StatsSnapshot, client: &ClientSnapshot) {
         let state = StreamState::of(snap, client);
+        // Before the supervisor publishes a status, the port check may
+        // already have found a holder.
+        let state = if snap.stream_status.is_none()
+            && state == StreamState::Off
+            && crate::startup::port::held().is_some()
+        {
+            StreamState::WaitingForPort
+        } else {
+            state
+        };
         let quality = self
             .quality
             .update(client.session_id, client.report.as_ref());
@@ -414,6 +424,16 @@ impl AnalyzerApp {
                 tr("Streaming is off").to_string(),
                 tr("Click Start streaming so your iPad can connect.").to_string(),
             ),
+            StreamState::Starting => ("Starting stream…".to_string(), String::new()),
+            StreamState::Recovering => (
+                "Restarting stream…".to_string(),
+                "EternalMonitor will try again automatically.".to_string(),
+            ),
+            StreamState::WaitingForPort => (
+                "Waiting for the stream port…".to_string(),
+                "EternalMonitor starts by itself when it's free.".to_string(),
+            ),
+            StreamState::ShuttingDown => (tr("Streaming is off").to_string(), String::new()),
             StreamState::Ready => (
                 tr("Ready for your iPad").to_string(),
                 "Open EternalMonitor on your iPad and tap this PC, or plug in a USB cable."
@@ -443,12 +463,6 @@ impl AnalyzerApp {
                 "Windows stopped screen capture. See the message above.".to_string(),
             ),
         };
-        // Off only until another program lets go of the stream port.
-        let waiting = crate::startup::port::held().is_some();
-        let (title, subtitle) =
-            super::port_notice::waiting_status(state == StreamState::Off, waiting)
-                .unwrap_or((title, subtitle));
-
         widgets::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             let width = ui.available_width();
@@ -466,7 +480,16 @@ impl AnalyzerApp {
                         mix(
                             SURFACE,
                             color,
-                            if state == StreamState::Off { 6 } else { 10 },
+                            if matches!(
+                                state,
+                                StreamState::Off
+                                    | StreamState::WaitingForPort
+                                    | StreamState::ShuttingDown
+                            ) {
+                                6
+                            } else {
+                                10
+                            },
                         ),
                         egui::Stroke::new(1.0, mix(SURFACE, color, 24)),
                     );
@@ -475,27 +498,16 @@ impl AnalyzerApp {
                     // Room for the buttons drawn below, as wide as their
                     // labels in this language, and never less than before.
                     let spacing = ui.spacing().item_spacing.x;
-                    let buttons = [
-                        (snap.pipeline_running || waiting, Icon::Stop, tr("Stop")),
-                        (snap.pipeline_running, Icon::Refresh, tr("Restart")),
-                        (
-                            !snap.pipeline_running && !waiting,
-                            Icon::Play,
-                            tr("Start streaming"),
-                        ),
-                    ];
+                    let buttons = state.header_commands();
                     let measured: f32 = buttons
-                        .into_iter()
-                        .filter(|&(shown, _, _)| shown)
-                        .map(|(_, icon, label)| {
+                        .iter()
+                        .map(|&command| {
+                            let (icon, label, _) = header_button(command);
                             widgets::button_width(ui, Some(icon), label) + spacing
                         })
                         .sum();
-                    let buttons_width = measured.max(if state == StreamState::Off {
-                        170.0
-                    } else {
-                        210.0
-                    });
+                    let buttons_width =
+                        measured.max(if buttons.len() <= 1 { 170.0 } else { 210.0 });
                     // A narrow window cuts the text short, never under the
                     // buttons: Russian at the minimum size leaves about 130.
                     let text_width = (ui.available_width() - buttons_width).max(0.0);
@@ -515,39 +527,19 @@ impl AnalyzerApp {
                         },
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if snap.pipeline_running || waiting {
-                            // While waiting for the port, Stop cancels the
-                            // start that would follow.
-                            if widgets::button(ui, Tone::Danger, Some(Icon::Stop), tr("Stop"))
-                                .clicked()
-                            {
-                                action = Some(HeaderAction::Stop);
+                        for &button in buttons {
+                            let (icon, label, tone) = header_button(button);
+                            let response = widgets::button(ui, tone, Some(icon), label);
+                            let response = if button == SupervisorCommand::Restart {
+                                response.on_hover_text(
+                                    "Restart capture and encoding. The iPad reconnects on its own.",
+                                )
+                            } else {
+                                response
+                            };
+                            if response.clicked() {
+                                action = Some(button);
                             }
-                        }
-                        if snap.pipeline_running {
-                            if widgets::button(
-                                ui,
-                                Tone::Secondary,
-                                Some(Icon::Refresh),
-                                tr("Restart"),
-                            )
-                            .on_hover_text(
-                                "Restart capture and encoding. The iPad reconnects on its own.",
-                            )
-                            .clicked()
-                            {
-                                action = Some(HeaderAction::Restart);
-                            }
-                        } else if !waiting
-                            && widgets::button(
-                                ui,
-                                Tone::Primary,
-                                Some(Icon::Play),
-                                tr("Start streaming"),
-                            )
-                            .clicked()
-                        {
-                            action = Some(HeaderAction::Start);
                         }
                     });
                 },
@@ -587,9 +579,25 @@ impl AnalyzerApp {
             }
 
             match action {
-                Some(HeaderAction::Stop) => self.control.request_stop(),
-                Some(HeaderAction::Start) => self.control.request_start(),
-                Some(HeaderAction::Restart) => self.restart_stream(),
+                Some(SupervisorCommand::Stop) => self.control.request_stop(),
+                Some(button @ (SupervisorCommand::Start | SupervisorCommand::Restart)) => {
+                    let restart = button == SupervisorCommand::Restart;
+                    if restart {
+                        self.prepare_stream_restart();
+                    }
+                    self.control
+                        .request_pipeline_start(SupervisorCommand::StartFromHeader {
+                            restart,
+                            attempt: snap.stream_start_attempt,
+                        });
+                }
+                Some(
+                    SupervisorCommand::StartFromHeader { .. }
+                    | SupervisorCommand::RestartStream { .. }
+                    | SupervisorCommand::Shutdown,
+                ) => {
+                    unreachable!("command has no header button")
+                }
                 None => {}
             }
         });
@@ -884,10 +892,185 @@ impl AnalyzerApp {
     }
 }
 
-enum HeaderAction {
-    Start,
-    Stop,
-    Restart,
+fn header_button(command: SupervisorCommand) -> (Icon, &'static str, Tone) {
+    match command {
+        SupervisorCommand::Start => (Icon::Play, tr("Start streaming"), Tone::Primary),
+        SupervisorCommand::Stop => (Icon::Stop, tr("Stop"), Tone::Danger),
+        SupervisorCommand::Restart => (Icon::Refresh, tr("Restart"), Tone::Secondary),
+        SupervisorCommand::StartFromHeader { .. }
+        | SupervisorCommand::RestartStream { .. }
+        | SupervisorCommand::Shutdown => {
+            unreachable!("command has no header button")
+        }
+    }
+}
+
+impl StreamState {
+    fn header_commands(self) -> &'static [SupervisorCommand] {
+        use SupervisorCommand::{Restart, Start, Stop};
+        match self {
+            Self::Off => &[Start],
+            Self::WaitingForPort => &[Stop],
+            Self::Recovering | Self::Ready | Self::Streaming | Self::Paused => &[Stop, Restart],
+            Self::Starting | Self::ShuttingDown => &[],
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn the_stream_header_only_offers_commands_the_supervisor_accepts() {
+    use crate::supervisor::{Effect, Machine, Stage, StreamStatus, SupervisorState};
+    use std::time::Instant;
+    use SupervisorCommand::{Restart, Start, Stop};
+
+    let now = Instant::now();
+    for (supervisor, connected, blocked, expected, commands) in [
+        (
+            SupervisorState::Stopped,
+            true,
+            false,
+            StreamState::Off,
+            &[Start][..],
+        ),
+        (
+            SupervisorState::Failed {
+                reason: "capture failed".into(),
+                stage: Stage::Capture,
+            },
+            true,
+            false,
+            StreamState::Off,
+            &[Start][..],
+        ),
+        (
+            SupervisorState::BackingOff {
+                until: now,
+                attempt: 1,
+            },
+            true,
+            false,
+            StreamState::Recovering,
+            &[Stop, Restart][..],
+        ),
+        (
+            SupervisorState::WaitingForPort { next_check: now },
+            false,
+            false,
+            StreamState::WaitingForPort,
+            &[Stop][..],
+        ),
+        (
+            SupervisorState::ShutDown,
+            true,
+            false,
+            StreamState::ShuttingDown,
+            &[][..],
+        ),
+        (
+            SupervisorState::Running { generation: 1 },
+            false,
+            false,
+            StreamState::Ready,
+            &[Stop, Restart][..],
+        ),
+        (
+            SupervisorState::Running { generation: 1 },
+            true,
+            false,
+            StreamState::Streaming,
+            &[Stop, Restart][..],
+        ),
+        (
+            SupervisorState::Running { generation: 1 },
+            true,
+            true,
+            StreamState::Paused,
+            &[Stop, Restart][..],
+        ),
+    ] {
+        let state = StreamState::from_status(StreamStatus::from(&supervisor), connected, blocked);
+        assert_eq!(state, expected);
+        for command in state.header_commands() {
+            let mut machine = Machine::new(1);
+            machine.state = supervisor.clone();
+            assert_ne!(
+                machine.on_command(command),
+                Effect::None,
+                "{supervisor:?} rejects the header's {command:?}"
+            );
+        }
+        assert_eq!(state.header_commands(), commands);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn the_stream_header_has_no_buttons_during_a_start_attempt() {
+    use crate::control::SharedControl;
+    use crate::stats::PipelineStats;
+    use crate::supervisor::{finish_pipeline_effect, Effect, Machine, Stage, SupervisorState};
+    use std::time::Instant;
+    use SupervisorCommand::{Restart, Start, Stop};
+
+    let now = Instant::now();
+    let failed = SupervisorState::Failed {
+        reason: "capture failed".into(),
+        stage: Stage::Capture,
+    };
+    let waiting = SupervisorState::WaitingForPort { next_check: now };
+    for (initial, command, port_free) in [
+        (SupervisorState::Stopped, Start, true),
+        (SupervisorState::Stopped, Start, false),
+        (failed.clone(), Start, true),
+        (SupervisorState::Running { generation: 1 }, Restart, true),
+        (
+            SupervisorState::BackingOff {
+                until: now,
+                attempt: 1,
+            },
+            Restart,
+            true,
+        ),
+        (waiting, Restart, false),
+        (SupervisorState::Stopped, Restart, true),
+        (failed, Restart, true),
+    ] {
+        let shared = SharedControl::new(0, 8_000_000);
+        let stats = parking_lot::Mutex::new(PipelineStats::new());
+        let mut machine = Machine::new(1);
+        machine.state = initial.clone();
+        stats.lock().stream_status = Some((&initial).into());
+        let request = SupervisorCommand::StartFromHeader {
+            restart: command == Restart,
+            attempt: stats.lock().stream_start_attempt,
+        };
+        let effect = machine.on_queued_command(request, &stats);
+        assert!(matches!(effect, Effect::Start | Effect::Restart));
+        finish_pipeline_effect(&effect, &machine.state, &shared, &stats, &mut None, 1);
+
+        let status = stats.lock().stream_status.unwrap();
+        let header = StreamState::from_status(status, true, false);
+        assert!(
+            header.header_commands().is_empty(),
+            "{command:?} from {initial:?} showed {header:?} before the port check (port free: {port_free})"
+        );
+        assert_eq!(header, StreamState::Starting);
+
+        if port_free {
+            stats.lock().reset_for_restart();
+            machine.note_started(2);
+        } else {
+            machine.wait_for_port(now);
+        }
+        // A command from the previous header may still be in the FIFO.
+        assert_eq!(machine.on_queued_command(request, &stats), Effect::None);
+        assert_eq!(
+            machine.on_queued_command(Stop, &stats),
+            Effect::StopPipeline
+        );
+        assert_eq!(machine.state, SupervisorState::Stopped);
+    }
 }
 
 pub(super) const SOFTWARE_FALLBACK_TITLE: &str =

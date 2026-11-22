@@ -94,6 +94,9 @@ pub struct PipelineStats {
 
     // Pipeline state
     pub pipeline_running: bool,
+    pub stream_status: Option<crate::supervisor::StreamStatus>,
+    /// Advances when the supervisor begins a start attempt.
+    pub(crate) stream_start_attempt: u64,
     pub start_time: Option<Instant>,
 
     // mDNS
@@ -159,6 +162,8 @@ impl PipelineStats {
             encode_time_history: VecDeque::with_capacity(HISTORY_LEN),
 
             pipeline_running: false,
+            stream_status: None,
+            stream_start_attempt: 0,
             start_time: None,
 
             mdns_active: false,
@@ -179,6 +184,8 @@ impl PipelineStats {
         self.gpu_detection_stalled = previous.gpu_detection_stalled;
         self.driver_update_vendors = previous.driver_update_vendors;
         self.mdns_active = previous.mdns_active;
+        self.stream_status = previous.stream_status;
+        self.stream_start_attempt = previous.stream_start_attempt;
         previous.audio
     }
 
@@ -211,13 +218,13 @@ impl PipelineStats {
         self.active_encoder.clear();
     }
 
-    /// An encoder opened in a pipeline generation, `current` while it is the
-    /// live one. An open that returns after Stop, or after a restart replaced
-    /// its generation, is no longer this pipeline's.
-    pub fn note_encoder_opened(&mut self, encoder_name: &str, current: bool) {
-        if self.pipeline_running && current {
-            self.active_encoder = encoder_name.to_string();
+    /// Records an encoder open and returns whether the live pipeline accepted it.
+    pub fn note_encoder_opened(&mut self, encoder_name: &str, current: bool) -> bool {
+        if !self.pipeline_running || !current {
+            return false;
         }
+        self.active_encoder = encoder_name.to_string();
+        true
     }
 
     pub fn set_gpu_name(&mut self, gpu_name: String) {

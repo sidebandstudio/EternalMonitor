@@ -239,16 +239,34 @@ struct SharedConfigSource<'a> {
     listen: SocketAddr,
 }
 
+#[cfg(test)]
+pub(crate) fn test_stream_config(
+    shared: &SharedControl,
+) -> eternal_wire::v2::control::StreamConfig {
+    SharedConfigSource {
+        shared,
+        stream_epoch: 1,
+        pen_available: false,
+        listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+    }
+    .stream_config()
+}
+
 impl ConfigSource for SharedConfigSource<'_> {
     fn pairing(&self) -> Option<&parking_lot::Mutex<crate::pairing::Pairing>> {
         Some(&self.shared.pairing)
     }
 
     fn stream_config(&self) -> eternal_wire::v2::control::StreamConfig {
-        let (width, height, software) = {
+        let (width, height, codec, software) = {
             let stats = PIPELINE_STATS.lock();
             let (w, h) = stats.capture_resolution;
-            (w, h, stats.using_software_fallback)
+            (
+                w,
+                h,
+                self.shared.active_codec.load(Ordering::SeqCst),
+                stats.using_software_fallback,
+            )
         };
         eternal_wire::v2::control::StreamConfig {
             stream_epoch: self.stream_epoch,
@@ -259,7 +277,7 @@ impl ConfigSource for SharedConfigSource<'_> {
                 .target_fps
                 .load(Ordering::SeqCst)
                 .min(u32::from(u16::MAX)) as u16,
-            codec: self.shared.active_codec.load(Ordering::SeqCst),
+            codec,
             flags: if software {
                 eternal_wire::v2::control::STREAM_FLAG_SOFTWARE_ENCODER
             } else {
@@ -348,7 +366,6 @@ fn look_at_network(
         listen_on = listen_on.label(),
         "The chosen network changed: restarting the stream to listen on it"
     );
-    shared.stop();
     if let Err(error) = supervisor.restart() {
         warn!(error = %error, "Failed to request a pipeline restart for the chosen network");
     }
@@ -1390,7 +1407,6 @@ async fn execute_actions(
         crate::diagnostics::log_session_end(&end, shared);
     }
     if restart {
-        shared.stop();
         if let Err(error) = supervisor.restart() {
             warn!(error = %error, "Failed to request pipeline restart for the virtual display");
         }
@@ -1424,6 +1440,25 @@ mod tests {
         CAP_DECODE_H264, FEATURE_SUPPORTS_NACK,
     };
 
+    #[test]
+    fn a_network_change_leaves_the_stream_running_until_the_supervisor_restarts_it() {
+        let shared = SharedControl::new(0, 15_000_000);
+        shared.running.store(true, Ordering::SeqCst);
+        let (tx, rx) = std_mpsc::channel();
+        let supervisor = StreamSupervisor { tx, generation: 42 };
+        look_at_network(
+            &shared,
+            &crate::network::ListenOn::Adapter("a network that is no longer connected".into()),
+            std::net::Ipv4Addr::new(192, 0, 2, 10),
+            &supervisor,
+        );
+        assert_eq!(
+            rx.try_recv(),
+            Ok(SupervisorCommand::RestartStream { generation: 42 })
+        );
+        assert!(shared.running.load(Ordering::SeqCst));
+    }
+
     /// No iPad came back to the virtual display within the grace period:
     /// the stream asks to restart itself, by its own generation, whichever
     /// generation the supervisor counts now.
@@ -1456,7 +1491,7 @@ mod tests {
                 supervisor_rx.try_recv(),
                 Ok(SupervisorCommand::RestartStream { generation })
             );
-            assert!(!shared.running.load(Ordering::SeqCst));
+            assert!(shared.running.load(Ordering::SeqCst));
             assert!(supervisor_rx.try_recv().is_err());
         });
     }

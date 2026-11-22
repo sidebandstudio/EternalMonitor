@@ -334,6 +334,12 @@ pub enum SupervisorCommand {
     Stop,
     /// Start a fresh pipeline from Stopped/Failed.
     Start,
+    /// Start only if the header click hasn't been superseded by an attempt.
+    /// A superseded Restart still resets the failure budget.
+    StartFromHeader {
+        restart: bool,
+        attempt: u64,
+    },
     Shutdown,
 }
 
@@ -345,11 +351,7 @@ pub struct GuiControl {
 
 impl GuiControl {
     pub fn request_restart(&self) {
-        crate::vdd::recheck_tasks();
-        self.shared.retry_second_screen();
-        if let Err(error) = self.supervisor_tx.send(SupervisorCommand::Restart) {
-            warn!(error = %error, "Failed to send restart command");
-        }
+        self.request_pipeline_start(SupervisorCommand::Restart);
     }
 
     pub fn request_stop(&self) {
@@ -359,10 +361,14 @@ impl GuiControl {
     }
 
     pub fn request_start(&self) {
+        self.request_pipeline_start(SupervisorCommand::Start);
+    }
+
+    pub(crate) fn request_pipeline_start(&self, command: SupervisorCommand) {
         crate::vdd::recheck_tasks();
         self.shared.retry_second_screen();
-        if let Err(error) = self.supervisor_tx.send(SupervisorCommand::Start) {
-            warn!(error = %error, "Failed to send start command");
+        if let Err(error) = self.supervisor_tx.send(command) {
+            warn!(error = %error, "Failed to send pipeline start command");
         }
     }
 

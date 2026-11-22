@@ -1,5 +1,4 @@
-//! The Stream page notice while another program holds the stream's port, and
-//! what the status card says meanwhile.
+//! The Stream page notice while another program holds the stream's port.
 
 use eframe::egui::Ui;
 
@@ -68,17 +67,6 @@ fn name(by: &HeldBy) -> Option<&str> {
         HeldBy::WindowsService => "A Windows service",
         HeldBy::OtherCopy => "Another copy of EternalMonitor",
         _ => return None,
-    })
-}
-
-/// The status card's title and subtitle while the stream is off only until
-/// the port is free, instead of "Click Start streaming".
-pub(super) fn waiting_status(off: bool, waiting: bool) -> Option<(String, String)> {
-    (off && waiting).then(|| {
-        (
-            "Waiting for the stream port…".to_string(),
-            "EternalMonitor starts by itself when it's free.".to_string(),
-        )
     })
 }
 
@@ -173,19 +161,6 @@ mod tests {
         assert_eq!(
             title,
             "A Windows service is using EternalMonitor's network port"
-        );
-    }
-
-    #[test]
-    fn the_status_card_waits_for_the_port_instead_of_asking_for_start() {
-        let (title, subtitle) = waiting_status(true, true).expect("waiting");
-        assert_eq!(title, "Waiting for the stream port…");
-        assert_eq!(subtitle, "EternalMonitor starts by itself when it's free.");
-        assert_eq!(waiting_status(true, false), None, "stopped: Click Start");
-        assert_eq!(
-            waiting_status(false, true),
-            None,
-            "streaming: its own status"
         );
     }
 }
