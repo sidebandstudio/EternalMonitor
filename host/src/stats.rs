@@ -46,8 +46,9 @@ pub struct PipelineStats {
     /// (see `encoder::holds_last_frame`), for the connected viewer.
     pub keyframe_resubmits: u64,
     /// NVENC refused to open because the NVIDIA driver is older than the
-    /// linked FFmpeg's NVENC needs. The fallback notice then says to update
-    /// it.
+    /// linked FFmpeg's NVENC needs. The fallback notice, or the NVIDIA
+    /// driver notice when another graphics card encodes, then says to
+    /// update it.
     pub nvidia_driver_outdated: bool,
     /// The processor encodes because startup's GPU detection did not return
     /// in time. The fallback notice then says the driver did not answer.

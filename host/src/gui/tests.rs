@@ -1,6 +1,7 @@
 use super::page_stream::{
     audio_summary, capture_block_notice, firewall_fix_failure, firewall_fix_offered,
-    firewall_notice, second_screen_notice, software_fallback_body, usb_cable_notice, usb_summary,
+    firewall_notice, nvidia_driver_notice, second_screen_notice, software_fallback_body,
+    usb_cable_notice, usb_summary,
 };
 use super::*;
 
@@ -498,6 +499,47 @@ fn an_outdated_nvidia_driver_is_named_with_the_version_to_install() {
         software_fallback_body(true, false, false, &[])
     );
     assert!(!software_fallback_body(false, false, false, &[]).contains("570"));
+}
+
+/// Field case (Nov 2026): an RTX 3060 on driver 566.36 beside Intel Iris
+/// Xe. NVENC refused the old driver and Quick Sync took over, so no software
+/// fallback notice showed and nothing said to update the NVIDIA driver.
+#[test]
+fn an_outdated_nvidia_driver_is_named_when_another_graphics_card_encodes() {
+    // Auto, or NVENC chosen in Settings: AMD or Intel took over.
+    for chosen in [None, Some("h264_nvenc"), Some("hevc_nvenc")] {
+        let body = nvidia_driver_notice(false, true, chosen).unwrap();
+        assert!(
+            body.contains("NVIDIA driver to version 570 or newer"),
+            "{body}"
+        );
+        assert!(body.contains("if your graphics card supports it"), "{body}");
+        assert!(body.contains("then click Restart"), "{body}");
+        assert!(body.contains("another graphics card encodes it"), "{body}");
+        assert!(!body.contains("processor"), "{body}");
+        for jargon in [
+            "NVENC",
+            "QSV",
+            "Quick Sync",
+            "AMF",
+            "API",
+            "encoder",
+            "http",
+        ] {
+            assert!(!body.contains(jargon), "{body}");
+        }
+    }
+    // The processor encodes: the software fallback notice says it, as before.
+    assert_eq!(nvidia_driver_notice(true, true, None), None);
+    assert!(software_fallback_body(false, true, false, &[])
+        .contains("Older cards keep using the processor"));
+    // NVENC failed for another reason, or was not tried.
+    assert_eq!(nvidia_driver_notice(false, false, None), None);
+    assert_eq!(nvidia_driver_notice(false, false, Some("h264_nvenc")), None);
+    // An AMD, Intel or processor encoder chosen in Settings.
+    for chosen in ["h264_qsv", "h264_amf", "libx264"] {
+        assert_eq!(nvidia_driver_notice(false, true, Some(chosen)), None);
+    }
 }
 
 #[test]

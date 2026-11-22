@@ -144,6 +144,30 @@ impl AnalyzerApp {
             }
             ui.add_space(GAP - 10.0);
         }
+        let encoder_override = self.control.shared.encoder_override.lock().clone();
+        if let Some(body) = nvidia_driver_notice(
+            snap.using_software_fallback,
+            snap.nvidia_driver_outdated,
+            encoder_override.as_deref(),
+        ) {
+            let mut restart = false;
+            widgets::banner(
+                ui,
+                WARNING,
+                Icon::Warning,
+                NVIDIA_DRIVER_TITLE,
+                &body,
+                110.0,
+                |ui| {
+                    restart = widgets::button(ui, Tone::Secondary, Some(Icon::Refresh), "Restart")
+                        .clicked();
+                },
+            );
+            if restart {
+                self.restart_stream();
+            }
+            ui.add_space(GAP - 10.0);
+        }
         #[allow(unused_mut)] // Debug builds may simulate a problem below.
         let (mut capture_block, mut vdd_status, mut vdd_health, mut vdd_problem) = (
             *self.control.shared.capture_block.lock(),
@@ -888,9 +912,9 @@ pub(super) fn software_fallback_body(
     } else if customized {
         "The graphics card could not encode video with the options chosen in Settings, so the picture may lag and the PC may run hot. Go back to the recommended options first.".to_string()
     } else if nvidia_driver_outdated {
-        format!(
-            "The NVIDIA graphics driver on this PC is too old for the graphics card to encode video, so the picture may lag and the PC may run hot. Update the NVIDIA driver to version {} or newer, if your graphics card supports it, then click Restart. Older cards keep using the processor.",
-            crate::encoder::NVENC_MIN_DRIVER
+        outdated_nvidia_driver_body(
+            "the picture may lag and the PC may run hot",
+            "the processor",
         )
     } else if amd && intel {
         "The AMD and Intel graphics drivers on this PC could not start video encoding on the graphics cards, so the picture may lag and the PC may run hot. Update the AMD and Intel graphics drivers, then click Restart.".to_string()
@@ -902,6 +926,36 @@ pub(super) fn software_fallback_body(
     } else {
         "The picture may lag and the PC may run hot. Update your graphics driver from NVIDIA, AMD or Intel, then click Restart.".to_string()
     }
+}
+
+/// The NVIDIA driver is too old for its card to encode video: what happens
+/// instead (`effect`), and what older cards keep encoding on (`fallback`).
+fn outdated_nvidia_driver_body(effect: &str, fallback: &str) -> String {
+    format!(
+        "The NVIDIA graphics driver on this PC is too old for the graphics card to encode video, so {effect}. Update the NVIDIA driver to version {} or newer, if your graphics card supports it, then click Restart. Older cards keep using {fallback}.",
+        crate::encoder::NVENC_MIN_DRIVER
+    )
+}
+
+const NVIDIA_DRIVER_TITLE: &str = "Your NVIDIA graphics card isn't encoding video";
+
+/// The notice for an NVIDIA card skipped because its driver is too old
+/// while another graphics card (AMD or Intel) encodes instead, so the
+/// software fallback notice does not show. `None` while that notice shows,
+/// when the driver is not outdated, or when `encoder_override` (the encoder
+/// chosen in Settings or by its variable) is not NVIDIA's.
+pub(super) fn nvidia_driver_notice(
+    using_software_fallback: bool,
+    nvidia_driver_outdated: bool,
+    encoder_override: Option<&str>,
+) -> Option<String> {
+    let chose_other = encoder_override.is_some_and(|name| !name.ends_with("_nvenc"));
+    (!using_software_fallback && nvidia_driver_outdated && !chose_other).then(|| {
+        outdated_nvidia_driver_body(
+            "another graphics card encodes it and the picture may lag",
+            "the other graphics card",
+        )
+    })
 }
 /// Why Second screen mirrors on Windows 10: the notice, and the note beside
 /// the choice.
