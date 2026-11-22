@@ -377,7 +377,13 @@ fn run_encode_loop(
                     {
                         PIPELINE_STATS.lock().set_software_fallback(false);
                     }
-                    note_encoder_opened(&shared, &desired_encoder, &gpu, generation);
+                    note_encoder_opened(
+                        &PIPELINE_STATS,
+                        &shared,
+                        &desired_encoder,
+                        &gpu,
+                        generation,
+                    );
                 }
                 // No picture yet, and the iPad would give up waiting for
                 // it: libx264 streams while the open goes on.
@@ -407,7 +413,7 @@ fn run_encode_loop(
                     PIPELINE_STATS
                         .lock()
                         .set_software_fallback(encoder_name != "libx264");
-                    note_encoder_opened(&shared, "libx264", &gpu, generation);
+                    note_encoder_opened(&PIPELINE_STATS, &shared, "libx264", &gpu, generation);
                 }
                 Err(e) if is_hevc_encoder(&desired_encoder) => {
                     warn!(
@@ -480,7 +486,7 @@ fn run_encode_loop(
                     PIPELINE_STATS
                         .lock()
                         .set_software_fallback(name == "libx264");
-                    note_encoder_opened(&shared, name, &gpu, generation);
+                    note_encoder_opened(&PIPELINE_STATS, &shared, name, &gpu, generation);
                 }
                 Err(e) => return Err(e),
             }
@@ -634,7 +640,13 @@ fn run_encode_loop(
                     {
                         PIPELINE_STATS.lock().set_software_fallback(false);
                     }
-                    note_encoder_opened(&shared, &reopen.encoder, &gpu, generation);
+                    note_encoder_opened(
+                        &PIPELINE_STATS,
+                        &shared,
+                        &reopen.encoder,
+                        &gpu,
+                        generation,
+                    );
                 }
                 // The old session cannot take a frame of the new size. A
                 // pipeline restart opens a fresh encoder, with the software
@@ -2726,9 +2738,19 @@ fn codec_display_name_for(encoder_name: &str) -> &str {
     }
 }
 
-/// After every successful encoder open: report the live codec on the wire
-/// (HELLO_ACK/heartbeat `StreamConfig.codec`) and in the GUI.
-fn note_encoder_opened(shared: &SharedControl, encoder_name: &str, gpu: &GpuInfo, generation: u64) {
+/// Reports the current generation's encoder on the wire and in the GUI,
+/// and remembers which adapter to wake when an iPad browses for hosts.
+fn note_encoder_opened(
+    stats: &parking_lot::Mutex<crate::stats::PipelineStats>,
+    shared: &SharedControl,
+    encoder_name: &str,
+    gpu: &GpuInfo,
+    generation: u64,
+) {
+    let mut stats = stats.lock();
+    if !crate::supervisor::generation_is_current(generation) {
+        return;
+    }
     *shared.wake_adapter.lock() = crate::gpu_wake::wake_adapter_for(encoder_name, gpu);
     let codec = if is_hevc_encoder(encoder_name) {
         eternal_wire::v2::control::CODEC_HEVC
@@ -2736,11 +2758,8 @@ fn note_encoder_opened(shared: &SharedControl, encoder_name: &str, gpu: &GpuInfo
         eternal_wire::v2::control::CODEC_H264
     };
     shared.active_codec.store(codec, Ordering::SeqCst);
-    let mut stats = PIPELINE_STATS.lock();
     stats.set_codec_name(codec_display_name_for(encoder_name));
-    // Checked under the lock Stop's clear takes.
-    let current = crate::supervisor::generation_is_current(generation);
-    stats.note_encoder_opened(encoder_name, current);
+    stats.note_encoder_opened(encoder_name, true);
 }
 
 fn encoder_options(encoder_name: &str) -> ffmpeg_next::Dictionary<'_> {
@@ -6550,20 +6569,46 @@ mod tests {
     /// NVIDIA card detection chose is unused and is not woken for iPads.
     #[test]
     fn an_encoder_open_publishes_the_card_to_wake() {
+        let stats = parking_lot::Mutex::new(crate::stats::PipelineStats::default());
+        let generation = crate::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
         let shared = SharedControl::new(0, 8_000_000);
         let gpu = GpuInfo {
             encoder_name: "h264_nvenc".to_string(),
             adapter_index: 1,
             ..GpuInfo::software_fallback()
         };
-        note_encoder_opened(&shared, "h264_nvenc", &gpu, 0);
+        note_encoder_opened(&stats, &shared, "h264_nvenc", &gpu, generation);
         assert_eq!(*shared.wake_adapter.lock(), Some(1));
-        note_encoder_opened(&shared, "h264_qsv", &gpu, 0);
+        note_encoder_opened(&stats, &shared, "h264_qsv", &gpu, generation);
         assert_eq!(*shared.wake_adapter.lock(), None, "a cross-vendor fallback");
-        note_encoder_opened(&shared, "libx264", &gpu, 0);
+        note_encoder_opened(&stats, &shared, "libx264", &gpu, generation);
         assert_eq!(*shared.wake_adapter.lock(), None, "the CPU");
-        note_encoder_opened(&shared, "hevc_nvenc", &gpu, 0);
+        note_encoder_opened(&stats, &shared, "hevc_nvenc", &gpu, generation);
         assert_eq!(*shared.wake_adapter.lock(), Some(1), "back on the card");
+    }
+
+    #[test]
+    fn a_stale_encoder_open_cannot_replace_the_live_codec_or_wake_adapter() {
+        use eternal_wire::v2::control::CODEC_HEVC;
+
+        let stats = parking_lot::Mutex::new(crate::stats::PipelineStats::default());
+        stats.lock().mark_pipeline_started();
+        let generation = crate::supervisor::CURRENT_GENERATION.load(Ordering::SeqCst);
+        let shared = SharedControl::new(0, 8_000_000);
+        let gpu = GpuInfo {
+            encoder_name: "h264_nvenc".to_string(),
+            adapter_index: 1,
+            ..GpuInfo::software_fallback()
+        };
+
+        note_encoder_opened(&stats, &shared, "hevc_nvenc", &gpu, generation);
+        note_encoder_opened(&stats, &shared, "libx264", &gpu, generation.wrapping_sub(1));
+
+        assert_eq!(shared.active_codec.load(Ordering::SeqCst), CODEC_HEVC);
+        assert_eq!(*shared.wake_adapter.lock(), Some(1));
+        let stats = stats.lock();
+        assert_eq!(stats.codec_name, "HEVC (NVENC)");
+        assert_eq!(stats.active_encoder, "hevc_nvenc");
     }
 
     /// An override FFmpeg lacks (VideoToolbox on Windows) starts the

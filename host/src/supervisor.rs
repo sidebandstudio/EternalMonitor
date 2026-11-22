@@ -37,6 +37,12 @@ pub fn generation_is_current(generation: u64) -> bool {
     CURRENT_GENERATION.load(Ordering::SeqCst) == generation
 }
 
+fn advance_generation() -> u64 {
+    // The stop mark and encoder publication check the generation under this lock.
+    let _stats = PIPELINE_STATS.lock();
+    CURRENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
     Capture,
@@ -375,7 +381,7 @@ pub fn run(
             .expect("spawn command forwarder");
     }
 
-    let mut generation = CURRENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+    let mut generation = advance_generation();
     let mut machine = Machine::new(generation);
     let mut pipeline = None;
     if crate::startup::port::check(listen_port) {
@@ -467,7 +473,7 @@ pub fn run(
                     stats.set_target_addr(shared.target_addr.lock().to_string());
                     stats.set_bitrate(shared.abr_current_bps.load(Ordering::SeqCst));
                 });
-                generation = CURRENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+                generation = advance_generation();
                 machine.note_started(generation);
                 settle(&machine, &shared, &mut standby, listen_port);
                 healthy_since = Instant::now();
