@@ -144,11 +144,11 @@ impl AnalyzerApp {
             }
             ui.add_space(GAP - 10.0);
         }
-        let encoder_override = self.control.shared.encoder_override.lock().clone();
         if let Some(body) = nvidia_driver_notice(
             snap.using_software_fallback,
             snap.nvidia_driver_outdated,
-            encoder_override.as_deref(),
+            &snap.chosen_encoder,
+            &snap.active_encoder,
         ) {
             let mut restart = false;
             widgets::banner(
@@ -941,21 +941,28 @@ const NVIDIA_DRIVER_TITLE: &str = "Your NVIDIA graphics card isn't encoding vide
 
 /// The notice for an NVIDIA card skipped because its driver is too old
 /// while another graphics card (AMD or Intel) encodes instead, so the
-/// software fallback notice does not show. `None` while that notice shows,
-/// when the driver is not outdated, or when `encoder_override` (the encoder
-/// chosen in Settings or by its variable) is not NVIDIA's.
+/// software fallback notice does not show. Shown only while the pipeline
+/// that started on NVIDIA's encoder (`chosen_encoder`: Automatic, or an
+/// override FFmpeg has) has an AMD or Intel encoder open (`active_encoder`,
+/// empty before one opens and after Stop). `None` while the software
+/// fallback notice shows or when the driver is not outdated.
 pub(super) fn nvidia_driver_notice(
     using_software_fallback: bool,
     nvidia_driver_outdated: bool,
-    encoder_override: Option<&str>,
+    chosen_encoder: &str,
+    active_encoder: &str,
 ) -> Option<String> {
-    let chose_other = encoder_override.is_some_and(|name| !name.ends_with("_nvenc"));
-    (!using_software_fallback && nvidia_driver_outdated && !chose_other).then(|| {
-        outdated_nvidia_driver_body(
-            "another graphics card encodes it and the picture may lag",
-            "the other graphics card",
-        )
-    })
+    let other_card = active_encoder.ends_with("_qsv") || active_encoder.ends_with("_amf");
+    (!using_software_fallback
+        && nvidia_driver_outdated
+        && chosen_encoder.ends_with("_nvenc")
+        && other_card)
+        .then(|| {
+            outdated_nvidia_driver_body(
+                "another graphics card encodes it and the picture may lag",
+                "the other graphics card",
+            )
+        })
 }
 /// Why Second screen mirrors on Windows 10: the notice, and the note beside
 /// the choice.

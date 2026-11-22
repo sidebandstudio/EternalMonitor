@@ -506,39 +506,69 @@ fn an_outdated_nvidia_driver_is_named_with_the_version_to_install() {
 /// fallback notice showed and nothing said to update the NVIDIA driver.
 #[test]
 fn an_outdated_nvidia_driver_is_named_when_another_graphics_card_encodes() {
-    // Auto, or NVENC chosen in Settings: AMD or Intel took over.
-    for chosen in [None, Some("h264_nvenc"), Some("hevc_nvenc")] {
-        let body = nvidia_driver_notice(false, true, chosen).unwrap();
-        assert!(
-            body.contains("NVIDIA driver to version 570 or newer"),
-            "{body}"
-        );
-        assert!(body.contains("if your graphics card supports it"), "{body}");
-        assert!(body.contains("then click Restart"), "{body}");
-        assert!(body.contains("another graphics card encodes it"), "{body}");
-        assert!(!body.contains("processor"), "{body}");
-        for jargon in [
-            "NVENC",
-            "QSV",
-            "Quick Sync",
-            "AMF",
-            "API",
-            "encoder",
-            "http",
-        ] {
-            assert!(!body.contains(jargon), "{body}");
+    // Automatic, or an NVENC override, with Quick Sync or AMF open.
+    for chosen in ["h264_nvenc", "hevc_nvenc"] {
+        for active in ["h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf"] {
+            let body = nvidia_driver_notice(false, true, chosen, active).unwrap();
+            assert!(
+                body.contains("NVIDIA driver to version 570 or newer"),
+                "{body}"
+            );
+            assert!(body.contains("if your graphics card supports it"), "{body}");
+            assert!(body.contains("then click Restart"), "{body}");
+            assert!(body.contains("another graphics card encodes it"), "{body}");
+            assert!(!body.contains("processor"), "{body}");
+            for jargon in [
+                "NVENC",
+                "QSV",
+                "Quick Sync",
+                "AMF",
+                "API",
+                "encoder",
+                "http",
+            ] {
+                assert!(!body.contains(jargon), "{body}");
+            }
         }
     }
     // The processor encodes: the software fallback notice says it, as before.
-    assert_eq!(nvidia_driver_notice(true, true, None), None);
+    assert_eq!(
+        nvidia_driver_notice(true, true, "h264_nvenc", "h264_qsv"),
+        None
+    );
+    assert_eq!(
+        nvidia_driver_notice(true, true, "h264_nvenc", "libx264"),
+        None
+    );
     assert!(software_fallback_body(false, true, false, &[])
         .contains("Older cards keep using the processor"));
-    // NVENC failed for another reason, or was not tried.
-    assert_eq!(nvidia_driver_notice(false, false, None), None);
-    assert_eq!(nvidia_driver_notice(false, false, Some("h264_nvenc")), None);
-    // An AMD, Intel or processor encoder chosen in Settings.
+    // NVENC refused the driver before Quick Sync or AMF opened (or while
+    // the processor opens on an NVIDIA-only PC), and after Stop.
+    assert_eq!(nvidia_driver_notice(false, true, "h264_nvenc", ""), None);
+    let mut stats = crate::stats::PipelineStats::default();
+    stats.nvidia_driver_outdated = true;
+    stats.chosen_encoder = "h264_nvenc".into();
+    stats.active_encoder = "h264_qsv".into();
+    stats.mark_pipeline_stopped();
+    assert_eq!(
+        nvidia_driver_notice(
+            stats.using_software_fallback,
+            stats.nvidia_driver_outdated,
+            &stats.chosen_encoder,
+            &stats.active_encoder,
+        ),
+        None
+    );
+    // NVENC failed for another reason.
+    assert_eq!(
+        nvidia_driver_notice(false, false, "h264_nvenc", "h264_qsv"),
+        None
+    );
+    // An AMD, Intel or processor encoder chosen in Settings: the pipeline
+    // starts on it (see `encoder::applied_encoder`, which starts an override
+    // FFmpeg lacks on detection's NVENC instead).
     for chosen in ["h264_qsv", "h264_amf", "libx264"] {
-        assert_eq!(nvidia_driver_notice(false, true, Some(chosen)), None);
+        assert_eq!(nvidia_driver_notice(false, true, chosen, "h264_qsv"), None);
     }
 }
 
