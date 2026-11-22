@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::Instant;
 
 use once_cell::sync::Lazy;
@@ -51,11 +52,10 @@ pub struct PipelineStats {
     /// Pictures given to an encoder again to bring out a keyframe it held
     /// (see `encoder::holds_last_frame`), for the connected viewer.
     pub keyframe_resubmits: u64,
-    /// NVENC could not open with an old NVIDIA driver or card. Used by both
-    /// Stream page notices.
+    /// Simulates an outdated NVIDIA driver in GUI snapshots.
     pub nvidia_driver_outdated: bool,
-    /// Whether the NVIDIA cards can run the driver that FFmpeg needs.
-    pub nvidia_driver_update: crate::encoder::NvidiaDriverUpdate,
+    /// The NVENC failure check attached when this pipeline starts.
+    pub(crate) nvidia_failure: Option<Arc<crate::encoder::NvidiaFailure>>,
     /// The processor encodes because startup's GPU detection did not return
     /// in time. The fallback notice then says the driver did not answer.
     pub gpu_detection_stalled: bool,
@@ -131,7 +131,7 @@ impl PipelineStats {
             using_software_fallback: false,
             keyframe_resubmits: 0,
             nvidia_driver_outdated: false,
-            nvidia_driver_update: Default::default(),
+            nvidia_failure: None,
             gpu_detection_stalled: false,
             driver_update_vendors: Vec::new(),
             encode_timestamps: VecDeque::with_capacity(128),
@@ -177,7 +177,7 @@ impl PipelineStats {
         self.codec_name = previous.codec_name;
         self.using_software_fallback = previous.using_software_fallback;
         self.nvidia_driver_outdated = previous.nvidia_driver_outdated;
-        self.nvidia_driver_update = previous.nvidia_driver_update;
+        self.nvidia_failure = previous.nvidia_failure;
         self.gpu_detection_stalled = previous.gpu_detection_stalled;
         self.driver_update_vendors = previous.driver_update_vendors;
         self.mdns_active = previous.mdns_active;
@@ -201,6 +201,15 @@ impl PipelineStats {
         self.bandwidth_bps = 0.0;
         self.bandwidth_mbps = 0.0;
         self.latency_ms = 0.0;
+    }
+
+    pub(crate) fn nvidia_driver_update(&self) -> Option<crate::encoder::NvidiaDriverUpdate> {
+        self.nvidia_failure
+            .as_ref()
+            .and_then(|failure| failure.update())
+            .or(self
+                .nvidia_driver_outdated
+                .then_some(crate::encoder::NvidiaDriverUpdate::Unknown))
     }
 
     pub fn mark_pipeline_started(&mut self) {

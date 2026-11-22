@@ -29,35 +29,31 @@ impl PciAddress {
         )
     }
 
-    /// Windows reports decimal numbers and omits the segment on a
-    /// single-segment system. Unrecognized location strings are unknown.
-    pub(crate) fn from_windows_location(location: &str) -> Option<Self> {
-        let location = location.strip_prefix("PCI ")?;
-        let (segment, location) = match location.strip_prefix("segment ") {
-            Some(location) => {
-                let (segment, location) = location.split_once(' ')?;
-                (segment.parse().ok()?, location)
-            }
-            None => (0, location),
-        };
-        let (bus, location) = location.strip_prefix("bus ")?.split_once(", device ")?;
-        let (device, function) = location.split_once(", function ")?;
+    /// Windows reports the bus separately and packs the device number in
+    /// the high word of the address and the function number in the low word.
+    pub(crate) fn from_windows_properties(bus: u32, address: u32) -> Option<Self> {
         Self::new(
-            segment,
-            bus.parse().ok()?,
-            device.parse().ok()?,
-            function.parse().ok()?,
+            0,
+            bus.try_into().ok()?,
+            (address >> 16).try_into().ok()?,
+            (address & 0xffff).try_into().ok()?,
         )
     }
 }
 
-/// The newest compute capability among the DXGI adapters, once every
-/// adapter has its own confirmed CUDA match. CUDA can also see cards
-/// that are only available for compute.
+/// The newest compute capability among the matched adapters. The Windows
+/// properties do not identify the PCI segment, so a nonzero CUDA domain
+/// leaves the match uncertain. CUDA can also see cards in TCC mode that
+/// DXGI does not list, and NVENC may be able to use them.
 pub(crate) fn matched_compute_capability(
     dxgi: &[PciAddress],
     cuda: &[(PciAddress, Option<i32>)],
 ) -> Option<i32> {
+    if cuda.iter().any(|(address, major)| {
+        address.segment != 0 || (!dxgi.contains(address) && !matches!(major, Some(1..=3)))
+    }) {
+        return None;
+    }
     let mut newest = None;
     for (index, address) in dxgi.iter().enumerate() {
         if dxgi[..index].contains(address) {
@@ -78,38 +74,62 @@ mod tests {
     use super::*;
     use crate::encoder::NvidiaDriverUpdate::{self, Supported, Unknown, Unsupported};
 
+    fn verdict(dxgi: &[PciAddress], cuda: &[(PciAddress, Option<i32>)]) -> NvidiaDriverUpdate {
+        NvidiaDriverUpdate::from_compute_capability(matched_compute_capability(dxgi, cuda))
+    }
+
     #[test]
     fn equal_device_counts_with_different_pci_addresses_leave_the_card_unknown() {
-        let display =
-            PciAddress::from_windows_location("PCI bus 10, device 0, function 0").unwrap();
-        let compute_only = PciAddress::from_cuda_bus_id("0000:0b:00.0").unwrap();
-        let other_segment = PciAddress::from_cuda_bus_id("0001:0a:00.0").unwrap();
-        for wrong_device in [compute_only, other_segment] {
-            assert_eq!(
-                NvidiaDriverUpdate::from_compute_capability(matched_compute_capability(
-                    &[display],
-                    &[(wrong_device, Some(3))],
-                )),
-                Unknown
-            );
+        let display = PciAddress::from_windows_properties(10, 0).unwrap();
+        let cuda = PciAddress::from_cuda_bus_id("0000:0b:00.0").unwrap();
+        assert_eq!(verdict(&[display], &[(cuda, Some(3))]), Unknown);
+    }
+
+    #[test]
+    fn the_windows_bus_and_packed_address_match_the_cuda_pci_id() {
+        let display = PciAddress::from_windows_properties(10, (31 << 16) | 7).unwrap();
+        assert_eq!(Some(display), PciAddress::from_cuda_bus_id("0000:0a:1f.7"));
+        for (bus, address) in [
+            (256, 0),
+            (10, 32 << 16),
+            (10, 8),
+            (10, 0x100),
+            (10, u32::MAX),
+        ] {
+            assert_eq!(PciAddress::from_windows_properties(bus, address), None);
         }
     }
 
     #[test]
+    fn a_nonzero_cuda_domain_leaves_even_a_matching_bus_and_address_unknown() {
+        let display = PciAddress::from_windows_properties(10, 0).unwrap();
+        let cuda = PciAddress::from_cuda_bus_id("0000:0a:00.0").unwrap();
+        let other_domain = PciAddress::from_cuda_bus_id("0001:0a:00.0").unwrap();
+        assert_eq!(
+            verdict(&[display], &[(cuda, Some(3)), (other_domain, Some(3))]),
+            Unknown
+        );
+    }
+
+    #[test]
     fn every_dxgi_card_gets_its_verdict_from_the_matching_cuda_device() {
-        let kepler = PciAddress::from_windows_location("PCI bus 10, device 0, function 0").unwrap();
-        let maxwell =
-            PciAddress::from_windows_location("PCI segment 2 bus 10, device 1, function 0")
-                .unwrap();
+        let kepler = PciAddress::from_windows_properties(10, 0).unwrap();
+        let maxwell = PciAddress::from_windows_properties(10, 1 << 16).unwrap();
         let cuda_kepler = PciAddress::from_cuda_bus_id("0000:0a:00.0").unwrap();
-        let cuda_maxwell = PciAddress::from_cuda_bus_id("0002:0a:01.0").unwrap();
+        let cuda_maxwell = PciAddress::from_cuda_bus_id("0000:0a:01.0").unwrap();
         let compute_only = PciAddress::from_cuda_bus_id("0000:0b:00.0").unwrap();
-        let verdict = |dxgi: &[PciAddress], cuda: &[(PciAddress, Option<i32>)]| {
-            NvidiaDriverUpdate::from_compute_capability(matched_compute_capability(dxgi, cuda))
-        };
-        let kepler_only = [(compute_only, Some(8)), (cuda_kepler, Some(3))];
-        assert_eq!(verdict(&[kepler], &kepler_only), Unsupported);
-        assert_eq!(verdict(&[kepler, maxwell], &kepler_only), Unknown);
+        for major in [Some(8), None, Some(0), Some(4)] {
+            let mixed = [(compute_only, major), (cuda_kepler, Some(3))];
+            assert_eq!(verdict(&[kepler], &mixed), Unknown);
+            assert_eq!(verdict(&[kepler, maxwell], &mixed), Unknown);
+        }
+        assert_eq!(
+            verdict(
+                &[kepler],
+                &[(compute_only, Some(3)), (cuda_kepler, Some(3))]
+            ),
+            Unsupported
+        );
         let both = [(cuda_maxwell, Some(5)), (cuda_kepler, Some(3))];
         assert_eq!(verdict(&[kepler, maxwell], &both), Supported);
         assert_eq!(

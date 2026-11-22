@@ -205,8 +205,8 @@ pub(crate) fn nvidia_driver_versions() -> (Vec<u64>, Option<Vec<LUID>>) {
     (versions, complete.then_some(adapters))
 }
 
-/// The newest CUDA compute capability among the NVIDIA adapters DXGI listed.
-/// Both APIs must identify each card by its full PCI address.
+/// The newest CUDA compute capability when the PCI addresses let us
+/// match the NVIDIA adapters DXGI and CUDA listed.
 pub(crate) fn nvidia_compute_capability(adapters: Vec<LUID>) -> Option<i32> {
     let addresses = adapters
         .into_iter()
@@ -215,10 +215,10 @@ pub(crate) fn nvidia_compute_capability(adapters: Vec<LUID>) -> Option<i32> {
     matched_compute_capability(&addresses, &cuda_devices()?)
 }
 
-/// Resolve the DXGI LUID to the adapter's device interface and read the
-/// location of the device that exposes it, including the PCI segment.
+/// Resolve the DXGI LUID to the device instance and read its numeric PCI
+/// bus and address properties.
 fn adapter_pci_address(luid: LUID) -> Option<PciAddress> {
-    use std::mem::{size_of, size_of_val};
+    use std::mem::size_of;
     use windows::core::{HRESULT, PCWSTR};
     use windows::Win32::Devices::DeviceAndDriverInstallation::{
         CM_Get_DevNode_PropertyW, SetupDiCreateDeviceInfoList, SetupDiDestroyDeviceInfoList,
@@ -230,7 +230,8 @@ fn adapter_pci_address(luid: LUID) -> Option<PciAddress> {
         DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME,
     };
     use windows::Win32::Devices::Properties::{
-        DEVPKEY_Device_LocationInfo, DEVPROPTYPE, DEVPROP_TYPE_STRING,
+        DEVPKEY_Device_Address, DEVPKEY_Device_BusNumber, DEVPROPTYPE, DEVPROP_TYPE_INT32,
+        DEVPROP_TYPE_UINT32,
     };
     use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HWND};
 
@@ -281,24 +282,30 @@ fn adapter_pci_address(luid: LUID) -> Option<PciAddress> {
     })();
     let _ = unsafe { SetupDiDestroyDeviceInfoList(devices) };
 
-    let mut location = [0u16; 128];
-    let mut size = size_of_val(&location) as u32;
-    let mut kind = DEVPROPTYPE(0);
-    let status = unsafe {
-        CM_Get_DevNode_PropertyW(
-            devinst?,
-            &DEVPKEY_Device_LocationInfo,
-            &mut kind,
-            Some(location.as_mut_ptr().cast()),
-            &mut size,
-            0,
-        )
+    let devinst = devinst?;
+    let read = |key| {
+        let mut value = 0u32;
+        let mut size = size_of::<u32>() as u32;
+        let mut kind = DEVPROPTYPE(0);
+        let status = unsafe {
+            CM_Get_DevNode_PropertyW(
+                devinst,
+                key,
+                &mut kind,
+                Some((&mut value as *mut u32).cast()),
+                &mut size,
+                0,
+            )
+        };
+        (status == CR_SUCCESS
+            && matches!(kind, DEVPROP_TYPE_INT32 | DEVPROP_TYPE_UINT32)
+            && size == size_of::<u32>() as u32)
+            .then_some(value)
     };
-    if status != CR_SUCCESS || kind != DEVPROP_TYPE_STRING || !size.is_multiple_of(2) {
-        return None;
-    }
-    let text = location.get(..size as usize / 2)?.strip_suffix(&[0])?;
-    PciAddress::from_windows_location(&String::from_utf16(text).ok()?)
+    PciAddress::from_windows_properties(
+        read(&DEVPKEY_Device_BusNumber)?,
+        read(&DEVPKEY_Device_Address)?,
+    )
 }
 
 fn cuda_devices() -> Option<Vec<(PciAddress, Option<i32>)>> {

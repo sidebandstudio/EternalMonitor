@@ -653,9 +653,7 @@ fn the_nvidia_driver_notice_follows_the_open_encoder() {
     let notice = |stats: &crate::stats::PipelineStats| {
         nvidia_driver_notice(
             stats.using_software_fallback,
-            stats
-                .nvidia_driver_outdated
-                .then_some(stats.nvidia_driver_update),
+            stats.nvidia_driver_update(),
             &stats.encoder_override,
             &stats.active_encoder,
         )

@@ -128,7 +128,7 @@ impl StatsSnapshot {
             encoder_override: s.encoder_override.clone(),
             active_encoder: s.active_encoder.clone(),
             using_software_fallback: s.using_software_fallback,
-            nvidia_driver_update: s.nvidia_driver_outdated.then_some(s.nvidia_driver_update),
+            nvidia_driver_update: s.nvidia_driver_update(),
             gpu_detection_stalled: s.gpu_detection_stalled,
             driver_update_vendors: s.driver_update_vendors.clone(),
             gpu_name: s.gpu_name.clone(),
