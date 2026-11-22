@@ -393,14 +393,16 @@ fn run_encode_loop(
                     let software_fallback = (stall_recovery.opened(&desired_encoder, &preferred)
                         && desired_encoder != "libx265")
                         .then_some(false);
-                    note_encoder_opened(
+                    if !note_encoder_opened(
                         &PIPELINE_STATS,
                         &shared,
                         &desired_encoder,
                         &gpu,
                         current,
                         software_fallback,
-                    );
+                    ) {
+                        return Ok(());
+                    }
                 }
                 // No picture yet, and the iPad would give up waiting for
                 // it: libx264 streams while the open goes on.
@@ -426,14 +428,16 @@ fn run_encode_loop(
                     encoder_state = Some(state);
                     first_picture_by = None;
                     bitrate_pacer.opened(Instant::now());
-                    note_encoder_opened(
+                    if !note_encoder_opened(
                         &PIPELINE_STATS,
                         &shared,
                         "libx264",
                         &gpu,
                         current,
                         Some(encoder_name != "libx264"),
-                    );
+                    ) {
+                        return Ok(());
+                    }
                 }
                 Err(e) if is_hevc_encoder(&desired_encoder) => {
                     warn!(
@@ -502,14 +506,16 @@ fn run_encode_loop(
                     encoder_state = Some(state);
                     first_picture_by = None;
                     bitrate_pacer.opened(Instant::now());
-                    note_encoder_opened(
+                    if !note_encoder_opened(
                         &PIPELINE_STATS,
                         &shared,
                         name,
                         &gpu,
                         current,
                         Some(name == "libx264"),
-                    );
+                    ) {
+                        return Ok(());
+                    }
                 }
                 Err(e) => return Err(e),
             }
@@ -660,14 +666,16 @@ fn run_encode_loop(
                     let software_fallback = (stall_recovery.opened(&reopen.encoder, &preferred)
                         && reopen.encoder != "libx265")
                         .then_some(false);
-                    note_encoder_opened(
+                    if !note_encoder_opened(
                         &PIPELINE_STATS,
                         &shared,
                         &reopen.encoder,
                         &gpu,
                         current,
                         software_fallback,
-                    );
+                    ) {
+                        return Ok(());
+                    }
                 }
                 // The old session cannot take a frame of the new size. A
                 // pipeline restart opens a fresh encoder, with the software
@@ -2795,7 +2803,8 @@ pub(crate) fn note_encoder_starting(
 
 /// Reports a running pipeline's encoder on the wire and in the GUI,
 /// and remembers which adapter to wake when an iPad browses for hosts.
-/// An absent fallback value keeps the current setting.
+/// An absent fallback value keeps the current setting. Returns whether the
+/// pipeline accepted the open. Only an accepted encoder may send video.
 pub(crate) fn note_encoder_opened(
     stats: &parking_lot::Mutex<crate::stats::PipelineStats>,
     shared: &SharedControl,
@@ -2803,10 +2812,10 @@ pub(crate) fn note_encoder_opened(
     gpu: &GpuInfo,
     current: impl FnOnce() -> bool,
     software_fallback: Option<bool>,
-) {
+) -> bool {
     let mut stats = stats.lock();
-    if !stats.pipeline_running || !current() {
-        return;
+    if !stats.note_encoder_opened(encoder_name, current()) {
+        return false;
     }
     *shared.wake_adapter.lock() = crate::gpu_wake::wake_adapter_for(encoder_name, gpu);
     let codec = if is_hevc_encoder(encoder_name) {
@@ -2819,7 +2828,7 @@ pub(crate) fn note_encoder_opened(
         stats.set_software_fallback(software_fallback);
     }
     stats.set_codec_name(codec_display_name_for(encoder_name));
-    stats.note_encoder_opened(encoder_name, true);
+    true
 }
 
 fn encoder_options(encoder_name: &str) -> ffmpeg_next::Dictionary<'_> {
@@ -5854,7 +5863,7 @@ mod tests {
         generation: u64,
         preferred_open_pending: bool,
         before_publication: impl FnOnce(),
-    ) {
+    ) -> bool {
         ffmpeg_next::init().unwrap();
         let (producer, consumer) = crate::capture::frame_slot();
         producer.publish(RawFrame {
@@ -5866,7 +5875,7 @@ mod tests {
             cached: false,
         });
         producer.close();
-        let (tx, _rx) = mpsc::channel(NAL_CHANNEL_CAPACITY);
+        let (tx, mut rx) = mpsc::channel(NAL_CHANNEL_CAPACITY);
         let gpu = GpuInfo {
             encoder_name: "mpeg4".into(),
             ..GpuInfo::software_fallback()
@@ -5910,6 +5919,7 @@ mod tests {
             wait_for_clear_lane(&LANES);
         }
         assert!(before_publication.is_none(), "the software fallback opened");
+        rx.blocking_recv().is_some()
     }
 
     /// A real libx264 session at 64x64 YUV420P, opened on the call's thread

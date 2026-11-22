@@ -95,6 +95,11 @@ const WAKE_GRACE_MS: u64 = 10_000;
 #[cfg(feature = "test-hooks")]
 pub static TEST_BACKOFF_BASE_MS: AtomicU64 = AtomicU64::new(BACKOFF_BASE.as_millis() as u64);
 
+/// Runs once after a restart command is accepted, before retiring its pipeline.
+#[cfg(feature = "test-hooks")]
+pub static TEST_BEFORE_RESTART: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>> =
+    parking_lot::Mutex::new(None);
+
 #[cfg(feature = "test-hooks")]
 fn backoff_base() -> Duration {
     Duration::from_millis(TEST_BACKOFF_BASE_MS.load(Ordering::SeqCst))
@@ -566,7 +571,10 @@ fn settle(
     standby: &mut Option<Standby>,
     listen_port: u16,
 ) {
-    PIPELINE_STATS.lock().stream_status = Some(StreamStatus::from(&machine.state));
+    // Running is published when the generation starts.
+    if !matches!(machine.state, SupervisorState::Running { .. }) {
+        PIPELINE_STATS.lock().stream_status = Some(StreamStatus::from(&machine.state));
+    }
     if !standby_answers(&machine.state) {
         if let Some(standby) = standby.take() {
             standby.stop();
@@ -626,9 +634,22 @@ fn finish_pipeline_effect(
     pipeline: &mut Option<std::thread::JoinHandle<()>>,
     generation: u64,
 ) {
+    #[cfg(feature = "test-hooks")]
+    if *effect == Effect::Restart {
+        let before_restart = TEST_BEFORE_RESTART.lock().take();
+        if let Some(before_restart) = before_restart {
+            before_restart();
+        }
+    }
+
     let status = match effect {
         Effect::None => return,
         Effect::StopPipeline | Effect::Shutdown => StreamStatus::from(state),
+        Effect::Restart | Effect::Start
+            if matches!(state, SupervisorState::WaitingForPort { .. }) =>
+        {
+            StreamStatus::WaitingForPort
+        }
         Effect::Restart | Effect::Start => StreamStatus::Recovering,
     };
     {
@@ -805,6 +826,7 @@ fn spawn_generation(
     {
         let mut stats = PIPELINE_STATS.lock();
         stats.mark_pipeline_started();
+        stats.stream_status = Some(StreamStatus::Running);
         stats.set_bitrate(shared.abr_current_bps.load(Ordering::SeqCst));
         stats.set_target_addr(shared.target_addr.lock().to_string());
     }
@@ -955,7 +977,7 @@ mod tests {
                     run_delayed_fallback(worker_shared, generation, preferred_open_pending, || {
                         opened.send(()).unwrap();
                         pending.recv_timeout(Duration::from_secs(10)).unwrap();
-                    });
+                    })
                 });
                 opening.recv_timeout(Duration::from_secs(5)).unwrap();
                 note_encoder_opened(
@@ -1023,7 +1045,7 @@ mod tests {
                     assert!(stats.active_encoder.is_empty(), "{stop:?}");
                 }
                 drop(session);
-                worker.join().unwrap();
+                assert!(!worker.join().unwrap(), "{stop:?} queued fallback video");
                 supervisor.join().unwrap();
                 assert!(!shared.running.load(Ordering::SeqCst));
             });
@@ -1432,6 +1454,25 @@ mod tests {
         let effect = machine.on_wedged("no frames for 5s", Instant::now());
         assert_eq!(effect, Effect::StopPipeline);
         assert!(matches!(machine.state, SupervisorState::BackingOff { .. }));
+    }
+
+    #[test]
+    fn an_automatic_port_check_keeps_the_stream_waiting() {
+        let shared = SharedControl::new(0, 8_000_000);
+        let now = Instant::now();
+        let mut machine = Machine::new(1);
+        machine.wait_for_port(now);
+        let stats = parking_lot::Mutex::new(PipelineStats::new());
+        stats.lock().stream_status = Some(StreamStatus::WaitingForPort);
+
+        let effect = machine.on_tick(now);
+        assert_eq!(effect, Effect::Start);
+        finish_pipeline_effect(&effect, &machine.state, &shared, &stats, &mut None, 1);
+
+        // The port check is next. The header still offers only Stop.
+        let stats = stats.lock();
+        assert_eq!(stats.stream_status, Some(StreamStatus::WaitingForPort));
+        assert!(!stats.pipeline_running);
     }
 
     /// A port another program holds for an hour: checked every 2 s, never

@@ -214,13 +214,13 @@ impl PipelineStats {
         self.active_encoder.clear();
     }
 
-    /// An encoder opened in a pipeline generation, `current` while it is the
-    /// live one. An open that returns after Stop, or after a restart replaced
-    /// its generation, is no longer this pipeline's.
-    pub fn note_encoder_opened(&mut self, encoder_name: &str, current: bool) {
-        if self.pipeline_running && current {
-            self.active_encoder = encoder_name.to_string();
+    /// Records an encoder open and returns whether the live pipeline accepted it.
+    pub fn note_encoder_opened(&mut self, encoder_name: &str, current: bool) -> bool {
+        if !self.pipeline_running || !current {
+            return false;
         }
+        self.active_encoder = encoder_name.to_string();
+        true
     }
 
     pub fn set_gpu_name(&mut self, gpu_name: String) {

@@ -10,7 +10,7 @@ use super::{
     CAPTURE_AUTO_LABEL, CAPTURE_VIRTUAL_LABEL, CAPTURE_VIRTUAL_SENTINEL, ENCODER_AUTO_LABEL,
 };
 use crate::capture::recovery::CaptureBlock;
-use crate::control::VddStatus;
+use crate::control::{SupervisorCommand, VddStatus};
 use crate::i18n::{tr, trf};
 use crate::vdd::VddTaskHealth;
 use crate::vdd_device::VddProblem;
@@ -497,11 +497,11 @@ impl AnalyzerApp {
                     // Room for the buttons drawn below, as wide as their
                     // labels in this language, and never less than before.
                     let spacing = ui.spacing().item_spacing.x;
-                    let buttons = state.header_actions();
+                    let buttons = state.header_commands();
                     let measured: f32 = buttons
                         .iter()
-                        .map(|action| {
-                            let (icon, label, _) = action.button();
+                        .map(|&command| {
+                            let (icon, label, _) = header_button(command);
                             widgets::button_width(ui, Some(icon), label) + spacing
                         })
                         .sum();
@@ -527,9 +527,9 @@ impl AnalyzerApp {
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         for &button in buttons {
-                            let (icon, label, tone) = button.button();
+                            let (icon, label, tone) = header_button(button);
                             let response = widgets::button(ui, tone, Some(icon), label);
-                            let response = if button == HeaderAction::Restart {
+                            let response = if button == SupervisorCommand::Restart {
                                 response.on_hover_text(
                                     "Restart capture and encoding. The iPad reconnects on its own.",
                                 )
@@ -578,9 +578,12 @@ impl AnalyzerApp {
             }
 
             match action {
-                Some(HeaderAction::Stop) => self.control.request_stop(),
-                Some(HeaderAction::Start) => self.control.request_start(),
-                Some(HeaderAction::Restart) => self.restart_stream(),
+                Some(SupervisorCommand::Stop) => self.control.request_stop(),
+                Some(SupervisorCommand::Start) => self.control.request_start(),
+                Some(SupervisorCommand::Restart) => self.restart_stream(),
+                Some(SupervisorCommand::RestartStream { .. } | SupervisorCommand::Shutdown) => {
+                    unreachable!("command has no header button")
+                }
                 None => {}
             }
         });
@@ -875,26 +878,20 @@ impl AnalyzerApp {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum HeaderAction {
-    Start,
-    Stop,
-    Restart,
-}
-
-impl HeaderAction {
-    fn button(self) -> (Icon, &'static str, Tone) {
-        match self {
-            Self::Start => (Icon::Play, tr("Start streaming"), Tone::Primary),
-            Self::Stop => (Icon::Stop, tr("Stop"), Tone::Danger),
-            Self::Restart => (Icon::Refresh, tr("Restart"), Tone::Secondary),
+fn header_button(command: SupervisorCommand) -> (Icon, &'static str, Tone) {
+    match command {
+        SupervisorCommand::Start => (Icon::Play, tr("Start streaming"), Tone::Primary),
+        SupervisorCommand::Stop => (Icon::Stop, tr("Stop"), Tone::Danger),
+        SupervisorCommand::Restart => (Icon::Refresh, tr("Restart"), Tone::Secondary),
+        SupervisorCommand::RestartStream { .. } | SupervisorCommand::Shutdown => {
+            unreachable!("command has no header button")
         }
     }
 }
 
 impl StreamState {
-    fn header_actions(self) -> &'static [HeaderAction] {
-        use HeaderAction::{Restart, Start, Stop};
+    fn header_commands(self) -> &'static [SupervisorCommand] {
+        use SupervisorCommand::{Restart, Start, Stop};
         match self {
             Self::Off => &[Start],
             Self::WaitingForPort => &[Stop],
@@ -906,64 +903,88 @@ impl StreamState {
 
 #[cfg(test)]
 #[test]
-fn the_stream_header_offers_controls_for_each_supervisor_state() {
-    use crate::supervisor::StreamStatus;
-    use HeaderAction::{Restart, Start, Stop};
+fn the_stream_header_only_offers_commands_the_supervisor_accepts() {
+    use crate::supervisor::{Effect, Machine, Stage, StreamStatus, SupervisorState};
+    use std::time::Instant;
+    use SupervisorCommand::{Restart, Start, Stop};
 
-    for (status, connected, blocked, expected, actions) in [
+    let now = Instant::now();
+    for (supervisor, connected, blocked, expected, commands) in [
         (
-            StreamStatus::Stopped,
+            SupervisorState::Stopped,
             true,
             false,
             StreamState::Off,
             &[Start][..],
         ),
         (
-            StreamStatus::Recovering,
+            SupervisorState::Failed {
+                reason: "capture failed".into(),
+                stage: Stage::Capture,
+            },
+            true,
+            false,
+            StreamState::Off,
+            &[Start][..],
+        ),
+        (
+            SupervisorState::BackingOff {
+                until: now,
+                attempt: 1,
+            },
             true,
             false,
             StreamState::Recovering,
             &[Stop, Restart][..],
         ),
         (
-            StreamStatus::WaitingForPort,
+            SupervisorState::WaitingForPort { next_check: now },
             false,
             false,
             StreamState::WaitingForPort,
             &[Stop][..],
         ),
         (
-            StreamStatus::ShuttingDown,
+            SupervisorState::ShutDown,
             true,
             false,
             StreamState::ShuttingDown,
             &[][..],
         ),
         (
-            StreamStatus::Running,
+            SupervisorState::Running { generation: 1 },
             false,
             false,
             StreamState::Ready,
             &[Stop, Restart][..],
         ),
         (
-            StreamStatus::Running,
+            SupervisorState::Running { generation: 1 },
             true,
             false,
             StreamState::Streaming,
             &[Stop, Restart][..],
         ),
         (
-            StreamStatus::Running,
+            SupervisorState::Running { generation: 1 },
             true,
             true,
             StreamState::Paused,
             &[Stop, Restart][..],
         ),
     ] {
-        let state = StreamState::from_status(status, connected, blocked);
+        let state = StreamState::from_status(StreamStatus::from(&supervisor), connected, blocked);
         assert_eq!(state, expected);
-        assert_eq!(state.header_actions(), actions);
+        for command in state.header_commands() {
+            let mut machine = Machine::new(1);
+            machine.state = supervisor.clone();
+            assert_ne!(
+                machine.on_command(command),
+                Effect::None,
+                "{supervisor:?} rejects the header's {command:?}"
+            );
+        }
+        assert_eq!(state.header_commands(), commands);
     }
 }
 
