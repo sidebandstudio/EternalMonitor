@@ -1077,8 +1077,10 @@ async fn act(
         state.retransmit_ring.clear();
         state.fault.clear();
     }
-    if actions.new_target.is_some() {
-        state.abr.new_session();
+    if let Some(target) = actions.new_target {
+        state
+            .abr
+            .new_session((target.link != LinkId::Udp).then(link::tunnel_congestion_drops));
     }
     if actions.new_target.is_some() || actions.client_lost || actions.release_input {
         state.input.reset();
@@ -1720,14 +1722,12 @@ mod tests {
         }
     }
 
-    /// A new session's reports count from its own start: `act` starts
-    /// ABR's clean streak again, or a quick reconnect inherits the old
-    /// session's streak and steps up on its first clean report.
-    #[tokio::test]
+    /// Accepts a USB session from a HELLO2 and carries it out through
+    /// `act`, as the transport loop does.
     // The slot only keeps other tests out; nothing on this test's runtime
     // takes it.
     #[allow(clippy::await_holding_lock)]
-    async fn a_new_session_starts_the_abr_clean_streak_again() {
+    async fn accept_usb_session(state: &mut LoopState) {
         // The session starts through `act`, which uses the fallback slot.
         let _slot = crate::diagnostics::tests::FALLBACK_SLOT.lock();
         let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
@@ -1745,16 +1745,6 @@ mod tests {
             tx: supervisor_tx,
             generation: 1,
         };
-        let mut state = loop_state();
-        state.abr = AbrController::new(20_000_000, true);
-        // 14.5 s clean: one more clean report would step up.
-        let t0 = Instant::now();
-        let mut report = ReceiverReport::default();
-        for tick in 0..30 {
-            report.frags_received += 500;
-            let at = t0 + Duration::from_millis(500 * tick);
-            assert!(!state.abr.on_report(&report, None, 30, at).changed);
-        }
         let hello = ControlMessage::Hello2(Hello2 {
             proto_min: 2,
             proto_max: 2,
@@ -1779,11 +1769,51 @@ mod tests {
                 .lock()
                 .handle_control(PeerId::usb(5), 0, hello, &config, now());
         assert!(accepted.new_target.is_some());
-        act(accepted, &mut state, &links, &shared, &config, &supervisor).await;
+        act(accepted, state, &links, &shared, &config, &supervisor).await;
+    }
+
+    /// A new session's reports count from its own start: `act` starts
+    /// ABR's clean streak again, or a quick reconnect inherits the old
+    /// session's streak and steps up on its first clean report.
+    #[tokio::test]
+    async fn a_new_session_starts_the_abr_clean_streak_again() {
+        let mut state = loop_state();
+        state.abr = AbrController::new(20_000_000, true);
+        // 14.5 s clean: one more clean report would step up.
+        let t0 = Instant::now();
+        let mut report = ReceiverReport::default();
+        for tick in 0..30 {
+            report.frags_received += 500;
+            let at = t0 + Duration::from_millis(500 * tick);
+            assert!(!state.abr.on_report(&report, None, 30, at).changed);
+        }
+        accept_usb_session(&mut state).await;
         report.frags_received += 500;
         let at = t0 + Duration::from_secs(15);
         assert!(!state.abr.on_report(&report, None, 30, at).changed);
         assert_eq!(state.abr.current_bps(), 15_000_000);
+    }
+
+    /// `act` takes the USB tunnel's drops as the session starts: drops
+    /// before its first report and again before the second step down. From
+    /// the first report on, only the second counted. (The count is
+    /// process-wide and other tests add to it; these are far above it.)
+    #[tokio::test]
+    async fn a_new_usb_session_counts_tunnel_drops_from_its_start() {
+        let mut state = loop_state();
+        state.abr = AbrController::new(20_000_000, true);
+        accept_usb_session(&mut state).await;
+        let t0 = Instant::now();
+        let mut report = ReceiverReport::default();
+        let mut changes = Vec::new();
+        for (tick, drops) in [u64::MAX - 1, u64::MAX].into_iter().enumerate() {
+            report.frags_received += 500;
+            let at = t0 + Duration::from_millis(500 * tick as u64);
+            if state.abr.on_report(&report, Some(drops), 30, at).changed {
+                changes.push(state.abr.current_bps());
+            }
+        }
+        assert_eq!(changes, [12_000_000]);
     }
 
     /// Review r2: the USB tunnel's control queue takes 64 datagrams and

@@ -73,6 +73,11 @@ pub struct AbrController {
     encoder_reopens: bool,
     /// The wait before a step up while it does.
     reopen_up_cooldown: Duration,
+    /// The latest step up is a probe a step down undoes: no session on
+    /// another link started since.
+    probe_pending: bool,
+    /// Whether the current session is over USB, once one started.
+    session_usb: Option<bool>,
 }
 
 impl AbrController {
@@ -98,6 +103,8 @@ impl AbrController {
             tunnel_drop_history: 0,
             encoder_reopens: false,
             reopen_up_cooldown: REOPEN_UP_COOLDOWN,
+            probe_pending: false,
+            session_usb: None,
         }
     }
 
@@ -122,10 +129,11 @@ impl AbrController {
     /// A step down at `now`. One soon after a step up undoes that probe:
     /// the next probe waits twice as long, while the encoder reopens.
     fn note_down(&mut self, now: Instant) {
-        let undoes_probe = matches!(
-            self.last_change,
-            Some((when, false)) if now.duration_since(when) < PROBE_HOLDS
-        );
+        let undoes_probe = self.probe_pending
+            && matches!(
+                self.last_change,
+                Some((when, false)) if now.duration_since(when) < PROBE_HOLDS
+            );
         if undoes_probe && self.encoder_reopens {
             self.reopen_up_cooldown = (self.reopen_up_cooldown * 2).min(REOPEN_UP_COOLDOWN_MAX);
         }
@@ -321,6 +329,7 @@ impl AbrController {
                     );
                     self.current_bps = target;
                     self.last_change = Some((now, false));
+                    self.probe_pending = true;
                     self.clean_since = Some(now);
                     return AbrDecision {
                         target_bps: target,
@@ -337,12 +346,25 @@ impl AbrController {
 
     /// A new client session started. Its reports count from its own start,
     /// and the old session's clean streak and tunnel drops say nothing about
-    /// it: they start again, as at a new stream epoch. The bitrate stays.
-    pub fn new_session(&mut self) {
+    /// it: they start again, as at a new stream epoch. `tunnel_drops` is the
+    /// USB tunnel's cumulative drops as it starts, or `None` on WiFi: its
+    /// first report counts the drops since then, not since that report.
+    ///
+    /// The bitrate and the wait after the last change stay. On another link
+    /// than the last session's, the probe backoff starts again too: what
+    /// failed on WiFi says nothing about the cable, and a step down there
+    /// does not undo a probe made on WiFi. On the same link it stays, or a
+    /// link that keeps reconnecting would probe every 30 s again.
+    pub fn new_session(&mut self, tunnel_drops: Option<u64>) {
         self.prev_cumulative = None;
         self.clean_since = None;
-        self.prev_tunnel_drops = None;
+        self.prev_tunnel_drops = tunnel_drops;
         self.tunnel_drop_history = 0;
+        let usb = tunnel_drops.is_some();
+        if self.session_usb.replace(usb).is_some_and(|was| was != usb) {
+            self.reopen_up_cooldown = REOPEN_UP_COOLDOWN;
+            self.probe_pending = false;
+        }
     }
 
     /// The system had no buffer space for a datagram: one rung down at
@@ -1203,7 +1225,7 @@ mod tests {
             let all = |_| (SENT, true);
             let old = half_second_reports(&mut abr, t0, &mut r, usb, 1..29, all, |_| 0);
             assert!(old.is_empty());
-            abr.new_session();
+            abr.new_session(usb.then_some(0));
             assert_eq!(abr.current_bps(), 12_000_000, "usb: {usb}");
             // The new session's first report has none of its frames yet.
             let mut r = ReceiverReport::default();
@@ -1236,5 +1258,100 @@ mod tests {
             }
         }
         assert_eq!(changes, [(20_500, 20_000_000)]);
+    }
+
+    /// Feeds one report a second over USB from `from` to `to` (in s from
+    /// `t0`), counters continuing from `counter`, the tunnel's cumulative
+    /// drops by second from `drops`. The changes, as (second, target).
+    fn usb_reports(
+        abr: &mut AbrController,
+        t0: Instant,
+        counter: &mut u32,
+        seconds: std::ops::Range<u64>,
+        drops: impl Fn(u64) -> u64,
+    ) -> Vec<(u64, u32)> {
+        let mut changes = Vec::new();
+        for second in seconds {
+            *counter += 1_000;
+            let at = t0 + Duration::from_secs(second);
+            let d = abr.on_report(&report(*counter, 0, 0), Some(drops(second)), SENT, at);
+            if d.changed {
+                changes.push((second, d.target_bps));
+            }
+        }
+        changes
+    }
+
+    /// A probe failed on WiFi doubles the wait to 60 s. A session on the
+    /// cable starts it again at 30 s after the last change; one on WiFi
+    /// again keeps it.
+    #[test]
+    fn a_session_on_another_link_starts_the_probe_backoff_again() {
+        for (usb, up_at) in [(true, 62), (false, 92)] {
+            let mut abr = AbrController::new(50_000_000, true);
+            abr.encoder_reopens(true);
+            abr.new_session(None);
+            let t0 = Instant::now();
+            let at = |s: u64| t0 + Duration::from_secs(s);
+            // Down at 0 s, a probe up at 30 s, undone at 32 s.
+            assert!(
+                abr.on_report(&report(980, 30, 0), None, SENT, at(0))
+                    .changed
+            );
+            let mut counter = 980;
+            let ups = clean_reports(&mut abr, t0, &mut counter, 1..31);
+            assert_eq!(ups, [(30, 15_000_000)]);
+            counter += 900;
+            assert!(
+                abr.on_report(&report(counter, 60, 0), None, SENT, at(32))
+                    .changed
+            );
+            abr.new_session(usb.then_some(0));
+            let ups = if usb {
+                usb_reports(&mut abr, t0, &mut counter, 33..100, |_| 0)
+            } else {
+                clean_reports(&mut abr, t0, &mut counter, 33..100)
+            };
+            assert_eq!(ups[0], (up_at, 15_000_000), "usb: {usb}");
+        }
+    }
+
+    /// A probe made on WiFi, then a session on the cable that steps down
+    /// within 30 s of it: that step down did not undo the probe, so the
+    /// next waits 30 s, not 60.
+    #[test]
+    fn a_step_down_on_another_link_does_not_undo_the_probe() {
+        let mut abr = AbrController::new(50_000_000, true);
+        abr.encoder_reopens(true);
+        abr.new_session(None);
+        let t0 = Instant::now();
+        assert!(abr.on_report(&report(980, 30, 0), None, SENT, t0).changed);
+        let mut counter = 980;
+        let ups = clean_reports(&mut abr, t0, &mut counter, 1..31);
+        assert_eq!(ups, [(30, 15_000_000)]);
+        abr.new_session(Some(0));
+        // The tunnel drops frames at 32 s and 33 s: down at 33 s.
+        let drops = |second: u64| match second {
+            ..32 => 0,
+            32 => 5,
+            _ => 10,
+        };
+        let changes = usb_reports(&mut abr, t0, &mut counter, 31..90, drops);
+        assert_eq!(changes, [(33, 12_000_000), (63, 15_000_000)]);
+    }
+
+    /// The tunnel drops frames between the session starting and the iPad's
+    /// first report, and again before the next: two of its first two
+    /// reports dropped frames, so it steps down. Counted from the first
+    /// report instead, only the second did.
+    #[test]
+    fn a_new_usb_session_counts_tunnel_drops_from_its_start() {
+        let mut abr = AbrController::new(20_000_000, true);
+        let t0 = Instant::now();
+        abr.new_session(Some(100));
+        let mut counter = 0;
+        let drops = |second: u64| if second == 0 { 105 } else { 110 };
+        let changes = usb_reports(&mut abr, t0, &mut counter, 0..3, drops);
+        assert_eq!(changes, [(1, 12_000_000)]);
     }
 }
