@@ -2,6 +2,7 @@
 //! receiver report. The transport applies the returned target through the
 //! encoder-reconfigure path; this module never touches sockets or encoders.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use eternal_wire::v2::control::ReceiverReport;
@@ -35,6 +36,11 @@ const REPORT_STALE_AFTER: Duration = Duration::from_secs(2);
 const LOSS_DOWN_ONE: f64 = 0.02;
 const LOSS_DOWN_TWO: f64 = 0.10;
 const LOSS_CLEAN: f64 = 0.005;
+const JITTER_DOWN_US: u32 = 15_000;
+
+/// Keep recent frame peaks so a receiver report can name a frame that
+/// the sender has already moved past.
+const SEND_JITTER_FRAMES: usize = 256;
 
 /// Over USB: step down when the tunnel dropped frames in this many of the
 /// last three reports.
@@ -48,6 +54,51 @@ const TUNNEL_DROPS_TO_STEP: u32 = 2;
 /// sends about one a second, so a lone frame on its way is that, not a
 /// link losing frames.
 const STILL_FRAMES_SENT: u32 = 1;
+
+#[derive(Default)]
+struct SendJitter {
+    epoch: Option<u32>,
+    previous_transit_us: Option<u64>,
+    jitter_us: f64,
+    frame_peaks: VecDeque<(u32, u32)>,
+}
+
+impl SendJitter {
+    fn record(&mut self, epoch: u32, seq: u32, capture_us: u64, send_us: u64) {
+        if self.epoch != Some(epoch) {
+            *self = Self {
+                epoch: Some(epoch),
+                ..Self::default()
+            };
+        }
+        let transit_us = send_us.saturating_sub(capture_us);
+        if let Some(previous) = self.previous_transit_us.replace(transit_us) {
+            let delta_us = transit_us.abs_diff(previous) as f64;
+            self.jitter_us += (delta_us - self.jitter_us) / 16.0;
+        }
+        let jitter_us = self.jitter_us as u32;
+        if let Some((frame, peak)) = self.frame_peaks.back_mut() {
+            if *frame == seq {
+                *peak = (*peak).max(jitter_us);
+                return;
+            }
+        }
+        if self.frame_peaks.len() == SEND_JITTER_FRAMES {
+            self.frame_peaks.pop_front();
+        }
+        self.frame_peaks.push_back((seq, jitter_us));
+    }
+
+    fn peak_at(&self, epoch: u32, seq: u32) -> Option<u32> {
+        if self.epoch != Some(epoch) {
+            return None;
+        }
+        self.frame_peaks
+            .iter()
+            .rev()
+            .find_map(|&(frame, peak)| (frame == seq).then_some(peak))
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AbrDecision {
@@ -63,6 +114,7 @@ pub struct AbrController {
     clean_since: Option<Instant>,
     last_report_at: Option<Instant>,
     prev_cumulative: Option<ReceiverReport>,
+    send_jitter: SendJitter,
     /// The USB tunnel's cumulative dropped frames at the previous report.
     prev_tunnel_drops: Option<u64>,
     /// Whether the tunnel dropped frames in each of the latest reports,
@@ -99,6 +151,7 @@ impl AbrController {
             clean_since: None,
             last_report_at: None,
             prev_cumulative: None,
+            send_jitter: SendJitter::default(),
             prev_tunnel_drops: None,
             tunnel_drop_history: 0,
             encoder_reopens: false,
@@ -153,6 +206,20 @@ impl AbrController {
 
     pub fn current_bps(&self) -> u32 {
         self.current_bps
+    }
+
+    /// Feed each original video datagram as it leaves WiFi pacing. The
+    /// iPad uses the same RFC 3550 filter and skips repairs.
+    pub(super) fn note_udp_fragment_sent(
+        &mut self,
+        epoch: u32,
+        seq: u32,
+        capture_us: u64,
+        send_us: u64,
+    ) {
+        if self.enabled {
+            self.send_jitter.record(epoch, seq, capture_us, send_us);
+        }
     }
 
     /// The user moved the ceiling: re-clamp immediately.
@@ -240,7 +307,19 @@ impl AbrController {
         self.last_report_at = Some(now);
 
         let total = u64::from(delta_received) + u64::from(delta_lost) + u64::from(delta_repaired);
-        let jitter_high = tunnel_drops.is_none() && report.jitter_us > 15_000;
+        // The report can sample any fragment of its highest frame, so
+        // compare to that frame's send jitter peak. With the same packet
+        // history, the triangle inequality makes the excess a lower
+        // bound on path jitter. Loss or reordering can change that history.
+        // A report without new originals repeats an earlier jitter sample.
+        let send_jitter_us = if tunnel_drops.is_none() && delta_received > 0 {
+            self.send_jitter
+                .peak_at(report.stream_epoch, report.highest_seq)
+        } else {
+            None
+        };
+        let jitter_high = send_jitter_us
+            .is_some_and(|sent| report.jitter_us.saturating_sub(sent) > JITTER_DOWN_US);
         let (loss, repairs, congested_queue, tunnel_lossy) = match tunnel_drops {
             Some(drops) => {
                 let dropped = self.prev_tunnel_drops.is_some_and(|prev| drops > prev);
@@ -286,6 +365,7 @@ impl AbrController {
                         loss_pct = format!("{:.1}", loss * 100.0),
                         repair_pct = format!("{:.1}", repairs * 100.0),
                         jitter_us = report.jitter_us,
+                        ?send_jitter_us,
                         "ABR stepping bitrate down"
                     );
                     self.current_bps = target;
@@ -357,6 +437,7 @@ impl AbrController {
     /// link that keeps reconnecting would probe every 30 s again.
     pub fn new_session(&mut self, tunnel_drops: Option<u64>) {
         self.prev_cumulative = None;
+        self.send_jitter = SendJitter::default();
         self.clean_since = None;
         self.prev_tunnel_drops = tunnel_drops;
         self.tunnel_drop_history = 0;
@@ -431,6 +512,33 @@ fn step(from: u32, rungs: i32, ceiling: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use eternal_wire::reassembly::Reassembler;
+    use eternal_wire::v2::media::MediaHeader;
+
+    #[test]
+    fn send_jitter_tracks_paced_fragments_and_keeps_each_frames_peak() {
+        let mut jitter = SendJitter::default();
+        jitter.record(1, 1, 0, 36_000);
+        assert_eq!(jitter.peak_at(1, 1), Some(0));
+        jitter.record(1, 1, 0, 68_000);
+        jitter.record(1, 1, 0, 68_000);
+        jitter.record(1, 2, 42_000, 110_000);
+        assert_eq!(jitter.peak_at(1, 1), Some(2_000));
+        assert_eq!(jitter.peak_at(1, 2), Some(1_757));
+    }
+
+    #[test]
+    fn send_jitter_discards_old_frames_and_starts_fresh_each_epoch() {
+        let mut jitter = SendJitter::default();
+        for seq in 1..=SEND_JITTER_FRAMES as u32 + 1 {
+            jitter.record(1, seq, 0, u64::from(seq) * 32_000);
+        }
+        assert_eq!(jitter.peak_at(1, 1), None);
+        assert!(jitter.peak_at(1, 2).is_some());
+        jitter.record(2, 1, 0, 40_000);
+        assert_eq!(jitter.peak_at(1, 2), None);
+        assert_eq!(jitter.peak_at(2, 1), Some(0));
+    }
 
     /// Frames the PC sent between two reports: a moving picture's, more
     /// than a still screen's.
@@ -580,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn repairs_and_jitter_step_down_before_unrecovered_loss() {
+    fn repairs_step_down_before_unrecovered_loss() {
         let now = Instant::now();
         let mut abr = AbrController::new(50_000_000, true);
         let mut r = ReceiverReport {
@@ -595,19 +703,12 @@ mod tests {
             !abr.on_report(&r, None, SENT, now + Duration::from_secs(1))
                 .changed
         );
-        r.frags_received += 1000;
-        r.jitter_us = 15_001;
-        assert_eq!(
-            abr.on_report(&r, None, SENT, now + Duration::from_secs(3))
-                .target_bps,
-            10_000_000
-        );
         r.frags_received += 850;
         r.frags_lost += 150;
         assert_eq!(
-            abr.on_report(&r, None, SENT, now + Duration::from_secs(6))
+            abr.on_report(&r, None, SENT, now + Duration::from_secs(3))
                 .target_bps,
-            6_000_000
+            8_000_000
         );
     }
 
@@ -1093,20 +1194,80 @@ mod tests {
         assert_eq!(changes, [(15_000, 20_000_000)]);
     }
 
-    /// Over WiFi the same jitter still steps down, a rung per cooldown.
-    #[test]
-    fn wifi_jitter_still_steps_down() {
+    /// Send one fragment per frame, with sender and receiver clocks running
+    /// independently up to each half-second report. In-flight frames have
+    /// been stamped by the host but are absent from that report.
+    fn wifi_jitter_reports(
+        ticks: u64,
+        encode_us: impl Fn(u32) -> u64,
+        network_us: impl Fn(u32) -> u64,
+    ) -> Vec<(u64, u32)> {
         let mut abr = AbrController::new(20_000_000, true);
-        let mut r = ReceiverReport::default();
-        let changes = half_second_reports(
-            &mut abr,
-            Instant::now(),
-            &mut r,
-            false,
-            0..20,
-            |_| (SENT, true),
-            encode_jitter,
-        );
+        let mut ipad = Reassembler::new();
+        let t0 = Instant::now();
+        let mut sent = 0;
+        let mut arrived = 0;
+        let mut changes = Vec::new();
+        let capture_us = |seq: u32| u64::from(seq - 1) * 42_000;
+        let send_us = |seq| capture_us(seq) + encode_us(seq);
+        let arrive_us = |seq| send_us(seq) + network_us(seq);
+        for tick in 0..ticks {
+            let report_us = 1_000_000 + 500_000 * tick;
+            let prev_sent = sent;
+            while send_us(sent + 1) <= report_us {
+                sent += 1;
+                abr.note_udp_fragment_sent(1, sent, capture_us(sent), send_us(sent));
+            }
+            while arrive_us(arrived + 1) <= report_us {
+                arrived += 1;
+                let header = MediaHeader {
+                    session_id: 1,
+                    stream_epoch: 1,
+                    frame_seq: arrived,
+                    frag_index: 0,
+                    frag_count: 1,
+                    is_keyframe: arrived == 1,
+                    is_retransmit: false,
+                    capture_ts_us: capture_us(arrived),
+                    payload_len: 1,
+                };
+                ipad.add_media(header, &[0], t0 + Duration::from_micros(arrive_us(arrived)));
+            }
+            let counters = ipad.counters();
+            assert_eq!(counters.frames_complete, u64::from(arrived));
+            assert!(counters.jitter_us > JITTER_DOWN_US);
+            let report = ReceiverReport {
+                stream_epoch: counters.stream_epoch,
+                highest_seq: counters.highest_seq,
+                frags_received: counters.frags_received as u32,
+                frags_lost: counters.frags_lost as u32,
+                jitter_us: counters.jitter_us,
+                ..Default::default()
+            };
+            let d = abr.on_report(
+                &report,
+                None,
+                sent - prev_sent,
+                t0 + Duration::from_micros(report_us),
+            );
+            if d.changed {
+                changes.push((500 * tick, d.target_bps));
+            }
+        }
+        changes
+    }
+
+    #[test]
+    fn a_slow_variable_encoder_on_clean_wifi_holds_then_steps_up() {
+        let changes =
+            wifi_jitter_reports(60, |seq| 36_000 + u64::from(seq % 2) * 29_000, |_| 20_000);
+        assert_eq!(changes, [(15_000, 20_000_000)]);
+    }
+
+    #[test]
+    fn network_jitter_on_wifi_still_steps_down() {
+        let changes =
+            wifi_jitter_reports(20, |_| 36_000, |seq| 10_000 + u64::from(seq % 2) * 30_000);
         assert_eq!(
             changes,
             [
@@ -1116,6 +1277,22 @@ mod tests {
                 (9_000, 6_000_000)
             ]
         );
+    }
+
+    #[test]
+    fn wifi_jitter_does_not_step_down_again_when_no_new_fragments_arrive() {
+        let mut abr = AbrController::new(20_000_000, true);
+        let t0 = Instant::now();
+        abr.note_udp_fragment_sent(1, 1, 0, 36_000);
+        let r = ReceiverReport {
+            stream_epoch: 1,
+            highest_seq: 1,
+            frags_received: 1,
+            jitter_us: 30_000,
+            ..Default::default()
+        };
+        assert_eq!(abr.on_report(&r, None, 1, t0).target_bps, 12_000_000);
+        assert!(!abr.on_report(&r, None, 0, t0 + DOWN_COOLDOWN).changed);
     }
 
     /// A still screen sends about a frame a second, so every other report

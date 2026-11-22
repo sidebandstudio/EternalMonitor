@@ -721,6 +721,8 @@ pub async fn start_sender(
                 }
 
                 let mut frame_pacer = FramePacer::new(frag_count_usize, Instant::now());
+                let wifi = target_addr.link == LinkId::Udp;
+                let inject_faults = wifi && state.fault.enabled();
                 let mut backed_off = false;
                 for datagram in &stored {
                     // A busy machine can exhaust the pacing budget mid-frame.
@@ -736,12 +738,23 @@ pub async fn start_sender(
                         }
                         _ => {}
                     };
-                    if target_addr.link == LinkId::Udp && state.fault.enabled() {
+                    if inject_faults {
+                        // The fault injector stands in for the network.
+                        state.abr.note_udp_fragment_sent(
+                            stream_epoch, frame_seq, capture_ts_us, crate::clock::host_now_us(),
+                        );
                         for due in state.fault.push(datagram, Instant::now()) {
                             note(links.send_to(&due, target_addr).await);
                         }
                     } else {
-                        note(links.send_to(datagram, target_addr).await);
+                        let sent = links.send_to(datagram, target_addr).await;
+                        if wifi && sent.is_ok() {
+                            // The socket accepted the datagram after pacing and any wait to send.
+                            state.abr.note_udp_fragment_sent(
+                                stream_epoch, frame_seq, capture_ts_us, crate::clock::host_now_us(),
+                            );
+                        }
+                        note(sent);
                     }
                     // The system had no buffer space for it. A frame backs
                     // off once and sends it again; a refusal after that gives
@@ -756,7 +769,7 @@ pub async fn start_sender(
 
                     let paced = frame_pacer.after_send(Instant::now());
                     let pause = if refused { congestion::BACKOFF } else { paced };
-                    if target_addr.link == LinkId::Udp && pause > Duration::ZERO {
+                    if wifi && pause > Duration::ZERO {
                         let repairs = repair_while_pacing(&links, &mut state, &shared, &config, &supervisor,
                             pacing_clock.until(Instant::now() + pause), &mut deferred_control);
                         tokio::pin!(repairs);
@@ -772,6 +785,11 @@ pub async fn start_sender(
                     }
                     if refused {
                         match links.send_to(datagram, target_addr).await {
+                            Ok(()) if wifi && !inject_faults => {
+                                state.abr.note_udp_fragment_sent(
+                                    stream_epoch, frame_seq, capture_ts_us, crate::clock::host_now_us(),
+                                );
+                            }
                             Err(e) if congestion::is_no_buffer_space(&e) => break,
                             Err(e) if !send_failed => {
                                 log_send_failed(target_addr.link, &e);
