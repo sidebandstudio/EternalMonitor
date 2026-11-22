@@ -3,7 +3,8 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::Command;
 use std::slice;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
@@ -17,7 +18,7 @@ use eternal_wire::h264::{
 use crate::capture::{FrameSlot, RawFrame, Taken};
 use crate::control::SharedControl;
 use crate::gpu::{GpuInfo, GpuVendor};
-use crate::stats::PIPELINE_STATS;
+use crate::stats::{PipelineStats, PIPELINE_STATS};
 
 pub mod input;
 use input::{select_input, EncoderInput};
@@ -367,6 +368,8 @@ fn run_encode_loop(
                 &mut input_mode,
                 first_open(&desired_encoder, picture_by),
                 &mut opening,
+                generation,
+                &shared.running,
             ) {
                 Ok(state) => {
                     encoder_state = Some(state);
@@ -398,6 +401,8 @@ fn run_encode_loop(
                         &mut input_mode,
                         Opening::First,
                         &mut opening,
+                        generation,
+                        &shared.running,
                     )?;
                     stall_recovery.outwaited(&desired_encoder, "libx264", Instant::now());
                     background = Some(Behind::first(open, desired_bitrate));
@@ -444,6 +449,8 @@ fn run_encode_loop(
                                 &mut input_mode,
                                 first_open(name, picture_by),
                                 &mut opening,
+                                generation,
+                                &shared.running,
                             );
                             if let Err(error) = &opened {
                                 if let Some(open) = take_still_opening(error.as_ref()) {
@@ -508,6 +515,8 @@ fn run_encode_loop(
                         behind.open.encoder(),
                         behind.open.args.size,
                         error.as_ref(),
+                        generation,
+                        &shared.running,
                     );
                 }
                 Some((result, behind.reopen))
@@ -585,6 +594,8 @@ fn run_encode_loop(
                     &mut input_mode,
                     how,
                     &mut opening,
+                    generation,
+                    &shared.running,
                 ) {
                     Err(e) if is_still_opening(e.as_ref()) => {
                         let open = take_still_opening(e.as_ref()).expect("the open going on");
@@ -1234,9 +1245,11 @@ impl EncoderState {
         let encoder = match result {
             Ok(Ok(encoder)) => encoder,
             Ok(Err(error)) => {
-                note_nvidia_driver(encoder_name, error);
                 let code: i32 = error.into();
-                return Err(format!("{encoder_name} open failed: FFmpeg code={code} error={error}; {width}x{height} input={pixel_format:?} bitrate={bitrate_bps} fps={target_fps}").into());
+                return Err(Box::new(EncoderOpenError {
+                    error,
+                    message: format!("{encoder_name} open failed: FFmpeg code={code} error={error}; {width}x{height} input={pixel_format:?} bitrate={bitrate_bps} fps={target_fps}"),
+                }));
             }
             Err(stall) => {
                 return Err(Box::new(OpenStalled(format!("{encoder_name} open failed: {stall}; {width}x{height} input={pixel_format:?} bitrate={bitrate_bps} fps={target_fps}"))));
@@ -1830,7 +1843,7 @@ pub enum NvidiaDriverUpdate {
 }
 
 impl NvidiaDriverUpdate {
-    fn from_compute_capability(major: Option<i32>) -> Self {
+    pub(crate) fn from_compute_capability(major: Option<i32>) -> Self {
         match major {
             Some(5..) => Self::Supported,
             Some(1..=3) => Self::Unsupported,
@@ -1848,44 +1861,108 @@ fn nvidia_release(windows_version: u64) -> u32 {
     (third % 10) * 10_000 + fourth
 }
 
+/// An NVENC open failure that might come from an old driver or card.
+fn nvidia_driver_errno(encoder_name: &str, error: ffmpeg_next::Error) -> Option<i32> {
+    let ffmpeg_next::Error::Other { errno } = error else {
+        return None;
+    };
+    (encoder_name.ends_with("_nvenc") && matches!(errno, libc::ENOSYS | libc::EPERM))
+        .then_some(errno)
+}
+
 /// The driver release and update advice when NVENC refuses an old driver.
 /// FFmpeg also returns ENOSYS for unsupported parameters, so look up the
 /// installed versions before offering an update. On earlier cards FFmpeg can
 /// fail to load CUDA or NVENC with EPERM before it checks the version. In that
 /// case only a confirmed old card explains the fallback.
-fn nvidia_driver_issue(
-    encoder_name: &str,
-    error: ffmpeg_next::Error,
-    driver_versions: impl FnOnce() -> (Vec<u64>, Option<usize>),
-    compute_capability: impl FnOnce(usize) -> Option<i32>,
+fn nvidia_driver_issue<Adapter>(
+    errno: i32,
+    driver_versions: impl FnOnce() -> (Vec<u64>, Option<Vec<Adapter>>),
+    compute_capability: impl FnOnce(Vec<Adapter>) -> Option<i32>,
 ) -> Option<(u32, NvidiaDriverUpdate)> {
-    let ffmpeg_next::Error::Other { errno } = error else {
-        return None;
-    };
-    if !encoder_name.ends_with("_nvenc") || !matches!(errno, libc::ENOSYS | libc::EPERM) {
-        return None;
-    }
-    let (versions, adapter_count) = driver_versions();
+    let (versions, adapters) = driver_versions();
     let newest = versions.into_iter().map(nvidia_release).max()?;
     if newest >= NVENC_MIN_RELEASE {
         return None;
     }
-    let update =
-        NvidiaDriverUpdate::from_compute_capability(adapter_count.and_then(compute_capability));
+    let update = NvidiaDriverUpdate::from_compute_capability(adapters.and_then(compute_capability));
     (errno == libc::ENOSYS || update == NvidiaDriverUpdate::Unsupported).then_some((newest, update))
 }
 
-/// Record why an old NVIDIA driver or card could not encode video.
-fn note_nvidia_driver(encoder_name: &str, error: ffmpeg_next::Error) {
-    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let Some((driver, update)) = nvidia_driver_issue(
-        encoder_name,
-        error,
-        crate::gpu::nvidia_driver_versions,
-        crate::gpu::nvidia_compute_capability,
-    ) else {
+/// Start one diagnosis and let the encoder continue. If a driver call
+/// never returns, it occupies only this slot, which GPU detection does
+/// not use.
+fn spawn_nvidia_diagnosis(
+    in_flight: &'static AtomicBool,
+    diagnose: impl FnOnce() + Send + 'static,
+) -> Option<std::thread::JoinHandle<()>> {
+    struct InFlight(&'static AtomicBool);
+    impl Drop for InFlight {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::Release);
+        }
+    }
+
+    in_flight
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .ok()?;
+    let slot = InFlight(in_flight);
+    std::thread::Builder::new()
+        .name("nvenc-diagnosis".into())
+        .spawn(move || {
+            let _slot = slot;
+            diagnose();
+        })
+        .map_err(|error| debug!(%error, "Could not start NVIDIA driver diagnosis"))
+        .ok()
+}
+
+/// Diagnose an NVENC failure away from the encoder thread.
+fn note_nvidia_driver(
+    encoder_name: &str,
+    error: ffmpeg_next::Error,
+    generation: u64,
+    running: &Arc<AtomicBool>,
+) {
+    static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+    let Some(errno) = nvidia_driver_errno(encoder_name, error) else {
         return;
     };
+    let running = Arc::clone(running);
+    drop(spawn_nvidia_diagnosis(&IN_FLIGHT, move || {
+        let Some((driver, update)) = nvidia_driver_issue(
+            errno,
+            crate::gpu::nvidia_driver_versions,
+            crate::gpu::nvidia_compute_capability,
+        ) else {
+            return;
+        };
+        if publish_nvidia_diagnosis(&PIPELINE_STATS, update, || {
+            running.load(Ordering::SeqCst) && crate::supervisor::generation_is_current(generation)
+        }) {
+            log_nvidia_driver(driver, update);
+        }
+    }));
+}
+
+/// Check the generation while holding the lock that Stop takes to clear
+/// the stream.
+fn publish_nvidia_diagnosis(
+    stats: &parking_lot::Mutex<PipelineStats>,
+    update: NvidiaDriverUpdate,
+    current: impl FnOnce() -> bool,
+) -> bool {
+    let mut stats = stats.lock();
+    if !stats.pipeline_running || !current() {
+        return false;
+    }
+    stats.nvidia_driver_outdated = true;
+    stats.nvidia_driver_update = update;
+    true
+}
+
+fn log_nvidia_driver(driver: u32, update: NvidiaDriverUpdate) {
+    static LOGGED: AtomicBool = AtomicBool::new(false);
     if !LOGGED.swap(true, Ordering::Relaxed) {
         let message = match update {
             NvidiaDriverUpdate::Unsupported => {
@@ -1904,9 +1981,6 @@ fn note_nvidia_driver(encoder_name: &str, error: ffmpeg_next::Error) {
             "{message}"
         );
     }
-    let mut stats = PIPELINE_STATS.lock();
-    stats.nvidia_driver_outdated = true;
-    stats.nvidia_driver_update = update;
 }
 
 /// Hardware encoders that failed to open this launch, each at the encoded
@@ -2017,6 +2091,8 @@ fn open_session(
     input_mode: &mut EncoderInput,
     opening: Opening,
     progress: &mut dyn FnMut(),
+    generation: u64,
+    running: &Arc<AtomicBool>,
 ) -> Result<EncoderState, Box<dyn std::error::Error + Send + Sync>> {
     let size = encoded_size(capture_width, capture_height);
     if let Some(why) = failures.lock().earlier(encoder_name, size) {
@@ -2033,7 +2109,14 @@ fn open_session(
         progress,
     );
     if let Err(error) = &opened {
-        note_open_failure(failures, encoder_name, size, error.as_ref());
+        note_open_failure(
+            failures,
+            encoder_name,
+            size,
+            error.as_ref(),
+            generation,
+            running,
+        );
     }
     opened
 }
@@ -2045,6 +2128,8 @@ fn note_open_failure(
     encoder_name: &str,
     size: (u32, u32),
     error: &(dyn std::error::Error + Send + Sync + 'static),
+    generation: u64,
+    running: &Arc<AtomicBool>,
 ) {
     if is_open_stall(error) {
         return;
@@ -2055,7 +2140,25 @@ fn note_open_failure(
         failures.vendors.clone()
     };
     PIPELINE_STATS.lock().driver_update_vendors = vendors;
+    if let Some(error) = error.downcast_ref::<EncoderOpenError>() {
+        note_nvidia_driver(encoder_name, error.error, generation, running);
+    }
 }
+
+/// FFmpeg's open error, kept with the session details for diagnosis.
+#[derive(Debug)]
+struct EncoderOpenError {
+    error: ffmpeg_next::Error,
+    message: String,
+}
+
+impl std::fmt::Display for EncoderOpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for EncoderOpenError {}
 
 /// An encoder open that its time limit gave up on, or refused while an
 /// earlier one was stuck. The driver did not answer in time, which says
@@ -4177,9 +4280,8 @@ mod tests {
         let eperm = ffmpeg_next::Error::Other { errno: libc::EPERM };
         let outdated = |name: &str, error, drivers: &[u64]| {
             nvidia_driver_issue(
-                name,
-                error,
-                || (drivers.to_vec(), Some(drivers.len())),
+                nvidia_driver_errno(name, error)?,
+                || (drivers.to_vec(), Some(vec![(); drivers.len()])),
                 |_| None,
             )
         };
@@ -4205,17 +4307,9 @@ mod tests {
             None
         );
         // Other encoders' failures never read the NVIDIA drivers.
+        assert_eq!(nvidia_driver_errno("h264_amf", enosys), None);
         assert_eq!(
-            nvidia_driver_issue("h264_amf", enosys, || panic!("read"), |_| panic!("probe")),
-            None
-        );
-        assert_eq!(
-            nvidia_driver_issue(
-                "h264_nvenc",
-                ffmpeg_next::Error::External,
-                || panic!("read"),
-                |_| panic!("probe")
-            ),
+            nvidia_driver_errno("h264_nvenc", ffmpeg_next::Error::External),
             None
         );
     }
@@ -4224,9 +4318,8 @@ mod tests {
     fn a_confirmed_old_card_explains_a_failure_to_load_the_encoder() {
         let issue = |major| {
             nvidia_driver_issue(
-                "h264_nvenc",
-                ffmpeg_next::Error::Other { errno: libc::EPERM },
-                || (vec![12 << 16 | 5897], Some(1)),
+                libc::EPERM,
+                || (vec![12 << 16 | 5897], Some(vec![()])),
                 |_| major,
             )
         };
@@ -4236,6 +4329,61 @@ mod tests {
         );
         assert_eq!(issue(Some(5)), None);
         assert_eq!(issue(None), None);
+    }
+
+    #[test]
+    fn the_fallback_opens_while_the_nvidia_diagnosis_is_waiting_for_the_driver() {
+        use std::sync::mpsc::channel;
+        const WAIT: Duration = Duration::from_secs(5);
+        static IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+        let (release, held) = channel();
+        let (started, probing) = channel();
+        let (fell_back, fallback) = channel();
+        let encoder = std::thread::spawn(move || {
+            let diagnosis = spawn_nvidia_diagnosis(&IN_FLIGHT, move || {
+                started.send(()).unwrap();
+                let _ = held.recv();
+            })
+            .expect("first diagnosis");
+            let (name, ()) = open_remaining_encoders(
+                ("h264_nvenc", "failed to open"),
+                || Some(vec![GpuVendor::Nvidia, GpuVendor::Intel]),
+                |name| match name {
+                    "h264_qsv" => Ok(()),
+                    _ => Err("device unavailable".into()),
+                },
+            )
+            .unwrap();
+            fell_back.send(name).unwrap();
+            diagnosis.join().unwrap();
+        });
+        probing.recv_timeout(WAIT).unwrap();
+        assert_eq!(fallback.recv_timeout(WAIT).unwrap(), "h264_qsv");
+        assert!(spawn_nvidia_diagnosis(&IN_FLIGHT, || panic!("second diagnosis")).is_none());
+        release.send(()).unwrap();
+        encoder.join().unwrap();
+        spawn_nvidia_diagnosis(&IN_FLIGHT, || {})
+            .expect("later diagnosis")
+            .join()
+            .unwrap();
+    }
+
+    #[test]
+    fn an_nvidia_diagnosis_that_returns_after_stop_or_restart_is_ignored() {
+        use NvidiaDriverUpdate::{Unknown, Unsupported};
+        let stats = parking_lot::Mutex::new(PipelineStats::default());
+        assert!(!publish_nvidia_diagnosis(&stats, Unsupported, || true));
+        stats.lock().mark_pipeline_started();
+        assert!(!publish_nvidia_diagnosis(&stats, Unsupported, || false));
+        assert!(!stats.lock().nvidia_driver_outdated);
+        assert_eq!(stats.lock().nvidia_driver_update, Unknown);
+        assert!(publish_nvidia_diagnosis(&stats, Unsupported, || {
+            assert!(stats.try_lock().is_none());
+            true
+        }));
+        assert!(stats.lock().nvidia_driver_outdated);
+        assert_eq!(stats.lock().nvidia_driver_update, Unsupported);
     }
 
     #[test]
@@ -5763,6 +5911,8 @@ mod tests {
                     &mut EncoderInput::Yuv420,
                     Opening::First,
                     &mut || {},
+                    0,
+                    &Arc::new(AtomicBool::new(false)),
                 )
                 .err()
                 .map(|error| error.to_string())
@@ -5804,6 +5954,8 @@ mod tests {
             &mut EncoderInput::Yuv420,
             Opening::First,
             &mut || {},
+            0,
+            &Arc::new(AtomicBool::new(false)),
         )
         .is_ok());
         *failures.lock() = LaunchFailures::default();

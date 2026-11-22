@@ -105,8 +105,8 @@ impl AnalyzerApp {
         }
         if snap.using_software_fallback {
             // Choices made while troubleshooting are the usual reason a
-            // working graphics card is skipped, so offer to undo them first,
-            // unless the driver did not answer at startup: then Restart.
+            // working graphics card is skipped. The notice chooses an action
+            // based on what we know about the fallback.
             let customized = !snap.gpu_detection_stalled
                 && (self.settings_encoder_choice != ENCODER_AUTO_LABEL
                     || self.settings_encoder_input
@@ -125,7 +125,7 @@ impl AnalyzerApp {
                 Icon::Warning,
                 SOFTWARE_FALLBACK_TITLE,
                 &notice.body,
-                if customized {
+                if notice.offer_recommended_settings {
                     230.0
                 } else if notice.offer_restart {
                     110.0
@@ -133,7 +133,7 @@ impl AnalyzerApp {
                     0.0
                 },
                 |ui| {
-                    if customized {
+                    if notice.offer_recommended_settings {
                         reset =
                             widgets::button(ui, Tone::Primary, None, "Use recommended settings")
                                 .clicked();
@@ -904,11 +904,8 @@ enum HeaderAction {
 pub(super) const SOFTWARE_FALLBACK_TITLE: &str =
     "Video is using the processor instead of the graphics card";
 
-/// What the CPU fallback notice says: that the graphics driver did not
-/// answer at startup, undo custom settings first, say the NVIDIA driver is
-/// too old when that is what the graphics card refused, name the AMD or
-/// Intel driver whose card could not start encoding (`driver_vendors`), or
-/// suggest a driver update.
+/// Explain the CPU fallback. A driver that stalled at startup or a confirmed
+/// old NVIDIA card takes priority over the custom settings explanation.
 pub(super) fn software_fallback_notice(
     customized: bool,
     nvidia_driver_update: Option<NvidiaDriverUpdate>,
@@ -920,6 +917,8 @@ pub(super) fn software_fallback_notice(
     let intel = driver_vendors.contains(&Intel);
     let body = if detection_stalled {
         "The graphics driver did not respond when EternalMonitor started, so the processor encodes the video for now. The picture may lag and the PC may run hot. Click Restart to try the graphics card again.".to_string()
+    } else if nvidia_driver_update == Some(NvidiaDriverUpdate::Unsupported) {
+        return outdated_nvidia_driver_notice(NvidiaDriverUpdate::Unsupported, true);
     } else if customized {
         "The graphics card could not encode video with the options chosen in Settings, so the picture may lag and the PC may run hot. Go back to the recommended options first.".to_string()
     } else if let Some(update) = nvidia_driver_update {
@@ -937,6 +936,7 @@ pub(super) fn software_fallback_notice(
     EncoderNotice {
         body,
         offer_restart: !customized || detection_stalled,
+        offer_recommended_settings: customized && !detection_stalled,
     }
 }
 
@@ -944,6 +944,7 @@ pub(super) fn software_fallback_notice(
 pub(super) struct EncoderNotice {
     pub(super) body: String,
     pub(super) offer_restart: bool,
+    pub(super) offer_recommended_settings: bool,
 }
 
 /// What the Stream page says after NVIDIA's driver is refused and another
@@ -963,6 +964,7 @@ fn outdated_nvidia_driver_notice(
                 "The NVIDIA graphics card on this PC is too old to encode video. {effect}"
             ),
             offer_restart: false,
+            offer_recommended_settings: false,
         };
     }
     let (effect, fallback) = if using_software_fallback {
@@ -987,6 +989,7 @@ fn outdated_nvidia_driver_notice(
     EncoderNotice {
         body,
         offer_restart: true,
+        offer_recommended_settings: false,
     }
 }
 

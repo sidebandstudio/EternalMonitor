@@ -47,5 +47,7 @@ pub mod gpu;
 #[cfg(not(windows))]
 #[path = "gpu_other.rs"]
 pub mod gpu;
+#[cfg(any(windows, test))]
+mod gpu_identity;
 
 pub mod telemetry;

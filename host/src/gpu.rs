@@ -1,9 +1,11 @@
 use tracing::{info, warn};
 use windows::core::Interface;
+use windows::Win32::Foundation::LUID;
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, DXGI_ERROR_NOT_FOUND,
 };
 
+use crate::gpu_identity::{matched_compute_capability, PciAddress};
 use crate::stall::Call;
 
 const VENDOR_NVIDIA: u32 = 0x10DE;
@@ -169,14 +171,14 @@ fn vendors_listed(
 
 /// Windows driver versions of the NVIDIA adapters, packed as DXGI reports
 /// them (32.0.15.6607). Read when NVENC refuses to open, to tell an old
-/// driver from other refusals. Also returns the NVIDIA adapter count if
+/// driver from other refusals. Also returns the NVIDIA adapter LUIDs if
 /// DXGI listed and described every adapter.
-pub fn nvidia_driver_versions() -> (Vec<u64>, Option<usize>) {
+pub(crate) fn nvidia_driver_versions() -> (Vec<u64>, Option<Vec<LUID>>) {
     let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
         return (Vec::new(), None);
     };
     let mut versions = Vec::new();
-    let mut count = 0;
+    let mut adapters = Vec::new();
     let mut complete = true;
     for index in 0u32.. {
         let adapter = match unsafe { factory.EnumAdapters1(index) } {
@@ -190,33 +192,116 @@ pub fn nvidia_driver_versions() -> (Vec<u64>, Option<usize>) {
             complete = false;
             continue;
         };
-        if desc.VendorId != VENDOR_NVIDIA {
+        if desc.VendorId != VENDOR_NVIDIA || desc.Flags & FLAG_SOFTWARE != 0 {
             continue;
         }
-        count += 1;
+        adapters.push(desc.AdapterLuid);
         if let Ok(version) = unsafe {
             adapter.CheckInterfaceSupport(&windows::Win32::Graphics::Dxgi::IDXGIDevice::IID)
         } {
             versions.push(version as u64);
         }
     }
-    (versions, complete.then_some(count))
+    (versions, complete.then_some(adapters))
 }
 
-/// The newest CUDA compute capability major number among the NVIDIA cards.
-/// Give up if the driver stops answering or CUDA sees a different number of
-/// cards than DXGI. A partial list could miss a card that can be updated.
-pub fn nvidia_compute_capability(adapter_count: usize) -> Option<i32> {
-    crate::stall::run(
-        Call::GpuDetect,
-        move || cuda_capability(adapter_count),
-        || {},
-    )
-    .ok()
-    .flatten()
+/// The newest CUDA compute capability among the NVIDIA adapters DXGI listed.
+/// Both APIs must identify each card by its full PCI address.
+pub(crate) fn nvidia_compute_capability(adapters: Vec<LUID>) -> Option<i32> {
+    let addresses = adapters
+        .into_iter()
+        .map(adapter_pci_address)
+        .collect::<Option<Vec<_>>>()?;
+    matched_compute_capability(&addresses, &cuda_devices()?)
 }
 
-fn cuda_capability(adapter_count: usize) -> Option<i32> {
+/// Resolve the DXGI LUID to the adapter's device interface and read the
+/// location of the device that exposes it, including the PCI segment.
+fn adapter_pci_address(luid: LUID) -> Option<PciAddress> {
+    use std::mem::{size_of, size_of_val};
+    use windows::core::{HRESULT, PCWSTR};
+    use windows::Win32::Devices::DeviceAndDriverInstallation::{
+        CM_Get_DevNode_PropertyW, SetupDiCreateDeviceInfoList, SetupDiDestroyDeviceInfoList,
+        SetupDiGetDeviceInterfaceDetailW, SetupDiOpenDeviceInterfaceW, CR_SUCCESS,
+        SP_DEVICE_INTERFACE_DATA, SP_DEVINFO_DATA,
+    };
+    use windows::Win32::Devices::Display::{
+        DisplayConfigGetDeviceInfo, DISPLAYCONFIG_ADAPTER_NAME,
+        DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME,
+    };
+    use windows::Win32::Devices::Properties::{
+        DEVPKEY_Device_LocationInfo, DEVPROPTYPE, DEVPROP_TYPE_STRING,
+    };
+    use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HWND};
+
+    let mut adapter = DISPLAYCONFIG_ADAPTER_NAME::default();
+    adapter.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME;
+    adapter.header.size = size_of::<DISPLAYCONFIG_ADAPTER_NAME>() as u32;
+    adapter.header.adapterId = luid;
+    let packet = (&mut adapter as *mut DISPLAYCONFIG_ADAPTER_NAME).cast();
+    if unsafe { DisplayConfigGetDeviceInfo(packet) } != 0 || !adapter.adapterDevicePath.contains(&0)
+    {
+        return None;
+    }
+
+    let devices = unsafe { SetupDiCreateDeviceInfoList(None, HWND::default()) }.ok()?;
+    let devinst = (|| {
+        let mut interface = SP_DEVICE_INTERFACE_DATA {
+            cbSize: size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
+            ..Default::default()
+        };
+        unsafe {
+            SetupDiOpenDeviceInterfaceW(
+                devices,
+                PCWSTR(adapter.adapterDevicePath.as_ptr()),
+                0,
+                Some(&mut interface),
+            )
+        }
+        .ok()?;
+        let mut device = SP_DEVINFO_DATA {
+            cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
+            ..Default::default()
+        };
+        // SetupAPI fills the device record even without an interface detail buffer.
+        let mut required = 0;
+        let error = unsafe {
+            SetupDiGetDeviceInterfaceDetailW(
+                devices,
+                &interface,
+                None,
+                0,
+                Some(&mut required),
+                Some(&mut device),
+            )
+        }
+        .err()?;
+        (error.code() == HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0) && device.DevInst != 0)
+            .then_some(device.DevInst)
+    })();
+    let _ = unsafe { SetupDiDestroyDeviceInfoList(devices) };
+
+    let mut location = [0u16; 128];
+    let mut size = size_of_val(&location) as u32;
+    let mut kind = DEVPROPTYPE(0);
+    let status = unsafe {
+        CM_Get_DevNode_PropertyW(
+            devinst?,
+            &DEVPKEY_Device_LocationInfo,
+            &mut kind,
+            Some(location.as_mut_ptr().cast()),
+            &mut size,
+            0,
+        )
+    };
+    if status != CR_SUCCESS || kind != DEVPROP_TYPE_STRING || !size.is_multiple_of(2) {
+        return None;
+    }
+    let text = location.get(..size as usize / 2)?.strip_suffix(&[0])?;
+    PciAddress::from_windows_location(&String::from_utf16(text).ok()?)
+}
+
+fn cuda_devices() -> Option<Vec<(PciAddress, Option<i32>)>> {
     use windows::core::{s, w};
     use windows::Win32::Foundation::{FreeLibrary, HANDLE};
     use windows::Win32::System::LibraryLoader::{
@@ -242,28 +327,33 @@ fn cuda_capability(adapter_count: usize) -> Option<i32> {
             std::mem::transmute(GetProcAddress(module, s!("cuDeviceGetCount"))?);
         let get_device: unsafe extern "system" fn(*mut i32, i32) -> i32 =
             std::mem::transmute(GetProcAddress(module, s!("cuDeviceGet"))?);
+        let pci_bus_id: unsafe extern "system" fn(*mut std::ffi::c_char, i32, i32) -> i32 =
+            std::mem::transmute(GetProcAddress(module, s!("cuDeviceGetPCIBusId"))?);
         let capability: unsafe extern "system" fn(*mut i32, *mut i32, i32) -> i32 =
             std::mem::transmute(GetProcAddress(module, s!("cuDeviceComputeCapability"))?);
 
         let mut count = 0;
-        if init(0) != 0
-            || get_count(&mut count) != 0
-            || usize::try_from(count).ok()? != adapter_count
-        {
+        if init(0) != 0 || get_count(&mut count) != 0 || count <= 0 {
             return None;
         }
-        let mut newest = None;
+        let mut devices = Vec::new();
         for ordinal in 0..count {
             let (mut device, mut major, mut minor) = (0, 0, 0);
+            let mut id = [0u8; 32];
             if get_device(&mut device, ordinal) != 0
-                || capability(&mut major, &mut minor, device) != 0
-                || major <= 0
+                || pci_bus_id(id.as_mut_ptr().cast(), id.len() as i32, device) != 0
             {
                 return None;
             }
-            newest = newest.max(Some(major));
+            let id = std::ffi::CStr::from_bytes_until_nul(&id)
+                .ok()?
+                .to_str()
+                .ok()?;
+            let address = PciAddress::from_cuda_bus_id(id)?;
+            let major = (capability(&mut major, &mut minor, device) == 0).then_some(major);
+            devices.push((address, major));
         }
-        newest
+        Some(devices)
     };
 
     let result = probe();

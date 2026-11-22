@@ -84,12 +84,12 @@ pub fn take_late_detection() -> Option<GpuInfo> {
 }
 
 /// No NVIDIA drivers to read outside Windows.
-pub fn nvidia_driver_versions() -> (Vec<u64>, Option<usize>) {
+pub(crate) fn nvidia_driver_versions() -> (Vec<u64>, Option<Vec<()>>) {
     (Vec::new(), None)
 }
 
 /// No NVIDIA cards to query outside Windows.
-pub fn nvidia_compute_capability(_adapter_count: usize) -> Option<i32> {
+pub(crate) fn nvidia_compute_capability(_adapters: Vec<()>) -> Option<i32> {
     None
 }
 

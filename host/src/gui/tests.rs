@@ -32,6 +32,17 @@ fn an_old_nvidia_card_leaves_the_processor_encoding_without_restart() {
 }
 
 #[test]
+fn a_confirmed_old_nvidia_card_takes_priority_over_custom_settings() {
+    let notice = software_fallback_notice(true, Some(Unsupported), false, &[]);
+    assert_eq!(
+        notice,
+        software_fallback_notice(false, Some(Unsupported), false, &[])
+    );
+    assert!(!notice.offer_recommended_settings);
+    assert!(!notice.offer_restart);
+}
+
+#[test]
 fn an_old_nvidia_card_leaves_another_card_encoding_without_restart() {
     let notice = nvidia_driver_notice(false, Some(Unsupported), "", "h264_qsv").unwrap();
     assert_eq!(
