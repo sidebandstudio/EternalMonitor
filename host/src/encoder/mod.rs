@@ -17,7 +17,7 @@ use eternal_wire::h264::{
 use crate::capture::{FrameSlot, RawFrame, Taken};
 use crate::control::SharedControl;
 use crate::gpu::{GpuInfo, GpuVendor};
-use crate::stats::PIPELINE_STATS;
+use crate::stats::{PipelineStats, PIPELINE_STATS};
 
 pub mod input;
 use input::{select_input, EncoderInput};
@@ -149,7 +149,9 @@ fn run_encode_loop(
         stats.gpu_detection_stalled = detection_stalled;
         // A driver note stays while the failure that gave it is remembered,
         // as that encoder is not tried again to give it anew.
-        stats.nvidia_driver_outdated &= nvenc_failed;
+        if !nvenc_failed {
+            stats.nvidia_driver_notice = None;
+        }
         stats.driver_update_vendors = vendors;
     }
 
@@ -1222,6 +1224,15 @@ impl EncoderState {
         result: OpenResult,
         args: &SessionArgs,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
+        Self::opened_with(result, args, crate::gpu::nvidia_adapters, &PIPELINE_STATS)
+    }
+
+    fn opened_with(
+        result: OpenResult,
+        args: &SessionArgs,
+        read_adapters: impl FnOnce() -> Vec<NvidiaAdapter>,
+        stats: &parking_lot::Mutex<PipelineStats>,
+    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let SessionArgs {
             ref encoder_name,
             size: (width, height),
@@ -1234,7 +1245,7 @@ impl EncoderState {
         let encoder = match result {
             Ok(Ok(encoder)) => encoder,
             Ok(Err(error)) => {
-                note_nvidia_driver(encoder_name, error, crate::gpu::nvidia_driver_versions);
+                note_nvidia_driver(encoder_name, error, read_adapters, stats);
                 let code: i32 = error.into();
                 return Err(format!("{encoder_name} open failed: FFmpeg code={code} error={error}; {width}x{height} input={pixel_format:?} bitrate={bitrate_bps} fps={target_fps}").into());
             }
@@ -1821,6 +1832,60 @@ pub const NVENC_MIN_DRIVER: &str = "570";
 /// [`NVENC_MIN_DRIVER`] in hundredths, as [`nvidia_release`] returns it.
 const NVENC_MIN_RELEASE: u32 = 57_000;
 
+pub(crate) struct NvidiaAdapter {
+    pub(crate) device_id: u32,
+    pub(crate) driver_version: Option<u64>,
+}
+
+/// Collect the hardware NVIDIA adapters from a complete scan. An enumeration
+/// or description error leaves both the cards and their driver versions unknown.
+#[cfg(any(windows, test))]
+pub(crate) fn nvidia_adapters_listed<A, E>(
+    mut enumerate: impl FnMut(u32) -> Result<Option<A>, E>,
+    mut describe: impl FnMut(&A) -> Result<(GpuVendor, u32, bool), E>,
+    mut driver_version: impl FnMut(&A) -> Option<u64>,
+) -> Vec<NvidiaAdapter> {
+    let mut adapters = Vec::new();
+    for index in 0.. {
+        let adapter = match enumerate(index) {
+            Ok(Some(adapter)) => adapter,
+            Ok(None) => break,
+            Err(_) => return Vec::new(),
+        };
+        let Ok((vendor, device_id, software)) = describe(&adapter) else {
+            return Vec::new();
+        };
+        if vendor == GpuVendor::Nvidia && !software {
+            adapters.push(NvidiaAdapter {
+                device_id,
+                driver_version: driver_version(&adapter),
+            });
+        }
+    }
+    adapters
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NvidiaDriverUpdate {
+    Unsupported,
+    Supported,
+    Unknown,
+}
+
+/// The PCI ID Repository lists the last pre-Maxwell GPU at 0x130B (GK110)
+/// and the first Maxwell GPU at 0x1340 (GM108). A single Maxwell or newer
+/// adapter is enough for a driver update to be worth trying.
+/// See <https://pci-ids.ucw.cz/read/PC/10de>.
+fn nvidia_card(adapters: &[NvidiaAdapter]) -> NvidiaDriverUpdate {
+    if adapters.is_empty() {
+        NvidiaDriverUpdate::Unknown
+    } else if adapters.iter().any(|adapter| adapter.device_id >= 0x1340) {
+        NvidiaDriverUpdate::Supported
+    } else {
+        NvidiaDriverUpdate::Unsupported
+    }
+}
+
 /// NVIDIA's driver number in hundredths (56607 for 566.07) from the Windows
 /// driver version packed as DXGI reports it (32.0.15.6607): the last digit
 /// of the third part followed by the four digits of the fourth.
@@ -1830,45 +1895,68 @@ fn nvidia_release(windows_version: u64) -> u32 {
     (third % 10) * 10_000 + fourth
 }
 
-/// The newest NVIDIA driver on the PC when an NVENC open failed because it is
-/// too old: FFmpeg returned ENOSYS, and every NVIDIA driver is older than
-/// NVENC needs. ENOSYS alone is not enough: FFmpeg also returns it for
-/// parameters the encoder does not support. `driver_versions` (the NVIDIA
-/// adapters' Windows driver versions) are read only then; none known means
-/// not outdated.
-fn outdated_nvidia_driver(
-    encoder_name: &str,
-    error: ffmpeg_next::Error,
-    driver_versions: impl FnOnce() -> Vec<u64>,
-) -> Option<u32> {
-    if !encoder_name.ends_with("_nvenc")
-        || !matches!(error, ffmpeg_next::Error::Other { errno } if errno == libc::ENOSYS)
-    {
-        return None;
+/// FFmpeg 7.1 propagates -1 from the DLL loader, which ffmpeg-next reports
+/// as EPERM. ENOSYS also covers unsupported parameters, so update advice
+/// requires a known driver release below the minimum.
+fn nvidia_notice(
+    card: NvidiaDriverUpdate,
+    errno: i32,
+    newest_driver: Option<u32>,
+) -> Option<NvidiaDriverUpdate> {
+    match (card, errno) {
+        (NvidiaDriverUpdate::Unsupported, libc::ENOSYS | libc::EPERM) => Some(card),
+        (_, libc::ENOSYS) if newest_driver.is_some_and(|driver| driver < NVENC_MIN_RELEASE) => {
+            Some(card)
+        }
+        _ => None,
     }
-    let newest = driver_versions().into_iter().map(nvidia_release).max()?;
-    (newest < NVENC_MIN_RELEASE).then_some(newest)
 }
 
-/// Says once, in the log and on the Stream page's fallback notice, that
-/// NVENC refused an NVIDIA driver older than it needs.
+/// Read the adapters at the individual FFmpeg open error, before a
+/// pixel-format retry can stall. Each read replaces the previous notice.
+/// A cached failure or a reopen that only tries the fallback keeps the last
+/// assessment even if a card changes. The GUI's Restart clears the cache
+/// so the next NVENC open can reassess the adapters.
 fn note_nvidia_driver(
     encoder_name: &str,
     error: ffmpeg_next::Error,
-    driver_versions: impl FnOnce() -> Vec<u64>,
+    read_adapters: impl FnOnce() -> Vec<NvidiaAdapter>,
+    stats: &parking_lot::Mutex<PipelineStats>,
 ) {
-    static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    let Some(driver) = outdated_nvidia_driver(encoder_name, error, driver_versions) else {
+    let ffmpeg_next::Error::Other { errno } = error else {
         return;
     };
-    if !LOGGED.swap(true, Ordering::Relaxed) {
-        warn!(
-            driver = %format!("{}.{:02}", driver / 100, driver % 100),
-            minimum = NVENC_MIN_DRIVER,
-            "The NVIDIA driver is too old for the graphics card to encode video; video is encoded on the processor unless another graphics card can, and updating the NVIDIA driver enables hardware encoding"
-        );
+    if !encoder_name.ends_with("_nvenc") || !matches!(errno, libc::ENOSYS | libc::EPERM) {
+        return;
     }
-    PIPELINE_STATS.lock().nvidia_driver_outdated = true;
+    let adapters = read_adapters();
+    let newest_driver = adapters
+        .iter()
+        .filter_map(|adapter| adapter.driver_version.map(nvidia_release))
+        .max();
+    let notice = nvidia_notice(nvidia_card(&adapters), errno, newest_driver);
+    let previous = std::mem::replace(&mut stats.lock().nvidia_driver_notice, notice);
+    let Some(notice) = notice.filter(|&notice| Some(notice) != previous) else {
+        return;
+    };
+    match (notice, newest_driver) {
+        (NvidiaDriverUpdate::Unsupported, _) => {
+            warn!("The NVIDIA graphics card is too old to encode video");
+        }
+        (notice, Some(driver)) => {
+            let message = if notice == NvidiaDriverUpdate::Supported {
+                "Update the NVIDIA driver to enable hardware encoding"
+            } else {
+                "Updating the NVIDIA driver may enable hardware encoding if the graphics card supports it"
+            };
+            warn!(
+                driver = %format!("{}.{:02}", driver / 100, driver % 100),
+                minimum = NVENC_MIN_DRIVER,
+                "{message}"
+            );
+        }
+        _ => {}
+    }
 }
 
 /// Hardware encoders that failed to open this launch, each at the encoded
@@ -4101,7 +4189,7 @@ mod tests {
     }
 
     #[test]
-    fn only_nvencs_refusal_of_a_driver_older_than_570_means_an_outdated_driver() {
+    fn packed_windows_driver_versions_give_the_nvidia_release_number() {
         let version = |a: u64, b: u64, c: u64, d: u64| a << 48 | b << 32 | c << 16 | d;
         // Field drivers: GTX 1650 on 517.18, RTX 4060 laptop on 566.07.
         let old = version(31, 0, 15, 1718);
@@ -4117,38 +4205,219 @@ mod tests {
             NVENC_MIN_RELEASE,
             NVENC_MIN_DRIVER.parse::<u32>().unwrap() * 100
         );
+    }
 
-        let enosys = ffmpeg_next::Error::Other {
+    fn nvidia_adapter(device_id: u32) -> NvidiaAdapter {
+        NvidiaAdapter {
+            device_id,
+            driver_version: None,
+        }
+    }
+
+    #[test]
+    fn pci_device_ids_distinguish_pre_maxwell_cards_from_newer_cards() {
+        use NvidiaDriverUpdate::{Supported, Unsupported};
+
+        for id in [
+            0x0649, // GeForce 9600M GT
+            0x06c0, // GeForce GTX 480
+            0x1180, // GeForce GTX 680
+            0x128b, // GeForce GT 710
+            0x130b, // GK110 Q12U-1
+        ] {
+            assert_eq!(nvidia_card(&[nvidia_adapter(id)]), Unsupported, "{id:#06x}");
+        }
+        for id in [
+            0x1340, // GeForce 830M
+            0x1341, // GeForce 840M
+            0x1380, // GeForce GTX 750 Ti
+            0x1b80, // GeForce GTX 1080
+        ] {
+            assert_eq!(nvidia_card(&[nvidia_adapter(id)]), Supported, "{id:#06x}");
+        }
+    }
+
+    #[test]
+    fn a_maxwell_card_keeps_the_update_option_on_a_pc_with_a_kepler_card() {
+        assert_eq!(
+            nvidia_card(&[nvidia_adapter(0x1180), nvidia_adapter(0x1380)]),
+            NvidiaDriverUpdate::Supported
+        );
+    }
+
+    #[test]
+    fn the_card_is_unknown_when_no_nvidia_adapter_was_read() {
+        assert_eq!(nvidia_card(&[]), NvidiaDriverUpdate::Unknown);
+    }
+
+    #[test]
+    fn the_card_and_ffmpeg_error_determine_the_nvidia_notice() {
+        use NvidiaDriverUpdate::{Supported, Unknown, Unsupported};
+        // ffmpeg-next converts the loader's raw -1 to EPERM.
+        assert_eq!(
+            ffmpeg_next::Error::from(-1),
+            ffmpeg_next::Error::Other { errno: libc::EPERM }
+        );
+        for errno in [libc::ENOSYS, libc::EPERM] {
+            assert_eq!(nvidia_notice(Unsupported, errno, None), Some(Unsupported));
+        }
+        for card in [Supported, Unknown] {
+            let old_driver = Some(56_607);
+            assert_eq!(nvidia_notice(card, libc::ENOSYS, old_driver), Some(card));
+            assert_eq!(nvidia_notice(card, libc::EPERM, old_driver), None);
+            assert_eq!(nvidia_notice(card, libc::ENOSYS, Some(57_000)), None);
+            assert_eq!(nvidia_notice(card, libc::ENOSYS, None), None);
+        }
+        for card in [Unsupported, Supported, Unknown] {
+            assert_eq!(nvidia_notice(card, libc::EINVAL, Some(56_607)), None);
+        }
+    }
+
+    #[test]
+    fn only_nvenc_driver_errors_read_nvidia_adapters() {
+        use ffmpeg_next::Error;
+        let stats = parking_lot::Mutex::new(PipelineStats::default());
+        note_nvidia_driver(
+            "h264_amf",
+            Error::Other {
+                errno: libc::ENOSYS,
+            },
+            || panic!("read adapters for AMF"),
+            &stats,
+        );
+        note_nvidia_driver(
+            "h264_nvenc",
+            Error::External,
+            || panic!("read adapters for an unrelated NVENC error"),
+            &stats,
+        );
+
+        note_nvidia_driver(
+            "h264_nvenc",
+            Error::Other {
+                errno: libc::ENOSYS,
+            },
+            || {
+                vec![
+                    NvidiaAdapter {
+                        device_id: 0x1180,
+                        driver_version: Some(14 << 16 | 7000),
+                    },
+                    NvidiaAdapter {
+                        device_id: 0x1380,
+                        driver_version: Some(15 << 16 | 7000),
+                    },
+                ]
+            },
+            &stats,
+        );
+        assert_eq!(stats.lock().nvidia_driver_update(), None);
+    }
+
+    #[test]
+    fn a_fresh_read_with_a_supported_card_clears_the_old_card_notice() {
+        let stats = parking_lot::Mutex::new(PipelineStats::default());
+        let error = ffmpeg_next::Error::Other {
             errno: libc::ENOSYS,
         };
-        let eperm = ffmpeg_next::Error::Other { errno: libc::EPERM };
-        let outdated = |name: &str, error, drivers: &[u64]| {
-            outdated_nvidia_driver(name, error, || drivers.to_vec())
-        };
-        assert_eq!(outdated("h264_nvenc", enosys, &[old]), Some(51_718));
-        assert_eq!(outdated("hevc_nvenc", enosys, &[laptop]), Some(56_607));
-        // 570.00 itself is new enough.
-        assert_eq!(outdated("h264_nvenc", enosys, &[first_new_enough]), None);
-        // ENOSYS with a driver new enough is an unsupported parameter.
-        assert_eq!(outdated("h264_nvenc", enosys, &[current]), None);
-        assert_eq!(outdated("h264_nvenc", enosys, &[old, current]), None);
-        // No NVIDIA driver version known.
-        assert_eq!(outdated("h264_nvenc", enosys, &[]), None);
-        // "Cannot load nvcuda.dll": no NVIDIA driver at all.
-        assert_eq!(outdated("h264_nvenc", eperm, &[old]), None);
+        note_nvidia_driver("h264_nvenc", error, || vec![nvidia_adapter(0x1180)], &stats);
         assert_eq!(
-            outdated("h264_nvenc", ffmpeg_next::Error::External, &[old]),
-            None
+            stats.lock().nvidia_driver_update(),
+            Some(NvidiaDriverUpdate::Unsupported)
         );
-        // Other encoders' failures never read the NVIDIA drivers.
-        assert_eq!(
-            outdated_nvidia_driver("h264_amf", enosys, || panic!("read")),
-            None
+
+        note_nvidia_driver(
+            "h264_nvenc",
+            error,
+            || {
+                vec![NvidiaAdapter {
+                    device_id: 0x1380,
+                    driver_version: Some(15 << 16 | 7000),
+                }]
+            },
+            &stats,
         );
-        assert_eq!(
-            outdated_nvidia_driver("h264_nvenc", eperm, || panic!("read")),
-            None
+        assert_eq!(stats.lock().nvidia_driver_update(), None);
+    }
+
+    #[test]
+    fn a_failed_adapter_description_leaves_the_nvidia_inventory_unknown() {
+        let adapters = nvidia_adapters_listed(
+            |index| Ok((index < 2).then_some(index)),
+            |&index| match index {
+                0 => Ok((GpuVendor::Nvidia, 0x1180, false)),
+                _ => Err(()),
+            },
+            |_| Some(15 << 16 | 1718),
         );
+        assert_eq!(nvidia_card(&adapters), NvidiaDriverUpdate::Unknown);
+        assert!(adapters.is_empty());
+    }
+
+    #[test]
+    fn an_enumeration_error_leaves_the_nvidia_inventory_unknown() {
+        let adapters = nvidia_adapters_listed(
+            |index| match index {
+                0 => Ok(Some(index)),
+                _ => Err(()),
+            },
+            |_| Ok((GpuVendor::Nvidia, 0x1380, false)),
+            |_| Some(15 << 16 | 6607),
+        );
+        assert_eq!(nvidia_card(&adapters), NvidiaDriverUpdate::Unknown);
+        assert!(adapters.is_empty());
+    }
+
+    #[test]
+    fn a_software_adapter_is_ignored_in_the_nvidia_inventory() {
+        let adapters = nvidia_adapters_listed(
+            |index| Ok::<_, ()>((index < 2).then_some(index)),
+            |&index| match index {
+                0 => Ok((GpuVendor::Nvidia, 0x1180, false)),
+                _ => Ok((GpuVendor::Nvidia, 0x1380, true)),
+            },
+            |&index| {
+                assert_eq!(index, 0, "queried the software adapter's driver");
+                Some(15 << 16 | 1718)
+            },
+        );
+        assert_eq!(nvidia_card(&adapters), NvidiaDriverUpdate::Unsupported);
+    }
+
+    #[test]
+    fn the_nvenc_open_error_records_the_notice_before_the_yuv_retry_can_stall() {
+        use ffmpeg_next::format::Pixel;
+        let stats = parking_lot::Mutex::new(PipelineStats::default());
+        let mut input = EncoderInput::Automatic;
+        let result = open_at_input(
+            &mut input,
+            "h264_nvenc",
+            &[Pixel::BGRA, Pixel::YUV420P],
+            |pixel_format| {
+                if pixel_format == Pixel::YUV420P {
+                    assert_eq!(
+                        stats.lock().nvidia_driver_update(),
+                        Some(NvidiaDriverUpdate::Unsupported)
+                    );
+                    return Err(Box::new(OpenStalled("YUV420 open timed out".into())));
+                }
+                EncoderState::opened_with(
+                    Ok(Err(ffmpeg_next::Error::from(-1))),
+                    &SessionArgs {
+                        encoder_name: "h264_nvenc".into(),
+                        size: (1280, 720),
+                        bitrate_bps: 8_000_000,
+                        target_fps: 60,
+                        pixel_format,
+                        legacy_pts: false,
+                    },
+                    || vec![nvidia_adapter(0x0649)],
+                    &stats,
+                )
+            },
+        );
+        assert_eq!(input, EncoderInput::Yuv420);
+        assert!(is_open_stall(result.err().unwrap().as_ref()));
     }
 
     #[test]

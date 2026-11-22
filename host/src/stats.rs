@@ -51,11 +51,10 @@ pub struct PipelineStats {
     /// Pictures given to an encoder again to bring out a keyframe it held
     /// (see `encoder::holds_last_frame`), for the connected viewer.
     pub keyframe_resubmits: u64,
-    /// NVENC refused to open because the NVIDIA driver is older than the
-    /// linked FFmpeg's NVENC needs. The fallback notice, or the NVIDIA
-    /// driver notice when another graphics card encodes, then says to
-    /// update it.
+    /// Simulates an outdated NVIDIA driver in GUI snapshots.
     pub nvidia_driver_outdated: bool,
+    /// What to tell the user after an NVENC open failed on this pipeline.
+    pub(crate) nvidia_driver_notice: Option<crate::encoder::NvidiaDriverUpdate>,
     /// The processor encodes because startup's GPU detection did not return
     /// in time. The fallback notice then says the driver did not answer.
     pub gpu_detection_stalled: bool,
@@ -131,6 +130,7 @@ impl PipelineStats {
             using_software_fallback: false,
             keyframe_resubmits: 0,
             nvidia_driver_outdated: false,
+            nvidia_driver_notice: None,
             gpu_detection_stalled: false,
             driver_update_vendors: Vec::new(),
             encode_timestamps: VecDeque::with_capacity(128),
@@ -176,6 +176,7 @@ impl PipelineStats {
         self.codec_name = previous.codec_name;
         self.using_software_fallback = previous.using_software_fallback;
         self.nvidia_driver_outdated = previous.nvidia_driver_outdated;
+        self.nvidia_driver_notice = previous.nvidia_driver_notice;
         self.gpu_detection_stalled = previous.gpu_detection_stalled;
         self.driver_update_vendors = previous.driver_update_vendors;
         self.mdns_active = previous.mdns_active;
@@ -199,6 +200,12 @@ impl PipelineStats {
         self.bandwidth_bps = 0.0;
         self.bandwidth_mbps = 0.0;
         self.latency_ms = 0.0;
+    }
+
+    pub(crate) fn nvidia_driver_update(&self) -> Option<crate::encoder::NvidiaDriverUpdate> {
+        self.nvidia_driver_notice.or(self
+            .nvidia_driver_outdated
+            .then_some(crate::encoder::NvidiaDriverUpdate::Unknown))
     }
 
     pub fn mark_pipeline_started(&mut self) {

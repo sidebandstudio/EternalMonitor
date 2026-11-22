@@ -83,8 +83,8 @@ pub fn take_late_detection() -> Option<GpuInfo> {
     None
 }
 
-/// No NVIDIA drivers to read outside Windows.
-pub fn nvidia_driver_versions() -> Vec<u64> {
+/// The NVIDIA adapter check uses DXGI on Windows.
+pub(crate) fn nvidia_adapters() -> Vec<crate::encoder::NvidiaAdapter> {
     Vec::new()
 }
 
