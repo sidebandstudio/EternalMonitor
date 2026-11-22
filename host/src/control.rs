@@ -334,7 +334,8 @@ pub enum SupervisorCommand {
     Stop,
     /// Start a fresh pipeline from Stopped/Failed.
     Start,
-    /// Apply a header click only if a start attempt hasn't superseded it.
+    /// Start only if the header click hasn't been superseded by an attempt.
+    /// A superseded Restart still resets the failure budget.
     StartFromHeader {
         restart: bool,
         attempt: u64,

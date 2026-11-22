@@ -201,9 +201,7 @@ impl Machine {
             SupervisorCommand::Restart => match self.state {
                 SupervisorState::ShutDown => Effect::None,
                 _ => {
-                    // User/receiver-driven restarts reset the failure budget.
-                    self.attempt = 0;
-                    self.restarts.clear();
+                    self.reset_restart_budget();
                     Effect::Restart
                 }
             },
@@ -211,8 +209,7 @@ impl Machine {
                 SupervisorState::Running {
                     generation: live_generation,
                 } if live_generation == *generation => {
-                    self.attempt = 0;
-                    self.restarts.clear();
+                    self.reset_restart_budget();
                     Effect::Restart
                 }
                 _ => {
@@ -236,8 +233,7 @@ impl Machine {
                 SupervisorState::Stopped
                 | SupervisorState::Failed { .. }
                 | SupervisorState::WaitingForPort { .. } => {
-                    self.attempt = 0;
-                    self.restarts.clear();
+                    self.reset_restart_budget();
                     Effect::Start
                 }
                 _ => Effect::None,
@@ -258,6 +254,10 @@ impl Machine {
         let command = match command {
             SupervisorCommand::StartFromHeader { restart, attempt } => {
                 if stats.lock().stream_start_attempt != attempt {
+                    // A superseded Restart still resets the failure budget.
+                    if restart && self.state != SupervisorState::ShutDown {
+                        self.reset_restart_budget();
+                    }
                     return Effect::None;
                 }
                 if restart {
@@ -269,6 +269,11 @@ impl Machine {
             command => command,
         };
         self.on_command(&command)
+    }
+
+    fn reset_restart_budget(&mut self) {
+        self.attempt = 0;
+        self.restarts.clear();
     }
 
     /// A stage from the LIVE generation ended.
@@ -1298,6 +1303,51 @@ mod tests {
             machine.state,
             SupervisorState::Running { generation: 2 }
         ));
+    }
+
+    #[test]
+    fn a_restart_queued_at_backoff_expiry_resets_the_budget_without_starting_again() {
+        let shared = SharedControl::new(0, 8_000_000);
+        let stats = parking_lot::Mutex::new(PipelineStats::new());
+        let mut machine = Machine::new(1);
+        let failure = failed("encoder failed");
+        let mut now = Instant::now();
+
+        for generation in 1..=STORM_LIMIT as u64 {
+            machine.note_started(generation);
+            machine.on_stage_exit(generation, Stage::Encoder, &failure, now);
+            let SupervisorState::BackingOff { until, .. } = machine.state else {
+                panic!("expected backoff after failure {generation}");
+            };
+            now = until;
+        }
+
+        let restart = SupervisorCommand::StartFromHeader {
+            restart: true,
+            attempt: stats.lock().stream_start_attempt,
+        };
+        let effect = machine.on_tick(now);
+        assert_eq!(effect, Effect::Start);
+        let generation = STORM_LIMIT as u64;
+        finish_pipeline_effect(
+            &effect,
+            &machine.state,
+            &shared,
+            &stats,
+            &mut None,
+            generation,
+        );
+        machine.note_started(generation + 1);
+        assert_eq!(machine.on_queued_command(restart, &stats), Effect::None);
+
+        machine.on_stage_exit(generation + 1, Stage::Encoder, &failure, now);
+        assert_eq!(
+            machine.state,
+            SupervisorState::BackingOff {
+                until: now + backoff_base(),
+                attempt: 1,
+            }
+        );
     }
 
     #[test]
