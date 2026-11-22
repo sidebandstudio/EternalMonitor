@@ -537,7 +537,7 @@ fn a_stream_restart_retires_publication_before_waiting_for_the_session() {
     }
     {
         let stats = PIPELINE_STATS.lock();
-        assert_eq!(stats.stream_status, Some(StreamStatus::Recovering));
+        assert_eq!(stats.stream_status, Some(StreamStatus::Starting));
         assert!(stats.active_encoder.is_empty());
     }
     assert!(host.shared.running.load(Ordering::SeqCst));

@@ -424,6 +424,7 @@ impl AnalyzerApp {
                 tr("Streaming is off").to_string(),
                 tr("Click Start streaming so your iPad can connect.").to_string(),
             ),
+            StreamState::Starting => ("Starting stream…".to_string(), String::new()),
             StreamState::Recovering => (
                 "Restarting stream…".to_string(),
                 "EternalMonitor will try again automatically.".to_string(),
@@ -579,9 +580,22 @@ impl AnalyzerApp {
 
             match action {
                 Some(SupervisorCommand::Stop) => self.control.request_stop(),
-                Some(SupervisorCommand::Start) => self.control.request_start(),
-                Some(SupervisorCommand::Restart) => self.restart_stream(),
-                Some(SupervisorCommand::RestartStream { .. } | SupervisorCommand::Shutdown) => {
+                Some(button @ (SupervisorCommand::Start | SupervisorCommand::Restart)) => {
+                    let restart = button == SupervisorCommand::Restart;
+                    if restart {
+                        self.prepare_stream_restart();
+                    }
+                    self.control
+                        .request_pipeline_start(SupervisorCommand::StartFromHeader {
+                            restart,
+                            attempt: snap.stream_start_attempt,
+                        });
+                }
+                Some(
+                    SupervisorCommand::StartFromHeader { .. }
+                    | SupervisorCommand::RestartStream { .. }
+                    | SupervisorCommand::Shutdown,
+                ) => {
                     unreachable!("command has no header button")
                 }
                 None => {}
@@ -883,7 +897,9 @@ fn header_button(command: SupervisorCommand) -> (Icon, &'static str, Tone) {
         SupervisorCommand::Start => (Icon::Play, tr("Start streaming"), Tone::Primary),
         SupervisorCommand::Stop => (Icon::Stop, tr("Stop"), Tone::Danger),
         SupervisorCommand::Restart => (Icon::Refresh, tr("Restart"), Tone::Secondary),
-        SupervisorCommand::RestartStream { .. } | SupervisorCommand::Shutdown => {
+        SupervisorCommand::StartFromHeader { .. }
+        | SupervisorCommand::RestartStream { .. }
+        | SupervisorCommand::Shutdown => {
             unreachable!("command has no header button")
         }
     }
@@ -896,7 +912,7 @@ impl StreamState {
             Self::Off => &[Start],
             Self::WaitingForPort => &[Stop],
             Self::Recovering | Self::Ready | Self::Streaming | Self::Paused => &[Stop, Restart],
-            Self::ShuttingDown => &[],
+            Self::Starting | Self::ShuttingDown => &[],
         }
     }
 }
@@ -985,6 +1001,75 @@ fn the_stream_header_only_offers_commands_the_supervisor_accepts() {
             );
         }
         assert_eq!(state.header_commands(), commands);
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn the_stream_header_has_no_buttons_during_a_start_attempt() {
+    use crate::control::SharedControl;
+    use crate::stats::PipelineStats;
+    use crate::supervisor::{finish_pipeline_effect, Effect, Machine, Stage, SupervisorState};
+    use std::time::Instant;
+    use SupervisorCommand::{Restart, Start, Stop};
+
+    let now = Instant::now();
+    let failed = SupervisorState::Failed {
+        reason: "capture failed".into(),
+        stage: Stage::Capture,
+    };
+    let waiting = SupervisorState::WaitingForPort { next_check: now };
+    for (initial, command, port_free) in [
+        (SupervisorState::Stopped, Start, true),
+        (SupervisorState::Stopped, Start, false),
+        (failed.clone(), Start, true),
+        (SupervisorState::Running { generation: 1 }, Restart, true),
+        (
+            SupervisorState::BackingOff {
+                until: now,
+                attempt: 1,
+            },
+            Restart,
+            true,
+        ),
+        (waiting, Restart, false),
+        (SupervisorState::Stopped, Restart, true),
+        (failed, Restart, true),
+    ] {
+        let shared = SharedControl::new(0, 8_000_000);
+        let stats = parking_lot::Mutex::new(PipelineStats::new());
+        let mut machine = Machine::new(1);
+        machine.state = initial.clone();
+        stats.lock().stream_status = Some((&initial).into());
+        let request = SupervisorCommand::StartFromHeader {
+            restart: command == Restart,
+            attempt: stats.lock().stream_start_attempt,
+        };
+        let effect = machine.on_queued_command(request, &stats);
+        assert!(matches!(effect, Effect::Start | Effect::Restart));
+        finish_pipeline_effect(&effect, &machine.state, &shared, &stats, &mut None, 1);
+
+        let status = stats.lock().stream_status.unwrap();
+        let header = StreamState::from_status(status, true, false);
+        assert!(
+            header.header_commands().is_empty(),
+            "{command:?} from {initial:?} showed {header:?} before the port check (port free: {port_free})"
+        );
+        assert_eq!(header, StreamState::Starting);
+
+        if port_free {
+            stats.lock().reset_for_restart();
+            machine.note_started(2);
+        } else {
+            machine.wait_for_port(now);
+        }
+        // A command from the previous header may still be in the FIFO.
+        assert_eq!(machine.on_queued_command(request, &stats), Effect::None);
+        assert_eq!(
+            machine.on_queued_command(Stop, &stats),
+            Effect::StopPipeline
+        );
+        assert_eq!(machine.state, SupervisorState::Stopped);
     }
 }
 

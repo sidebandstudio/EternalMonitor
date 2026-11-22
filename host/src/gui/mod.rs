@@ -109,6 +109,7 @@ struct StatsSnapshot {
     encode_time_history: Vec<f64>,
     pipeline_running: bool,
     stream_status: Option<StreamStatus>,
+    stream_start_attempt: u64,
     uptime_secs: f64,
     mdns_active: bool,
 }
@@ -152,6 +153,7 @@ impl StatsSnapshot {
             encode_time_history: s.encode_time_history.iter().copied().collect(),
             pipeline_running: s.pipeline_running,
             stream_status: s.stream_status,
+            stream_start_attempt: s.stream_start_attempt,
             uptime_secs: s.uptime_secs(),
             mdns_active: s.mdns_active,
         }
@@ -199,6 +201,7 @@ impl ClientSnapshot {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum StreamState {
     Off,
+    Starting,
     Recovering,
     WaitingForPort,
     ShuttingDown,
@@ -226,6 +229,7 @@ impl StreamState {
     fn from_status(status: StreamStatus, connected: bool, capture_blocked: bool) -> Self {
         match status {
             StreamStatus::Stopped => Self::Off,
+            StreamStatus::Starting => Self::Starting,
             StreamStatus::Recovering => Self::Recovering,
             StreamStatus::WaitingForPort => Self::WaitingForPort,
             StreamStatus::ShuttingDown => Self::ShuttingDown,
@@ -239,7 +243,7 @@ impl StreamState {
         match self {
             Self::Off | Self::WaitingForPort | Self::ShuttingDown => TEXT_FAINT,
             StreamState::Ready | StreamState::Streaming => ACCENT,
-            Self::Paused | Self::Recovering => WARNING,
+            Self::Paused | Self::Recovering | Self::Starting => WARNING,
         }
     }
 
@@ -247,6 +251,7 @@ impl StreamState {
         match self {
             Self::Off
             | Self::Paused
+            | Self::Starting
             | Self::Recovering
             | Self::WaitingForPort
             | Self::ShuttingDown => widgets::Dot::Idle,
@@ -875,10 +880,14 @@ impl AnalyzerApp {
     }
 
     fn restart_stream(&mut self) {
+        self.prepare_stream_restart();
+        self.control.request_restart();
+    }
+
+    fn prepare_stream_restart(&mut self) {
         self.restart_pending = false;
         // The user may have updated a driver, as the fallback notice asks.
         crate::encoder::forget_launch_failures();
-        self.control.request_restart();
     }
 
     /// The Stream page notice: move EternalMonitor onto the card the screen
@@ -1529,6 +1538,7 @@ fn sidebar_status(ui: &mut egui::Ui, snap: &StatsSnapshot, client: &ClientSnapsh
             tr("Stopped").to_string(),
             tr("Streaming is off").to_string(),
         ),
+        StreamState::Starting => ("Starting stream…".to_string(), String::new()),
         StreamState::Recovering => (
             "Restarting stream…".to_string(),
             "Trying again automatically.".to_string(),

@@ -139,6 +139,7 @@ pub enum SupervisorState {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StreamStatus {
     Running,
+    Starting,
     Recovering,
     WaitingForPort,
     Stopped,
@@ -241,11 +242,33 @@ impl Machine {
                 }
                 _ => Effect::None,
             },
+            SupervisorCommand::StartFromHeader { .. } => Effect::None,
             SupervisorCommand::Shutdown => {
                 self.state = SupervisorState::ShutDown;
                 Effect::Shutdown
             }
         }
+    }
+
+    pub(crate) fn on_queued_command(
+        &mut self,
+        command: SupervisorCommand,
+        stats: &parking_lot::Mutex<PipelineStats>,
+    ) -> Effect {
+        let command = match command {
+            SupervisorCommand::StartFromHeader { restart, attempt } => {
+                if stats.lock().stream_start_attempt != attempt {
+                    return Effect::None;
+                }
+                if restart {
+                    SupervisorCommand::Restart
+                } else {
+                    SupervisorCommand::Start
+                }
+            }
+            command => command,
+        };
+        self.on_command(&command)
     }
 
     /// A stage from the LIVE generation ended.
@@ -444,7 +467,7 @@ pub fn run(
         }
 
         let effect = match message {
-            Ok(SupMsg::Command(command)) => machine.on_command(&command),
+            Ok(SupMsg::Command(command)) => machine.on_queued_command(command, &PIPELINE_STATS),
             Ok(SupMsg::Health {
                 generation: g,
                 stage,
@@ -626,7 +649,7 @@ fn not_streaming(state: &SupervisorState, shared: &SharedControl) -> Option<NotS
 }
 
 /// Retires the pipeline before waiting on the session or the transport.
-fn finish_pipeline_effect(
+pub(crate) fn finish_pipeline_effect(
     effect: &Effect,
     state: &SupervisorState,
     shared: &SharedControl,
@@ -645,17 +668,19 @@ fn finish_pipeline_effect(
     let status = match effect {
         Effect::None => return,
         Effect::StopPipeline | Effect::Shutdown => StreamStatus::from(state),
-        Effect::Restart | Effect::Start
-            if matches!(state, SupervisorState::WaitingForPort { .. }) =>
-        {
+        // Keep Stop available during the automatic recheck of a held port.
+        Effect::Start if matches!(state, SupervisorState::WaitingForPort { .. }) => {
             StreamStatus::WaitingForPort
         }
-        Effect::Restart | Effect::Start => StreamStatus::Recovering,
+        Effect::Restart | Effect::Start => StreamStatus::Starting,
     };
     {
         let mut stats = stats.lock();
         stats.mark_pipeline_stopped();
         stats.stream_status = Some(status);
+        if matches!(effect, Effect::Start | Effect::Restart) {
+            stats.stream_start_attempt += 1;
+        }
     }
     if *effect != Effect::Shutdown {
         // A HELLO2 the stopping transport still takes hears why.
@@ -988,10 +1013,10 @@ mod tests {
                     || generation_is_current(generation),
                     Some(false),
                 );
-                let expected_status = if matches!(stop, Some(SupervisorCommand::Stop)) {
-                    StreamStatus::Stopped
-                } else {
-                    StreamStatus::Recovering
+                let expected_status = match stop {
+                    Some(SupervisorCommand::Stop) => StreamStatus::Stopped,
+                    Some(_) => StreamStatus::Starting,
+                    None => StreamStatus::Recovering,
                 };
                 let effect = match &stop {
                     Some(command) => machine.on_command(command),
@@ -1053,6 +1078,7 @@ mod tests {
         let mut stats = stats.lock();
         stats.pipeline_running = previous.pipeline_running;
         stats.stream_status = previous.stream_status;
+        stats.stream_start_attempt = previous.stream_start_attempt;
         stats.start_time = previous.start_time;
         stats.codec_name = previous.codec_name;
         stats.active_encoder = previous.active_encoder;

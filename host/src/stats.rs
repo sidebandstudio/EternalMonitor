@@ -95,6 +95,8 @@ pub struct PipelineStats {
     // Pipeline state
     pub pipeline_running: bool,
     pub stream_status: Option<crate::supervisor::StreamStatus>,
+    /// Advances when the supervisor begins a start attempt.
+    pub(crate) stream_start_attempt: u64,
     pub start_time: Option<Instant>,
 
     // mDNS
@@ -161,6 +163,7 @@ impl PipelineStats {
 
             pipeline_running: false,
             stream_status: None,
+            stream_start_attempt: 0,
             start_time: None,
 
             mdns_active: false,
@@ -182,6 +185,7 @@ impl PipelineStats {
         self.driver_update_vendors = previous.driver_update_vendors;
         self.mdns_active = previous.mdns_active;
         self.stream_status = previous.stream_status;
+        self.stream_start_attempt = previous.stream_start_attempt;
         previous.audio
     }
 
