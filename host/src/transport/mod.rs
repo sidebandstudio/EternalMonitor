@@ -244,6 +244,10 @@ impl ConfigSource for SharedConfigSource<'_> {
         Some(&self.shared.pairing)
     }
 
+    fn stream_epoch(&self) -> u32 {
+        self.stream_epoch
+    }
+
     fn stream_config(&self) -> eternal_wire::v2::control::StreamConfig {
         let (width, height, software) = {
             let stats = PIPELINE_STATS.lock();
@@ -436,7 +440,8 @@ pub async fn start_sender(
     };
 
     let abr_enabled = !std::env::var("ETERNAL_ABR").is_ok_and(|v| v.trim() == "0");
-    let abr = AbrController::new(shared.bitrate_bps.load(Ordering::SeqCst), abr_enabled);
+    let abr = AbrController::new(shared.bitrate_bps.load(Ordering::SeqCst), abr_enabled)
+        .with_stream_epoch(stream_epoch);
     shared
         .abr_current_bps
         .store(abr.current_bps(), Ordering::SeqCst);
@@ -721,7 +726,10 @@ pub async fn start_sender(
                 }
 
                 let mut frame_pacer = FramePacer::new(frag_count_usize, Instant::now());
+                let wifi = target_addr.link == LinkId::Udp;
+                let inject_faults = wifi && state.fault.enabled();
                 let mut backed_off = false;
+                let mut waited = Duration::ZERO;
                 for datagram in &stored {
                     // A busy machine can exhaust the pacing budget mid-frame.
                     // Keep serving audio even when there are no more pauses;
@@ -736,12 +744,24 @@ pub async fn start_sender(
                         }
                         _ => {}
                     };
-                    if target_addr.link == LinkId::Udp && state.fault.enabled() {
+                    if inject_faults {
+                        // The fault injector stands in for the network.
+                        state.abr.note_udp_fragment_sent(
+                            stream_epoch, frame_seq, capture_ts_us, crate::clock::host_now_us(),
+                            frag_count, Duration::ZERO,
+                        );
                         for due in state.fault.push(datagram, Instant::now()) {
                             note(links.send_to(&due, target_addr).await);
                         }
                     } else {
-                        note(links.send_to(datagram, target_addr).await);
+                        let sent = links.send_to_with_wait(datagram, target_addr, &mut waited).await;
+                        if wifi && sent.is_ok() {
+                            state.abr.note_udp_fragment_sent(
+                                stream_epoch, frame_seq, capture_ts_us, crate::clock::host_now_us(),
+                                frag_count, std::mem::take(&mut waited),
+                            );
+                        }
+                        note(sent);
                     }
                     // The system had no buffer space for it. A frame backs
                     // off once and sends it again; a refusal after that gives
@@ -756,7 +776,7 @@ pub async fn start_sender(
 
                     let paced = frame_pacer.after_send(Instant::now());
                     let pause = if refused { congestion::BACKOFF } else { paced };
-                    if target_addr.link == LinkId::Udp && pause > Duration::ZERO {
+                    if wifi && pause > Duration::ZERO {
                         let repairs = repair_while_pacing(&links, &mut state, &shared, &config, &supervisor,
                             pacing_clock.until(Instant::now() + pause), &mut deferred_control);
                         tokio::pin!(repairs);
@@ -771,7 +791,13 @@ pub async fn start_sender(
                         }
                     }
                     if refused {
-                        match links.send_to(datagram, target_addr).await {
+                        match links.send_to_with_wait(datagram, target_addr, &mut waited).await {
+                            Ok(()) if wifi && !inject_faults => {
+                                state.abr.note_udp_fragment_sent(
+                                    stream_epoch, frame_seq, capture_ts_us, crate::clock::host_now_us(),
+                                    frag_count, std::mem::take(&mut waited),
+                                );
+                            }
                             Err(e) if congestion::is_no_buffer_space(&e) => break,
                             Err(e) if !send_failed => {
                                 log_send_failed(target_addr.link, &e);
@@ -780,6 +806,10 @@ pub async fn start_sender(
                             _ => {}
                         }
                     }
+                }
+
+                if wifi && !waited.is_zero() {
+                    state.abr.note_socket_wait(waited);
                 }
 
                 let total_bytes = payload.len();
@@ -1886,7 +1916,7 @@ mod tests {
         accept_usb_session(&mut state).await;
         report.frags_received += 500;
         let at = t0 + Duration::from_secs(15);
-        assert!(!state.abr.on_report(&report, None, 30, at).changed);
+        assert!(!state.abr.on_report(&report, Some(0), 30, at).changed);
         assert_eq!(state.abr.current_bps(), 15_000_000);
     }
 

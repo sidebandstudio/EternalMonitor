@@ -315,9 +315,19 @@ impl TransportLinks {
     }
 
     pub async fn send_to(&self, bytes: &[u8], peer: PeerId) -> io::Result<()> {
+        let mut waited = Duration::ZERO;
+        self.send_to_with_wait(bytes, peer, &mut waited).await
+    }
+
+    pub(super) async fn send_to_with_wait(
+        &self,
+        bytes: &[u8],
+        peer: PeerId,
+        waited: &mut Duration,
+    ) -> io::Result<()> {
         match peer.link {
             LinkId::Udp => {
-                let sent = self.udp.send(peer, bytes).await;
+                let sent = self.udp.send_with_wait(peer, bytes, waited).await;
                 if let Err(error) = &sent {
                     if is_no_buffer_space(error) {
                         self.congestion.lock().refused(error, super::now());
