@@ -1046,7 +1046,7 @@ mod tests {
 
         let mut usb = AbrController::new(20_000_000, true);
         let mut r = ReceiverReport::default();
-        let even = |tick: u64| tick % 2 == 0;
+        let even = |tick: u64| !odd(tick);
         let changes = half_second_reports(&mut usb, t0, &mut r, true, 0..60, even, |_| 0);
         assert_eq!(changes, [(15_000, 20_000_000)]);
 
