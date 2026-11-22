@@ -11,6 +11,7 @@ use super::{
 };
 use crate::capture::recovery::CaptureBlock;
 use crate::control::VddStatus;
+use crate::encoder::{NvidiaDriverUpdate, NVENC_MIN_DRIVER};
 use crate::i18n::{tr, trf};
 use crate::vdd::VddTaskHealth;
 use crate::vdd_device::VddProblem;
@@ -110,6 +111,12 @@ impl AnalyzerApp {
                 && (self.settings_encoder_choice != ENCODER_AUTO_LABEL
                     || self.settings_encoder_input
                         != crate::encoder::input::EncoderInput::default());
+            let notice = software_fallback_notice(
+                customized,
+                snap.nvidia_driver_update,
+                snap.gpu_detection_stalled,
+                &snap.driver_update_vendors,
+            );
             let mut reset = false;
             let mut restart = false;
             widgets::banner(
@@ -117,19 +124,20 @@ impl AnalyzerApp {
                 WARNING,
                 Icon::Warning,
                 SOFTWARE_FALLBACK_TITLE,
-                &software_fallback_body(
-                    customized,
-                    snap.nvidia_driver_outdated,
-                    snap.gpu_detection_stalled,
-                    &snap.driver_update_vendors,
-                ),
-                if customized { 230.0 } else { 110.0 },
+                &notice.body,
+                if customized {
+                    230.0
+                } else if notice.offer_restart {
+                    110.0
+                } else {
+                    0.0
+                },
                 |ui| {
                     if customized {
                         reset =
                             widgets::button(ui, Tone::Primary, None, "Use recommended settings")
                                 .clicked();
-                    } else {
+                    } else if notice.offer_restart {
                         restart =
                             widgets::button(ui, Tone::Secondary, Some(Icon::Refresh), "Restart")
                                 .clicked();
@@ -144,9 +152,9 @@ impl AnalyzerApp {
             }
             ui.add_space(GAP - 10.0);
         }
-        if let Some(body) = nvidia_driver_notice(
+        if let Some(notice) = nvidia_driver_notice(
             snap.using_software_fallback,
-            snap.nvidia_driver_outdated,
+            snap.nvidia_driver_update,
             &snap.encoder_override,
             &snap.active_encoder,
         ) {
@@ -156,11 +164,14 @@ impl AnalyzerApp {
                 WARNING,
                 Icon::Warning,
                 NVIDIA_DRIVER_TITLE,
-                &body,
-                110.0,
+                &notice.body,
+                if notice.offer_restart { 110.0 } else { 0.0 },
                 |ui| {
-                    restart = widgets::button(ui, Tone::Secondary, Some(Icon::Refresh), "Restart")
-                        .clicked();
+                    if notice.offer_restart {
+                        restart =
+                            widgets::button(ui, Tone::Secondary, Some(Icon::Refresh), "Restart")
+                                .clicked();
+                    }
                 },
             );
             if restart {
@@ -898,24 +909,21 @@ pub(super) const SOFTWARE_FALLBACK_TITLE: &str =
 /// too old when that is what the graphics card refused, name the AMD or
 /// Intel driver whose card could not start encoding (`driver_vendors`), or
 /// suggest a driver update.
-pub(super) fn software_fallback_body(
+pub(super) fn software_fallback_notice(
     customized: bool,
-    nvidia_driver_outdated: bool,
+    nvidia_driver_update: Option<NvidiaDriverUpdate>,
     detection_stalled: bool,
     driver_vendors: &[crate::gpu::GpuVendor],
-) -> String {
+) -> EncoderNotice {
     use crate::gpu::GpuVendor::{Amd, Intel};
     let amd = driver_vendors.contains(&Amd);
     let intel = driver_vendors.contains(&Intel);
-    if detection_stalled {
+    let body = if detection_stalled {
         "The graphics driver did not respond when EternalMonitor started, so the processor encodes the video for now. The picture may lag and the PC may run hot. Click Restart to try the graphics card again.".to_string()
     } else if customized {
         "The graphics card could not encode video with the options chosen in Settings, so the picture may lag and the PC may run hot. Go back to the recommended options first.".to_string()
-    } else if nvidia_driver_outdated {
-        outdated_nvidia_driver_body(
-            "the picture may lag and the PC may run hot",
-            "the processor",
-        )
+    } else if let Some(update) = nvidia_driver_update {
+        return outdated_nvidia_driver_notice(update, true);
     } else if amd && intel {
         "The AMD and Intel graphics drivers on this PC could not start video encoding on the graphics cards, so the picture may lag and the PC may run hot. Update the AMD and Intel graphics drivers, then click Restart.".to_string()
     } else if amd || intel {
@@ -925,16 +933,61 @@ pub(super) fn software_fallback_body(
         )
     } else {
         "The picture may lag and the PC may run hot. Update your graphics driver from NVIDIA, AMD or Intel, then click Restart.".to_string()
+    };
+    EncoderNotice {
+        body,
+        offer_restart: !customized || detection_stalled,
     }
 }
 
-/// The NVIDIA driver is too old for its card to encode video: what happens
-/// instead (`effect`), and what older cards keep encoding on (`fallback`).
-fn outdated_nvidia_driver_body(effect: &str, fallback: &str) -> String {
-    format!(
-        "The NVIDIA graphics driver on this PC is too old for the graphics card to encode video, so {effect}. Update the NVIDIA driver to version {} or newer, if your graphics card supports it, then click Restart. Older cards keep using {fallback}.",
-        crate::encoder::NVENC_MIN_DRIVER
-    )
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct EncoderNotice {
+    pub(super) body: String,
+    pub(super) offer_restart: bool,
+}
+
+/// What the Stream page says after NVIDIA's driver is refused and another
+/// device takes over, with Restart when a driver update could help.
+fn outdated_nvidia_driver_notice(
+    update: NvidiaDriverUpdate,
+    using_software_fallback: bool,
+) -> EncoderNotice {
+    if update == NvidiaDriverUpdate::Unsupported {
+        let effect = if using_software_fallback {
+            "The processor encodes it instead, so the picture may lag and the PC may run hot."
+        } else {
+            "Another graphics card encodes it instead, so the picture may lag."
+        };
+        return EncoderNotice {
+            body: format!(
+                "The NVIDIA graphics card on this PC is too old to encode video. {effect}"
+            ),
+            offer_restart: false,
+        };
+    }
+    let (effect, fallback) = if using_software_fallback {
+        (
+            "the picture may lag and the PC may run hot",
+            "the processor",
+        )
+    } else {
+        (
+            "another graphics card encodes it and the picture may lag",
+            "the other graphics card",
+        )
+    };
+    let advice = if update == NvidiaDriverUpdate::Supported {
+        "then click Restart.".to_string()
+    } else {
+        format!("if your graphics card supports it, then click Restart. Older cards keep using {fallback}.")
+    };
+    let body = format!(
+        "The NVIDIA graphics driver on this PC is too old for the graphics card to encode video, so {effect}. Update the NVIDIA driver to version {NVENC_MIN_DRIVER} or newer, {advice}"
+    );
+    EncoderNotice {
+        body,
+        offer_restart: true,
+    }
 }
 
 const NVIDIA_DRIVER_TITLE: &str = "Your NVIDIA graphics card isn't encoding video";
@@ -949,19 +1002,15 @@ const NVIDIA_DRIVER_TITLE: &str = "Your NVIDIA graphics card isn't encoding vide
 /// not outdated.
 pub(super) fn nvidia_driver_notice(
     using_software_fallback: bool,
-    nvidia_driver_outdated: bool,
+    nvidia_driver_update: Option<NvidiaDriverUpdate>,
     encoder_override: &str,
     active_encoder: &str,
-) -> Option<String> {
+) -> Option<EncoderNotice> {
     let other_card = active_encoder.ends_with("_qsv") || active_encoder.ends_with("_amf");
     let nvidia_or_automatic = encoder_override.is_empty() || encoder_override.ends_with("_nvenc");
-    let shown = !using_software_fallback && nvidia_driver_outdated && nvidia_or_automatic;
-    (shown && other_card).then(|| {
-        outdated_nvidia_driver_body(
-            "another graphics card encodes it and the picture may lag",
-            "the other graphics card",
-        )
-    })
+    let update = nvidia_driver_update?;
+    (!using_software_fallback && nvidia_or_automatic && other_card)
+        .then(|| outdated_nvidia_driver_notice(update, false))
 }
 /// Why Second screen mirrors on Windows 10: the notice, and the note beside
 /// the choice.

@@ -1,9 +1,82 @@
 use super::page_stream::{
     audio_summary, capture_block_notice, firewall_fix_failure, firewall_fix_offered,
-    firewall_notice, nvidia_driver_notice, second_screen_notice, software_fallback_body,
+    firewall_notice, nvidia_driver_notice, second_screen_notice, software_fallback_notice,
     usb_cable_notice, usb_summary,
 };
 use super::*;
+use crate::encoder::NvidiaDriverUpdate::{self, Supported, Unknown, Unsupported};
+
+fn software_fallback_body(
+    customized: bool,
+    nvidia_driver_outdated: bool,
+    detection_stalled: bool,
+    driver_vendors: &[crate::gpu::GpuVendor],
+) -> String {
+    software_fallback_notice(
+        customized,
+        nvidia_driver_outdated.then_some(Unknown),
+        detection_stalled,
+        driver_vendors,
+    )
+    .body
+}
+
+#[test]
+fn an_old_nvidia_card_leaves_the_processor_encoding_without_restart() {
+    let notice = software_fallback_notice(false, Some(Unsupported), false, &[]);
+    assert_eq!(
+        notice.body,
+        "The NVIDIA graphics card on this PC is too old to encode video. The processor encodes it instead, so the picture may lag and the PC may run hot."
+    );
+    assert!(!notice.offer_restart);
+}
+
+#[test]
+fn an_old_nvidia_card_leaves_another_card_encoding_without_restart() {
+    let notice = nvidia_driver_notice(false, Some(Unsupported), "", "h264_qsv").unwrap();
+    assert_eq!(
+        notice.body,
+        "The NVIDIA graphics card on this PC is too old to encode video. Another graphics card encodes it instead, so the picture may lag."
+    );
+    assert!(!notice.offer_restart);
+}
+
+fn notices_for_an_outdated_nvidia_driver(
+    update: NvidiaDriverUpdate,
+) -> [super::page_stream::EncoderNotice; 2] {
+    [
+        software_fallback_notice(false, Some(update), false, &[]),
+        nvidia_driver_notice(false, Some(update), "", "h264_qsv").unwrap(),
+    ]
+}
+
+#[test]
+fn a_supported_nvidia_card_can_update_its_driver_and_restart() {
+    for notice in notices_for_an_outdated_nvidia_driver(Supported) {
+        assert!(notice.offer_restart);
+        assert!(
+            notice
+                .body
+                .contains("Update the NVIDIA driver to version 570 or newer, then click Restart."),
+            "{}",
+            notice.body,
+        );
+    }
+}
+
+#[test]
+fn an_unknown_nvidia_card_keeps_the_conditional_update_advice() {
+    for (notice, fallback) in notices_for_an_outdated_nvidia_driver(Unknown)
+        .into_iter()
+        .zip(["the processor", "the other graphics card"])
+    {
+        assert!(notice.offer_restart);
+        assert!(notice.body.contains("if your graphics card supports it"));
+        assert!(notice
+            .body
+            .ends_with(&format!("Older cards keep using {fallback}.")));
+    }
+}
 
 /// A fix that failed says so in its own banner, whatever the firewall
 /// reads now. One that worked, or a No to the Windows prompt, says nothing.
@@ -484,7 +557,7 @@ fn an_outdated_nvidia_driver_is_named_with_the_version_to_install() {
         "{body}"
     );
     assert!(body.contains("Restart"), "{body}");
-    // Kepler cards (GTX 600/700) stop at driver 470 and can't install 570.
+    // With no generation known, the advice leaves room for older cards.
     assert!(body.contains("if your graphics card supports it"), "{body}");
     assert!(
         body.contains("Older cards keep using the processor"),
@@ -511,7 +584,9 @@ fn an_outdated_nvidia_driver_is_named_when_another_graphics_card_encodes() {
     // Quick Sync or AMF open.
     for chosen in ["", "h264_nvenc", "hevc_nvenc"] {
         for active in ["h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf"] {
-            let body = nvidia_driver_notice(false, true, chosen, active).unwrap();
+            let body = nvidia_driver_notice(false, Some(Unknown), chosen, active)
+                .unwrap()
+                .body;
             assert!(
                 body.contains("NVIDIA driver to version 570 or newer"),
                 "{body}"
@@ -534,20 +609,29 @@ fn an_outdated_nvidia_driver_is_named_when_another_graphics_card_encodes() {
         }
     }
     // The processor encodes: the software fallback notice says it, as before.
-    assert_eq!(nvidia_driver_notice(true, true, "", "h264_qsv"), None);
-    assert_eq!(nvidia_driver_notice(true, true, "", "libx264"), None);
+    assert_eq!(
+        nvidia_driver_notice(true, Some(Unknown), "", "h264_qsv"),
+        None
+    );
+    assert_eq!(
+        nvidia_driver_notice(true, Some(Unknown), "", "libx264"),
+        None
+    );
     assert!(software_fallback_body(false, true, false, &[])
         .contains("Older cards keep using the processor"));
     // NVENC refused the driver before Quick Sync or AMF opened (or while
     // the processor opens on an NVIDIA-only PC).
-    assert_eq!(nvidia_driver_notice(false, true, "", ""), None);
+    assert_eq!(nvidia_driver_notice(false, Some(Unknown), "", ""), None);
     // NVENC failed for another reason.
-    assert_eq!(nvidia_driver_notice(false, false, "", "h264_qsv"), None);
+    assert_eq!(nvidia_driver_notice(false, None, "", "h264_qsv"), None);
     // An AMD, Intel or processor encoder chosen in Settings (an override
     // FFmpeg lacks starts as Automatic: see `encoder::applied_encoder`).
     for chosen in ["h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf", "libx264"] {
         for active in ["h264_qsv", "h264_amf"] {
-            assert_eq!(nvidia_driver_notice(false, true, chosen, active), None);
+            assert_eq!(
+                nvidia_driver_notice(false, Some(Unknown), chosen, active),
+                None
+            );
         }
     }
 }
@@ -558,7 +642,9 @@ fn the_nvidia_driver_notice_follows_the_open_encoder() {
     let notice = |stats: &crate::stats::PipelineStats| {
         nvidia_driver_notice(
             stats.using_software_fallback,
-            stats.nvidia_driver_outdated,
+            stats
+                .nvidia_driver_outdated
+                .then_some(stats.nvidia_driver_update),
             &stats.encoder_override,
             &stats.active_encoder,
         )

@@ -169,28 +169,106 @@ fn vendors_listed(
 
 /// Windows driver versions of the NVIDIA adapters, packed as DXGI reports
 /// them (32.0.15.6607). Read when NVENC refuses to open, to tell an old
-/// driver from other refusals.
-pub fn nvidia_driver_versions() -> Vec<u64> {
+/// driver from other refusals. Also returns the NVIDIA adapter count if
+/// DXGI listed and described every adapter.
+pub fn nvidia_driver_versions() -> (Vec<u64>, Option<usize>) {
     let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     let mut versions = Vec::new();
-    let mut index = 0u32;
-    while let Ok(adapter) = unsafe { factory.EnumAdapters1(index) } {
-        index += 1;
+    let mut count = 0;
+    let mut complete = true;
+    for index in 0u32.. {
+        let adapter = match unsafe { factory.EnumAdapters1(index) } {
+            Ok(adapter) => adapter,
+            Err(error) => {
+                complete &= error.code() == DXGI_ERROR_NOT_FOUND;
+                break;
+            }
+        };
         let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
+            complete = false;
             continue;
         };
         if desc.VendorId != VENDOR_NVIDIA {
             continue;
         }
+        count += 1;
         if let Ok(version) = unsafe {
             adapter.CheckInterfaceSupport(&windows::Win32::Graphics::Dxgi::IDXGIDevice::IID)
         } {
             versions.push(version as u64);
         }
     }
-    versions
+    (versions, complete.then_some(count))
+}
+
+/// The newest CUDA compute capability major number among the NVIDIA cards.
+/// Give up if the driver stops answering or CUDA sees a different number of
+/// cards than DXGI. A partial list could miss a card that can be updated.
+pub fn nvidia_compute_capability(adapter_count: usize) -> Option<i32> {
+    crate::stall::run(
+        Call::GpuDetect,
+        move || cuda_capability(adapter_count),
+        || {},
+    )
+    .ok()
+    .flatten()
+}
+
+fn cuda_capability(adapter_count: usize) -> Option<i32> {
+    use windows::core::{s, w};
+    use windows::Win32::Foundation::{FreeLibrary, HANDLE};
+    use windows::Win32::System::LibraryLoader::{
+        GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+    };
+
+    let module = unsafe {
+        LoadLibraryExW(
+            w!("nvcuda.dll"),
+            HANDLE::default(),
+            LOAD_LIBRARY_SEARCH_SYSTEM32,
+        )
+    }
+    .ok()?;
+
+    // These CUDA driver functions use CUDAAPI (stdcall on Windows).
+    // cuDeviceComputeCapability predates the attribute API and is present
+    // on early CUDA drivers, including those for Tesla cards.
+    let probe = || unsafe {
+        let init: unsafe extern "system" fn(u32) -> i32 =
+            std::mem::transmute(GetProcAddress(module, s!("cuInit"))?);
+        let get_count: unsafe extern "system" fn(*mut i32) -> i32 =
+            std::mem::transmute(GetProcAddress(module, s!("cuDeviceGetCount"))?);
+        let get_device: unsafe extern "system" fn(*mut i32, i32) -> i32 =
+            std::mem::transmute(GetProcAddress(module, s!("cuDeviceGet"))?);
+        let capability: unsafe extern "system" fn(*mut i32, *mut i32, i32) -> i32 =
+            std::mem::transmute(GetProcAddress(module, s!("cuDeviceComputeCapability"))?);
+
+        let mut count = 0;
+        if init(0) != 0
+            || get_count(&mut count) != 0
+            || usize::try_from(count).ok()? != adapter_count
+        {
+            return None;
+        }
+        let mut newest = None;
+        for ordinal in 0..count {
+            let (mut device, mut major, mut minor) = (0, 0, 0);
+            if get_device(&mut device, ordinal) != 0
+                || capability(&mut major, &mut minor, device) != 0
+                || major <= 0
+            {
+                return None;
+            }
+            newest = newest.max(Some(major));
+        }
+        newest
+    };
+
+    let result = probe();
+    let _ = unsafe { FreeLibrary(module) };
+    result
 }
 
 fn detect_from_dxgi() -> Result<GpuInfo, Box<dyn std::error::Error>> {
