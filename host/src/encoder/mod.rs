@@ -1837,6 +1837,34 @@ pub(crate) struct NvidiaAdapter {
     pub(crate) driver_version: Option<u64>,
 }
 
+/// Collect the hardware NVIDIA adapters from a complete scan. An enumeration
+/// or description error leaves both the cards and their driver versions unknown.
+#[cfg(any(windows, test))]
+pub(crate) fn nvidia_adapters_listed<A, E>(
+    mut enumerate: impl FnMut(u32) -> Result<Option<A>, E>,
+    mut describe: impl FnMut(&A) -> Result<(GpuVendor, u32, bool), E>,
+    mut driver_version: impl FnMut(&A) -> Option<u64>,
+) -> Vec<NvidiaAdapter> {
+    let mut adapters = Vec::new();
+    for index in 0.. {
+        let adapter = match enumerate(index) {
+            Ok(Some(adapter)) => adapter,
+            Ok(None) => break,
+            Err(_) => return Vec::new(),
+        };
+        let Ok((vendor, device_id, software)) = describe(&adapter) else {
+            return Vec::new();
+        };
+        if vendor == GpuVendor::Nvidia && !software {
+            adapters.push(NvidiaAdapter {
+                device_id,
+                driver_version: driver_version(&adapter),
+            });
+        }
+    }
+    adapters
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum NvidiaDriverUpdate {
     Unsupported,
@@ -1884,8 +1912,11 @@ fn nvidia_notice(
     }
 }
 
-/// Check the adapters at the individual FFmpeg open error so a later
-/// pixel-format retry can leave this notice in place.
+/// Read the adapters at the individual FFmpeg open error, before a
+/// pixel-format retry can stall. Each read replaces the previous notice.
+/// A cached failure or a reopen that only tries the fallback keeps the last
+/// assessment even if a card changes. The GUI's Restart clears the cache
+/// so the next NVENC open can reassess the adapters.
 fn note_nvidia_driver(
     encoder_name: &str,
     error: ffmpeg_next::Error,
@@ -1903,15 +1934,11 @@ fn note_nvidia_driver(
         .iter()
         .filter_map(|adapter| adapter.driver_version.map(nvidia_release))
         .max();
-    let Some(notice) = nvidia_notice(nvidia_card(&adapters), errno, newest_driver) else {
+    let notice = nvidia_notice(nvidia_card(&adapters), errno, newest_driver);
+    let previous = std::mem::replace(&mut stats.lock().nvidia_driver_notice, notice);
+    let Some(notice) = notice.filter(|&notice| Some(notice) != previous) else {
         return;
     };
-    {
-        let mut stats = stats.lock();
-        if stats.nvidia_driver_notice.replace(notice) == Some(notice) {
-            return;
-        }
-    }
     match (notice, newest_driver) {
         (NvidiaDriverUpdate::Unsupported, _) => {
             warn!("The NVIDIA graphics card is too old to encode video");
@@ -4285,6 +4312,76 @@ mod tests {
             &stats,
         );
         assert_eq!(stats.lock().nvidia_driver_update(), None);
+    }
+
+    #[test]
+    fn a_fresh_read_with_a_supported_card_clears_the_old_card_notice() {
+        let stats = parking_lot::Mutex::new(PipelineStats::default());
+        let error = ffmpeg_next::Error::Other {
+            errno: libc::ENOSYS,
+        };
+        note_nvidia_driver("h264_nvenc", error, || vec![nvidia_adapter(0x1180)], &stats);
+        assert_eq!(
+            stats.lock().nvidia_driver_update(),
+            Some(NvidiaDriverUpdate::Unsupported)
+        );
+
+        note_nvidia_driver(
+            "h264_nvenc",
+            error,
+            || {
+                vec![NvidiaAdapter {
+                    device_id: 0x1380,
+                    driver_version: Some(15 << 16 | 7000),
+                }]
+            },
+            &stats,
+        );
+        assert_eq!(stats.lock().nvidia_driver_update(), None);
+    }
+
+    #[test]
+    fn a_failed_adapter_description_leaves_the_nvidia_inventory_unknown() {
+        let adapters = nvidia_adapters_listed(
+            |index| Ok((index < 2).then_some(index)),
+            |&index| match index {
+                0 => Ok((GpuVendor::Nvidia, 0x1180, false)),
+                _ => Err(()),
+            },
+            |_| Some(15 << 16 | 1718),
+        );
+        assert_eq!(nvidia_card(&adapters), NvidiaDriverUpdate::Unknown);
+        assert!(adapters.is_empty());
+    }
+
+    #[test]
+    fn an_enumeration_error_leaves_the_nvidia_inventory_unknown() {
+        let adapters = nvidia_adapters_listed(
+            |index| match index {
+                0 => Ok(Some(index)),
+                _ => Err(()),
+            },
+            |_| Ok((GpuVendor::Nvidia, 0x1380, false)),
+            |_| Some(15 << 16 | 6607),
+        );
+        assert_eq!(nvidia_card(&adapters), NvidiaDriverUpdate::Unknown);
+        assert!(adapters.is_empty());
+    }
+
+    #[test]
+    fn a_software_adapter_is_ignored_in_the_nvidia_inventory() {
+        let adapters = nvidia_adapters_listed(
+            |index| Ok::<_, ()>((index < 2).then_some(index)),
+            |&index| match index {
+                0 => Ok((GpuVendor::Nvidia, 0x1180, false)),
+                _ => Ok((GpuVendor::Nvidia, 0x1380, true)),
+            },
+            |&index| {
+                assert_eq!(index, 0, "queried the software adapter's driver");
+                Some(15 << 16 | 1718)
+            },
+        );
+        assert_eq!(nvidia_card(&adapters), NvidiaDriverUpdate::Unsupported);
     }
 
     #[test]

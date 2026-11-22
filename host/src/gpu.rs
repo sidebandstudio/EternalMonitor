@@ -4,7 +4,7 @@ use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, DXGI_ERROR_NOT_FOUND,
 };
 
-use crate::encoder::NvidiaAdapter;
+use crate::encoder::{nvidia_adapters_listed, NvidiaAdapter};
 use crate::stall::Call;
 
 const VENDOR_NVIDIA: u32 = 0x10DE;
@@ -168,33 +168,34 @@ fn vendors_listed(
     Some(vendors)
 }
 
-/// Read the PCI device IDs and packed Windows driver versions of the NVIDIA
-/// adapters when NVENC refuses to open.
+/// Read the PCI device IDs and packed Windows driver versions of the hardware
+/// NVIDIA adapters when NVENC refuses to open. An incomplete scan returns
+/// an empty inventory.
 pub(crate) fn nvidia_adapters() -> Vec<NvidiaAdapter> {
     let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
         return Vec::new();
     };
-    let mut adapters = Vec::new();
-    let mut index = 0u32;
-    while let Ok(adapter) = unsafe { factory.EnumAdapters1(index) } {
-        index += 1;
-        let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
-            continue;
-        };
-        if desc.VendorId != VENDOR_NVIDIA {
-            continue;
-        }
-        let driver_version = unsafe {
-            adapter.CheckInterfaceSupport(&windows::Win32::Graphics::Dxgi::IDXGIDevice::IID)
-        }
-        .ok()
-        .map(|version| version as u64);
-        adapters.push(NvidiaAdapter {
-            device_id: desc.DeviceId,
-            driver_version,
-        });
-    }
-    adapters
+    nvidia_adapters_listed(
+        |index| match unsafe { factory.EnumAdapters1(index) } {
+            Err(error) if error.code() == DXGI_ERROR_NOT_FOUND => Ok(None),
+            result => result.map(Some),
+        },
+        |adapter| {
+            let desc = unsafe { adapter.GetDesc1() }?;
+            Ok((
+                GpuVendor::from_vendor_id(desc.VendorId),
+                desc.DeviceId,
+                desc.Flags & FLAG_SOFTWARE != 0,
+            ))
+        },
+        |adapter| {
+            unsafe {
+                adapter.CheckInterfaceSupport(&windows::Win32::Graphics::Dxgi::IDXGIDevice::IID)
+            }
+            .ok()
+            .map(|version| version as u64)
+        },
+    )
 }
 
 fn detect_from_dxgi() -> Result<GpuInfo, Box<dyn std::error::Error>> {
