@@ -436,7 +436,8 @@ pub async fn start_sender(
     };
 
     let abr_enabled = !std::env::var("ETERNAL_ABR").is_ok_and(|v| v.trim() == "0");
-    let abr = AbrController::new(shared.bitrate_bps.load(Ordering::SeqCst), abr_enabled);
+    let abr = AbrController::new(shared.bitrate_bps.load(Ordering::SeqCst), abr_enabled)
+        .with_stream_epoch(stream_epoch);
     shared
         .abr_current_bps
         .store(abr.current_bps(), Ordering::SeqCst);

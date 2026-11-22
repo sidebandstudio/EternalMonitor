@@ -36,6 +36,8 @@ const LOSS_DOWN_ONE: f64 = 0.02;
 const LOSS_DOWN_TWO: f64 = 0.10;
 const LOSS_CLEAN: f64 = 0.005;
 const JITTER_DOWN_US: u32 = 15_000;
+/// Allow this much path variation above the sender peak in a clean report.
+const JITTER_CLEAN_MARGIN_US: u32 = 5_000;
 /// Real write waits must add up within one report to count as congestion.
 const SOCKET_WAIT_MIN: Duration = Duration::from_millis(5);
 
@@ -174,6 +176,11 @@ impl AbrController {
         }
     }
 
+    pub(super) fn with_stream_epoch(mut self, epoch: u32) -> Self {
+        self.send_jitter.epoch = Some(epoch);
+        self
+    }
+
     /// Whether the open encoder session takes a new bitrate only by
     /// reopening it, as the transport reads it before each report. Then a
     /// step up waits [`REOPEN_UP_COOLDOWN`] or more after any change instead
@@ -280,8 +287,8 @@ impl AbrController {
     /// to step down. The sender peak is per report interval, not per packet.
     /// Reordering inflates reported jitter. Network jitter that coincides
     /// with sender jitter needs corroboration from loss, repairs or socket
-    /// waits in the interval. A high report can count as clean if the
-    /// sender peak fully explains it and there is no corroboration.
+    /// waits in the interval. A high report can count as clean if it is
+    /// within 5 ms of the sender peak and there is no corroboration.
     ///
     /// `frames_sent` is the video frames the PC sent since the previous
     /// report. A report with no frames neither starts nor breaks the clean
@@ -306,9 +313,19 @@ impl AbrController {
         if !self.enabled {
             return unchanged;
         }
-        self.note_probe_held(now);
 
         let wifi = tunnel_drops.is_none();
+        // A report from another epoch cannot close this sender interval.
+        if wifi
+            && self
+                .send_jitter
+                .epoch
+                .is_some_and(|epoch| report.stream_epoch != epoch)
+        {
+            return unchanged;
+        }
+        self.note_probe_held(now);
+
         // The iPad resets its counters on an epoch change or sequence wrap.
         let prev = self.prev_cumulative.filter(|prev| {
             prev.stream_epoch == report.stream_epoch
@@ -380,7 +397,7 @@ impl AbrController {
         let jitter_reported = wifi && delta_received > 0 && report.jitter_us > JITTER_DOWN_US;
         let excess_us = report.jitter_us.saturating_sub(send_jitter_us);
         let jitter_high = jitter_reported && (excess_us > JITTER_DOWN_US || corroborated);
-        let jitter_unexplained = jitter_reported && excess_us > 0;
+        let jitter_unexplained = jitter_reported && excess_us > JITTER_CLEAN_MARGIN_US;
 
         // ---- Downgrade path ----
         let down_rungs = if loss > LOSS_DOWN_TWO {
@@ -431,7 +448,7 @@ impl AbrController {
             Some(_) => !tunnel_lossy,
             None => frames_sent <= STILL_FRAMES_SENT,
         };
-        if total == 0 && none_lost && !socket_waited && !stalled {
+        if total == 0 && none_lost && !stalled {
             return unchanged;
         }
         if total > 0
@@ -486,7 +503,10 @@ impl AbrController {
     /// link that keeps reconnecting would probe every 30 s again.
     pub fn new_session(&mut self, tunnel_drops: Option<u64>) {
         self.prev_cumulative = None;
-        self.send_jitter = SendJitter::default();
+        self.send_jitter = SendJitter {
+            epoch: self.send_jitter.epoch,
+            ..SendJitter::default()
+        };
         self.no_progress_since = None;
         self.clean_since = None;
         self.prev_tunnel_drops = tunnel_drops;
@@ -1394,6 +1414,54 @@ mod tests {
     }
 
     #[test]
+    fn clean_wifi_with_an_uneven_encoder_and_path_variation_reaches_its_ceiling() {
+        for random_path in [false, true] {
+            let mut seed = 42u64;
+            let frames = (0..).map(|n| {
+                let variation_us = if random_path {
+                    seed = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+                    1_000 + (seed >> 32) % 4_001
+                } else {
+                    5_000 - n % 2 * 4_000
+                };
+                WifiFrame {
+                    capture_us: n * 1_000_000 / 30,
+                    encode_us: if n % 2 == 0 { 65_000 } else { 36_000 },
+                    path_us: 20_000 + variation_us,
+                    wait_us: 0,
+                    fragments: 1,
+                }
+            });
+            let packets = wifi_packets(frames, 17_000_000);
+            for phase_us in [0, 123_000, 499_000] {
+                assert_eq!(
+                    wifi_jitter_reports(&packets, 1_000_000 + phase_us, 32, 0),
+                    [(15_000, 20_000_000)],
+                    "random path: {random_path}, phase: {phase_us} us",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn wifi_clean_jitter_margin_is_inclusive() {
+        let t0 = Instant::now();
+        for (excess_us, clean) in [(5_000, true), (5_001, false)] {
+            let mut abr = AbrController::new(20_000_000, true);
+            abr.on_report(&report(1, 0, 0), None, 1, t0);
+            abr.note_udp_fragment_sent(0, 2, 0, 0, 1, Duration::ZERO);
+            abr.note_udp_fragment_sent(0, 3, 0, 240_000, 1, Duration::ZERO);
+            assert_eq!(abr.send_jitter.peak_us, 15_000);
+            let r = ReceiverReport {
+                jitter_us: 15_000 + excess_us,
+                ..report(3, 0, 0)
+            };
+            assert!(!abr.on_report(&r, None, 2, t0 + NO_PROGRESS_GRACE).changed);
+            assert_eq!(abr.clean_since, clean.then_some(t0), "{excess_us} us");
+        }
+    }
+
+    #[test]
     fn network_jitter_on_wifi_steps_down_one_rung_per_cooldown() {
         let frames = (0..).map(|n| WifiFrame {
             capture_us: n * 42_000,
@@ -1511,6 +1579,45 @@ mod tests {
         abr.new_session(None);
         assert_eq!(abr.send_jitter.peak_us, 0);
         assert!(abr.send_jitter.previous_transit_us.is_none());
+    }
+
+    #[test]
+    fn wifi_reports_from_the_previous_epoch_leave_sender_samples_and_clean_streak_alone() {
+        let mut abr = AbrController::new(20_000_000, true).with_stream_epoch(2);
+        abr.new_session(None);
+        let t0 = Instant::now();
+        let old = ReceiverReport {
+            stream_epoch: 1,
+            frags_received: 100,
+            jitter_us: 28_000,
+            ..Default::default()
+        };
+        assert!(!abr.on_report(&old, None, 0, t0).changed);
+        assert!(abr.prev_cumulative.is_none());
+        assert!(abr.clean_since.is_none());
+
+        abr.note_udp_fragment_sent(2, 1, 0, 36_000, 1, Duration::ZERO);
+        assert!(!abr.on_report(&old, None, 1, t0 + NO_PROGRESS_GRACE).changed);
+        assert_eq!(abr.send_jitter.complete_since_report, 1);
+
+        let current = ReceiverReport {
+            stream_epoch: 2,
+            frags_received: 1,
+            ..Default::default()
+        };
+        let clean_start = t0 + Duration::from_secs(1);
+        assert!(!abr.on_report(&current, None, 1, clean_start).changed);
+        assert_eq!(abr.clean_since, Some(clean_start));
+
+        abr.note_udp_fragment_sent(2, 2, 0, 68_000, 1, Duration::ZERO);
+        abr.note_udp_fragment_sent(2, 3, 0, 68_000, 1, Duration::ZERO);
+        let delayed = clean_start + NO_PROGRESS_GRACE;
+        assert!(!abr.on_report(&old, None, 2, delayed).changed);
+        assert_eq!(abr.send_jitter.peak_us, 2_000);
+        assert_eq!(abr.send_jitter.complete_since_report, 2);
+        assert_eq!(abr.prev_cumulative, Some(current));
+        assert_eq!(abr.last_report_at, Some(clean_start));
+        assert_eq!(abr.clean_since, Some(clean_start));
     }
 
     #[test]
@@ -1668,6 +1775,34 @@ mod tests {
             );
             assert_eq!(changes, [(15_500, 20_000_000)], "usb: {usb}");
         }
+    }
+
+    #[test]
+    fn wifi_empty_report_with_one_frame_in_flight_and_a_socket_wait_is_neutral() {
+        let t0 = Instant::now();
+        let mut abr = AbrController::new(20_000_000, true);
+        let mut r = ReceiverReport::default();
+        for tick in 0..=30 {
+            let waited = if tick == 14 {
+                SOCKET_WAIT_MIN
+            } else {
+                Duration::ZERO
+            };
+            let seq = tick + 1;
+            abr.note_udp_fragment_sent(0, seq, 0, 36_000 + waited.as_micros() as u64, 1, waited);
+            if waited.is_zero() {
+                r.frags_received = seq;
+                r.highest_seq = seq;
+            }
+            let d = abr.on_report(
+                &r,
+                None,
+                1,
+                t0 + Duration::from_millis(500 * u64::from(tick)),
+            );
+            assert_eq!(d.changed, tick == 30, "tick {tick}");
+        }
+        assert_eq!(abr.current_bps(), 20_000_000);
     }
 
     /// Over WiFi the PC kept sending for 3 s and nothing arrived, while the
