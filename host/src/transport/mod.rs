@@ -244,6 +244,10 @@ impl ConfigSource for SharedConfigSource<'_> {
         Some(&self.shared.pairing)
     }
 
+    fn stream_epoch(&self) -> u32 {
+        self.stream_epoch
+    }
+
     fn stream_config(&self) -> eternal_wire::v2::control::StreamConfig {
         let (width, height, software) = {
             let stats = PIPELINE_STATS.lock();

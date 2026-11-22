@@ -290,8 +290,8 @@ impl AbrController {
     /// waits in the interval. A high report can count as clean if it is
     /// within 5 ms of the sender peak and there is no corroboration.
     ///
-    /// `frames_sent` is the video frames the PC sent since the previous
-    /// report. A report with no frames neither starts nor breaks the clean
+    /// `frames_sent` is the video send attempts since the previous report
+    /// accepted by ABR. A report with no frames neither starts nor breaks the clean
     /// streak when the PC sent next to none either (a still screen sends
     /// about one a second, [`STILL_FRAMES_SENT`]). Over WiFi, when it sent
     /// more, they were lost, all of each frame, which the iPad does not

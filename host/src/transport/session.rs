@@ -177,8 +177,8 @@ pub struct Actions {
     pub release_input: bool,
     /// A fresh receiver report arrived (feeds the ABR controller).
     pub report: Option<ReceiverReport>,
-    /// With `report`: the video frames sent to its session since that
-    /// session's previous report, or since it started.
+    /// Video send attempts since the session's last report accepted by ABR,
+    /// or since it started. A Wi-Fi report from another epoch leaves this at zero.
     pub frames_sent_since_report: u32,
     /// A validated `(session_id, event)` from the connected client (only
     /// produced when that client's HELLO2 asked for input relay). The
@@ -378,7 +378,7 @@ struct ActiveSession {
     frags_received: bool,
     /// Video frames let through to this session ([`Session::may_send_media`]).
     frames_sent: u32,
-    /// [`Self::frames_sent`] at its latest receiver report.
+    /// [`Self::frames_sent`] at its latest receiver report accepted by ABR.
     frames_sent_at_report: u32,
     /// The largest media datagram the client asked for in this session
     /// ([`KeyframeRequest::max_media_dgram`]), and how many times it went
@@ -537,6 +537,10 @@ pub trait ConfigSource {
     }
 
     fn stream_config(&self) -> StreamConfig;
+    fn stream_epoch(&self) -> u32 {
+        self.stream_config().stream_epoch
+    }
+
     fn host_name(&self) -> String;
     fn host_caps(&self) -> u16 {
         0
@@ -1095,7 +1099,9 @@ impl Session {
             ControlMessage::Identify(request) => self.answer_identify(source, request, config, now),
             ControlMessage::Bye(reason) => self.handle_bye(source, reason, now),
             ControlMessage::KeyframeRequest(request) => self.handle_keyframe(source, request, now),
-            ControlMessage::ReceiverReport(report) => self.handle_report(source, report, now),
+            ControlMessage::ReceiverReport(report) => {
+                self.handle_report(source, report, config, now)
+            }
             ControlMessage::Ping(ping) => self.handle_ping(source, ping, now),
             ControlMessage::InputEvent(event) => {
                 self.handle_input(source, event, datagram.map(|(seq, _)| seq), now)
@@ -1473,7 +1479,13 @@ impl Session {
         actions
     }
 
-    fn handle_report(&mut self, source: PeerId, report: ReceiverReport, now: Instant) -> Actions {
+    fn handle_report(
+        &mut self,
+        source: PeerId,
+        report: ReceiverReport,
+        config: &impl ConfigSource,
+        now: Instant,
+    ) -> Actions {
         let mut actions = Actions::default();
         if let Some(session) = self.active.as_mut() {
             if session_peer_matches(session, source) {
@@ -1482,10 +1494,13 @@ impl Session {
                 session.frames_received |= report.frames_complete > 0;
                 session.frags_received |= report.frags_received > 0;
                 actions.report = Some(report);
-                actions.frames_sent_since_report = session
-                    .frames_sent
-                    .saturating_sub(session.frames_sent_at_report);
-                session.frames_sent_at_report = session.frames_sent;
+                // ABR only closes the Wi-Fi interval on a current-epoch report.
+                if source.link != LinkId::Udp || report.stream_epoch == config.stream_epoch() {
+                    actions.frames_sent_since_report = session
+                        .frames_sent
+                        .saturating_sub(session.frames_sent_at_report);
+                    session.frames_sent_at_report = session.frames_sent;
+                }
             }
         }
         actions
@@ -2887,12 +2902,134 @@ mod tests {
             for _ in 0..frames {
                 assert!(session.may_send_media(id, 1000, now));
             }
-            let report = ControlMessage::ReceiverReport(ReceiverReport::default());
+            let report = ControlMessage::ReceiverReport(ReceiverReport {
+                stream_epoch: TestConfig.stream_epoch(),
+                ..ReceiverReport::default()
+            });
             session
                 .handle_control_authed(peer, report, &TestConfig, now)
                 .frames_sent_since_report
         };
         assert_eq!([3, 0, 2].map(send_then_report), [3, 0, 2]);
+    }
+
+    #[test]
+    fn wifi_old_epoch_report_preserves_send_attempts_for_the_next_report() {
+        let mut session = Session::new(1234);
+        let start = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        session.handle_control_authed(peer, hello(1, 50000), &TestConfig, start);
+        let id = session.session_id().unwrap();
+        let current = ReceiverReport {
+            stream_epoch: TestConfig.stream_epoch(),
+            frags_received: 1,
+            frames_complete: 1,
+            ..ReceiverReport::default()
+        };
+        let old = ReceiverReport {
+            stream_epoch: current.stream_epoch - 1,
+            ..current
+        };
+        let mut receive = |report, now, attempts| {
+            for _ in 0..attempts {
+                assert!(session.may_send_media(id, 1000, now));
+            }
+            session.handle_control_authed(
+                peer,
+                ControlMessage::ReceiverReport(report),
+                &TestConfig,
+                now,
+            )
+        };
+
+        assert_eq!(receive(current, start, 1).frames_sent_since_report, 1);
+        let delayed = receive(old, start + Duration::from_millis(250), 2);
+        assert_eq!(delayed.report, Some(old));
+        assert_eq!(session.last_report(), Some(old));
+        let empty = session.handle_control_authed(
+            peer,
+            ControlMessage::ReceiverReport(current),
+            &TestConfig,
+            start + Duration::from_millis(500),
+        );
+        assert_eq!(empty.frames_sent_since_report, 2);
+    }
+
+    #[test]
+    fn wifi_old_epoch_report_does_not_advance_the_next_upgrade() {
+        use crate::transport::abr::AbrController;
+
+        let mut session = Session::new(1234);
+        let start = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        session.handle_control_authed(peer, hello(1, 50000), &TestConfig, start);
+        let id = session.session_id().unwrap();
+        let epoch = TestConfig.stream_epoch();
+        let mut abr = AbrController::new(20_000_000, true).with_stream_epoch(epoch);
+        abr.new_session(None);
+        let mut current = ReceiverReport {
+            stream_epoch: epoch,
+            ..ReceiverReport::default()
+        };
+        let mut seq = 0;
+        let mut upgrades = Vec::new();
+
+        for tick in 0..=32 {
+            let now = start + Duration::from_millis(500 * tick);
+            if tick == 1 {
+                // One attempt made it onto the network but did not arrive.
+                // The other failed locally, so only one feeds the sender filter.
+                let sent_at = now - Duration::from_millis(250);
+                assert!(session.may_send_media(id, 1000, sent_at));
+                seq += 1;
+                abr.note_udp_fragment_sent(epoch, seq, 0, 36_000, 1, Duration::ZERO);
+                assert!(session.may_send_media(id, 1000, sent_at));
+                seq += 1;
+                let old = ReceiverReport {
+                    stream_epoch: epoch - 1,
+                    ..current
+                };
+                let actions = session.handle_control_authed(
+                    peer,
+                    ControlMessage::ReceiverReport(old),
+                    &TestConfig,
+                    sent_at,
+                );
+                assert!(
+                    !abr.on_report(
+                        &actions.report.unwrap(),
+                        None,
+                        actions.frames_sent_since_report,
+                        sent_at
+                    )
+                    .changed
+                );
+            } else {
+                assert!(session.may_send_media(id, 1000, now));
+                seq += 1;
+                abr.note_udp_fragment_sent(epoch, seq, 0, 36_000, 1, Duration::ZERO);
+                current.frags_received += 1;
+                current.frames_complete += 1;
+                current.highest_seq = seq;
+            }
+            let actions = session.handle_control_authed(
+                peer,
+                ControlMessage::ReceiverReport(current),
+                &TestConfig,
+                now,
+            );
+            let decision = abr.on_report(
+                &actions.report.unwrap(),
+                None,
+                actions.frames_sent_since_report,
+                now,
+            );
+            if decision.changed {
+                upgrades.push((now.duration_since(start), decision.target_bps));
+            }
+        }
+
+        assert_eq!(upgrades, [(Duration::from_secs(16), 20_000_000)]);
     }
 
     #[test]
