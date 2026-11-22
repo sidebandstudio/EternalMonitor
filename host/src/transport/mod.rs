@@ -245,10 +245,15 @@ impl ConfigSource for SharedConfigSource<'_> {
     }
 
     fn stream_config(&self) -> eternal_wire::v2::control::StreamConfig {
-        let (width, height, software) = {
+        let (width, height, codec, software) = {
             let stats = PIPELINE_STATS.lock();
             let (w, h) = stats.capture_resolution;
-            (w, h, stats.using_software_fallback)
+            (
+                w,
+                h,
+                self.shared.active_codec.load(Ordering::SeqCst),
+                stats.using_software_fallback,
+            )
         };
         eternal_wire::v2::control::StreamConfig {
             stream_epoch: self.stream_epoch,
@@ -259,7 +264,7 @@ impl ConfigSource for SharedConfigSource<'_> {
                 .target_fps
                 .load(Ordering::SeqCst)
                 .min(u32::from(u16::MAX)) as u16,
-            codec: self.shared.active_codec.load(Ordering::SeqCst),
+            codec,
             flags: if software {
                 eternal_wire::v2::control::STREAM_FLAG_SOFTWARE_ENCODER
             } else {

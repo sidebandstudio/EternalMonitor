@@ -206,6 +206,7 @@ fn run_stage_once(
     let (tx, mut rx) = tokio::sync::mpsc::channel(NAL_CHANNEL_CAPACITY);
     let shared = SharedControl::new(0, 8_000_000);
     shared.running.store(true, Ordering::SeqCst);
+    PIPELINE_STATS.lock().mark_pipeline_started();
     let gpu = GpuInfo {
         encoder_name: encoder.to_string(),
         codec_display_name: encoder.to_string(),
@@ -727,6 +728,7 @@ fn keyframe_on_a_still_desktop_once(serial: &Serial, encoder: &str) -> Option<St
     let (tx, mut rx) = tokio::sync::mpsc::channel(NAL_CHANNEL_CAPACITY);
     let shared = SharedControl::new(0, 8_000_000);
     shared.running.store(true, Ordering::SeqCst);
+    PIPELINE_STATS.lock().mark_pipeline_started();
     let gpu = GpuInfo {
         encoder_name: encoder.to_string(),
         codec_display_name: encoder.to_string(),

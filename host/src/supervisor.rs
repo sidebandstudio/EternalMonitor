@@ -15,7 +15,7 @@ use tracing::{error, info, warn};
 
 use crate::control::{SharedControl, SupervisorCommand};
 use crate::gpu::GpuInfo;
-use crate::stats::PIPELINE_STATS;
+use crate::stats::{PipelineStats, PIPELINE_STATS};
 use crate::transport::session::{NotStreaming, StageFailure, StreamStop};
 use crate::transport::standby::Standby;
 
@@ -38,7 +38,7 @@ pub fn generation_is_current(generation: u64) -> bool {
 }
 
 fn advance_generation() -> u64 {
-    // The stop mark and encoder publication check the generation under this lock.
+    // Pipeline and encoder state writes check the generation under this lock.
     let _stats = PIPELINE_STATS.lock();
     CURRENT_GENERATION.fetch_add(1, Ordering::SeqCst) + 1
 }
@@ -445,7 +445,7 @@ pub fn run(
                     .session
                     .lock()
                     .set_not_streaming(not_streaming(&machine.state, &shared));
-                stop_pipeline(&shared, &machine.state);
+                retire_pipeline(&shared, &PIPELINE_STATS, stop_when_stopped(&machine.state));
                 bounded_join(&mut pipeline, generation);
             }
             Effect::Restart | Effect::Start => {
@@ -454,7 +454,7 @@ pub fn run(
                     .session
                     .lock()
                     .set_not_streaming(Some(NotStreaming::Restarting));
-                shared.stop();
+                retire_pipeline(&shared, &PIPELINE_STATS, None);
                 bounded_join(&mut pipeline, generation);
                 // The check below binds the port: the standby lets go first.
                 if let Some(standby) = standby.take() {
@@ -492,7 +492,7 @@ pub fn run(
                 ));
             }
             Effect::Shutdown => {
-                shared.stop();
+                retire_pipeline(&shared, &PIPELINE_STATS, None);
                 bounded_join(&mut pipeline, generation);
                 // The port closes as the stream ends, as it always did: a
                 // copy that takes over after this one quits binds it.
@@ -605,11 +605,16 @@ fn not_streaming(state: &SupervisorState, shared: &SharedControl) -> Option<NotS
     }
 }
 
-/// Stops the pipeline that the machine stopped in `state`, first ending the
-/// session as [`stop_when_stopped`] says: its goodbye goes out with the
-/// transport, which runs until it sees `running` false.
-fn stop_pipeline(shared: &SharedControl, state: &SupervisorState) {
-    if let Some(why) = stop_when_stopped(state) {
+/// Marks the pipeline stopped before waiting for a transport that may never
+/// exit. If the session is ending, queue its goodbye before the transport
+/// sees `running` turn false.
+fn retire_pipeline(
+    shared: &SharedControl,
+    stats: &parking_lot::Mutex<PipelineStats>,
+    why: Option<StreamStop>,
+) {
+    stats.lock().mark_pipeline_stopped();
+    if let Some(why) = why {
         crate::diagnostics::stop_session(shared, why);
     }
     shared.stop();
@@ -882,6 +887,121 @@ mod tests {
     }
 
     #[test]
+    fn a_worker_held_across_stop_and_start_cannot_change_the_live_encoder() {
+        use crate::encoder::{note_encoder_opened, note_encoder_starting};
+        use eternal_wire::v2::control::CODEC_HEVC;
+
+        let shared = SharedControl::new(0, 8_000_000);
+        let stats = parking_lot::Mutex::new(PipelineStats::default());
+        let generation = AtomicU64::new(1);
+        let mut machine = Machine::new(1);
+        let gpu = GpuInfo {
+            encoder_name: "h264_nvenc".into(),
+            adapter_index: 1,
+            ..GpuInfo::software_fallback()
+        };
+        let old_is_current = || generation.load(Ordering::SeqCst) == 1;
+        let new_is_current = || generation.load(Ordering::SeqCst) == 2;
+        let assert_encoder = |running, active| {
+            let stats = stats.lock();
+            assert_eq!(stats.pipeline_running, running);
+            assert_eq!(stats.active_encoder, active);
+            assert_eq!(stats.codec_name, "HEVC (NVENC)");
+            assert!(!stats.using_software_fallback);
+            assert_eq!(shared.active_codec.load(Ordering::SeqCst), CODEC_HEVC);
+            assert_eq!(*shared.wake_adapter.lock(), Some(1));
+        };
+
+        shared.running.store(true, Ordering::SeqCst);
+        stats.lock().mark_pipeline_started();
+        note_encoder_opened(
+            &stats,
+            &shared,
+            "hevc_nvenc",
+            &gpu,
+            old_is_current,
+            Some(false),
+        );
+        assert_encoder(true, "hevc_nvenc");
+
+        std::thread::scope(|scope| {
+            enum Write {
+                Startup,
+                Fallback,
+            }
+            let (resume, pending) = mpsc::channel();
+            let (done, written) = mpsc::channel();
+            let (stats, shared, gpu) = (&stats, &shared, &gpu);
+            scope.spawn(move || {
+                if done.send(()).is_err() {
+                    return;
+                }
+                for write in pending {
+                    match write {
+                        Write::Startup => note_encoder_starting(
+                            stats,
+                            old_is_current,
+                            "libx264",
+                            "H.264 (x264)",
+                            false,
+                            true,
+                        ),
+                        Write::Fallback => note_encoder_opened(
+                            stats,
+                            shared,
+                            "libx264",
+                            gpu,
+                            old_is_current,
+                            Some(true),
+                        ),
+                    }
+                    if done.send(()).is_err() {
+                        break;
+                    }
+                }
+            });
+            written.recv().unwrap();
+            let publish = |write| {
+                resume.send(write).unwrap();
+                written.recv().unwrap();
+            };
+
+            assert_eq!(
+                machine.on_command(&SupervisorCommand::Stop),
+                Effect::StopPipeline
+            );
+            retire_pipeline(shared, stats, stop_when_stopped(&machine.state));
+            assert_encoder(false, "");
+            publish(Write::Fallback);
+            assert_encoder(false, "");
+
+            assert_eq!(machine.on_command(&SupervisorCommand::Start), Effect::Start);
+            crate::audio::restart_stats(stats, |_| {});
+            {
+                let _stats = stats.lock();
+                generation.store(2, Ordering::SeqCst);
+            }
+            machine.note_started(2);
+            shared.running.store(true, Ordering::SeqCst);
+            stats.lock().mark_pipeline_started();
+            note_encoder_opened(
+                stats,
+                shared,
+                "hevc_nvenc",
+                gpu,
+                new_is_current,
+                Some(false),
+            );
+            assert_encoder(true, "hevc_nvenc");
+
+            publish(Write::Startup);
+            assert_encoder(true, "hevc_nvenc");
+            publish(Write::Fallback);
+            assert_encoder(true, "hevc_nvenc");
+        });
+    }
+
+    #[test]
     fn audio_failures_never_restart_or_exhaust_the_video_failure_budget() {
         let mut machine = Machine::new(7);
         for _ in 0..20 {
@@ -1005,7 +1125,11 @@ mod tests {
                 .session
                 .lock()
                 .handle_control(peer, 0, hello, &Config, Instant::now());
-            stop_pipeline(&shared, state);
+            retire_pipeline(
+                &shared,
+                &parking_lot::Mutex::new(PipelineStats::default()),
+                stop_when_stopped(state),
+            );
             assert!(!shared.running.load(Ordering::SeqCst));
             let goodbye = shared.session.lock().take_goodbye();
             let ended = !shared.client_connected();
