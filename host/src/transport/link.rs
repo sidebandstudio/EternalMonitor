@@ -2,7 +2,7 @@
 //! and discard queued video when a reader falls behind.
 
 use std::collections::VecDeque;
-use std::future::{poll_fn, Future};
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -120,19 +120,20 @@ impl UdpLink {
             return Err(error);
         }
 
-        let mut blocked_at = None;
-        let sent = poll_fn(|cx| {
-            let result = self.socket.poll_send_to(cx, datagram, addr);
-            if result.is_pending() {
-                blocked_at.get_or_insert_with(Instant::now);
+        loop {
+            // Charge the task for the send outside the socket wait timer.
+            tokio::task::consume_budget().await;
+            match self.socket.try_send_to(datagram, addr) {
+                Ok(_) => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    let blocked_at = Instant::now();
+                    let ready = self.socket.writable().await;
+                    *waited += blocked_at.elapsed();
+                    ready?;
+                }
+                Err(error) => return Err(error),
             }
-            result
-        })
-        .await;
-        if let Some(at) = blocked_at {
-            *waited += at.elapsed();
         }
-        sent?;
         #[cfg(feature = "test-hooks")]
         super::probe::sent(addr);
         Ok(())
@@ -826,6 +827,33 @@ mod tests {
     use super::*;
     use eternal_wire::v2::control::{encode_control, ControlMessage, Ping};
     use eternal_wire::v2::media::MEDIA_HEADER_SIZE;
+
+    #[tokio::test]
+    async fn a_writable_socket_can_yield_without_counting_a_wait() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let peer = PeerId::udp(receiver.local_addr().unwrap());
+        let link = UdpLink::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        link.socket.writable().await.unwrap();
+
+        let mut waited = Duration::ZERO;
+        let mut yields = 0;
+        {
+            let sends = async {
+                for _ in 0..512 {
+                    link.send_with_wait(peer, &[0], &mut waited).await.unwrap();
+                }
+            };
+            tokio::pin!(sends);
+            std::future::poll_fn(|cx| {
+                let result = sends.as_mut().poll(cx);
+                yields += usize::from(result.is_pending());
+                result
+            })
+            .await;
+        }
+        assert!(yields > 0);
+        assert_eq!(waited, Duration::ZERO);
+    }
 
     #[test]
     fn audio_queue_drops_old_packets_and_marks_recovery_without_growing_latency() {

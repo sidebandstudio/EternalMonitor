@@ -804,7 +804,7 @@ pub async fn start_sender(
                 }
 
                 if wifi && !waited.is_zero() {
-                    state.abr.note_socket_wait();
+                    state.abr.note_socket_wait(waited);
                 }
 
                 let total_bytes = payload.len();
