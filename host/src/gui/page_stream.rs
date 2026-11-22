@@ -401,6 +401,16 @@ impl AnalyzerApp {
 
     fn status_header(&mut self, ui: &mut Ui, snap: &StatsSnapshot, client: &ClientSnapshot) {
         let state = StreamState::of(snap, client);
+        // Before the supervisor publishes a status, the port check may
+        // already have found a holder.
+        let state = if snap.stream_status.is_none()
+            && state == StreamState::Off
+            && crate::startup::port::held().is_some()
+        {
+            StreamState::WaitingForPort
+        } else {
+            state
+        };
         let quality = self
             .quality
             .update(client.session_id, client.report.as_ref());
@@ -414,6 +424,15 @@ impl AnalyzerApp {
                 tr("Streaming is off").to_string(),
                 tr("Click Start streaming so your iPad can connect.").to_string(),
             ),
+            StreamState::Recovering => (
+                "Restarting stream…".to_string(),
+                "EternalMonitor will try again automatically.".to_string(),
+            ),
+            StreamState::WaitingForPort => (
+                "Waiting for the stream port…".to_string(),
+                "EternalMonitor starts by itself when it's free.".to_string(),
+            ),
+            StreamState::ShuttingDown => (tr("Streaming is off").to_string(), String::new()),
             StreamState::Ready => (
                 tr("Ready for your iPad").to_string(),
                 "Open EternalMonitor on your iPad and tap this PC, or plug in a USB cable."
@@ -443,12 +462,6 @@ impl AnalyzerApp {
                 "Windows stopped screen capture. See the message above.".to_string(),
             ),
         };
-        // Off only until another program lets go of the stream port.
-        let waiting = crate::startup::port::held().is_some();
-        let (title, subtitle) =
-            super::port_notice::waiting_status(state == StreamState::Off, waiting)
-                .unwrap_or((title, subtitle));
-
         widgets::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
             let width = ui.available_width();
@@ -466,7 +479,16 @@ impl AnalyzerApp {
                         mix(
                             SURFACE,
                             color,
-                            if state == StreamState::Off { 6 } else { 10 },
+                            if matches!(
+                                state,
+                                StreamState::Off
+                                    | StreamState::WaitingForPort
+                                    | StreamState::ShuttingDown
+                            ) {
+                                6
+                            } else {
+                                10
+                            },
                         ),
                         egui::Stroke::new(1.0, mix(SURFACE, color, 24)),
                     );
@@ -475,27 +497,16 @@ impl AnalyzerApp {
                     // Room for the buttons drawn below, as wide as their
                     // labels in this language, and never less than before.
                     let spacing = ui.spacing().item_spacing.x;
-                    let buttons = [
-                        (snap.pipeline_running || waiting, Icon::Stop, tr("Stop")),
-                        (snap.pipeline_running, Icon::Refresh, tr("Restart")),
-                        (
-                            !snap.pipeline_running && !waiting,
-                            Icon::Play,
-                            tr("Start streaming"),
-                        ),
-                    ];
+                    let buttons = state.header_actions();
                     let measured: f32 = buttons
-                        .into_iter()
-                        .filter(|&(shown, _, _)| shown)
-                        .map(|(_, icon, label)| {
+                        .iter()
+                        .map(|action| {
+                            let (icon, label, _) = action.button();
                             widgets::button_width(ui, Some(icon), label) + spacing
                         })
                         .sum();
-                    let buttons_width = measured.max(if state == StreamState::Off {
-                        170.0
-                    } else {
-                        210.0
-                    });
+                    let buttons_width =
+                        measured.max(if buttons.len() <= 1 { 170.0 } else { 210.0 });
                     // A narrow window cuts the text short, never under the
                     // buttons: Russian at the minimum size leaves about 130.
                     let text_width = (ui.available_width() - buttons_width).max(0.0);
@@ -515,39 +526,19 @@ impl AnalyzerApp {
                         },
                     );
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if snap.pipeline_running || waiting {
-                            // While waiting for the port, Stop cancels the
-                            // start that would follow.
-                            if widgets::button(ui, Tone::Danger, Some(Icon::Stop), tr("Stop"))
-                                .clicked()
-                            {
-                                action = Some(HeaderAction::Stop);
+                        for &button in buttons {
+                            let (icon, label, tone) = button.button();
+                            let response = widgets::button(ui, tone, Some(icon), label);
+                            let response = if button == HeaderAction::Restart {
+                                response.on_hover_text(
+                                    "Restart capture and encoding. The iPad reconnects on its own.",
+                                )
+                            } else {
+                                response
+                            };
+                            if response.clicked() {
+                                action = Some(button);
                             }
-                        }
-                        if snap.pipeline_running {
-                            if widgets::button(
-                                ui,
-                                Tone::Secondary,
-                                Some(Icon::Refresh),
-                                tr("Restart"),
-                            )
-                            .on_hover_text(
-                                "Restart capture and encoding. The iPad reconnects on its own.",
-                            )
-                            .clicked()
-                            {
-                                action = Some(HeaderAction::Restart);
-                            }
-                        } else if !waiting
-                            && widgets::button(
-                                ui,
-                                Tone::Primary,
-                                Some(Icon::Play),
-                                tr("Start streaming"),
-                            )
-                            .clicked()
-                        {
-                            action = Some(HeaderAction::Start);
                         }
                     });
                 },
@@ -884,10 +875,96 @@ impl AnalyzerApp {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum HeaderAction {
     Start,
     Stop,
     Restart,
+}
+
+impl HeaderAction {
+    fn button(self) -> (Icon, &'static str, Tone) {
+        match self {
+            Self::Start => (Icon::Play, tr("Start streaming"), Tone::Primary),
+            Self::Stop => (Icon::Stop, tr("Stop"), Tone::Danger),
+            Self::Restart => (Icon::Refresh, tr("Restart"), Tone::Secondary),
+        }
+    }
+}
+
+impl StreamState {
+    fn header_actions(self) -> &'static [HeaderAction] {
+        use HeaderAction::{Restart, Start, Stop};
+        match self {
+            Self::Off => &[Start],
+            Self::WaitingForPort => &[Stop],
+            Self::Recovering | Self::Ready | Self::Streaming | Self::Paused => &[Stop, Restart],
+            Self::ShuttingDown => &[],
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn the_stream_header_offers_controls_for_each_supervisor_state() {
+    use crate::supervisor::StreamStatus;
+    use HeaderAction::{Restart, Start, Stop};
+
+    for (status, connected, blocked, expected, actions) in [
+        (
+            StreamStatus::Stopped,
+            true,
+            false,
+            StreamState::Off,
+            &[Start][..],
+        ),
+        (
+            StreamStatus::Recovering,
+            true,
+            false,
+            StreamState::Recovering,
+            &[Stop, Restart][..],
+        ),
+        (
+            StreamStatus::WaitingForPort,
+            false,
+            false,
+            StreamState::WaitingForPort,
+            &[Stop][..],
+        ),
+        (
+            StreamStatus::ShuttingDown,
+            true,
+            false,
+            StreamState::ShuttingDown,
+            &[][..],
+        ),
+        (
+            StreamStatus::Running,
+            false,
+            false,
+            StreamState::Ready,
+            &[Stop, Restart][..],
+        ),
+        (
+            StreamStatus::Running,
+            true,
+            false,
+            StreamState::Streaming,
+            &[Stop, Restart][..],
+        ),
+        (
+            StreamStatus::Running,
+            true,
+            true,
+            StreamState::Paused,
+            &[Stop, Restart][..],
+        ),
+    ] {
+        let state = StreamState::from_status(status, connected, blocked);
+        assert_eq!(state, expected);
+        assert_eq!(state.header_actions(), actions);
+    }
 }
 
 pub(super) const SOFTWARE_FALLBACK_TITLE: &str =

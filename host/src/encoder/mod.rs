@@ -60,7 +60,26 @@ pub fn run_encode_stage(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     #[cfg(target_os = "macos")]
     crate::capture::timing::set_stream_qos();
-    let result = run_encode_loop(frames, tx, shared, gpu, generation);
+    let result = run_encode_loop(
+        frames,
+        tx,
+        shared,
+        gpu,
+        generation,
+        |name, width, height, bitrate, fps, input, how, progress| {
+            open_session(
+                &LAUNCH_FAILURES,
+                name,
+                width,
+                height,
+                bitrate,
+                fps,
+                input,
+                how,
+                progress,
+            )
+        },
+    );
     if let Err(ref e) = result {
         error!(error = %e, "Encode loop exited with error");
     }
@@ -107,12 +126,27 @@ fn applied_encoder(
 /// dropped — a lost P-frame corrupts until the next IDR).
 pub const NAL_CHANNEL_CAPACITY: usize = CHANNEL_CAPACITY;
 
+type OpenSessionResult = Result<EncoderState, Box<dyn std::error::Error + Send + Sync>>;
+
+#[cfg(test)]
+pub(crate) use tests::run_delayed_fallback;
+
 fn run_encode_loop(
     frames: FrameSlot,
     tx: mpsc::Sender<NALUnit>,
     shared: SharedControl,
     gpu: GpuInfo,
     generation: u64,
+    mut open: impl FnMut(
+        &str,
+        u32,
+        u32,
+        u32,
+        u32,
+        &mut EncoderInput,
+        Opening,
+        &mut dyn FnMut(),
+    ) -> OpenSessionResult,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Apply GUI encoder override at pipeline start. The override is consulted only here;
     // mid-stream changes don't take effect until the user requests a Restart.
@@ -342,8 +376,7 @@ fn run_encode_loop(
         if encoder_state.is_none() {
             let picture_by =
                 *first_picture_by.get_or_insert_with(|| Instant::now() + FIRST_PICTURE_WAIT);
-            match open_session(
-                &LAUNCH_FAILURES,
+            match open(
                 &desired_encoder,
                 raw_frame.width,
                 raw_frame.height,
@@ -372,14 +405,13 @@ fn run_encode_loop(
                 // No picture yet, and the iPad would give up waiting for
                 // it: libx264 streams while the open goes on.
                 Err(e) if is_still_opening(e.as_ref()) => {
-                    let open = take_still_opening(e.as_ref()).expect("the open going on");
+                    let pending = take_still_opening(e.as_ref()).expect("the open going on");
                     warn!(
                         encoder = %desired_encoder,
-                        waited_ms = open.pending.running_for().as_millis() as u64,
+                        waited_ms = pending.pending.running_for().as_millis() as u64,
                         "The encoder has not opened yet; streaming on libx264 while it opens in the background"
                     );
-                    let state = open_session(
-                        &LAUNCH_FAILURES,
+                    let state = open(
                         "libx264",
                         raw_frame.width,
                         raw_frame.height,
@@ -390,7 +422,7 @@ fn run_encode_loop(
                         &mut opening,
                     )?;
                     stall_recovery.outwaited(&desired_encoder, "libx264", Instant::now());
-                    background = Some(Behind::first(open, desired_bitrate));
+                    background = Some(Behind::first(pending, desired_bitrate));
                     encoder_state = Some(state);
                     first_picture_by = None;
                     bitrate_pacer.opened(Instant::now());
@@ -428,8 +460,7 @@ fn run_encode_loop(
                         (&desired_encoder, &e.to_string()),
                         crate::gpu::vendors_present,
                         |name| {
-                            let opened = open_session(
-                                &LAUNCH_FAILURES,
+                            let opened = open(
                                 name,
                                 raw_frame.width,
                                 raw_frame.height,
@@ -573,8 +604,7 @@ fn run_encode_loop(
                     first: false,
                     in_background: false,
                 };
-                match open_session(
-                    &LAUNCH_FAILURES,
+                match open(
                     &desired_encoder,
                     raw_frame.width,
                     raw_frame.height,
@@ -5817,6 +5847,69 @@ mod tests {
                 yuv_retry: false,
             },
         )
+    }
+
+    pub(crate) fn run_delayed_fallback(
+        shared: SharedControl,
+        generation: u64,
+        preferred_open_pending: bool,
+        before_publication: impl FnOnce(),
+    ) {
+        ffmpeg_next::init().unwrap();
+        let (producer, consumer) = crate::capture::frame_slot();
+        producer.publish(RawFrame {
+            frame_number: 1,
+            timestamp: Instant::now(),
+            data: std::sync::Arc::new(crate::capture::frame_buffer(64 * 64 * 4)),
+            width: 64,
+            height: 64,
+            cached: false,
+        });
+        producer.close();
+        let (tx, _rx) = mpsc::channel(NAL_CHANNEL_CAPACITY);
+        let gpu = GpuInfo {
+            encoder_name: "mpeg4".into(),
+            ..GpuInfo::software_fallback()
+        };
+        let mut before_publication = Some(before_publication);
+        static LANES: crate::stall::Lanes = crate::stall::Lanes::new();
+        let mut release_background = None;
+        run_encode_loop(
+            consumer,
+            tx,
+            shared,
+            gpu,
+            generation,
+            |name, width, height, bitrate, fps, input, how, progress| {
+                if name == "mpeg4" {
+                    if preferred_open_pending {
+                        let (release, open) = parked_background_open(
+                            &LANES,
+                            name,
+                            ffmpeg_next::format::Pixel::YUV420P,
+                            real_yuv_encoder,
+                        );
+                        release_background = Some(release);
+                        return Err(Box::new(StillOpening(
+                            name.to_string(),
+                            parking_lot::Mutex::new(Some(open)),
+                        )));
+                    }
+                    return Err("test encoder could not open".into());
+                }
+                assert_eq!(name, "libx264");
+                let state =
+                    EncoderState::new(name, width, height, bitrate, fps, input, how, progress)?;
+                before_publication.take().expect("the fallback opens once")();
+                Ok(state)
+            },
+        )
+        .unwrap();
+        if let Some(release) = release_background {
+            release.send(()).unwrap();
+            wait_for_clear_lane(&LANES);
+        }
+        assert!(before_publication.is_none(), "the software fallback opened");
     }
 
     /// A real libx264 session at 64x64 YUV420P, opened on the call's thread

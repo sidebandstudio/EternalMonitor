@@ -94,6 +94,7 @@ pub struct PipelineStats {
 
     // Pipeline state
     pub pipeline_running: bool,
+    pub stream_status: Option<crate::supervisor::StreamStatus>,
     pub start_time: Option<Instant>,
 
     // mDNS
@@ -159,6 +160,7 @@ impl PipelineStats {
             encode_time_history: VecDeque::with_capacity(HISTORY_LEN),
 
             pipeline_running: false,
+            stream_status: None,
             start_time: None,
 
             mdns_active: false,
@@ -179,6 +181,7 @@ impl PipelineStats {
         self.gpu_detection_stalled = previous.gpu_detection_stalled;
         self.driver_update_vendors = previous.driver_update_vendors;
         self.mdns_active = previous.mdns_active;
+        self.stream_status = previous.stream_status;
         previous.audio
     }
 
