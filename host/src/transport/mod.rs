@@ -1128,7 +1128,12 @@ async fn act(
         state
             .abr
             .encoder_reopens(shared.encoder_reopens_for_bitrate.load(Ordering::Relaxed));
-        let reported = state.abr.on_report(&report, tunnel_drops, Instant::now());
+        let reported = state.abr.on_report(
+            &report,
+            tunnel_drops,
+            actions.frames_sent_since_report,
+            Instant::now(),
+        );
         let decision = abr::AbrDecision {
             target_bps: reported.target_bps,
             changed: clamped.changed || reported.changed,

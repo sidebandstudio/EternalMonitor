@@ -7214,6 +7214,7 @@ mod tests {
         let mut changes = Vec::new();
         let end = stage.started + Duration::from_secs(minutes * 60);
         let mut next_report = stage.started + Duration::from_secs(1);
+        let mut frames_at_report = stage.number;
         while Instant::now() < end {
             stage.publish();
             if Instant::now() < next_report {
@@ -7238,7 +7239,9 @@ mod tests {
                     .load(Ordering::Relaxed),
             );
             // AFTER-ONLY end
-            let decision = abr.on_report(&report, None, Instant::now());
+            let frames_sent = u32::try_from(stage.number - frames_at_report).unwrap_or(u32::MAX);
+            frames_at_report = stage.number;
+            let decision = abr.on_report(&report, None, frames_sent, Instant::now());
             if decision.changed {
                 stage
                     .shared

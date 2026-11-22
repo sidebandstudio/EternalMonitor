@@ -41,6 +41,13 @@ const LOSS_CLEAN: f64 = 0.005;
 const TUNNEL_WINDOW_MASK: u8 = 0b111;
 const TUNNEL_DROPS_TO_STEP: u32 = 2;
 
+/// A report with no frames is a still screen's when the PC sent at most
+/// this many since the previous report. The PC counts a frame as it sends
+/// it and the iPad as it arrives, so one sent within a round trip of the
+/// report shows up only in the next; a still screen sends about one a
+/// second, so a lone frame on its way is that, not a link losing frames.
+const STILL_FRAMES_SENT: u32 = 1;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AbrDecision {
     pub target_bps: u32,
@@ -172,12 +179,17 @@ impl AbrController {
     /// the capture time, so over the cable it is the PC's encode time
     /// varying, which a lower bitrate does not fix.
     ///
-    /// A report with no frames (a still screen sends about one a second)
-    /// neither starts nor breaks the clean streak.
+    /// `frames_sent` is the video frames the PC sent since the previous
+    /// report. A report with no frames neither starts nor breaks the clean
+    /// streak when the PC sent next to none either (a still screen sends
+    /// about one a second, [`STILL_FRAMES_SENT`]). When it sent more, they
+    /// were lost, all of each frame, which the iPad does not count: the
+    /// streak starts again.
     pub fn on_report(
         &mut self,
         report: &ReceiverReport,
         tunnel_drops: Option<u64>,
+        frames_sent: u32,
         now: Instant,
     ) -> AbrDecision {
         let unchanged = AbrDecision {
@@ -276,10 +288,11 @@ impl AbrController {
         }
 
         // ---- Upgrade path ----
-        if total == 0 && !tunnel_lossy {
+        if total == 0 && frames_sent <= STILL_FRAMES_SENT && !tunnel_lossy {
             return unchanged;
         }
-        if loss < LOSS_CLEAN
+        if total > 0
+            && loss < LOSS_CLEAN
             && repairs < LOSS_CLEAN
             && !congested_queue
             && !tunnel_lossy
@@ -379,6 +392,10 @@ fn step(from: u32, rungs: i32, ceiling: u32) -> u32 {
 mod tests {
     use super::*;
 
+    /// Frames the PC sent between two reports: a moving picture's, more
+    /// than a still screen's.
+    const SENT: u32 = 30;
+
     fn report(received: u32, lost: u32, depth: u8) -> ReceiverReport {
         ReceiverReport {
             frags_received: received,
@@ -403,16 +420,26 @@ mod tests {
         let mut abr = AbrController::new(20_000_000, true);
         let t0 = Instant::now();
         // 15% loss -> two rungs: 15M -> 10M.
-        let d = abr.on_report(&report(850, 150, 0), None, t0);
+        let d = abr.on_report(&report(850, 150, 0), None, SENT, t0);
         assert!(d.changed);
         assert_eq!(d.target_bps, 10_000_000);
 
         // Still lossy 1s later: inside the 3s down-cooldown, no change.
-        let d = abr.on_report(&report(1700, 300, 0), None, t0 + Duration::from_secs(1));
+        let d = abr.on_report(
+            &report(1700, 300, 0),
+            None,
+            SENT,
+            t0 + Duration::from_secs(1),
+        );
         assert!(!d.changed);
 
         // After the cooldown, mild loss steps one more rung: 10M -> 8M.
-        let d = abr.on_report(&report(2540, 340, 0), None, t0 + Duration::from_secs(4));
+        let d = abr.on_report(
+            &report(2540, 340, 0),
+            None,
+            SENT,
+            t0 + Duration::from_secs(4),
+        );
         assert!(d.changed);
         assert_eq!(d.target_bps, 8_000_000);
     }
@@ -420,7 +447,7 @@ mod tests {
     #[test]
     fn queue_depth_alone_steps_down() {
         let mut abr = AbrController::new(20_000_000, true);
-        let d = abr.on_report(&report(1000, 0, 4), None, Instant::now());
+        let d = abr.on_report(&report(1000, 0, 4), None, SENT, Instant::now());
         assert!(d.changed);
         assert_eq!(d.target_bps, 12_000_000);
     }
@@ -430,7 +457,7 @@ mod tests {
         let mut abr = AbrController::new(20_000_000, true);
         let t0 = Instant::now();
         // Step down first: 15M -> 12M.
-        let d = abr.on_report(&report(950, 50, 0), None, t0);
+        let d = abr.on_report(&report(950, 50, 0), None, SENT, t0);
         assert_eq!(d.target_bps, 12_000_000);
 
         // Clean reports every 500ms; must NOT step up before 15s clean.
@@ -442,7 +469,7 @@ mod tests {
         for i in 1..=40 {
             cumulative += 500;
             let at = t0 + Duration::from_millis(500 * i);
-            last = abr.on_report(&report(cumulative, 50, 0), None, at);
+            last = abr.on_report(&report(cumulative, 50, 0), None, SENT, at);
             if last.changed {
                 assert!(
                     at.duration_since(t0) >= Duration::from_secs(15),
@@ -460,14 +487,15 @@ mod tests {
     fn report_gap_resets_clean_streak() {
         let mut abr = AbrController::new(20_000_000, true);
         let t0 = Instant::now();
-        abr.on_report(&report(950, 50, 0), None, t0); // down to 12M
-                                                      // 10s of clean...
+        abr.on_report(&report(950, 50, 0), None, SENT, t0); // down to 12M
+                                                            // 10s of clean...
         let mut cumulative = 1000;
         for i in 1..=20 {
             cumulative += 500;
             abr.on_report(
                 &report(cumulative, 50, 0),
                 None,
+                SENT,
                 t0 + Duration::from_millis(500 * i),
             );
         }
@@ -479,6 +507,7 @@ mod tests {
             let d = abr.on_report(
                 &report(cumulative, 50, 0),
                 None,
+                SENT,
                 resume + Duration::from_secs(i),
             );
             assert!(!d.changed, "must not upgrade at +{i}s after an outage");
@@ -493,7 +522,7 @@ mod tests {
         assert_eq!(d.target_bps, 8_000_000);
 
         let mut off = AbrController::new(20_000_000, false);
-        let d = off.on_report(&report(500, 500, 5), None, Instant::now());
+        let d = off.on_report(&report(500, 500, 5), None, SENT, Instant::now());
         assert!(!d.changed, "disabled controller must never adapt");
     }
 
@@ -504,7 +533,7 @@ mod tests {
         let mut cumulative = (0u32, 0u32);
         for _ in 0..12 {
             cumulative = (cumulative.0 + 800, cumulative.1 + 200);
-            abr.on_report(&report(cumulative.0, cumulative.1, 0), None, now);
+            abr.on_report(&report(cumulative.0, cumulative.1, 0), None, SENT, now);
             now += Duration::from_secs(4);
         }
         assert_eq!(abr.current_bps(), 4_000_000, "must bottom out at the floor");
@@ -519,24 +548,24 @@ mod tests {
             frags_repaired: 51,
             ..Default::default()
         };
-        assert_eq!(abr.on_report(&r, None, now).target_bps, 12_000_000);
+        assert_eq!(abr.on_report(&r, None, SENT, now).target_bps, 12_000_000);
         r.frags_received += 1000;
         r.frags_repaired += 100;
         assert!(
-            !abr.on_report(&r, None, now + Duration::from_secs(1))
+            !abr.on_report(&r, None, SENT, now + Duration::from_secs(1))
                 .changed
         );
         r.frags_received += 1000;
         r.jitter_us = 15_001;
         assert_eq!(
-            abr.on_report(&r, None, now + Duration::from_secs(3))
+            abr.on_report(&r, None, SENT, now + Duration::from_secs(3))
                 .target_bps,
             10_000_000
         );
         r.frags_received += 850;
         r.frags_lost += 150;
         assert_eq!(
-            abr.on_report(&r, None, now + Duration::from_secs(6))
+            abr.on_report(&r, None, SENT, now + Duration::from_secs(6))
                 .target_bps,
             6_000_000
         );
@@ -550,7 +579,7 @@ mod tests {
         let mut rungs = Vec::new();
         for tick in 0..=150 {
             r.frags_received += 1000;
-            let d = abr.on_report(&r, None, now + Duration::from_millis(tick * 500));
+            let d = abr.on_report(&r, None, SENT, now + Duration::from_millis(tick * 500));
             if d.changed {
                 rungs.push(d.target_bps);
             }
@@ -576,7 +605,7 @@ mod tests {
             r.frags_received += 1000;
             r.frags_repaired += 10;
             assert!(
-                !abr.on_report(&r, None, now + Duration::from_millis(tick * 500))
+                !abr.on_report(&r, None, SENT, now + Duration::from_millis(tick * 500))
                     .changed
             );
         }
@@ -587,7 +616,7 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(
-            abr.on_report(&restarted, None, now + Duration::from_secs(21))
+            abr.on_report(&restarted, None, SENT, now + Duration::from_secs(21))
                 .target_bps,
             10_000_000
         );
@@ -606,17 +635,17 @@ mod tests {
             assembler_depth: 5,
             ..Default::default()
         };
-        assert!(!abr.on_report(&r, Some(0), now).changed);
+        assert!(!abr.on_report(&r, Some(0), SENT, now).changed);
         r.frags_received += 600;
         r.frags_lost += 400;
         assert!(
-            !abr.on_report(&r, Some(0), now + Duration::from_secs(4))
+            !abr.on_report(&r, Some(0), SENT, now + Duration::from_secs(4))
                 .changed
         );
         assert_eq!(abr.current_bps(), 15_000_000);
         // The same report over WiFi is heavy loss.
         let mut wifi = AbrController::new(20_000_000, true);
-        assert_eq!(wifi.on_report(&r, None, now).target_bps, 10_000_000);
+        assert_eq!(wifi.on_report(&r, None, SENT, now).target_bps, 10_000_000);
     }
 
     /// A tunnel that drops frames in every other report is overloaded
@@ -634,7 +663,12 @@ mod tests {
             if tick % 2 == 1 {
                 drops += 10;
             }
-            let d = abr.on_report(&r, Some(drops), start + Duration::from_millis(500 * tick));
+            let d = abr.on_report(
+                &r,
+                Some(drops),
+                SENT,
+                start + Duration::from_millis(500 * tick),
+            );
             if d.changed {
                 rungs.push((500 * tick, d.target_bps));
             }
@@ -661,7 +695,7 @@ mod tests {
         let mut r = ReceiverReport::default();
         let mut decide = |drops: u64, ms: u64| {
             r.frags_received += 500;
-            abr.on_report(&r, Some(drops), start + Duration::from_millis(ms))
+            abr.on_report(&r, Some(drops), SENT, start + Duration::from_millis(ms))
         };
         assert!(!decide(0, 0).changed);
         assert!(!decide(3, 500).changed, "one burst is not a slow link");
@@ -694,7 +728,7 @@ mod tests {
         let t0 = Instant::now();
         let d = abr.on_send_refused(t0);
         assert_eq!((d.target_bps, d.changed), (12_000_000, true));
-        let d = abr.on_report(&report(950, 50, 0), None, t0 + Duration::from_secs(1));
+        let d = abr.on_report(&report(950, 50, 0), None, SENT, t0 + Duration::from_secs(1));
         assert!(!d.changed, "the same loss, inside the cooldown");
         assert_eq!(abr.current_bps(), 12_000_000);
 
@@ -732,7 +766,7 @@ mod tests {
     fn a_refusal_right_after_a_report_downgrade_waits_the_cooldown() {
         let mut abr = AbrController::new(20_000_000, true);
         let t0 = Instant::now();
-        let d = abr.on_report(&report(950, 50, 0), None, t0);
+        let d = abr.on_report(&report(950, 50, 0), None, SENT, t0);
         assert_eq!((d.target_bps, d.changed), (12_000_000, true));
         assert!(!abr.on_send_refused(t0 + Duration::from_millis(500)).changed);
         assert!(
@@ -758,6 +792,7 @@ mod tests {
             let d = abr.on_report(
                 &report(*counter, 0, 0),
                 None,
+                SENT,
                 t0 + Duration::from_secs(second),
             );
             if d.changed {
@@ -777,7 +812,7 @@ mod tests {
             abr.encoder_reopens(reopens);
             let t0 = Instant::now();
             // Loss steps 15 -> 12 Mbps at 0 s; clean from then on.
-            assert!(abr.on_report(&report(980, 30, 0), None, t0).changed);
+            assert!(abr.on_report(&report(980, 30, 0), None, SENT, t0).changed);
             let mut counter = 980;
             let changes = clean_reports(&mut abr, t0, &mut counter, 1..80);
             assert_eq!(changes[0], (first_up, 15_000_000), "reopens={reopens}");
@@ -802,7 +837,10 @@ mod tests {
         let mut counter = 0;
         // Steps down at 0 s, then probes up once the wait is over, and each
         // probe is lost 4 s later, on a link that cannot carry it.
-        assert!(abr.on_report(&report(980, 30, 0), None, at(0)).changed);
+        assert!(
+            abr.on_report(&report(980, 30, 0), None, SENT, at(0))
+                .changed
+        );
         let mut downs = vec![0u64];
         let mut ups = Vec::new();
         let mut second = 1;
@@ -813,7 +851,7 @@ mod tests {
                 .is_some_and(|&up: &u64| up > *downs.last().unwrap() && second - up == 4);
             counter += 1_000;
             let lost = if lossy { 50 } else { 0 };
-            let d = abr.on_report(&report(counter, lost, 0), None, at(second));
+            let d = abr.on_report(&report(counter, lost, 0), None, SENT, at(second));
             if d.changed {
                 if lossy {
                     downs.push(second);
@@ -832,12 +870,15 @@ mod tests {
         // A probe that holds 30 s: the next one waits 30 s again.
         let mut abr = AbrController::new(50_000_000, true);
         abr.encoder_reopens(true);
-        assert!(abr.on_report(&report(980, 30, 0), None, at(0)).changed);
+        assert!(
+            abr.on_report(&report(980, 30, 0), None, SENT, at(0))
+                .changed
+        );
         let mut counter = 980;
         let ups = clean_reports(&mut abr, t0, &mut counter, 1..31);
         assert_eq!(ups, [(30, 15_000_000)]);
         assert!(
-            abr.on_report(&report(counter + 900, 60, 0), None, at(32))
+            abr.on_report(&report(counter + 900, 60, 0), None, SENT, at(32))
                 .changed
         );
         counter += 900;
@@ -861,7 +902,7 @@ mod tests {
             counter += 1_000;
             lost += 50;
             if abr
-                .on_report(&report(counter, lost, 0), None, at(ms))
+                .on_report(&report(counter, lost, 0), None, SENT, at(ms))
                 .changed
             {
                 downs.push((ms, abr.current_bps()));
@@ -905,6 +946,7 @@ mod tests {
             let d = abr.on_report(
                 &report(received, lost, 0),
                 None,
+                SENT,
                 t0 + Duration::from_secs(second),
             );
             if d.changed {
@@ -955,24 +997,31 @@ mod tests {
     }
 
     /// Reports every 500 ms from `t0` over `ticks`, counters continuing
-    /// from `r`, with frames on the ticks `frames` picks and `jitter_us`;
-    /// the link is USB when `usb`. The changes, as (ms, target).
+    /// from `r`, with `jitter_us`; `frames` gives each tick's frames the PC
+    /// sent and whether any arrived. The link is USB when `usb`. The
+    /// changes, as (ms, target).
     fn half_second_reports(
         abr: &mut AbrController,
         t0: Instant,
         r: &mut ReceiverReport,
         usb: bool,
         ticks: std::ops::Range<u64>,
-        frames: impl Fn(u64) -> bool,
+        frames: impl Fn(u64) -> (u32, bool),
         jitter_us: impl Fn(u64) -> u32,
     ) -> Vec<(u64, u32)> {
         let mut changes = Vec::new();
         for tick in ticks {
-            if frames(tick) {
+            let (sent, arrived) = frames(tick);
+            if arrived {
                 r.frags_received += 500;
             }
             r.jitter_us = jitter_us(tick);
-            let d = abr.on_report(r, usb.then_some(0), t0 + Duration::from_millis(500 * tick));
+            let d = abr.on_report(
+                r,
+                usb.then_some(0),
+                sent,
+                t0 + Duration::from_millis(500 * tick),
+            );
             if d.changed {
                 changes.push((500 * tick, d.target_bps));
             }
@@ -998,7 +1047,7 @@ mod tests {
             &mut r,
             true,
             0..60,
-            |_| true,
+            |_| (SENT, true),
             encode_jitter,
         );
         assert_eq!(changes, [(15_000, 20_000_000)]);
@@ -1015,7 +1064,7 @@ mod tests {
             &mut r,
             false,
             0..20,
-            |_| true,
+            |_| (SENT, true),
             encode_jitter,
         );
         assert_eq!(
@@ -1030,8 +1079,8 @@ mod tests {
     }
 
     /// A still screen sends about a frame a second, so every other report
-    /// has none. Those neither break the clean streak, which kept a field
-    /// session at 4 Mbps for hours, nor start it.
+    /// has none, and the PC sent none either. Those neither break the clean
+    /// streak, which kept a field session at 4 Mbps for hours, nor start it.
     #[test]
     fn reports_without_frames_neither_break_nor_start_the_clean_streak() {
         // Loss steps 15 -> 12 Mbps at 0 ms, then frames on odd ticks only:
@@ -1039,22 +1088,92 @@ mod tests {
         let t0 = Instant::now();
         let mut wifi = AbrController::new(20_000_000, true);
         let mut r = report(950, 50, 0);
-        assert!(wifi.on_report(&r, None, t0).changed);
-        let odd = |tick: u64| tick % 2 == 1;
+        assert!(wifi.on_report(&r, None, SENT, t0).changed);
+        let odd = |tick: u64| (u32::from(tick % 2 == 1), tick % 2 == 1);
         let changes = half_second_reports(&mut wifi, t0, &mut r, false, 1..80, odd, |_| 0);
         assert_eq!(changes, [(15_500, 15_000_000), (30_500, 20_000_000)]);
 
         let mut usb = AbrController::new(20_000_000, true);
         let mut r = ReceiverReport::default();
-        let even = |tick: u64| !odd(tick);
+        let even = |tick: u64| (u32::from(tick.is_multiple_of(2)), tick.is_multiple_of(2));
         let changes = half_second_reports(&mut usb, t0, &mut r, true, 0..60, even, |_| 0);
         assert_eq!(changes, [(15_000, 20_000_000)]);
 
         // 20 s with no frames at all, then frames: up 15 s after the first.
         let mut idle = AbrController::new(20_000_000, true);
         let mut r = ReceiverReport::default();
-        let after_20_s = |tick: u64| tick >= 40;
+        let after_20_s = |tick: u64| if tick >= 40 { (SENT, true) } else { (0, false) };
         let changes = half_second_reports(&mut idle, t0, &mut r, false, 0..80, after_20_s, |_| 0);
         assert_eq!(changes, [(35_000, 20_000_000)]);
+    }
+
+    /// A frame sent just before a report reaches the iPad after it: the
+    /// next report counts it. The one without it is still a still screen's.
+    #[test]
+    fn a_frame_on_its_way_does_not_break_the_clean_streak() {
+        // Sent on even ticks, arrived by odd ones: clean from 500 ms.
+        let in_flight = |tick: u64| (u32::from(tick.is_multiple_of(2)), tick % 2 == 1);
+        for usb in [false, true] {
+            let mut abr = AbrController::new(20_000_000, true);
+            let mut r = ReceiverReport::default();
+            let changes = half_second_reports(
+                &mut abr,
+                Instant::now(),
+                &mut r,
+                usb,
+                0..60,
+                in_flight,
+                |_| 0,
+            );
+            assert_eq!(changes, [(15_500, 20_000_000)], "usb: {usb}");
+        }
+    }
+
+    /// The PC kept sending for 3 s and nothing arrived, while the iPad's
+    /// reports still did. It counts no loss for frames it saw none of, so
+    /// reports without frames are the blackout's: the streak starts again.
+    #[test]
+    fn a_blackout_while_frames_are_sent_breaks_the_clean_streak() {
+        // Clean from 0, nothing arrives from 10 s to 13 s: up 15 s after.
+        let blackout = |tick: u64| (SENT, !(20..26).contains(&tick));
+        for usb in [false, true] {
+            let mut abr = AbrController::new(20_000_000, true);
+            let mut r = ReceiverReport::default();
+            let changes = half_second_reports(
+                &mut abr,
+                Instant::now(),
+                &mut r,
+                usb,
+                0..60,
+                blackout,
+                |_| 0,
+            );
+            assert_eq!(changes, [(28_000, 20_000_000)], "usb: {usb}");
+        }
+    }
+
+    /// Over USB a report without frames, but with a frame the tunnel
+    /// dropped, breaks the streak: up 15 s after it, not 15 s after the
+    /// first report.
+    #[test]
+    fn a_tunnel_drop_in_a_report_without_frames_breaks_the_clean_streak() {
+        let t0 = Instant::now();
+        let mut abr = AbrController::new(20_000_000, true);
+        let mut r = ReceiverReport::default();
+        let mut changes = Vec::new();
+        for tick in 0..60 {
+            // At 5 s the one frame sent was the tunnel's one drop.
+            let dropped = tick == 10;
+            if !dropped {
+                r.frags_received += 500;
+            }
+            let drops = u64::from(tick >= 10);
+            let at = t0 + Duration::from_millis(500 * tick);
+            let d = abr.on_report(&r, Some(drops), u32::from(dropped), at);
+            if d.changed {
+                changes.push((500 * tick, d.target_bps));
+            }
+        }
+        assert_eq!(changes, [(20_500, 20_000_000)]);
     }
 }

@@ -177,6 +177,9 @@ pub struct Actions {
     pub release_input: bool,
     /// A fresh receiver report arrived (feeds the ABR controller).
     pub report: Option<ReceiverReport>,
+    /// With `report`: the video frames sent to its session since that
+    /// session's previous report, or since it started.
+    pub frames_sent_since_report: u32,
     /// A validated `(session_id, event)` from the connected client (only
     /// produced when that client's HELLO2 asked for input relay). The
     /// transport dedupes per session and injects.
@@ -375,6 +378,8 @@ struct ActiveSession {
     frags_received: bool,
     /// Video frames let through to this session ([`Session::may_send_media`]).
     frames_sent: u32,
+    /// [`Self::frames_sent`] at its latest receiver report.
+    frames_sent_at_report: u32,
     /// The largest media datagram the client asked for in this session
     /// ([`KeyframeRequest::max_media_dgram`]), and how many times it went
     /// down.
@@ -1355,6 +1360,7 @@ impl Session {
             frames_received: false,
             frags_received: false,
             frames_sent: 0,
+            frames_sent_at_report: 0,
             max_media_dgram: None,
             media_size_lowered: 0,
             bye: None,
@@ -1476,6 +1482,10 @@ impl Session {
                 session.frames_received |= report.frames_complete > 0;
                 session.frags_received |= report.frags_received > 0;
                 actions.report = Some(report);
+                actions.frames_sent_since_report = session
+                    .frames_sent
+                    .saturating_sub(session.frames_sent_at_report);
+                session.frames_sent_at_report = session.frames_sent;
             }
         }
         actions
@@ -2862,6 +2872,27 @@ mod tests {
         assert!(held.release_input && !held.client_lost);
         let expired = session.tick(&TestConfig, false, later + HOLD_LIMIT);
         assert!(expired.client_lost);
+    }
+
+    /// Each report comes with the frames sent to its session since the one
+    /// before, for ABR to tell a still screen from frames lost.
+    #[test]
+    fn reports_carry_the_frames_sent_since_the_last() {
+        let mut session = Session::new(1234);
+        let now = Instant::now();
+        let peer = addr([10, 0, 0, 5], 50000);
+        session.handle_control_authed(peer, hello(1, 50000), &TestConfig, now);
+        let id = session.session_id().unwrap();
+        let send_then_report = |frames: u32| {
+            for _ in 0..frames {
+                assert!(session.may_send_media(id, 1000, now));
+            }
+            let report = ControlMessage::ReceiverReport(ReceiverReport::default());
+            session
+                .handle_control_authed(peer, report, &TestConfig, now)
+                .frames_sent_since_report
+        };
+        assert_eq!([3, 0, 2].map(send_then_report), [3, 0, 2]);
     }
 
     #[test]

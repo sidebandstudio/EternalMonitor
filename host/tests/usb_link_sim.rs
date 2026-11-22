@@ -6,7 +6,7 @@
 //! Every run is deterministic: the tokio clock only moves when every task
 //! waits, so a busy machine cannot change the result.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -106,6 +106,9 @@ async fn simulate_stream(stream: Stream, bytes_per_sec: f64, run_for: Duration) 
     let start = Instant::now();
 
     let encoder_request = Arc::clone(&client_request);
+    // The frames handed to the link, as the host counts frames sent.
+    let sent = Arc::new(AtomicU64::new(0));
+    let encoder_sent = Arc::clone(&sent);
     let encoder = tokio::spawn(async move {
         let (mut encoded, mut forced) = (0u64, 0u64);
         let mut last_grant: Option<Instant> = None;
@@ -125,6 +128,7 @@ async fn simulate_stream(stream: Stream, bytes_per_sec: f64, run_for: Duration) 
                 link.send(peer, &datagram).await.unwrap();
             }
             encoded += 1;
+            encoder_sent.store(encoded, Ordering::Relaxed);
             if stream.batch_before_keyframe && encoded.is_multiple_of(stream.gop) {
                 continue;
             }
@@ -166,6 +170,7 @@ async fn simulate_stream(stream: Stream, bytes_per_sec: f64, run_for: Duration) 
     let mut abr = AbrController::new(20_000_000, true);
     let mut report = ReceiverReport::default();
     let mut reports = tokio::time::interval(Duration::from_millis(500));
+    let mut sent_at_report = 0;
     while start.elapsed() < run_for {
         let bytes = tokio::select! {
             bytes = arrivals.recv() => bytes.unwrap(),
@@ -176,7 +181,10 @@ async fn simulate_stream(stream: Stream, bytes_per_sec: f64, run_for: Duration) 
             _ = reports.tick() => {
                 report.frags_received = reassembler.counters().frags_received as u32;
                 let drops = stats.congestion_drops.load(Ordering::Relaxed);
-                abr.on_report(&report, Some(drops), clock(Instant::now()));
+                let sent_now = sent.load(Ordering::Relaxed);
+                let frames_sent = (sent_now - sent_at_report) as u32;
+                sent_at_report = sent_now;
+                abr.on_report(&report, Some(drops), frames_sent, clock(Instant::now()));
                 continue;
             }
         };
