@@ -1,11 +1,10 @@
 use tracing::{info, warn};
 use windows::core::Interface;
-use windows::Win32::Foundation::LUID;
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, DXGI_ERROR_NOT_FOUND,
 };
 
-use crate::gpu_identity::{matched_compute_capability, PciAddress};
+use crate::encoder::NvidiaAdapter;
 use crate::stall::Call;
 
 const VENDOR_NVIDIA: u32 = 0x10DE;
@@ -169,203 +168,33 @@ fn vendors_listed(
     Some(vendors)
 }
 
-/// Windows driver versions of the NVIDIA adapters, packed as DXGI reports
-/// them (32.0.15.6607). Read when NVENC refuses to open, to tell an old
-/// driver from other refusals. Also returns the NVIDIA adapter LUIDs if
-/// DXGI listed and described every adapter.
-pub(crate) fn nvidia_driver_versions() -> (Vec<u64>, Option<Vec<LUID>>) {
+/// Read the PCI device IDs and packed Windows driver versions of the NVIDIA
+/// adapters when NVENC refuses to open.
+pub(crate) fn nvidia_adapters() -> Vec<NvidiaAdapter> {
     let Ok(factory) = (unsafe { CreateDXGIFactory1::<IDXGIFactory1>() }) else {
-        return (Vec::new(), None);
+        return Vec::new();
     };
-    let mut versions = Vec::new();
     let mut adapters = Vec::new();
-    let mut complete = true;
-    for index in 0u32.. {
-        let adapter = match unsafe { factory.EnumAdapters1(index) } {
-            Ok(adapter) => adapter,
-            Err(error) => {
-                complete &= error.code() == DXGI_ERROR_NOT_FOUND;
-                break;
-            }
-        };
+    let mut index = 0u32;
+    while let Ok(adapter) = unsafe { factory.EnumAdapters1(index) } {
+        index += 1;
         let Ok(desc) = (unsafe { adapter.GetDesc1() }) else {
-            complete = false;
             continue;
         };
-        if desc.VendorId != VENDOR_NVIDIA || desc.Flags & FLAG_SOFTWARE != 0 {
+        if desc.VendorId != VENDOR_NVIDIA {
             continue;
         }
-        adapters.push(desc.AdapterLuid);
-        if let Ok(version) = unsafe {
+        let driver_version = unsafe {
             adapter.CheckInterfaceSupport(&windows::Win32::Graphics::Dxgi::IDXGIDevice::IID)
-        } {
-            versions.push(version as u64);
         }
+        .ok()
+        .map(|version| version as u64);
+        adapters.push(NvidiaAdapter {
+            device_id: desc.DeviceId,
+            driver_version,
+        });
     }
-    (versions, complete.then_some(adapters))
-}
-
-/// The newest CUDA compute capability when the PCI addresses let us
-/// match the NVIDIA adapters DXGI and CUDA listed.
-pub(crate) fn nvidia_compute_capability(adapters: Vec<LUID>) -> Option<i32> {
-    let addresses = adapters
-        .into_iter()
-        .map(adapter_pci_address)
-        .collect::<Option<Vec<_>>>()?;
-    matched_compute_capability(&addresses, &cuda_devices()?)
-}
-
-/// Resolve the DXGI LUID to the device instance and read its numeric PCI
-/// bus and address properties.
-fn adapter_pci_address(luid: LUID) -> Option<PciAddress> {
-    use std::mem::size_of;
-    use windows::core::{HRESULT, PCWSTR};
-    use windows::Win32::Devices::DeviceAndDriverInstallation::{
-        CM_Get_DevNode_PropertyW, SetupDiCreateDeviceInfoList, SetupDiDestroyDeviceInfoList,
-        SetupDiGetDeviceInterfaceDetailW, SetupDiOpenDeviceInterfaceW, CR_SUCCESS,
-        SP_DEVICE_INTERFACE_DATA, SP_DEVINFO_DATA,
-    };
-    use windows::Win32::Devices::Display::{
-        DisplayConfigGetDeviceInfo, DISPLAYCONFIG_ADAPTER_NAME,
-        DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME,
-    };
-    use windows::Win32::Devices::Properties::{
-        DEVPKEY_Device_Address, DEVPKEY_Device_BusNumber, DEVPROPTYPE, DEVPROP_TYPE_INT32,
-        DEVPROP_TYPE_UINT32,
-    };
-    use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HWND};
-
-    let mut adapter = DISPLAYCONFIG_ADAPTER_NAME::default();
-    adapter.header.r#type = DISPLAYCONFIG_DEVICE_INFO_GET_ADAPTER_NAME;
-    adapter.header.size = size_of::<DISPLAYCONFIG_ADAPTER_NAME>() as u32;
-    adapter.header.adapterId = luid;
-    let packet = (&mut adapter as *mut DISPLAYCONFIG_ADAPTER_NAME).cast();
-    if unsafe { DisplayConfigGetDeviceInfo(packet) } != 0 || !adapter.adapterDevicePath.contains(&0)
-    {
-        return None;
-    }
-
-    let devices = unsafe { SetupDiCreateDeviceInfoList(None, HWND::default()) }.ok()?;
-    let devinst = (|| {
-        let mut interface = SP_DEVICE_INTERFACE_DATA {
-            cbSize: size_of::<SP_DEVICE_INTERFACE_DATA>() as u32,
-            ..Default::default()
-        };
-        unsafe {
-            SetupDiOpenDeviceInterfaceW(
-                devices,
-                PCWSTR(adapter.adapterDevicePath.as_ptr()),
-                0,
-                Some(&mut interface),
-            )
-        }
-        .ok()?;
-        let mut device = SP_DEVINFO_DATA {
-            cbSize: size_of::<SP_DEVINFO_DATA>() as u32,
-            ..Default::default()
-        };
-        // SetupAPI fills the device record even without an interface detail buffer.
-        let mut required = 0;
-        let error = unsafe {
-            SetupDiGetDeviceInterfaceDetailW(
-                devices,
-                &interface,
-                None,
-                0,
-                Some(&mut required),
-                Some(&mut device),
-            )
-        }
-        .err()?;
-        (error.code() == HRESULT::from_win32(ERROR_INSUFFICIENT_BUFFER.0) && device.DevInst != 0)
-            .then_some(device.DevInst)
-    })();
-    let _ = unsafe { SetupDiDestroyDeviceInfoList(devices) };
-
-    let devinst = devinst?;
-    let read = |key| {
-        let mut value = 0u32;
-        let mut size = size_of::<u32>() as u32;
-        let mut kind = DEVPROPTYPE(0);
-        let status = unsafe {
-            CM_Get_DevNode_PropertyW(
-                devinst,
-                key,
-                &mut kind,
-                Some((&mut value as *mut u32).cast()),
-                &mut size,
-                0,
-            )
-        };
-        (status == CR_SUCCESS
-            && matches!(kind, DEVPROP_TYPE_INT32 | DEVPROP_TYPE_UINT32)
-            && size == size_of::<u32>() as u32)
-            .then_some(value)
-    };
-    PciAddress::from_windows_properties(
-        read(&DEVPKEY_Device_BusNumber)?,
-        read(&DEVPKEY_Device_Address)?,
-    )
-}
-
-fn cuda_devices() -> Option<Vec<(PciAddress, Option<i32>)>> {
-    use windows::core::{s, w};
-    use windows::Win32::Foundation::{FreeLibrary, HANDLE};
-    use windows::Win32::System::LibraryLoader::{
-        GetProcAddress, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
-    };
-
-    let module = unsafe {
-        LoadLibraryExW(
-            w!("nvcuda.dll"),
-            HANDLE::default(),
-            LOAD_LIBRARY_SEARCH_SYSTEM32,
-        )
-    }
-    .ok()?;
-
-    // These CUDA driver functions use CUDAAPI (stdcall on Windows).
-    // cuDeviceComputeCapability predates the attribute API and is present
-    // on early CUDA drivers, including those for Tesla cards.
-    let probe = || unsafe {
-        let init: unsafe extern "system" fn(u32) -> i32 =
-            std::mem::transmute(GetProcAddress(module, s!("cuInit"))?);
-        let get_count: unsafe extern "system" fn(*mut i32) -> i32 =
-            std::mem::transmute(GetProcAddress(module, s!("cuDeviceGetCount"))?);
-        let get_device: unsafe extern "system" fn(*mut i32, i32) -> i32 =
-            std::mem::transmute(GetProcAddress(module, s!("cuDeviceGet"))?);
-        let pci_bus_id: unsafe extern "system" fn(*mut std::ffi::c_char, i32, i32) -> i32 =
-            std::mem::transmute(GetProcAddress(module, s!("cuDeviceGetPCIBusId"))?);
-        let capability: unsafe extern "system" fn(*mut i32, *mut i32, i32) -> i32 =
-            std::mem::transmute(GetProcAddress(module, s!("cuDeviceComputeCapability"))?);
-
-        let mut count = 0;
-        if init(0) != 0 || get_count(&mut count) != 0 || count <= 0 {
-            return None;
-        }
-        let mut devices = Vec::new();
-        for ordinal in 0..count {
-            let (mut device, mut major, mut minor) = (0, 0, 0);
-            let mut id = [0u8; 32];
-            if get_device(&mut device, ordinal) != 0
-                || pci_bus_id(id.as_mut_ptr().cast(), id.len() as i32, device) != 0
-            {
-                return None;
-            }
-            let id = std::ffi::CStr::from_bytes_until_nul(&id)
-                .ok()?
-                .to_str()
-                .ok()?;
-            let address = PciAddress::from_cuda_bus_id(id)?;
-            let major = (capability(&mut major, &mut minor, device) == 0).then_some(major);
-            devices.push((address, major));
-        }
-        Some(devices)
-    };
-
-    let result = probe();
-    let _ = unsafe { FreeLibrary(module) };
-    result
+    adapters
 }
 
 fn detect_from_dxgi() -> Result<GpuInfo, Box<dyn std::error::Error>> {
