@@ -2151,7 +2151,6 @@ fn review_screens() {
     {
         let mut stats = PIPELINE_STATS.lock();
         stats.using_software_fallback = false;
-        stats.chosen_encoder = "h264_nvenc".into();
         stats.active_encoder = "h264_qsv".into();
     }
     let mut h = harness(&shared, egui::vec2(1040.0, 900.0), 2.0);
