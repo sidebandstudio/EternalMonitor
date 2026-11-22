@@ -488,16 +488,7 @@ pub async fn start_sender(
     let pacing_clock = PacingClock::new()?;
 
     let mut links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
-    // One lock, with `running` read under it: a stop
-    // (`diagnostics::stop_session`) queues its goodbye and clears `running`
-    // under the same lock, so this either sees that stop and keeps its
-    // goodbye, or comes first and the stop's goodbye is kept anyway.
-    let retired = {
-        let mut session = shared.session.lock();
-        let stopping = !shared.running.load(Ordering::SeqCst);
-        session.transport_resumed(now(), stopping)
-    };
-    if retired {
+    if resume_session(&shared, &mut state.abr) {
         debug!("Dropped a goodbye left while the stream was stopped");
     }
     let beat = std::sync::Arc::clone(&shared.transport_beat);
@@ -1061,6 +1052,32 @@ struct LoopState {
     pointer: pointer::PointerSender,
 }
 
+/// A new pipeline generation is listening
+/// ([`session::Session::transport_resumed`]). A session kept through the
+/// restart has no `new_target` here, so the fresh `abr` takes its link and
+/// the tunnel's drops from now, as `act` does for a session accepted later.
+/// Returns whether a goodbye was retired.
+fn resume_session(shared: &SharedControl, abr: &mut AbrController) -> bool {
+    // One lock, with `running` read under it: a stop
+    // (`diagnostics::stop_session`) queues its goodbye and clears `running`
+    // under the same lock, so this either sees that stop and keeps its
+    // goodbye, or comes first and the stop's goodbye is kept anyway.
+    let (retired, kept) = {
+        let mut session = shared.session.lock();
+        let stopping = !shared.running.load(Ordering::SeqCst);
+        (session.transport_resumed(now(), stopping), session.peer())
+    };
+    if let Some(peer) = kept {
+        abr_session_started(abr, peer.link);
+    }
+    retired
+}
+
+/// A session on `on` started for ABR ([`AbrController::new_session`]).
+fn abr_session_started(abr: &mut AbrController, on: LinkId) {
+    abr.new_session((on != LinkId::Udp).then(link::tunnel_congestion_drops));
+}
+
 /// Carries out everything the session decided. Every path that feeds the
 /// session ends here, so none can drop a decision: a NACK served while a
 /// frame was paced once sent only its repair, and lost the IDR of a session
@@ -1078,9 +1095,7 @@ async fn act(
         state.fault.clear();
     }
     if let Some(target) = actions.new_target {
-        state
-            .abr
-            .new_session((target.link != LinkId::Udp).then(link::tunnel_congestion_drops));
+        abr_session_started(&mut state.abr, target.link);
     }
     if actions.new_target.is_some() || actions.client_lost || actions.release_input {
         state.input.reset();
@@ -1770,6 +1785,87 @@ mod tests {
                 .handle_control(PeerId::usb(5), 0, hello, &config, now());
         assert!(accepted.new_target.is_some());
         act(accepted, state, &links, &shared, &config, &supervisor).await;
+    }
+
+    /// Review: a session kept through a pipeline restart has no
+    /// `new_target`, so the new generation's ABR never took its link. A
+    /// WiFi probe undone there doubled the wait, and the cable taking over
+    /// kept it: the step up came 60 s after the last change, not 30.
+    #[tokio::test]
+    async fn a_session_kept_through_a_restart_is_on_the_new_abrs_link() {
+        let shared = SharedControl::new(0, 20_000_000);
+        shared.pairing.lock().required = false;
+        let config = SharedConfigSource {
+            shared: &shared,
+            stream_epoch: 1,
+            pen_available: false,
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+        };
+        let hello = ControlMessage::Hello2(Hello2 {
+            proto_min: 2,
+            proto_max: 2,
+            client_nonce: 1,
+            listen_port: 19894,
+            decoder_caps: CAP_DECODE_H264,
+            feature_caps: 0,
+            screen_px_w: 1920,
+            screen_px_h: 1080,
+            screen_pt_w: 960,
+            screen_pt_h: 540,
+            refresh_hz: 60,
+            device_name: "wifi test".into(),
+            device_id: 0,
+            preferred_fps: 0,
+            auth_token: [0; 16],
+            pairing_code: 0,
+        });
+        let wifi = PeerId::udp("127.0.0.1:19894".parse().unwrap());
+        let accepted = shared
+            .session
+            .lock()
+            .handle_control(wifi, 0, hello, &config, now());
+        assert!(accepted.new_target.is_some());
+        // The pipeline restarts: the next generation's controller.
+        let mut state = loop_state();
+        state.abr = AbrController::new(50_000_000, true);
+        state.abr.encoder_reopens(true);
+        resume_session(&shared, &mut state.abr);
+        assert_eq!(shared.session.lock().peer(), Some(wifi));
+        // Over WiFi: down at 0 s, a probe up at 30 s, undone at 32 s.
+        let t0 = Instant::now();
+        let mut report = ReceiverReport::default();
+        let mut changes = Vec::new();
+        let mut feed = |state: &mut LoopState, second: u64, lost: u32, usb: bool| {
+            report.frags_received += 1_000;
+            report.frags_lost += lost;
+            let at = t0 + Duration::from_secs(second);
+            if state
+                .abr
+                .on_report(&report, usb.then_some(0), 30, at)
+                .changed
+            {
+                changes.push((second, state.abr.current_bps()));
+            }
+        };
+        feed(&mut state, 0, 100, false);
+        for second in 1..31 {
+            feed(&mut state, second, 0, false);
+        }
+        feed(&mut state, 32, 100, false);
+        // The cable takes over: its probe waits 30 s, not WiFi's 60.
+        accept_usb_session(&mut state).await;
+        for second in 33..92 {
+            feed(&mut state, second, 0, true);
+        }
+        assert_eq!(
+            changes,
+            [
+                (0, 12_000_000),
+                (30, 15_000_000),
+                (32, 12_000_000),
+                (62, 15_000_000)
+            ]
+        );
     }
 
     /// A new session's reports count from its own start: `act` starts
