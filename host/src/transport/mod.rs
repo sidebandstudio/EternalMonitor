@@ -1077,6 +1077,9 @@ async fn act(
         state.retransmit_ring.clear();
         state.fault.clear();
     }
+    if actions.new_target.is_some() {
+        state.abr.new_session();
+    }
     if actions.new_target.is_some() || actions.client_lost || actions.release_input {
         state.input.reset();
     }
@@ -1715,6 +1718,72 @@ mod tests {
             abr: AbrController::new(15_000_000, true),
             pointer: Default::default(),
         }
+    }
+
+    /// A new session's reports count from its own start: `act` starts
+    /// ABR's clean streak again, or a quick reconnect inherits the old
+    /// session's streak and steps up on its first clean report.
+    #[tokio::test]
+    // The slot only keeps other tests out; nothing on this test's runtime
+    // takes it.
+    #[allow(clippy::await_holding_lock)]
+    async fn a_new_session_starts_the_abr_clean_streak_again() {
+        // The session starts through `act`, which uses the fallback slot.
+        let _slot = crate::diagnostics::tests::FALLBACK_SLOT.lock();
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let shared = SharedControl::new(socket.local_addr().unwrap().port(), 20_000_000);
+        shared.pairing.lock().required = false;
+        let config = SharedConfigSource {
+            shared: &shared,
+            stream_epoch: 1,
+            pen_available: false,
+            listen: SocketAddr::from(([127, 0, 0, 1], 0)),
+        };
+        let links = TransportLinks::new(socket, std::sync::Arc::clone(&shared.force_next_idr));
+        let (supervisor_tx, _supervisor_rx) = std_mpsc::channel();
+        let supervisor = StreamSupervisor {
+            tx: supervisor_tx,
+            generation: 1,
+        };
+        let mut state = loop_state();
+        state.abr = AbrController::new(20_000_000, true);
+        // 14.5 s clean: one more clean report would step up.
+        let t0 = Instant::now();
+        let mut report = ReceiverReport::default();
+        for tick in 0..30 {
+            report.frags_received += 500;
+            let at = t0 + Duration::from_millis(500 * tick);
+            assert!(!state.abr.on_report(&report, None, 30, at).changed);
+        }
+        let hello = ControlMessage::Hello2(Hello2 {
+            proto_min: 2,
+            proto_max: 2,
+            client_nonce: 1,
+            listen_port: 0,
+            decoder_caps: CAP_DECODE_H264,
+            feature_caps: 0,
+            screen_px_w: 1920,
+            screen_px_h: 1080,
+            screen_pt_w: 960,
+            screen_pt_h: 540,
+            refresh_hz: 60,
+            device_name: "cable test".into(),
+            device_id: 0,
+            preferred_fps: 0,
+            auth_token: [0; 16],
+            pairing_code: 0,
+        });
+        let accepted =
+            shared
+                .session
+                .lock()
+                .handle_control(PeerId::usb(5), 0, hello, &config, now());
+        assert!(accepted.new_target.is_some());
+        act(accepted, &mut state, &links, &shared, &config, &supervisor).await;
+        report.frags_received += 500;
+        let at = t0 + Duration::from_secs(15);
+        assert!(!state.abr.on_report(&report, None, 30, at).changed);
+        assert_eq!(state.abr.current_bps(), 15_000_000);
     }
 
     /// Review r2: the USB tunnel's control queue takes 64 datagrams and

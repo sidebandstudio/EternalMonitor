@@ -41,11 +41,12 @@ const LOSS_CLEAN: f64 = 0.005;
 const TUNNEL_WINDOW_MASK: u8 = 0b111;
 const TUNNEL_DROPS_TO_STEP: u32 = 2;
 
-/// A report with no frames is a still screen's when the PC sent at most
-/// this many since the previous report. The PC counts a frame as it sends
-/// it and the iPad as it arrives, so one sent within a round trip of the
-/// report shows up only in the next; a still screen sends about one a
-/// second, so a lone frame on its way is that, not a link losing frames.
+/// Over WiFi, a report with no frames is a still screen's when the PC
+/// sent at most this many since the previous report. The PC counts a
+/// frame as it sends it and the iPad as it arrives, so one sent within a
+/// round trip of the report shows up only in the next; a still screen
+/// sends about one a second, so a lone frame on its way is that, not a
+/// link losing frames.
 const STILL_FRAMES_SENT: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,9 +183,12 @@ impl AbrController {
     /// `frames_sent` is the video frames the PC sent since the previous
     /// report. A report with no frames neither starts nor breaks the clean
     /// streak when the PC sent next to none either (a still screen sends
-    /// about one a second, [`STILL_FRAMES_SENT`]). When it sent more, they
-    /// were lost, all of each frame, which the iPad does not count: the
-    /// streak starts again.
+    /// about one a second, [`STILL_FRAMES_SENT`]). Over WiFi, when it sent
+    /// more, they were lost, all of each frame, which the iPad does not
+    /// count: the streak starts again. Over USB a frame is lost only where
+    /// the tunnel drops it, so a report without frames is neutral unless the
+    /// tunnel dropped some: a slow encode followed by a fast one can leave
+    /// two frames queued behind a stalled writer when the iPad reports.
     pub fn on_report(
         &mut self,
         report: &ReceiverReport,
@@ -288,7 +292,11 @@ impl AbrController {
         }
 
         // ---- Upgrade path ----
-        if total == 0 && frames_sent <= STILL_FRAMES_SENT && !tunnel_lossy {
+        let none_lost = match tunnel_drops {
+            Some(_) => !tunnel_lossy,
+            None => frames_sent <= STILL_FRAMES_SENT,
+        };
+        if total == 0 && none_lost {
             return unchanged;
         }
         if total > 0
@@ -325,6 +333,16 @@ impl AbrController {
         }
 
         unchanged
+    }
+
+    /// A new client session started. Its reports count from its own start,
+    /// and the old session's clean streak and tunnel drops say nothing about
+    /// it: they start again, as at a new stream epoch. The bitrate stays.
+    pub fn new_session(&mut self) {
+        self.prev_cumulative = None;
+        self.clean_since = None;
+        self.prev_tunnel_drops = None;
+        self.tunnel_drop_history = 0;
     }
 
     /// The system had no buffer space for a datagram: one rung down at
@@ -1129,26 +1147,69 @@ mod tests {
         }
     }
 
-    /// The PC kept sending for 3 s and nothing arrived, while the iPad's
-    /// reports still did. It counts no loss for frames it saw none of, so
-    /// reports without frames are the blackout's: the streak starts again.
+    /// Over WiFi the PC kept sending for 3 s and nothing arrived, while the
+    /// iPad's reports still did. It counts no loss for frames it saw none
+    /// of, so reports without frames are the blackout's: the streak starts
+    /// again. (Over USB the tunnel counts what it drops.)
     #[test]
     fn a_blackout_while_frames_are_sent_breaks_the_clean_streak() {
         // Clean from 0, nothing arrives from 10 s to 13 s: up 15 s after.
         let blackout = |tick: u64| (SENT, !(20..26).contains(&tick));
-        for usb in [false, true] {
+        let mut abr = AbrController::new(20_000_000, true);
+        let mut r = ReceiverReport::default();
+        let changes = half_second_reports(
+            &mut abr,
+            Instant::now(),
+            &mut r,
+            false,
+            0..60,
+            blackout,
+            |_| 0,
+        );
+        assert_eq!(changes, [(28_000, 20_000_000)]);
+    }
+
+    /// Over USB a frame is lost only where the tunnel drops it. A 400 ms
+    /// encode then a 10 ms one can leave two frames queued behind a stalled
+    /// writer when the iPad reports: with no tunnel drops that report is
+    /// neutral, and the step up comes at 15 s, not 20.5 s. Over WiFi the
+    /// same two frames went missing: the streak starts again.
+    #[test]
+    fn usb_reports_without_frames_are_neutral_while_the_tunnel_drops_none() {
+        // A frame each tick; at 5 s two sent and none arrived yet.
+        let queued = |tick: u64| if tick == 10 { (2, false) } else { (1, true) };
+        for (usb, up_at) in [(true, 15_000), (false, 20_500)] {
             let mut abr = AbrController::new(20_000_000, true);
             let mut r = ReceiverReport::default();
-            let changes = half_second_reports(
-                &mut abr,
-                Instant::now(),
-                &mut r,
-                usb,
-                0..60,
-                blackout,
-                |_| 0,
-            );
-            assert_eq!(changes, [(28_000, 20_000_000)], "usb: {usb}");
+            let changes =
+                half_second_reports(&mut abr, Instant::now(), &mut r, usb, 0..60, queued, |_| 0);
+            assert_eq!(changes, [(up_at, 20_000_000)], "usb: {usb}");
+        }
+    }
+
+    /// A new session's reports count from its start. A quick reconnect in
+    /// the same stream epoch reported lower counters: the deltas came to
+    /// nothing, that empty report kept the old session's clean streak, and
+    /// the new session stepped up on its second report. The streak starts
+    /// again with the new session; the bitrate stays.
+    #[test]
+    fn a_new_session_starts_the_clean_streak_again_and_keeps_the_bitrate() {
+        for usb in [false, true] {
+            let t0 = Instant::now();
+            let mut abr = AbrController::new(20_000_000, true);
+            assert!(abr.on_send_refused(t0).changed);
+            // Clean from 500 ms to 14 s.
+            let mut r = ReceiverReport::default();
+            let all = |_| (SENT, true);
+            let old = half_second_reports(&mut abr, t0, &mut r, usb, 1..29, all, |_| 0);
+            assert!(old.is_empty());
+            abr.new_session();
+            assert_eq!(abr.current_bps(), 12_000_000, "usb: {usb}");
+            // The new session's first report has none of its frames yet.
+            let mut r = ReceiverReport::default();
+            let first_empty = |tick| if tick == 29 { (1, false) } else { (SENT, true) };
+            let new = half_second_reports(&mut abr, t0, &mut r, usb, 29..80, first_empty, |_| 0);
+            assert_eq!(new, [(30_000, 15_000_000)], "usb: {usb}");
         }
     }
 
