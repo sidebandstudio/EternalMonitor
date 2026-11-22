@@ -1863,19 +1863,6 @@ mod tests {
         let mut feed = |state: &mut LoopState, second: u64, lost: u32, usb: bool| {
             report.frags_received += 1_000;
             report.frags_lost += lost;
-            report.highest_seq += 1;
-            if !usb {
-                for _ in 0..1000 {
-                    state.abr.note_udp_fragment_sent(
-                        0,
-                        report.highest_seq,
-                        0,
-                        0,
-                        1000,
-                        Duration::ZERO,
-                    );
-                }
-            }
             let at = t0 + Duration::from_secs(second);
             if state
                 .abr
@@ -1918,12 +1905,6 @@ mod tests {
         let mut report = ReceiverReport::default();
         for tick in 0..30 {
             report.frags_received += 500;
-            report.highest_seq += 1;
-            for _ in 0..500 {
-                state
-                    .abr
-                    .note_udp_fragment_sent(0, report.highest_seq, 0, 0, 500, Duration::ZERO);
-            }
             let at = t0 + Duration::from_millis(500 * tick);
             assert!(!state.abr.on_report(&report, None, 30, at).changed);
         }
