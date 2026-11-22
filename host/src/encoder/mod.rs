@@ -7215,6 +7215,7 @@ mod tests {
         let end = stage.started + Duration::from_secs(minutes * 60);
         let mut next_report = stage.started + Duration::from_secs(1);
         let mut frames_at_report = stage.number;
+        let mut report_seq = 0;
         while Instant::now() < end {
             stage.publish();
             if Instant::now() < next_report {
@@ -7224,9 +7225,15 @@ mod tests {
             // What the open session sends, as the encode loop records it.
             let rate = PIPELINE_STATS.lock().bitrate_bps.max(1);
             let over = rate.saturating_sub(CAPACITY) / 1_000;
-            received += rate / 1_000 - over;
+            let fragments = u16::try_from(rate / 1_000).unwrap();
+            report_seq += 1;
+            for _ in 0..fragments {
+                abr.note_udp_fragment_sent(0, report_seq, 0, 0, fragments, Duration::ZERO);
+            }
+            received += u32::from(fragments) - over;
             lost += over;
             let report = eternal_wire::v2::control::ReceiverReport {
+                highest_seq: report_seq,
                 frags_received: received,
                 frags_lost: lost,
                 ..Default::default()

@@ -724,6 +724,7 @@ pub async fn start_sender(
                 let wifi = target_addr.link == LinkId::Udp;
                 let inject_faults = wifi && state.fault.enabled();
                 let mut backed_off = false;
+                let mut waited = Duration::ZERO;
                 for datagram in &stored {
                     // A busy machine can exhaust the pacing budget mid-frame.
                     // Keep serving audio even when there are no more pauses;
@@ -742,16 +743,17 @@ pub async fn start_sender(
                         // The fault injector stands in for the network.
                         state.abr.note_udp_fragment_sent(
                             stream_epoch, frame_seq, capture_ts_us, crate::clock::host_now_us(),
+                            frag_count, Duration::ZERO,
                         );
                         for due in state.fault.push(datagram, Instant::now()) {
                             note(links.send_to(&due, target_addr).await);
                         }
                     } else {
-                        let sent = links.send_to(datagram, target_addr).await;
+                        let sent = links.send_to_with_wait(datagram, target_addr, &mut waited).await;
                         if wifi && sent.is_ok() {
-                            // The socket accepted the datagram after pacing and any wait to send.
                             state.abr.note_udp_fragment_sent(
                                 stream_epoch, frame_seq, capture_ts_us, crate::clock::host_now_us(),
+                                frag_count, std::mem::take(&mut waited),
                             );
                         }
                         note(sent);
@@ -784,10 +786,11 @@ pub async fn start_sender(
                         }
                     }
                     if refused {
-                        match links.send_to(datagram, target_addr).await {
+                        match links.send_to_with_wait(datagram, target_addr, &mut waited).await {
                             Ok(()) if wifi && !inject_faults => {
                                 state.abr.note_udp_fragment_sent(
                                     stream_epoch, frame_seq, capture_ts_us, crate::clock::host_now_us(),
+                                    frag_count, std::mem::take(&mut waited),
                                 );
                             }
                             Err(e) if congestion::is_no_buffer_space(&e) => break,
@@ -798,6 +801,10 @@ pub async fn start_sender(
                             _ => {}
                         }
                     }
+                }
+
+                if wifi && !waited.is_zero() {
+                    state.abr.note_socket_wait();
                 }
 
                 let total_bytes = payload.len();
@@ -1856,6 +1863,19 @@ mod tests {
         let mut feed = |state: &mut LoopState, second: u64, lost: u32, usb: bool| {
             report.frags_received += 1_000;
             report.frags_lost += lost;
+            report.highest_seq += 1;
+            if !usb {
+                for _ in 0..1000 {
+                    state.abr.note_udp_fragment_sent(
+                        0,
+                        report.highest_seq,
+                        0,
+                        0,
+                        1000,
+                        Duration::ZERO,
+                    );
+                }
+            }
             let at = t0 + Duration::from_secs(second);
             if state
                 .abr
@@ -1898,13 +1918,19 @@ mod tests {
         let mut report = ReceiverReport::default();
         for tick in 0..30 {
             report.frags_received += 500;
+            report.highest_seq += 1;
+            for _ in 0..500 {
+                state
+                    .abr
+                    .note_udp_fragment_sent(0, report.highest_seq, 0, 0, 500, Duration::ZERO);
+            }
             let at = t0 + Duration::from_millis(500 * tick);
             assert!(!state.abr.on_report(&report, None, 30, at).changed);
         }
         accept_usb_session(&mut state).await;
         report.frags_received += 500;
         let at = t0 + Duration::from_secs(15);
-        assert!(!state.abr.on_report(&report, None, 30, at).changed);
+        assert!(!state.abr.on_report(&report, Some(0), 30, at).changed);
         assert_eq!(state.abr.current_bps(), 15_000_000);
     }
 

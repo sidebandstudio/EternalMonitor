@@ -2,7 +2,7 @@
 //! and discard queued video when a reader falls behind.
 
 use std::collections::VecDeque;
-use std::future::Future;
+use std::future::{poll_fn, Future};
 use std::io;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -99,6 +99,18 @@ impl Link for UdpLink {
     }
 
     async fn send(&self, peer: PeerId, datagram: &[u8]) -> io::Result<()> {
+        let mut waited = Duration::ZERO;
+        self.send_with_wait(peer, datagram, &mut waited).await
+    }
+}
+
+impl UdpLink {
+    pub(super) async fn send_with_wait(
+        &self,
+        peer: PeerId,
+        datagram: &[u8],
+        waited: &mut Duration,
+    ) -> io::Result<()> {
         let Some(addr) = peer.addr.filter(|_| peer.link == LinkId::Udp) else {
             return Err(invalid("UDP destination"));
         };
@@ -107,7 +119,20 @@ impl Link for UdpLink {
         if let Some(error) = super::probe::fail(addr, datagram) {
             return Err(error);
         }
-        self.socket.send_to(datagram, addr).await?;
+
+        let mut blocked_at = None;
+        let sent = poll_fn(|cx| {
+            let result = self.socket.poll_send_to(cx, datagram, addr);
+            if result.is_pending() {
+                blocked_at.get_or_insert_with(Instant::now);
+            }
+            result
+        })
+        .await;
+        if let Some(at) = blocked_at {
+            *waited += at.elapsed();
+        }
+        sent?;
         #[cfg(feature = "test-hooks")]
         super::probe::sent(addr);
         Ok(())
