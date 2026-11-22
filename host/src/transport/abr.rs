@@ -166,9 +166,14 @@ impl AbrController {
     /// partial-frame figures say nothing about the link: a partial frame is
     /// one still arriving. 0.3.1 read them as network loss and cut a slow
     /// PC's bitrate two rungs at once. Over USB only a queue that dropped
-    /// frames in at least two of the last three reports, or rising jitter,
-    /// steps down, and one rung at a time. A single burst does not; a link
-    /// that drops every other report does.
+    /// frames in at least two of the last three reports steps down, and one
+    /// rung at a time. A single burst does not; a link that drops every
+    /// other report does. Jitter does not either: the iPad measures it from
+    /// the capture time, so over the cable it is the PC's encode time
+    /// varying, which a lower bitrate does not fix.
+    ///
+    /// A report with no frames (a still screen sends about one a second)
+    /// neither starts nor breaks the clean streak.
     pub fn on_report(
         &mut self,
         report: &ReceiverReport,
@@ -211,7 +216,7 @@ impl AbrController {
         self.last_report_at = Some(now);
 
         let total = u64::from(delta_received) + u64::from(delta_lost) + u64::from(delta_repaired);
-        let jitter_high = report.jitter_us > 15_000;
+        let jitter_high = tunnel_drops.is_none() && report.jitter_us > 15_000;
         let (loss, repairs, congested_queue, tunnel_lossy) = match tunnel_drops {
             Some(drops) => {
                 let dropped = self.prev_tunnel_drops.is_some_and(|prev| drops > prev);
@@ -271,8 +276,10 @@ impl AbrController {
         }
 
         // ---- Upgrade path ----
-        if total > 0
-            && loss < LOSS_CLEAN
+        if total == 0 && !tunnel_lossy {
+            return unchanged;
+        }
+        if loss < LOSS_CLEAN
             && repairs < LOSS_CLEAN
             && !congested_queue
             && !tunnel_lossy
@@ -945,5 +952,109 @@ mod tests {
             Some(50_000_000),
             "{recovered:?}"
         );
+    }
+
+    /// Reports every 500 ms from `t0` over `ticks`, counters continuing
+    /// from `r`, with frames on the ticks `frames` picks and `jitter_us`;
+    /// the link is USB when `usb`. The changes, as (ms, target).
+    fn half_second_reports(
+        abr: &mut AbrController,
+        t0: Instant,
+        r: &mut ReceiverReport,
+        usb: bool,
+        ticks: std::ops::Range<u64>,
+        frames: impl Fn(u64) -> bool,
+        jitter_us: impl Fn(u64) -> u32,
+    ) -> Vec<(u64, u32)> {
+        let mut changes = Vec::new();
+        for tick in ticks {
+            if frames(tick) {
+                r.frags_received += 500;
+            }
+            r.jitter_us = jitter_us(tick);
+            let d = abr.on_report(r, usb.then_some(0), t0 + Duration::from_millis(500 * tick));
+            if d.changed {
+                changes.push((500 * tick, d.target_bps));
+            }
+        }
+        changes
+    }
+
+    /// Jitter between 15 and 110 ms, as a QSV encode swinging from 10 to
+    /// 400 ms gave a field session over the cable.
+    fn encode_jitter(tick: u64) -> u32 {
+        15_001 + (tick as u32 * 37_000) % 95_000
+    }
+
+    /// Over USB the iPad's jitter is the PC's encode time varying. With no
+    /// dropped frames it neither steps down nor holds back a step up.
+    #[test]
+    fn usb_jitter_alone_neither_steps_down_nor_blocks_a_step_up() {
+        let mut abr = AbrController::new(20_000_000, true);
+        let mut r = ReceiverReport::default();
+        let changes = half_second_reports(
+            &mut abr,
+            Instant::now(),
+            &mut r,
+            true,
+            0..60,
+            |_| true,
+            encode_jitter,
+        );
+        assert_eq!(changes, [(15_000, 20_000_000)]);
+    }
+
+    /// Over WiFi the same jitter still steps down, a rung per cooldown.
+    #[test]
+    fn wifi_jitter_still_steps_down() {
+        let mut abr = AbrController::new(20_000_000, true);
+        let mut r = ReceiverReport::default();
+        let changes = half_second_reports(
+            &mut abr,
+            Instant::now(),
+            &mut r,
+            false,
+            0..20,
+            |_| true,
+            encode_jitter,
+        );
+        assert_eq!(
+            changes,
+            [
+                (0, 12_000_000),
+                (3_000, 10_000_000),
+                (6_000, 8_000_000),
+                (9_000, 6_000_000)
+            ]
+        );
+    }
+
+    /// A still screen sends about a frame a second, so every other report
+    /// has none. Those neither break the clean streak, which kept a field
+    /// session at 4 Mbps for hours, nor start it.
+    #[test]
+    fn reports_without_frames_neither_break_nor_start_the_clean_streak() {
+        // Loss steps 15 -> 12 Mbps at 0 ms, then frames on odd ticks only:
+        // clean from 500 ms, so up at 15.5 s and again 15 s later.
+        let t0 = Instant::now();
+        let mut wifi = AbrController::new(20_000_000, true);
+        let mut r = report(950, 50, 0);
+        assert!(wifi.on_report(&r, None, t0).changed);
+        let odd = |tick: u64| tick % 2 == 1;
+        let changes = half_second_reports(&mut wifi, t0, &mut r, false, 1..80, odd, |_| 0);
+        assert_eq!(changes, [(15_500, 15_000_000), (30_500, 20_000_000)]);
+
+        let mut usb = AbrController::new(20_000_000, true);
+        let mut r = ReceiverReport::default();
+        let even = |tick: u64| tick % 2 == 0;
+        let changes = half_second_reports(&mut usb, t0, &mut r, true, 0..60, even, |_| 0);
+        assert_eq!(changes, [(15_000, 20_000_000)]);
+
+        // 20 s with no frames at all, then frames: up 15 s after the first.
+        let mut idle = AbrController::new(20_000_000, true);
+        let mut r = ReceiverReport::default();
+        let after_20_s = |tick: u64| tick >= 40;
+        let changes = half_second_reports(&mut idle, t0, &mut r, false, 0..80, after_20_s, |_| 0);
+        assert_eq!(changes, [(35_000, 20_000_000)]);
     }
 }
