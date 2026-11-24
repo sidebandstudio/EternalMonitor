@@ -48,12 +48,14 @@ final class DiagnosticsUploadTests: XCTestCase {
             "Connected to ASH-DESKTOP session_id=5 host_caps=3 liveness_ms=3000 config=StreamConfig()",
             "Connection closed by ash-desktop before a picture",
         ] {
-            upload.record(level: "info", category: "ctrl", message: message, timestamp: Date())
+            upload.record(level: "warning", category: "ctrl", message: message, timestamp: Date())
         }
+        upload.record(level: "info", category: "ctrl", message: "Routine playback detail", timestamp: Date())
         _ = await upload.status()
-        let events = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
+        let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
             .filter { $0.pathExtension == "json" }
-            .flatMap { try JSONDecoder().decode(DiagnosticsUpload.Batch.self, from: Data(contentsOf: $0)).events }
+        XCTAssertEqual(files.count, 1)
+        let events = try files.flatMap { try JSONDecoder().decode(DiagnosticsUpload.Batch.self, from: Data(contentsOf: $0)).events }
         XCTAssertEqual(events.sorted { $0.sequence < $1.sequence }.map(\.message), [
             "Session 5 established with %COMPUTERNAME%",
             "Connected to %COMPUTERNAME% session_id=5 host_caps=3 liveness_ms=3000 config=StreamConfig()",
@@ -74,7 +76,7 @@ final class DiagnosticsUploadTests: XCTestCase {
         for address in addresses {
             SupportDiagnostics.noteTypedAddress(address)
             let bare = address.replacingOccurrences(of: ".local", with: "")
-            upload.record(level: "info", category: "connection", message: "Starting connection attempt=1 transport=WiFi to \(address):9876 drawing=false", timestamp: Date())
+            upload.record(level: "warning", category: "connection", message: "Starting connection attempt=1 transport=WiFi to \(address):9876 drawing=false", timestamp: Date())
             upload.record(level: "warning", category: "connection", message: "Cannot resolve \(bare): nodename nor servname provided", timestamp: Date())
         }
         _ = await upload.status()
@@ -133,7 +135,7 @@ final class DiagnosticsUploadTests: XCTestCase {
         XCTAssertTrue(failedStatus.contains("dropped=8"), failedStatus)
         try FileManager.default.removeItem(at: directory)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
-        upload.record(level: "info", category: "storage", message: "recovered", timestamp: Date())
+        upload.record(level: "error", category: "storage", message: "recovered", timestamp: Date())
         _ = await upload.status()
         let files = try FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil)
         var count = 0

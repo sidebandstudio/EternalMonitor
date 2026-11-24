@@ -444,7 +444,7 @@ impl Drop for UploadGuard {
     }
 }
 pub fn record(line: &str) {
-    if enabled() {
+    if enabled() && automatically_uploaded(line) {
         if let Some(sender) = SENDER.get() {
             if sender
                 .try_send(Queued::Line(queued(capped(line), &redact::NAMES.read())))
@@ -454,6 +454,12 @@ pub fn record(line: &str) {
             }
         }
     }
+}
+
+fn automatically_uploaded(line: &str) -> bool {
+    session_summary(line).is_some()
+        || level(line) != "info"
+        || line.ends_with(" INFO EternalMonitor shutting down")
 }
 /// `line` as the queue keeps it: redacted with the device names known now,
 /// so a name the registry lets go later stays out of it. A session summary
@@ -825,6 +831,28 @@ fn finish(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn routine_logs_stay_local_and_support_reports_upload() {
+        for (line, upload) in [
+            ("2026-10-21T03:04:31Z  INFO Receiver report fps=60", false),
+            (
+                "2026-10-21T03:04:31Z  INFO session_summary v=1 role=pc",
+                true,
+            ),
+            (
+                "2026-10-21T03:04:31Z  INFO EternalMonitor shutting down",
+                true,
+            ),
+            (
+                "2026-10-21T03:04:31Z  WARN Desktop duplication access lost",
+                true,
+            ),
+            ("2026-10-21T03:04:31Z ERROR Capture loop exited", true),
+        ] {
+            assert_eq!(automatically_uploaded(line), upload, "{line}");
+        }
+    }
     #[test]
     fn events_keep_their_level_on_every_path() {
         let [warn, error, info] = [
