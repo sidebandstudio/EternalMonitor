@@ -1779,9 +1779,10 @@ mod tests {
     /// reports for each and how well each turn matches, and with
     /// `ETERNAL_ROTATION_DUMP` set to a folder, saves both pictures there as
     /// BMPs to look at. `ETERNAL_ROTATION_ONLY` names the one display to
-    /// check, which then must be compared. Something must change on the
-    /// screen for Desktop Duplication to give an image, and it must not look
-    /// the same turned (`Pattern-Window.ps1`).
+    /// check. At least one display must be compared; the test skips only when
+    /// none is listed (no interactive desktop) and no display is named.
+    /// Something must change on the screen for Desktop Duplication to give an
+    /// image, and it must not look the same turned (`Pattern-Window.ps1`).
     /// `cargo test -p eternal-host --lib every_screen_is_read_back_upright -- --ignored --nocapture`
     #[test]
     #[ignore = "native: needs an interactive Windows desktop"]
@@ -1945,12 +1946,11 @@ mod tests {
             }
             compared += 1;
         }
-        if let Some(only) = &only {
-            assert!(
-                compared > 0,
-                "ETERNAL_ROTATION_ONLY={only}: no display was compared"
-            );
-        }
+        assert!(
+            compared > 0,
+            "no display was compared (ETERNAL_ROTATION_ONLY={})",
+            only.as_deref().unwrap_or("unset")
+        );
     }
 
     /// Native: a real D3D11CreateDevice held past its limit. The caller gets
