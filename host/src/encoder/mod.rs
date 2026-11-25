@@ -67,6 +67,42 @@ pub fn run_encode_stage(
     result
 }
 
+/// The encoder a pipeline starts with, its display name, and whether the
+/// override chose it: the override when FFmpeg has it (`available`),
+/// otherwise detection's choice.
+fn applied_encoder(
+    override_name: Option<String>,
+    gpu: &GpuInfo,
+    available: impl Fn(&str) -> bool,
+) -> (String, String, bool) {
+    match override_name {
+        Some(name) if available(&name) => {
+            let display = codec_display_name_for(&name).to_string();
+            if display == name {
+                warn!(encoder = %name, "Unknown encoder override label");
+            }
+            info!(encoder = %name, "Encoder override honoured");
+            (name, display, true)
+        }
+        Some(name) => {
+            warn!(
+                encoder = %name,
+                "Encoder override not available in FFmpeg — falling back to auto-detected encoder"
+            );
+            (
+                gpu.encoder_name.clone(),
+                gpu.codec_display_name.clone(),
+                false,
+            )
+        }
+        None => (
+            gpu.encoder_name.clone(),
+            gpu.codec_display_name.clone(),
+            false,
+        ),
+    }
+}
+
 /// Capacity of the encoded-output channel (lossless: encoded frames are never
 /// dropped — a lost P-frame corrupts until the next IDR).
 pub const NAL_CHANNEL_CAPACITY: usize = CHANNEL_CAPACITY;
@@ -80,27 +116,10 @@ fn run_encode_loop(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Apply GUI encoder override at pipeline start. The override is consulted only here;
     // mid-stream changes don't take effect until the user requests a Restart.
-    let (mut encoder_name, codec_display_name) = {
-        let override_name = shared.encoder_override.lock().clone();
-        match override_name {
-            Some(name) if ffmpeg_next::encoder::find_by_name(&name).is_some() => {
-                let display = codec_display_name_for(&name).to_string();
-                if display == name {
-                    warn!(encoder = %name, "Unknown encoder override label");
-                }
-                info!(encoder = %name, "Encoder override honoured");
-                (name, display)
-            }
-            Some(name) => {
-                warn!(
-                    encoder = %name,
-                    "Encoder override not available in FFmpeg — falling back to auto-detected encoder"
-                );
-                (gpu.encoder_name.clone(), gpu.codec_display_name.clone())
-            }
-            None => (gpu.encoder_name.clone(), gpu.codec_display_name.clone()),
-        }
-    };
+    let (mut encoder_name, codec_display_name, overridden) =
+        applied_encoder(shared.encoder_override.lock().clone(), &gpu, |name| {
+            ffmpeg_next::encoder::find_by_name(name).is_some()
+        });
 
     if ffmpeg_next::encoder::find_by_name(&encoder_name).is_none() {
         return Err(format!("{} codec not found in FFmpeg", encoder_name).into());
@@ -116,6 +135,12 @@ fn run_encode_loop(
         };
         let mut stats = PIPELINE_STATS.lock();
         stats.set_codec_name(&codec_display_name);
+        stats.encoder_override = if overridden {
+            encoder_name.clone()
+        } else {
+            String::new()
+        };
+        stats.active_encoder.clear();
         // Fresh pipeline start: clear any stale software-fallback flag. The encode loop
         // re-sets it below only if a hardware encoder actually fails to open. A deliberate
         // libx264 override is not a fallback, so it intentionally leaves this false. A
@@ -352,7 +377,7 @@ fn run_encode_loop(
                     {
                         PIPELINE_STATS.lock().set_software_fallback(false);
                     }
-                    note_encoder_opened(&shared, &desired_encoder, &gpu);
+                    note_encoder_opened(&shared, &desired_encoder, &gpu, generation);
                 }
                 // No picture yet, and the iPad would give up waiting for
                 // it: libx264 streams while the open goes on.
@@ -382,7 +407,7 @@ fn run_encode_loop(
                     PIPELINE_STATS
                         .lock()
                         .set_software_fallback(encoder_name != "libx264");
-                    note_encoder_opened(&shared, "libx264", &gpu);
+                    note_encoder_opened(&shared, "libx264", &gpu, generation);
                 }
                 Err(e) if is_hevc_encoder(&desired_encoder) => {
                     warn!(
@@ -455,7 +480,7 @@ fn run_encode_loop(
                     PIPELINE_STATS
                         .lock()
                         .set_software_fallback(name == "libx264");
-                    note_encoder_opened(&shared, name, &gpu);
+                    note_encoder_opened(&shared, name, &gpu, generation);
                 }
                 Err(e) => return Err(e),
             }
@@ -609,7 +634,7 @@ fn run_encode_loop(
                     {
                         PIPELINE_STATS.lock().set_software_fallback(false);
                     }
-                    note_encoder_opened(&shared, &reopen.encoder, &gpu);
+                    note_encoder_opened(&shared, &reopen.encoder, &gpu, generation);
                 }
                 // The old session cannot take a frame of the new size. A
                 // pipeline restart opens a fresh encoder, with the software
@@ -2703,7 +2728,7 @@ fn codec_display_name_for(encoder_name: &str) -> &str {
 
 /// After every successful encoder open: report the live codec on the wire
 /// (HELLO_ACK/heartbeat `StreamConfig.codec`) and in the GUI.
-fn note_encoder_opened(shared: &SharedControl, encoder_name: &str, gpu: &GpuInfo) {
+fn note_encoder_opened(shared: &SharedControl, encoder_name: &str, gpu: &GpuInfo, generation: u64) {
     *shared.wake_adapter.lock() = crate::gpu_wake::wake_adapter_for(encoder_name, gpu);
     let codec = if is_hevc_encoder(encoder_name) {
         eternal_wire::v2::control::CODEC_HEVC
@@ -2711,9 +2736,11 @@ fn note_encoder_opened(shared: &SharedControl, encoder_name: &str, gpu: &GpuInfo
         eternal_wire::v2::control::CODEC_H264
     };
     shared.active_codec.store(codec, Ordering::SeqCst);
-    PIPELINE_STATS
-        .lock()
-        .set_codec_name(codec_display_name_for(encoder_name));
+    let mut stats = PIPELINE_STATS.lock();
+    stats.set_codec_name(codec_display_name_for(encoder_name));
+    // Checked under the lock Stop's clear takes.
+    let current = crate::supervisor::generation_is_current(generation);
+    stats.note_encoder_opened(encoder_name, current);
 }
 
 fn encoder_options(encoder_name: &str) -> ffmpeg_next::Dictionary<'_> {
@@ -6529,14 +6556,37 @@ mod tests {
             adapter_index: 1,
             ..GpuInfo::software_fallback()
         };
-        note_encoder_opened(&shared, "h264_nvenc", &gpu);
+        note_encoder_opened(&shared, "h264_nvenc", &gpu, 0);
         assert_eq!(*shared.wake_adapter.lock(), Some(1));
-        note_encoder_opened(&shared, "h264_qsv", &gpu);
+        note_encoder_opened(&shared, "h264_qsv", &gpu, 0);
         assert_eq!(*shared.wake_adapter.lock(), None, "a cross-vendor fallback");
-        note_encoder_opened(&shared, "libx264", &gpu);
+        note_encoder_opened(&shared, "libx264", &gpu, 0);
         assert_eq!(*shared.wake_adapter.lock(), None, "the CPU");
-        note_encoder_opened(&shared, "hevc_nvenc", &gpu);
+        note_encoder_opened(&shared, "hevc_nvenc", &gpu, 0);
         assert_eq!(*shared.wake_adapter.lock(), Some(1), "back on the card");
+    }
+
+    /// An override FFmpeg lacks (VideoToolbox on Windows) starts the
+    /// pipeline on detection's encoder as Automatic, which the NVIDIA driver
+    /// notice treats as such.
+    #[test]
+    fn an_unavailable_encoder_override_starts_on_the_detected_encoder() {
+        let gpu = GpuInfo {
+            encoder_name: "h264_nvenc".to_string(),
+            codec_display_name: "H.264 (NVENC)".to_string(),
+            ..GpuInfo::software_fallback()
+        };
+        let windows = |name: &str| name != "h264_videotoolbox";
+        let applied = |name: Option<&str>| {
+            let (name, _, overridden) = applied_encoder(name.map(Into::into), &gpu, windows);
+            (name, overridden)
+        };
+        assert_eq!(
+            applied(Some("h264_videotoolbox")),
+            ("h264_nvenc".into(), false)
+        );
+        assert_eq!(applied(None), ("h264_nvenc".into(), false));
+        assert_eq!(applied(Some("h264_qsv")), ("h264_qsv".into(), true));
     }
 
     #[test]

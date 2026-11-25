@@ -38,6 +38,12 @@ pub struct PipelineStats {
     pub nal_bytes_last: usize,
     pub bitrate_bps: u32,
     pub codec_name: String,
+    /// The encoder override this pipeline applied (one FFmpeg has); empty
+    /// for Automatic. Pending Settings edits wait for a Restart.
+    pub encoder_override: String,
+    /// The encoder that last opened in this pipeline. Empty until one opens
+    /// and once the pipeline stops; kept while a session reopens.
+    pub active_encoder: String,
     /// True when a hardware encoder failed to open and the pipeline fell back to libx264
     /// (CPU) encoding. Surfaced as a warning banner in the GUI so a tester is never silently
     /// stuck on slow software encoding.
@@ -46,8 +52,9 @@ pub struct PipelineStats {
     /// (see `encoder::holds_last_frame`), for the connected viewer.
     pub keyframe_resubmits: u64,
     /// NVENC refused to open because the NVIDIA driver is older than the
-    /// linked FFmpeg's NVENC needs. The fallback notice then says to update
-    /// it.
+    /// linked FFmpeg's NVENC needs. The fallback notice, or the NVIDIA
+    /// driver notice when another graphics card encodes, then says to
+    /// update it.
     pub nvidia_driver_outdated: bool,
     /// The processor encodes because startup's GPU detection did not return
     /// in time. The fallback notice then says the driver did not answer.
@@ -119,6 +126,8 @@ impl PipelineStats {
             nal_bytes_last: 0,
             bitrate_bps: 0,
             codec_name: String::new(),
+            encoder_override: String::new(),
+            active_encoder: String::new(),
             using_software_fallback: false,
             keyframe_resubmits: 0,
             nvidia_driver_outdated: false,
@@ -199,6 +208,16 @@ impl PipelineStats {
 
     pub fn mark_pipeline_stopped(&mut self) {
         self.pipeline_running = false;
+        self.active_encoder.clear();
+    }
+
+    /// An encoder opened in a pipeline generation, `current` while it is the
+    /// live one. An open that returns after Stop, or after a restart replaced
+    /// its generation, is no longer this pipeline's.
+    pub fn note_encoder_opened(&mut self, encoder_name: &str, current: bool) {
+        if self.pipeline_running && current {
+            self.active_encoder = encoder_name.to_string();
+        }
     }
 
     pub fn set_gpu_name(&mut self, gpu_name: String) {
@@ -357,5 +376,39 @@ mod tests {
         assert_eq!(stats.encode_frame_count, 0);
         assert_eq!(stats.transport_packets_sent, 0);
         assert!(stats.encode_time_history.is_empty());
+    }
+
+    /// The NVIDIA driver notice names the card that encodes: none once the
+    /// stream stops or restarts.
+    #[test]
+    fn the_open_encoder_is_forgotten_on_stop_and_restart() {
+        let mut stats = PipelineStats {
+            active_encoder: "h264_qsv".into(),
+            ..PipelineStats::default()
+        };
+        stats.mark_pipeline_stopped();
+        assert_eq!(stats.active_encoder, "");
+        stats.active_encoder = "h264_qsv".into();
+        stats.reset_for_restart();
+        assert_eq!(stats.active_encoder, "");
+    }
+
+    /// Stop leaves an encoder thread opening Quick Sync in the background:
+    /// when the open returns, the stopped stream does not take it.
+    #[test]
+    fn an_encoder_open_that_returns_after_stop_or_restart_is_not_noted() {
+        let mut stats = PipelineStats::default();
+        stats.mark_pipeline_started();
+        stats.note_encoder_opened("h264_qsv", true);
+        assert_eq!(stats.active_encoder, "h264_qsv");
+        stats.mark_pipeline_stopped();
+        stats.note_encoder_opened("h264_qsv", true);
+        assert_eq!(stats.active_encoder, "", "opened after Stop");
+        stats.reset_for_restart();
+        stats.mark_pipeline_started();
+        stats.note_encoder_opened("h264_qsv", false);
+        assert_eq!(stats.active_encoder, "", "the replaced generation's open");
+        stats.note_encoder_opened("h264_amf", true);
+        assert_eq!(stats.active_encoder, "h264_amf");
     }
 }

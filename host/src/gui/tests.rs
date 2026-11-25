@@ -1,6 +1,7 @@
 use super::page_stream::{
     audio_summary, capture_block_notice, firewall_fix_failure, firewall_fix_offered,
-    firewall_notice, second_screen_notice, software_fallback_body, usb_cable_notice, usb_summary,
+    firewall_notice, nvidia_driver_notice, second_screen_notice, software_fallback_body,
+    usb_cable_notice, usb_summary,
 };
 use super::*;
 
@@ -498,6 +499,90 @@ fn an_outdated_nvidia_driver_is_named_with_the_version_to_install() {
         software_fallback_body(true, false, false, &[])
     );
     assert!(!software_fallback_body(false, false, false, &[]).contains("570"));
+}
+
+/// Field case (Nov 2026): an RTX 3060 on driver 566.36 beside Intel Iris
+/// Xe. NVENC refused the old driver and Quick Sync took over, so no software
+/// fallback notice showed and nothing said to update the NVIDIA driver.
+#[test]
+fn an_outdated_nvidia_driver_is_named_when_another_graphics_card_encodes() {
+    // Automatic (whichever card detection tried first: AMF that failed
+    // before NVENC refused the driver, too), or an NVENC override, with
+    // Quick Sync or AMF open.
+    for chosen in ["", "h264_nvenc", "hevc_nvenc"] {
+        for active in ["h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf"] {
+            let body = nvidia_driver_notice(false, true, chosen, active).unwrap();
+            assert!(
+                body.contains("NVIDIA driver to version 570 or newer"),
+                "{body}"
+            );
+            assert!(body.contains("if your graphics card supports it"), "{body}");
+            assert!(body.contains("then click Restart"), "{body}");
+            assert!(body.contains("another graphics card encodes it"), "{body}");
+            assert!(!body.contains("processor"), "{body}");
+            for jargon in [
+                "NVENC",
+                "QSV",
+                "Quick Sync",
+                "AMF",
+                "API",
+                "encoder",
+                "http",
+            ] {
+                assert!(!body.contains(jargon), "{body}");
+            }
+        }
+    }
+    // The processor encodes: the software fallback notice says it, as before.
+    assert_eq!(nvidia_driver_notice(true, true, "", "h264_qsv"), None);
+    assert_eq!(nvidia_driver_notice(true, true, "", "libx264"), None);
+    assert!(software_fallback_body(false, true, false, &[])
+        .contains("Older cards keep using the processor"));
+    // NVENC refused the driver before Quick Sync or AMF opened (or while
+    // the processor opens on an NVIDIA-only PC).
+    assert_eq!(nvidia_driver_notice(false, true, "", ""), None);
+    // NVENC failed for another reason.
+    assert_eq!(nvidia_driver_notice(false, false, "", "h264_qsv"), None);
+    // An AMD, Intel or processor encoder chosen in Settings (an override
+    // FFmpeg lacks starts as Automatic: see `encoder::applied_encoder`).
+    for chosen in ["h264_qsv", "hevc_qsv", "h264_amf", "hevc_amf", "libx264"] {
+        for active in ["h264_qsv", "h264_amf"] {
+            assert_eq!(nvidia_driver_notice(false, true, chosen, active), None);
+        }
+    }
+}
+
+/// The notice follows the encoder the running pipeline has open.
+#[test]
+fn the_nvidia_driver_notice_follows_the_open_encoder() {
+    let notice = |stats: &crate::stats::PipelineStats| {
+        nvidia_driver_notice(
+            stats.using_software_fallback,
+            stats.nvidia_driver_outdated,
+            &stats.encoder_override,
+            &stats.active_encoder,
+        )
+        .is_some()
+    };
+    let mut stats = crate::stats::PipelineStats::default();
+    stats.nvidia_driver_outdated = true;
+    stats.mark_pipeline_started();
+    stats.note_encoder_opened("h264_qsv", true);
+    assert!(notice(&stats));
+    // A session dropped to reopen (Quick Sync refusing a bitrate on the
+    // open session) keeps the notice until the reopen returns: on Quick
+    // Sync again, or on the processor while it opens in the background.
+    stats.note_encoder_opened("h264_qsv", true);
+    assert!(notice(&stats));
+    stats.note_encoder_opened("libx264", true);
+    assert!(!notice(&stats));
+    stats.note_encoder_opened("h264_qsv", true);
+    assert!(notice(&stats));
+    // Stopped, then the open still going on returns.
+    stats.mark_pipeline_stopped();
+    assert!(!notice(&stats));
+    stats.note_encoder_opened("h264_qsv", true);
+    assert!(!notice(&stats));
 }
 
 #[test]

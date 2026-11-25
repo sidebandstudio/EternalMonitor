@@ -1964,7 +1964,10 @@ fn feedback_and_star(shared: &SharedControl, dir: &std::path::Path, results: &mu
     let copied = copied_text(&window).expect("Copy message copies");
     let version = env!("CARGO_PKG_VERSION");
     let subject = format!("Subject: EternalMonitor {version} for Windows: Something I like");
-    assert!(copied.starts_with(&format!("To: hello@sideband.studio\n{subject}")), "{copied}");
+    assert!(
+        copied.starts_with(&format!("To: hello@sideband.studio\n{subject}")),
+        "{copied}"
+    );
     assert!(copied.contains("Drawing on the iPad in Krita feels great."));
     assert!(copied.contains("Setup: Second screen, USB, iPad 2420 × 1668 at 120 Hz"));
     assert!(!copied.contains("Test iPad Pro") && !copied.contains("192.0.2.10"));
@@ -2144,6 +2147,15 @@ fn review_screens() {
     PIPELINE_STATS.lock().nvidia_driver_outdated = true;
     let mut h = harness(&shared, egui::vec2(1040.0, 900.0), 2.0);
     save(&mut h, "problem-nvidia-driver-outdated");
+    // Another graphics card encodes instead of the NVIDIA card.
+    {
+        let mut stats = PIPELINE_STATS.lock();
+        stats.using_software_fallback = false;
+        stats.active_encoder = "h264_qsv".into();
+    }
+    let mut h = harness(&shared, egui::vec2(1040.0, 900.0), 2.0);
+    save(&mut h, "problem-nvidia-driver-outdated-other-card");
+    PIPELINE_STATS.lock().active_encoder.clear();
     PIPELINE_STATS.lock().nvidia_driver_outdated = false;
     *shared.vdd_status.lock() = VddStatus::Failed;
     PIPELINE_STATS.lock().using_software_fallback = false;
