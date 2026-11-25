@@ -749,7 +749,8 @@ impl AnalyzerApp {
     /// Landscape or Portrait for the second screen. A second screen on now,
     /// with modes written for its iPad, is turned off and on in the new
     /// shape through a stream restart (`capture::reuse_vdd` finds its modes
-    /// lack the new size); otherwise the next start uses it.
+    /// lack the new size), while streaming is on; otherwise the next start
+    /// uses it. A stream the user stopped stays stopped.
     fn set_vdd_orientation(&mut self, orientation: crate::vdd_settings::Orientation) {
         self.settings_vdd_orientation = orientation;
         *self.control.shared.vdd_orientation.lock() = orientation;
@@ -762,9 +763,10 @@ impl AnalyzerApp {
         self.persist_settings();
         if live {
             // Not `restart_stream`, which forgets the encoders that failed
-            // this launch: a turn says nothing about their drivers.
+            // this launch (a turn says nothing about their drivers) and
+            // starts a stream that is off.
             self.restart_pending = false;
-            self.control.request_restart();
+            self.control.request_restart_if_on();
         }
     }
 
