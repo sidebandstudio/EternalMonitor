@@ -49,6 +49,10 @@ pub struct SettingsFile {
     /// resolution/refresh (writes vdd_settings.xml before enabling it).
     #[serde(default = "default_true")]
     pub vdd_match_resolution: bool,
+    /// Which way up the second screen stands while it matches the iPad:
+    /// Landscape, or Portrait for a tall screen.
+    #[serde(default, deserialize_with = "orientation_or_landscape")]
+    pub vdd_orientation: crate::vdd_settings::Orientation,
     pub start_on_boot: bool,
     /// Streaming sessions of five minutes or more, counted up to the
     /// one-time "How's EternalMonitor working for you?" card.
@@ -77,6 +81,16 @@ pub struct SettingsFile {
 
 fn default_true() -> bool {
     true
+}
+
+/// `vdd_orientation` as saved, or Landscape for a value this version
+/// doesn't know, as from a later one: a field that fails to read resets
+/// every setting, the pairing too.
+fn orientation_or_landscape<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<crate::vdd_settings::Orientation, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(crate::vdd_settings::Orientation::deserialize(value).unwrap_or_default())
 }
 
 /// The encoder input on disk. `encoder_input` keeps to the values every
@@ -159,6 +173,7 @@ impl Default for SettingsFile {
             auth_token_hex: String::new(),
             listen_on: Default::default(),
             vdd_match_resolution: true,
+            vdd_orientation: Default::default(),
             start_on_boot: false,
             feedback_sessions: 0,
             feedback_ask_done: false,
@@ -340,6 +355,46 @@ mod tests {
                 .max_dgram,
             1200
         );
+    }
+
+    /// The second screen's orientation: Landscape in a file from before it
+    /// existed, Portrait kept once picked. Older versions ignore the field.
+    #[test]
+    fn the_second_screen_orientation_round_trips_and_defaults_to_landscape() {
+        use crate::vdd_settings::Orientation;
+        let old = r#"{"bitrate_mbps":15,"target_fps":60,"start_on_boot":false}"#;
+        let parsed: SettingsFile = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.vdd_orientation, Orientation::Landscape);
+        assert_eq!(
+            SettingsFile::default().vdd_orientation,
+            Orientation::Landscape
+        );
+        let settings = SettingsFile {
+            vdd_orientation: Orientation::Portrait,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains(r#""vdd_orientation":"portrait""#), "{json}");
+        let parsed: SettingsFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.vdd_orientation, Orientation::Portrait);
+    }
+
+    /// An orientation this version doesn't know, as a later one might save,
+    /// reads as Landscape and the rest of the file is kept, the pairing too.
+    #[test]
+    fn an_unknown_orientation_reads_as_landscape() {
+        use crate::vdd_settings::Orientation;
+        for value in [r#""portrait_flipped""#, "2", "null", r#"{"turn":90}"#] {
+            let text = format!(
+                r#"{{"bitrate_mbps":15,"target_fps":60,"start_on_boot":false,"auth_token_hex":"0123456789abcdef0123456789abcdef","vdd_orientation":{value}}}"#
+            );
+            let parsed: SettingsFile = serde_json::from_str(&text).expect(value);
+            assert_eq!(parsed.vdd_orientation, Orientation::Landscape, "{value}");
+            assert_eq!(
+                parsed.auth_token_hex, "0123456789abcdef0123456789abcdef",
+                "{value}"
+            );
+        }
     }
 
     /// A settings file from before Automatic keeps the input it names, so
