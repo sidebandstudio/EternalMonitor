@@ -16,6 +16,7 @@ use super::recovery::{
     note_capture_resumed, note_gpu_outcome, CaptureBlock, CaptureUnavailable, LossRecovery,
     LossStep, OpenStep, Reopen, LOSS_GIVE_UP,
 };
+use super::rotation::Rotation;
 use super::{
     acquired, client_connected, composite_pointer, frame_budget_for, frame_buffer, heartbeat,
     idle_heartbeat, keepalive_allowed, keepalive_due, nap_unless, pointer_apart, pointer_place,
@@ -34,10 +35,7 @@ use windows::Win32::Graphics::Direct3D11::{
     D3D11_CREATE_DEVICE_BGRA_SUPPORT, D3D11_MAPPED_SUBRESOURCE, D3D11_MAP_READ, D3D11_SDK_VERSION,
     D3D11_TEXTURE2D_DESC, D3D11_USAGE_STAGING,
 };
-use windows::Win32::Graphics::Dxgi::Common::{
-    DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_MODE_ROTATION, DXGI_MODE_ROTATION_IDENTITY,
-    DXGI_MODE_ROTATION_UNSPECIFIED, DXGI_SAMPLE_DESC,
-};
+use windows::Win32::Graphics::Dxgi::Common::{DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_SAMPLE_DESC};
 use windows::Win32::Graphics::Dxgi::{
     CreateDXGIFactory1, IDXGIAdapter1, IDXGIFactory1, IDXGIOutput, IDXGIOutput1,
     IDXGIOutputDuplication, IDXGIResource, DXGI_ADAPTER_DESC1, DXGI_ERROR_ACCESS_LOST,
@@ -253,28 +251,42 @@ pub fn run_capture_loop(
     // These are `mut` because a mid-stream resolution change surfaces as ACCESS_LOST; the error
     // handler re-reads the geometry and rebuilds the staging texture / CPU buffer below.
     let dupl_desc = unsafe { duplication.as_ref().expect("just created").GetDesc() };
-    let mut tex_width = dupl_desc.ModeDesc.Width;
-    let mut tex_height = dupl_desc.ModeDesc.Height;
+    // `ModeDesc` is the desktop's size, upright, as measured on an RTX
+    // 5080. A screen turned in Windows' display settings is duplicated as
+    // the display scans it out, its sides swapped for a quarter turn (see
+    // `Rotation`): the staging texture starts at that size. CopyResource
+    // copies nothing between textures of different sizes, so an image
+    // acquired at another size rebuilds it at the image's. Frames are read
+    // back upright, at the desktop's size the pointer and input use.
+    let mut frame_width = dupl_desc.ModeDesc.Width;
+    let mut frame_height = dupl_desc.ModeDesc.Height;
+    let mut rotation = Rotation::from_dxgi(dupl_desc.Rotation.0);
+    // The mode the duplication last reported, for the ACCESS_LOST handler
+    // to tell a change from it: the frames' size may be the image's instead.
+    let mut mode = (frame_width, frame_height);
+    let (mut tex_width, mut tex_height) = rotation.duplicated((frame_width, frame_height));
     info!(
-        width = tex_width,
-        height = tex_height,
+        width = frame_width,
+        height = frame_height,
+        ?rotation,
         "Desktop duplication dimensions"
     );
     if second_screen {
         // The size the second screen is at, for the app; a resize updates it.
-        super::note_vdd_size(&shared, &chosen.device_name, (tex_width, tex_height));
+        super::note_vdd_size(&shared, &chosen.device_name, (frame_width, frame_height));
     }
-    if tex_width == 0 || tex_height == 0 {
+    if frame_width == 0 || frame_height == 0 {
         return Err(format!(
-            "Desktop duplication reported invalid dimensions {tex_width}x{tex_height}"
+            "Desktop duplication reported invalid dimensions {frame_width}x{frame_height}"
         )
         .into());
     }
 
     // Publish the output's desktop-space rect for the input relay: the iPad's
     // normalized touches map onto exactly this rectangle. DesktopCoordinates
-    // (not ModeDesc) is authoritative — under DPI virtualization or rotation
-    // the two differ, and injected coordinates live in desktop space.
+    // (not ModeDesc) is authoritative — under DPI virtualization the two can
+    // differ, and injected coordinates live in desktop space. On a turned
+    // screen both are the upright desktop's size (measured on an RTX 5080).
     publish_capture_geometry(&output1, &shared);
 
     // --- Create staging texture for CPU readback (reused every frame) ---
@@ -289,8 +301,8 @@ pub fn run_capture_loop(
     };
     info!("Staging texture created for CPU readback");
 
-    let mut row_bytes = (tex_width * 4) as usize;
-    let mut frame_bytes = row_bytes * tex_height as usize;
+    let mut row_bytes = (frame_width * 4) as usize;
+    let mut frame_bytes = row_bytes * frame_height as usize;
     // Buffer recycling (see synthetic.rs): steady state re-uses one buffer.
     let mut spare: Option<Arc<Vec<u8>>> = None;
     // The last published frame, shared for keepalive resends without a copy.
@@ -407,7 +419,8 @@ pub fn run_capture_loop(
                     copy_staging(
                         &device_context,
                         &staging_texture,
-                        tex_height,
+                        (tex_width, tex_height),
+                        rotation,
                         row_bytes,
                         &mut pixel_buf,
                     )
@@ -421,8 +434,8 @@ pub fn run_capture_loop(
                     if composite_pointer(draws_pointer, place, cursor_visible, cursor.has_shape) {
                         draw_cursor(
                             &mut pixel_buf,
-                            tex_width,
-                            tex_height,
+                            frame_width,
+                            frame_height,
                             row_bytes,
                             &cursor,
                             cursor_x,
@@ -439,7 +452,7 @@ pub fn run_capture_loop(
                             frame_number,
                             &mut last_send,
                             &last_frame,
-                            (tex_width, tex_height),
+                            (frame_width, frame_height),
                         );
                     }
                 }
@@ -447,10 +460,10 @@ pub fn run_capture_loop(
         }
 
         if start_picture.due(picture.real(), second_screen, Instant::now()) {
-            let rotation = duplication
+            let pixels = duplication
                 .as_ref()
-                .map(|duplication| unsafe { duplication.GetDesc() }.Rotation);
-            if let Some(pixels) = read_screen_gdi(&output1, (tex_width, tex_height), rotation) {
+                .and_then(|_| read_screen_gdi(&output1, (frame_width, frame_height)));
+            if let Some(pixels) = pixels {
                 info!(
                     device = %chosen.device_name,
                     "Desktop duplication gave no image yet — starting from the screen's picture"
@@ -462,14 +475,16 @@ pub fn run_capture_loop(
                 let now = Instant::now();
                 if idle.on_frame(client_connected(&shared), now) == FrameUse::Publish {
                     *frame_number += 1;
-                    PIPELINE_STATS.lock().record_capture(tex_width, tex_height);
+                    PIPELINE_STATS
+                        .lock()
+                        .record_capture(frame_width, frame_height);
                     heartbeat(&shared.hb_capture_frame_ms);
                     slot.publish(RawFrame {
                         frame_number: *frame_number,
                         timestamp: now,
                         data: Arc::clone(&last_frame),
-                        width: tex_width,
-                        height: tex_height,
+                        width: frame_width,
+                        height: frame_height,
                         cached: true,
                     });
                     last_send = now;
@@ -623,16 +638,56 @@ pub fn run_capture_loop(
                                 frame_number,
                                 &mut last_send,
                                 &last_frame,
-                                (tex_width, tex_height),
+                                (frame_width, frame_height),
                             );
                         }
                         continue;
                     }
                 }
+                let desktop_texture = desktop_resource
+                    .as_ref()
+                    .map(|resource| resource.cast::<ID3D11Texture2D>());
+                // The staging texture's size is inferred from the mode and
+                // the rotation; the acquired image's own decides.
+                if let Some(Ok(texture)) = &desktop_texture {
+                    let mut desc = D3D11_TEXTURE2D_DESC::default();
+                    unsafe { texture.GetDesc(&mut desc) };
+                    let image = (desc.Width, desc.Height);
+                    if image != (tex_width, tex_height) && image.0 != 0 && image.1 != 0 {
+                        let upright = rotation.upright(image);
+                        warn!(
+                            staging = %format_args!("{tex_width}x{tex_height}"),
+                            image = %format_args!("{}x{}", image.0, image.1),
+                            upright = %format_args!("{}x{}", upright.0, upright.1),
+                            ?rotation,
+                            "The duplicated image is not the size its mode gave — rebuilding staging resources at its size"
+                        );
+                        (tex_width, tex_height) = image;
+                        (frame_width, frame_height) = upright;
+                        row_bytes = (frame_width * 4) as usize;
+                        frame_bytes = row_bytes * frame_height as usize;
+                        spare = None;
+                        last_frame = Arc::new(frame_buffer(frame_bytes));
+                        picture.resized();
+                        start_picture.duplicated(Instant::now());
+                        if second_screen {
+                            super::note_vdd_size(&shared, &chosen.device_name, upright);
+                        }
+                        staging_texture = unsafe {
+                            let mut tex = None;
+                            device.CreateTexture2D(
+                                &make_staging_desc(tex_width, tex_height),
+                                None,
+                                Some(&mut tex),
+                            )?;
+                            tex.expect("CreateTexture2D returned None")
+                        };
+                    }
+                }
                 let seen_image = &mut picture.seen_image;
                 let frame_data = read_back_image(&shared, generation, seen_image, || {
-                    windows::core::Result::Ok(if let Some(ref resource) = desktop_resource {
-                        match resource.cast::<ID3D11Texture2D>() {
+                    windows::core::Result::Ok(if let Some(desktop_texture) = desktop_texture {
+                        match desktop_texture {
                             Ok(desktop_texture) => {
                                 unsafe {
                                     device_context.CopyResource(&staging_texture, &desktop_texture);
@@ -654,7 +709,8 @@ pub fn run_capture_loop(
                                 copy_staging(
                                     &device_context,
                                     &staging_texture,
-                                    tex_height,
+                                    (tex_width, tex_height),
+                                    rotation,
                                     row_bytes,
                                     &mut pixel_buf,
                                 )?;
@@ -668,8 +724,8 @@ pub fn run_capture_loop(
                                 ) {
                                     draw_cursor(
                                         &mut pixel_buf,
-                                        tex_width,
-                                        tex_height,
+                                        frame_width,
+                                        frame_height,
                                         row_bytes,
                                         &cursor,
                                         cursor_x,
@@ -705,15 +761,17 @@ pub fn run_capture_loop(
                 if let Some(data) = frame_data {
                     picture.cached();
                     if idle.on_frame(client_connected(&shared), now) == FrameUse::Publish {
-                        PIPELINE_STATS.lock().record_capture(tex_width, tex_height);
+                        PIPELINE_STATS
+                            .lock()
+                            .record_capture(frame_width, frame_height);
                         heartbeat(&shared.hb_capture_frame_ms);
 
                         slot.publish(RawFrame {
                             frame_number: *frame_number,
                             timestamp: now,
                             data: Arc::clone(&data),
-                            width: tex_width,
-                            height: tex_height,
+                            width: frame_width,
+                            height: frame_height,
                             cached: false,
                         });
                         last_send = now;
@@ -756,7 +814,7 @@ pub fn run_capture_loop(
                         frame_number,
                         &mut last_send,
                         &last_frame,
-                        (tex_width, tex_height),
+                        (frame_width, frame_height),
                     );
                 } else if !client_connected(&shared)
                     && last_send.elapsed() >= Duration::from_secs(2)
@@ -789,7 +847,7 @@ pub fn run_capture_loop(
                     info!("Desktop duplication access lost — reinitializing");
                 }
                 let allowed = keepalive_allowed(picture.real(), second_screen);
-                let dims = (tex_width, tex_height);
+                let dims = (frame_width, frame_height);
                 let call = super::second_screen::driver_call(&shared, generation);
                 let moved = target_moved(&shared, &output1, &chosen, &target, false, || {
                     if crate::supervisor::generation_is_current(generation) {
@@ -852,7 +910,7 @@ pub fn run_capture_loop(
                             frame_number,
                             &mut last_send,
                             &last_frame,
-                            (tex_width, tex_height),
+                            (frame_width, frame_height),
                             keepalive_allowed(picture.real(), second_screen),
                         );
                         let now = Instant::now();
@@ -873,7 +931,7 @@ pub fn run_capture_loop(
                             frame_number,
                             &mut last_send,
                             &last_frame,
-                            (tex_width, tex_height),
+                            (frame_width, frame_height),
                             keepalive_allowed(picture.real(), second_screen),
                         );
                     };
@@ -918,7 +976,7 @@ pub fn run_capture_loop(
                             }
                             // The output may be gone: look at the whole layout.
                             let allowed = keepalive_allowed(picture.real(), second_screen);
-                            let dims = (tex_width, tex_height);
+                            let dims = (frame_width, frame_height);
                             let call = super::second_screen::driver_call(&shared, generation);
                             let moved =
                                 target_moved(&shared, &output1, &chosen, &target, true, || {
@@ -946,18 +1004,26 @@ pub fn run_capture_loop(
                 // otherwise CopyResource silently no-ops on a size mismatch and the iPad freezes.
                 let new_desc = unsafe { duplication.as_ref().expect("re-created above").GetDesc() };
                 let (new_w, new_h) = (new_desc.ModeDesc.Width, new_desc.ModeDesc.Height);
-                if new_w != 0 && new_h != 0 && (new_w != tex_width || new_h != tex_height) {
+                // Turning the screen in Windows' settings may keep the mode's
+                // size and change only the rotation; the frames change shape.
+                let new_rotation = Rotation::from_dxgi(new_desc.Rotation.0);
+                if new_w != 0 && new_h != 0 && ((new_w, new_h) != mode || new_rotation != rotation)
+                {
                     info!(
-                        old_width = tex_width,
-                        old_height = tex_height,
+                        old_width = frame_width,
+                        old_height = frame_height,
                         new_width = new_w,
                         new_height = new_h,
+                        old_rotation = ?rotation,
+                        new_rotation = ?new_rotation,
                         "Capture resolution changed — rebuilding staging resources"
                     );
-                    tex_width = new_w;
-                    tex_height = new_h;
-                    row_bytes = (tex_width * 4) as usize;
-                    frame_bytes = row_bytes * tex_height as usize;
+                    (frame_width, frame_height) = (new_w, new_h);
+                    mode = (new_w, new_h);
+                    rotation = new_rotation;
+                    (tex_width, tex_height) = rotation.duplicated((frame_width, frame_height));
+                    row_bytes = (frame_width * 4) as usize;
+                    frame_bytes = row_bytes * frame_height as usize;
                     spare = None;
                     last_frame = Arc::new(frame_buffer(frame_bytes));
                     picture.resized();
@@ -1254,26 +1320,17 @@ fn publish_capture_geometry(output: &IDXGIOutput1, shared: &SharedControl) {
 
 /// The picture `output` shows, read through GDI, as `width`x`height` BGRA
 /// rows in a [`frame_buffer`]: for a duplication that gives no image (see
-/// [`StartPicture`]). The pointer is not in it. None if the display is
-/// rotated (the duplication's `rotation`, or a desktop rect that isn't that
-/// size, as for 90 or 270 degrees), if GDI can't read it (no interactive
+/// [`StartPicture`]). The pointer is not in it. GDI reads the desktop
+/// upright, as capture's frames are on a screen turned in Windows' settings
+/// (see [`Rotation`]). None if the desktop rect isn't that size (the screen
+/// was resized or turned since), if GDI can't read it (no interactive
 /// desktop), or if it read only black, as on the secure desktop: the
 /// duplication's own image is waited for then.
-fn read_screen_gdi(
-    output: &IDXGIOutput1,
-    (width, height): (u32, u32),
-    rotation: Option<DXGI_MODE_ROTATION>,
-) -> Option<Vec<u8>> {
+fn read_screen_gdi(output: &IDXGIOutput1, (width, height): (u32, u32)) -> Option<Vec<u8>> {
     use windows::Win32::Graphics::Gdi::{
         BitBlt, CreateCompatibleDC, CreateDIBSection, DeleteDC, DeleteObject, GdiFlush, GetDC,
         ReleaseDC, SelectObject, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DIB_RGB_COLORS, SRCCOPY,
     };
-    if !matches!(
-        rotation,
-        Some(DXGI_MODE_ROTATION_IDENTITY | DXGI_MODE_ROTATION_UNSPECIFIED)
-    ) {
-        return None;
-    }
     let rect = unsafe { output.GetDesc() }.ok()?.DesktopCoordinates;
     if (rect.right - rect.left, rect.bottom - rect.top) != (width as i32, height as i32) {
         return None;
@@ -1349,12 +1406,15 @@ fn read_screen_gdi(
     }
 }
 
-/// Reads the staging texture's image into `buf`, row by row (its pitch may
-/// differ from `row_bytes`).
+/// Reads the staging texture's image, `size` as duplicated, into `buf`
+/// upright ([`super::rotation::copy_upright`]): row by row when it is
+/// upright already, as before (the texture's pitch may differ from
+/// `row_bytes`, the upright rows').
 fn copy_staging(
     device_context: &ID3D11DeviceContext,
     staging_texture: &ID3D11Texture2D,
-    height: u32,
+    size: (u32, u32),
+    rotation: Rotation,
     row_bytes: usize,
     buf: &mut [u8],
 ) -> windows::core::Result<()> {
@@ -1364,16 +1424,16 @@ fn copy_staging(
     }
     let src_pitch = mapped.RowPitch as usize;
     let src_ptr = mapped.pData as *const u8;
-    debug_assert!(buf.len() >= height as usize * row_bytes);
-    for row in 0..height as usize {
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                src_ptr.add(row * src_pitch),
-                buf.as_mut_ptr().add(row * row_bytes),
-                row_bytes,
-            );
-        }
-    }
+    let (width, height) = (size.0 as usize, size.1 as usize);
+    // One row at a time: the padding the pitch may leave after a row's
+    // pixels need not be initialized, so no slice spans it.
+    let source_row = |row: usize| {
+        assert!(row < height);
+        // SAFETY: a mapped staging texture of `size` holds `height` rows of
+        // `width` BGRA pixels, `RowPitch` apart, until the Unmap.
+        unsafe { std::slice::from_raw_parts(src_ptr.add(row * src_pitch), width * 4) }
+    };
+    super::rotation::copy_upright(rotation, source_row, size, buf, row_bytes);
     unsafe {
         device_context.Unmap(staging_texture, 0);
     }
@@ -1637,16 +1697,13 @@ mod tests {
     use super::*;
 
     /// Native: GDI reads the primary display at its own size, as opaque BGRA
-    /// in a capture buffer, and nothing at another size or rotation. Needs an
-    /// interactive desktop that isn't all black; skips with no output listed
-    /// (a non-interactive SSH session).
+    /// in a capture buffer, and nothing at another size or turned on its
+    /// side. Needs an interactive desktop that isn't all black; skips with no
+    /// output listed (a non-interactive SSH session).
     /// `cargo test -p eternal-host --lib the_screen_is_read_through_gdi -- --ignored --nocapture`
     #[test]
     #[ignore = "native: needs an interactive Windows desktop"]
-    fn the_screen_is_read_through_gdi_only_at_its_own_size_and_rotation() {
-        use windows::Win32::Graphics::Dxgi::Common::{
-            DXGI_MODE_ROTATION_ROTATE180, DXGI_MODE_ROTATION_ROTATE90,
-        };
+    fn the_screen_is_read_through_gdi_only_at_its_own_size() {
         let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.expect("DXGI factory");
         let shared = SharedControl::new(0, 8_000_000);
         let (listed, _) = super::super::listing::listed(&shared, &factory);
@@ -1656,37 +1713,244 @@ mod tests {
         };
         let output: IDXGIOutput1 = primary.output.cast().expect("IDXGIOutput1");
         let (width, height) = (primary.info.width, primary.info.height);
-        let pixels = read_screen_gdi(&output, (width, height), Some(DXGI_MODE_ROTATION_IDENTITY))
-            .expect("the desktop read through GDI");
+        let pixels =
+            read_screen_gdi(&output, (width, height)).expect("the desktop read through GDI");
         let picture_bytes = (width * height * 4) as usize;
         assert_eq!(pixels.len(), picture_bytes + FRAME_PADDING);
         let (read, _) = pixels[..picture_bytes].as_chunks::<4>();
         assert!(read.iter().all(|pixel| pixel[3] == 255), "not opaque");
         assert!(read.iter().any(|pixel| pixel[..3] != [0, 0, 0]));
-        for (size, rotation, what) in [
-            (
-                (width + 1, height),
-                Some(DXGI_MODE_ROTATION_IDENTITY),
-                "another size",
-            ),
-            (
-                (width, height),
-                Some(DXGI_MODE_ROTATION_ROTATE180),
-                "upside down",
-            ),
-            (
-                (width, height),
-                Some(DXGI_MODE_ROTATION_ROTATE90),
-                "a quarter turn",
-            ),
-            ((width, height), None, "no duplication"),
-        ] {
+        assert!(
+            read_screen_gdi(&output, (width + 1, height)).is_none(),
+            "another size was read"
+        );
+        if width != height {
             assert!(
-                read_screen_gdi(&output, size, rotation).is_none(),
-                "{what} was read"
+                read_screen_gdi(&output, (height, width)).is_none(),
+                "the turned size was read"
             );
         }
         eprintln!("read {width}x{height} through GDI");
+    }
+
+    /// `pixels`, `width`x`height` BGRA rows, as a top-down 32-bit BMP.
+    fn write_bmp(path: &std::path::Path, (width, height): (u32, u32), pixels: &[u8]) {
+        let image = (width * height * 4) as usize;
+        let mut file = Vec::with_capacity(54 + image);
+        file.extend_from_slice(b"BM");
+        file.extend_from_slice(&(54 + image as u32).to_le_bytes());
+        file.extend_from_slice(&[0; 4]);
+        file.extend_from_slice(&54u32.to_le_bytes());
+        file.extend_from_slice(&40u32.to_le_bytes());
+        file.extend_from_slice(&(width as i32).to_le_bytes());
+        file.extend_from_slice(&(-(height as i32)).to_le_bytes());
+        file.extend_from_slice(&1u16.to_le_bytes());
+        file.extend_from_slice(&32u16.to_le_bytes());
+        file.extend_from_slice(&[0; 24]);
+        file.extend_from_slice(&pixels[..image]);
+        std::fs::write(path, file).expect("write the picture");
+    }
+
+    /// The share of pixels of the same colour in two BGRA pictures, `a_size`
+    /// and `b_size` with rows of their own width, where they overlap from
+    /// their top-left corners.
+    fn matching_share(a: &[u8], a_size: (u32, u32), b: &[u8], b_size: (u32, u32)) -> f64 {
+        let width = a_size.0.min(b_size.0) as usize;
+        let height = a_size.1.min(b_size.1) as usize;
+        let same: usize = (0..height)
+            .map(|y| {
+                let (ours, _) = a[y * a_size.0 as usize * 4..][..width * 4].as_chunks::<4>();
+                let (theirs, _) = b[y * b_size.0 as usize * 4..][..width * 4].as_chunks::<4>();
+                ours.iter()
+                    .zip(theirs)
+                    .filter(|(p, q)| p[..3] == q[..3])
+                    .count()
+            })
+            .sum();
+        same as f64 / (width * height).max(1) as f64
+    }
+
+    /// Native: each screen, as turned in Windows' display settings, reads
+    /// back upright. The staging texture takes the acquired image's size, as
+    /// capture's does; turned by the duplication's rotation the picture is
+    /// the desktop rect's size and matches what GDI shows of it (most of it:
+    /// the pointer and anything that moved in between differ), clearly
+    /// better than turned any of the other three ways. Prints what Windows
+    /// reports for each and how well each turn matches, and with
+    /// `ETERNAL_ROTATION_DUMP` set to a folder, saves both pictures there as
+    /// BMPs to look at. `ETERNAL_ROTATION_ONLY` names the one display to
+    /// check. At least one display must be compared; the test skips only when
+    /// none is listed (no interactive desktop) and no display is named.
+    /// Something must change on the screen for Desktop Duplication to give an
+    /// image, and it must not look the same turned (`Pattern-Window.ps1`).
+    /// `cargo test -p eternal-host --lib every_screen_is_read_back_upright -- --ignored --nocapture`
+    #[test]
+    #[ignore = "native: needs an interactive Windows desktop"]
+    fn every_screen_is_read_back_upright() {
+        use windows::Win32::UI::HiDpi::{
+            SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+        };
+        // The right turn matches at least this much better than any other:
+        // an animated wallpaper costs the right one about a tenth, and a
+        // wrong one matched under a third (November 2026).
+        const CLEAR_MARGIN: f64 = 0.25;
+        const TURNS: [Rotation; 4] = [
+            Rotation::Identity,
+            Rotation::Rotate90,
+            Rotation::Rotate180,
+            Rotation::Rotate270,
+        ];
+        // Desktop coordinates in pixels, as the app (per-monitor aware) sees them.
+        let _ =
+            unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+        let only = std::env::var("ETERNAL_ROTATION_ONLY").ok();
+        let factory: IDXGIFactory1 = unsafe { CreateDXGIFactory1() }.expect("DXGI factory");
+        let shared = SharedControl::new(0, 8_000_000);
+        let (listed, _) = super::super::listing::listed(&shared, &factory);
+        if listed.is_empty() && only.is_none() {
+            eprintln!("skipping: no display output is listed in this session");
+            return;
+        }
+        let dump = std::env::var_os("ETERNAL_ROTATION_DUMP").map(std::path::PathBuf::from);
+        let mut compared = 0;
+        for listed in listed {
+            if only
+                .as_ref()
+                .is_some_and(|only| !listed.info.device_name.eq_ignore_ascii_case(only))
+            {
+                continue;
+            }
+            let name = listed.info.device_name.replace(['\\', '.'], "");
+            let device = create_device(listed.adapter.clone(), || {})
+                .unwrap()
+                .expect("a device on the screen's card");
+            let context = unsafe { device.GetImmediateContext() }.unwrap();
+            let output: IDXGIOutput1 = listed.output.cast().expect("IDXGIOutput1");
+            let Ok(Ok(duplication)) = duplicate_output(&output, &device, || {}) else {
+                eprintln!("{name}: not duplicated here (another session or card); skipped");
+                continue;
+            };
+            let desc = unsafe { duplication.GetDesc() };
+            let rect = unsafe { output.GetDesc() }.unwrap().DesktopCoordinates;
+            let rotation = Rotation::from_dxgi(desc.Rotation.0);
+            let mode = (desc.ModeDesc.Width, desc.ModeDesc.Height);
+            let desktop = (
+                (rect.right - rect.left) as u32,
+                (rect.bottom - rect.top) as u32,
+            );
+            eprintln!(
+                "{name}: mode {}x{}, rotation {} ({rotation:?}), desktop {}x{}",
+                mode.0, mode.1, desc.Rotation.0, desktop.0, desktop.1
+            );
+            if mode != desktop {
+                eprintln!("{name}: NOTE the mode is not the desktop's size, as measured before");
+            }
+            let mut staged = None;
+            for _ in 0..40 {
+                let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
+                let mut resource: Option<IDXGIResource> = None;
+                if let Err(error) =
+                    unsafe { duplication.AcquireNextFrame(100, &mut info, &mut resource) }
+                {
+                    if error.code() != DXGI_ERROR_WAIT_TIMEOUT {
+                        eprintln!("{name}: AcquireNextFrame: {error}");
+                    }
+                    continue;
+                }
+                let texture: ID3D11Texture2D = resource.unwrap().cast().unwrap();
+                let mut tex_desc = D3D11_TEXTURE2D_DESC::default();
+                unsafe { texture.GetDesc(&mut tex_desc) };
+                let fresh = info.LastPresentTime != 0;
+                eprintln!(
+                    "{name}: frame {}x{}, presented {}, accumulated {}",
+                    tex_desc.Width, tex_desc.Height, info.LastPresentTime, info.AccumulatedFrames
+                );
+                if fresh {
+                    let image = (tex_desc.Width, tex_desc.Height);
+                    if image != rotation.duplicated(mode) {
+                        eprintln!(
+                            "{name}: NOTE the image is not the mode turned as measured before"
+                        );
+                    }
+                    let staging: ID3D11Texture2D = unsafe {
+                        let mut tex = None;
+                        device
+                            .CreateTexture2D(
+                                &make_staging_desc(image.0, image.1),
+                                None,
+                                Some(&mut tex),
+                            )
+                            .unwrap();
+                        tex.unwrap()
+                    };
+                    unsafe { context.CopyResource(&staging, &texture) };
+                    staged = Some((staging, image));
+                }
+                unsafe { duplication.ReleaseFrame() }.unwrap();
+                if staged.is_some() {
+                    break;
+                }
+            }
+            let Some((staging, image)) = staged else {
+                eprintln!("{name}: no new image within 4 s; skipped");
+                continue;
+            };
+            let Some(gdi) = read_screen_gdi(&output, desktop) else {
+                eprintln!("{name}: GDI read nothing (black or no desktop); skipped");
+                continue;
+            };
+            assert_eq!(
+                rotation.upright(image),
+                desktop,
+                "{name}: the image turned upright is the desktop's size"
+            );
+            let mut shares = Vec::new();
+            let mut upright = Vec::new();
+            for turn in TURNS {
+                let size = turn.upright(image);
+                let row_bytes = size.0 as usize * 4;
+                let mut picture = frame_buffer(row_bytes * size.1 as usize);
+                copy_staging(&context, &staging, image, turn, row_bytes, &mut picture).unwrap();
+                let share = matching_share(&picture, size, &gdi, desktop);
+                eprintln!(
+                    "{name}: turned {turn:?}, {:.1}% matches GDI's picture",
+                    share * 100.0
+                );
+                shares.push((turn, share));
+                if turn == rotation {
+                    upright = picture;
+                }
+            }
+            if let Some(dir) = &dump {
+                std::fs::create_dir_all(dir).unwrap();
+                write_bmp(&dir.join(format!("{name}-upright.bmp")), desktop, &upright);
+                write_bmp(&dir.join(format!("{name}-gdi.bmp")), desktop, &gdi);
+            }
+            let share = shares
+                .iter()
+                .find(|(turn, _)| *turn == rotation)
+                .map(|&(_, share)| share)
+                .unwrap();
+            assert!(
+                share > 0.75,
+                "{name}: the upright picture is not the desktop"
+            );
+            for &(turn, other) in &shares {
+                assert!(
+                    turn == rotation || share - other >= CLEAR_MARGIN,
+                    "{name}: turned {rotation:?} matches {:.1}% and turned {turn:?} {:.1}%: \
+                     this desktop does not tell the turns apart (Pattern-Window.ps1)",
+                    share * 100.0,
+                    other * 100.0
+                );
+            }
+            compared += 1;
+        }
+        assert!(
+            compared > 0,
+            "no display was compared (ETERNAL_ROTATION_ONLY={})",
+            only.as_deref().unwrap_or("unset")
+        );
     }
 
     /// Native: a real D3D11CreateDevice held past its limit. The caller gets

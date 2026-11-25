@@ -25,6 +25,7 @@ pub mod dxgi;
 pub mod listing;
 pub mod pointer;
 pub mod recovery;
+pub mod rotation;
 pub mod second_screen;
 pub mod synthetic;
 pub(crate) mod timing;
@@ -633,8 +634,12 @@ fn prepare_vdd_settings(shared: &SharedControl, outputs: &[OutputInfo]) -> VddRe
     let applied = match &record {
         None => Err(std::io::Error::other("no app data folder")),
         Some(record) if crate::settings::SettingsFile::load().vdd_match_resolution => {
-            let (device, modes) = connected_vdd_modes(shared)
-                .unwrap_or_else(|| (0, crate::vdd_settings::default_modes()));
+            let (device, modes) = connected_vdd_modes(shared).unwrap_or_else(|| {
+                (
+                    0,
+                    turned_modes(shared, crate::vdd_settings::default_modes()),
+                )
+            });
             let written = crate::vdd_settings::write_with_pin(path, record, owned, &modes, gpu);
             match &written {
                 Ok(_) => {
@@ -742,14 +747,23 @@ pub struct PreparedModes {
     pub choice: Option<(u32, u32)>,
 }
 
-/// The connected iPad's id and the second screen modes offered for it.
+/// The connected iPad's id and the second screen modes offered for it,
+/// standing the way picked in Settings.
 pub fn connected_vdd_modes(
     shared: &SharedControl,
 ) -> Option<(u64, Vec<crate::vdd_settings::VddMode>)> {
     let info = shared.session.lock().client_info()?;
     let modes =
         crate::vdd_settings::modes_for_client(info.screen_px.0, info.screen_px.1, info.refresh_hz);
-    Some((info.device_id, modes))
+    Some((info.device_id, turned_modes(shared, modes)))
+}
+
+/// `modes` standing the way picked in Settings (`vdd_settings::turned`).
+fn turned_modes(
+    shared: &SharedControl,
+    modes: Vec<crate::vdd_settings::VddMode>,
+) -> Vec<crate::vdd_settings::VddMode> {
+    crate::vdd_settings::turned(modes, *shared.vdd_orientation.lock())
 }
 
 /// The mode the second screen should have now: the connected iPad's latest

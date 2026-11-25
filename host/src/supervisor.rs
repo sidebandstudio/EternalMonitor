@@ -173,6 +173,16 @@ impl Machine {
                     Effect::Restart
                 }
             },
+            SupervisorCommand::RestartIfOn => match self.state {
+                SupervisorState::Running { .. }
+                | SupervisorState::BackingOff { .. }
+                | SupervisorState::WaitingForPort { .. } => {
+                    self.attempt = 0;
+                    self.restarts.clear();
+                    Effect::Restart
+                }
+                _ => Effect::None,
+            },
             SupervisorCommand::RestartStream { generation } => match self.state {
                 SupervisorState::Running {
                     generation: live_generation,
@@ -1114,6 +1124,43 @@ mod tests {
         machine.on_stage_exit(7, Stage::Capture, &failed("dxgi died"), t0);
         assert_eq!(machine.on_command(&restart(7)), Effect::None);
         assert!(matches!(machine.state, SupervisorState::BackingOff { .. }));
+    }
+
+    /// A setting that applies at once (the second screen's orientation)
+    /// restarts a stream that is on, also while it backs off or waits for
+    /// the port, but never undoes Stop or starts a stream that failed.
+    #[test]
+    fn a_changed_setting_restarts_only_a_stream_that_is_on() {
+        let restart = SupervisorCommand::RestartIfOn;
+        let mut machine = Machine::new(5);
+        assert_eq!(machine.on_command(&restart), Effect::Restart);
+        machine.note_started(6);
+        let t0 = Instant::now();
+        machine.on_stage_exit(6, Stage::Capture, &failed("dxgi died"), t0);
+        assert!(matches!(machine.state, SupervisorState::BackingOff { .. }));
+        assert_eq!(machine.on_command(&restart), Effect::Restart);
+        machine.note_started(7);
+        machine.state = SupervisorState::WaitingForPort { next_check: t0 };
+        assert_eq!(machine.on_command(&restart), Effect::Restart);
+        machine.note_started(8);
+
+        assert_eq!(
+            machine.on_command(&SupervisorCommand::Stop),
+            Effect::StopPipeline
+        );
+        assert_eq!(machine.on_command(&restart), Effect::None);
+        assert_eq!(machine.state, SupervisorState::Stopped);
+
+        let failed_state = SupervisorState::Failed {
+            reason: "encoder".into(),
+            stage: Stage::Encoder,
+        };
+        machine.state = failed_state.clone();
+        assert_eq!(machine.on_command(&restart), Effect::None);
+        assert_eq!(machine.state, failed_state);
+
+        machine.state = SupervisorState::ShutDown;
+        assert_eq!(machine.on_command(&restart), Effect::None);
     }
 
     #[test]

@@ -87,6 +87,9 @@ pub struct SharedControl {
     /// The second screen's size chosen for each iPad, as saved in the app
     /// data folder (`vdd_settings::RESOLUTION_RECORD`).
     pub vdd_resolutions: Arc<Mutex<crate::vdd_settings::ResolutionMemory>>,
+    /// Which way up the second screen stands (Settings > Display), for the
+    /// modes written for the driver.
+    pub vdd_orientation: Arc<Mutex<crate::vdd_settings::Orientation>>,
     /// The modes last written for the driver, and for which iPad; none when
     /// the driver's own modes apply.
     pub vdd_prepared: Arc<Mutex<Option<crate::capture::PreparedModes>>>,
@@ -233,6 +236,7 @@ impl SharedControl {
             vdd_worker: Arc::new(Default::default()),
             vdd_output: Arc::new(Mutex::new(None)),
             vdd_resolutions: Arc::new(Mutex::new(Default::default())),
+            vdd_orientation: Arc::new(Mutex::new(Default::default())),
             vdd_prepared: Arc::new(Mutex::new(None)),
             vdd_live: Arc::default(),
             second_screen: Arc::new(Mutex::new(Default::default())),
@@ -323,6 +327,10 @@ pub fn merge_fps(host: u32, client: u32) -> u32 {
 pub enum SupervisorCommand {
     /// Tear the current pipeline down and start a fresh generation.
     Restart,
+    /// [`Self::Restart`] for a changed setting, only while streaming is on
+    /// (running, backing off or waiting for the port): a stream the user
+    /// stopped, or one that failed, stays off and uses it when it starts.
+    RestartIfOn,
     /// The stream of `generation` asks to start again: its chosen network
     /// changed, or its virtual display has to go. Only while that stream
     /// still runs: one the user stopped, or one a newer stream replaced,
@@ -348,6 +356,14 @@ impl GuiControl {
         crate::vdd::recheck_tasks();
         self.shared.retry_second_screen();
         if let Err(error) = self.supervisor_tx.send(SupervisorCommand::Restart) {
+            warn!(error = %error, "Failed to send restart command");
+        }
+    }
+
+    /// Restarts the stream for a changed setting if it is on; see
+    /// [`SupervisorCommand::RestartIfOn`].
+    pub fn request_restart_if_on(&self) {
+        if let Err(error) = self.supervisor_tx.send(SupervisorCommand::RestartIfOn) {
             warn!(error = %error, "Failed to send restart command");
         }
     }

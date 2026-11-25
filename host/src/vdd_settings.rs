@@ -63,6 +63,35 @@ pub fn modes_for_client(screen_px_w: u16, screen_px_h: u16, refresh_hz: u8) -> V
     modes
 }
 
+/// Which way up the second screen stands. The iPad's panel is portrait, but
+/// the desktop is landscape unless the user picks Portrait (Settings >
+/// Display), for a tall screen such as a chat beside a game.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Orientation {
+    #[default]
+    Landscape,
+    Portrait,
+}
+
+/// `modes` (landscape, from [`modes_for_client`] or [`default_modes`]) for
+/// a second screen standing `orientation`: in Portrait each size turned on
+/// its side, height over width, in the same order. Windows then treats the
+/// display as a tall monitor, with no rotation of its own.
+pub fn turned(modes: Vec<VddMode>, orientation: Orientation) -> Vec<VddMode> {
+    match orientation {
+        Orientation::Landscape => modes,
+        Orientation::Portrait => modes
+            .into_iter()
+            .map(|mode| VddMode {
+                width: mode.height,
+                height: mode.width,
+                ..mode
+            })
+            .collect(),
+    }
+}
+
 /// Smaller sizes at the panel's own shape, as fractions of it. At 100%
 /// scale a smaller size makes everything on the second screen larger. Windows
 /// picks a default scale from the resolution and the reported screen size,
@@ -73,7 +102,7 @@ pub fn modes_for_client(screen_px_w: u16, screen_px_h: u16, refresh_hz: u8) -> V
 /// makes the picture larger than the panel's own size can.
 const LADDER: [(u32, u32); 4] = [(3, 4), (2, 3), (1, 2), (2, 5)];
 
-/// The smallest size at the panel's shape. The desktop is always landscape.
+/// The smallest size at the panel's shape, landscape (see [`turned`]).
 const LADDER_FLOOR: (u32, u32) = (800, 600);
 
 /// Common sizes in other shapes (16:9, 16:10, 4:3), largest first. The
@@ -207,16 +236,17 @@ pub fn modes_to_try(requested: VddMode, modes: &[VddMode]) -> Vec<VddMode> {
 pub const LARGEST_SIDE: u32 = 8192;
 
 /// Whether a size read from the saved file can be a second screen mode:
-/// landscape, even sides for 4:2:0 encoders, no smaller than
-/// [`LADDER_FLOOR`] and no side over [`LARGEST_SIDE`]. No refresh rate is
-/// saved with it; the iPad's own is used.
+/// landscape or portrait ([`Orientation`]), even sides for 4:2:0 encoders,
+/// no smaller than [`LADDER_FLOOR`] either way up and no side over
+/// [`LARGEST_SIDE`]. No refresh rate is saved with it; the iPad's own is
+/// used.
 fn usable_size((width, height): (u32, u32)) -> bool {
+    let (long, short) = (width.max(height), width.min(height));
     width % 2 == 0
         && height % 2 == 0
-        && width >= height
-        && width >= LADDER_FLOOR.0
-        && height >= LADDER_FLOOR.1
-        && width <= LARGEST_SIDE
+        && long >= LADDER_FLOOR.0
+        && short >= LADDER_FLOOR.1
+        && long <= LARGEST_SIDE
 }
 
 /// In the app data folder: the second screen's size chosen for each iPad.
@@ -2061,13 +2091,20 @@ mod tests {
     }
 
     /// Review r6, r12: an entry of the saved file becomes a choice only if
-    /// an encoder can take its size (even sides, landscape, 800x600 to 8192
-    /// wide) and it was chosen in the app: one an earlier build kept from
+    /// an encoder can take its size (even sides, 800x600 to 8192 wide, or
+    /// the same turned for Portrait) and it was chosen in the app: one an earlier build kept from
     /// Windows' display settings (`"windows": true`) is dropped, the rest of
     /// the file kept. An unreadable file means none chosen.
     #[test]
     fn only_usable_app_choices_are_loaded() {
-        for size in [(800, 600), (1366, 768), (2266, 1488), (8192, 4320)] {
+        for size in [
+            (800, 600),
+            (1366, 768),
+            (2266, 1488),
+            (8192, 4320),
+            (1488, 2266),
+            (600, 800),
+        ] {
             assert!(usable_size(size), "{size:?}");
         }
         for size in [
@@ -2077,7 +2114,8 @@ mod tests {
             (798, 600),
             (800, 598),
             (8194, 4320),
-            (1488, 2266),
+            (598, 800),
+            (4320, 8194),
         ] {
             assert!(!usable_size(size), "{size:?}");
         }
@@ -2179,6 +2217,92 @@ mod tests {
         assert_eq!(best_offered(ipad(2048, 1536), &vendor), Some((1920, 1080)));
         assert_eq!(best_offered(ipad(2752, 2064), &vendor), Some((2560, 1440)));
         assert_eq!(best_offered(ipad(640, 480), &vendor), None);
+    }
+
+    /// Portrait offers the same sizes as Landscape, in the same order, each
+    /// standing on its short side: the iPad's own size first, then the
+    /// smaller ones at its shape down to 600x800, then the common shapes
+    /// (1080x1920 among them), at the panel's refresh rate and 60 Hz.
+    #[test]
+    fn portrait_offers_the_landscape_sizes_turned_tall() {
+        for (w, h, hz) in [(1668, 2420, 120), (1488, 2266, 60), (1640, 2360, 60)] {
+            let landscape = modes_for_client(w, h, hz);
+            let portrait = turned(modes_for_client(w, h, hz), Orientation::Portrait);
+            assert_eq!(portrait.len(), landscape.len());
+            for (tall, wide) in portrait.iter().zip(&landscape) {
+                assert_eq!((tall.width, tall.height), (wide.height, wide.width));
+                assert_eq!(tall.refresh_hz, wide.refresh_hz);
+                assert!(tall.height > tall.width, "{tall}");
+                assert!(usable_size((tall.width, tall.height)), "{tall}");
+            }
+            assert_eq!(
+                (portrait[0].width, portrait[0].height),
+                (u32::from(w.min(h)) & !1, u32::from(w.max(h)) & !1),
+                "the iPad's own size, upright"
+            );
+        }
+        let portrait = sizes(&turned(
+            modes_for_client(1488, 2266, 60),
+            Orientation::Portrait,
+        ));
+        assert_eq!(
+            portrait,
+            client_sizes(1488, 2266)
+                .into_iter()
+                .map(|(w, h)| (h, w))
+                .collect::<Vec<_>>()
+        );
+        assert!(portrait.contains(&(1080, 1920)), "{portrait:?}");
+        assert!(portrait.iter().all(|&(w, h)| w >= 600 && h >= 800));
+        assert_eq!(
+            turned(default_modes(), Orientation::Portrait),
+            vec![VddMode {
+                width: 1080,
+                height: 1920,
+                refresh_hz: 60
+            }]
+        );
+    }
+
+    /// Landscape is the default and leaves the mode list exactly as it was.
+    #[test]
+    fn landscape_is_the_default_and_changes_nothing() {
+        assert_eq!(Orientation::default(), Orientation::Landscape);
+        for (w, h, hz) in [(1668, 2420, 120), (0, 0, 0)] {
+            assert_eq!(
+                turned(modes_for_client(w, h, hz), Orientation::Landscape),
+                modes_for_client(w, h, hz)
+            );
+        }
+        assert_eq!(
+            serde_json::to_string(&Orientation::Portrait).unwrap(),
+            r#""portrait""#
+        );
+    }
+
+    /// A portrait choice is saved and asked for like a landscape one, and
+    /// one saved in the other orientation gives way to the iPad's own size.
+    #[test]
+    fn a_portrait_choice_is_kept_and_a_landscape_one_gives_way() {
+        let portrait = turned(modes_for_client(1488, 2266, 60), Orientation::Portrait);
+        let smaller = (portrait[2].width, portrait[2].height);
+        let mut choices = ResolutionChoices::default();
+        assert!(choices.choose(7, &portrait, smaller));
+        assert_eq!(
+            requested_mode(&portrait, choices.chosen(7)).map(|m| (m.width, m.height)),
+            Some(smaller)
+        );
+        let landscape = modes_for_client(1488, 2266, 60);
+        assert_eq!(
+            requested_mode(&landscape, choices.chosen(7)),
+            Some(landscape[0])
+        );
+        let dir = temp_dir("vdd-resolutions-portrait-test");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(RESOLUTION_RECORD);
+        std::fs::write(&path, serde_json::to_string(&choices).unwrap()).unwrap();
+        assert_eq!(ResolutionChoices::load(&path).chosen(7), Some(smaller));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
