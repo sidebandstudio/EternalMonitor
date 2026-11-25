@@ -3,8 +3,9 @@
 Windows and iPad versions listed on the download page work together.
 Each 0.3.6 app works with the other app on 0.3.5, 0.3.4 and 0.3.3.
 
-This release changes how the apps send diagnostics. Streaming, Second
-screen and the settings are the same as in 0.3.5.
+### Second screen
+
+- [Portrait second screen: one line, wording to come.]
 
 ### Diagnostics
 
