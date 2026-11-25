@@ -58,7 +58,7 @@ final class DiagnosticsUpload: NSObject, URLSessionTaskDelegate, @unchecked Send
     private let lossLock = NSLock()
     static let enabledKey = "automaticallyShareDiagnostics"
 
-    init(directory: URL? = nil, configuration: Configuration? = Configuration.load(), defaults: UserDefaults = .standard, sessionConfiguration: URLSessionConfiguration? = nil) {
+    init(directory: URL? = nil, configuration: Configuration? = Configuration.load(), defaults: UserDefaults = .standard, sessionConfiguration: URLSessionConfiguration? = nil, automaticallyFlush: Bool = true) {
         self.directory = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("DiagnosticsOutbox", isDirectory: true)
         self.configuration = configuration
         self.defaults = defaults
@@ -81,6 +81,7 @@ final class DiagnosticsUpload: NSObject, URLSessionTaskDelegate, @unchecked Send
                 var values = URLResourceValues(); values.isExcludedFromBackup = true
                 try? url.setResourceValues(values)
             } catch { self.statusText = "Automatic upload outbox unavailable: \(error.localizedDescription)" }
+            guard automaticallyFlush else { return }
             let timer = DispatchSource.makeTimerSource(queue: self.queue)
             timer.schedule(deadline: .now() + 1, repeating: 5)
             timer.setEventHandler { [weak self] in self?.flush() }

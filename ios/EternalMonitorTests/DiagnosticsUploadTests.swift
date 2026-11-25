@@ -40,7 +40,7 @@ final class DiagnosticsUploadTests: XCTestCase {
         let defaults = UserDefaults(suiteName: suite)!
         defer { try? FileManager.default.removeItem(at: directory); defaults.removePersistentDomain(forName: suite) }
         let config = DiagnosticsUpload.Configuration(endpoint: URL(string: "http://127.0.0.1:1/v1/events")!, ingestKey: "write-only", allowHTTP: true)
-        let upload = DiagnosticsUpload(directory: directory, configuration: config, defaults: defaults)
+        let upload = DiagnosticsUpload(directory: directory, configuration: config, defaults: defaults, automaticallyFlush: false)
         defer { upload.shutdown() }
         SupportDiagnostics.notePCName("ASH-DESKTOP")
         for message in [

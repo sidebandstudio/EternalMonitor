@@ -459,7 +459,9 @@ pub fn record(line: &str) {
 fn automatically_uploaded(line: &str) -> bool {
     session_summary(line).is_some()
         || level(line) != "info"
-        || line.ends_with(" INFO EternalMonitor shutting down")
+        || line
+            .split_once(' ')
+            .is_some_and(|(_, rest)| rest.trim_start() == "INFO EternalMonitor shutting down")
 }
 /// `line` as the queue keeps it: redacted with the device names known now,
 /// so a name the registry lets go later stays out of it. A session summary
@@ -565,12 +567,10 @@ fn identity(directory: &Path) -> std::io::Result<(String, String)> {
 /// Lines drained at shutdown keep their level: an error logged just before
 /// exit is usually the one that explains the exit.
 fn level(line: &str) -> &'static str {
-    if line.contains(" ERROR ") {
-        "error"
-    } else if line.contains(" WARN ") {
-        "warning"
-    } else {
-        "info"
+    match line.split_ascii_whitespace().nth(1) {
+        Some("ERROR") => "error",
+        Some("WARN") => "warning",
+        _ => "info",
     }
 }
 /// The message of a session summary line (`crate::diagnostics::session_summary`):
@@ -836,6 +836,10 @@ mod tests {
     fn routine_logs_stay_local_and_support_reports_upload() {
         for (line, upload) in [
             ("2026-10-21T03:04:31Z  INFO Receiver report fps=60", false),
+            (
+                "2026-10-21T03:04:31Z  INFO Connected to ERROR display",
+                false,
+            ),
             (
                 "2026-10-21T03:04:31Z  INFO session_summary v=1 role=pc",
                 true,
