@@ -8,6 +8,7 @@ use super::theme::*;
 use super::widgets::{self, Tone, GAP};
 use super::{AnalyzerApp, StatsSnapshot, CAPTURE_VIRTUAL_SENTINEL};
 use crate::i18n::{self, tr, trf, Lang};
+use crate::vdd_settings::Orientation;
 
 impl AnalyzerApp {
     pub(super) fn settings_page(&mut self, ui: &mut Ui, snap: &StatsSnapshot) {
@@ -52,6 +53,29 @@ impl AnalyzerApp {
             );
             if vdd_match != self.settings_vdd_match {
                 self.set_vdd_match(vdd_match);
+            }
+            widgets::divider(ui);
+            let mut orientation = self.settings_vdd_orientation;
+            widgets::setting_row(
+                ui,
+                tr("Orientation"),
+                orientation_description(vdd_match),
+                230.0,
+                |ui| {
+                    ui.add_enabled_ui(vdd_match, |ui| {
+                        widgets::segmented(
+                            ui,
+                            &mut orientation,
+                            &[
+                                (Orientation::Landscape, tr("Landscape")),
+                                (Orientation::Portrait, tr("Portrait")),
+                            ],
+                        );
+                    });
+                },
+            );
+            if orientation != self.settings_vdd_orientation {
+                self.set_vdd_orientation(orientation);
             }
             widgets::divider(ui);
             self.resolution_row(ui, vdd_match);
@@ -398,11 +422,12 @@ fn resolution_label((width, height): (u32, u32), native: bool) -> String {
     if native {
         return trf("{size} (native)", &[("size", &size)]);
     }
-    let shape = [(16, 9, "16:9"), (16, 10, "16:10"), (4, 3, "4:3")]
+    let shape = [(16, 9), (16, 10), (4, 3)]
         .into_iter()
-        .find(|&(w, h, _)| width * h == height * w);
+        .find(|&(w, h)| width * h == height * w || width * w == height * h);
     match shape {
-        Some((_, _, name)) => format!("{size} ({name})"),
+        Some((w, h)) if height > width => format!("{size} ({h}:{w})"),
+        Some((w, h)) => format!("{size} ({w}:{h})"),
         None => size,
     }
 }
@@ -414,6 +439,16 @@ pub(super) fn resolution_description(matching: bool, connected: bool) -> &'stati
         "Used by Second screen. Connect the iPad to choose its size. Each iPad keeps its own."
     } else {
         "Used by Second screen. A smaller size makes everything larger at the same Windows scale, and a little less sharp. Other shapes show with bars. Each iPad keeps the size picked here. One set in Windows lasts for that session."
+    }
+}
+
+/// What Orientation does, and when a change applies: at once on a second
+/// screen that is on, which turns off and on in the new shape.
+pub(super) fn orientation_description(matching: bool) -> &'static str {
+    if matching {
+        "Used by Second screen. Portrait makes it a tall screen, for a chat or a long page, with the iPad held upright. A change turns the second screen off and on again."
+    } else {
+        "Used by Second screen. Turn on Match the iPad's resolution to choose one."
     }
 }
 

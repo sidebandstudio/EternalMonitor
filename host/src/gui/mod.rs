@@ -328,6 +328,7 @@ pub struct AnalyzerApp {
     settings_start_on_boot: bool,
     settings_hevc_enabled: bool,
     settings_vdd_match: bool,
+    settings_vdd_orientation: crate::vdd_settings::Orientation,
     /// Set when a high-frequency control (the bitrate slider) changed; the
     /// settings file is written once the value has been stable for 800 ms.
     settings_dirty_at: Option<Instant>,
@@ -515,6 +516,7 @@ impl AnalyzerApp {
             settings_start_on_boot: start_on_boot,
             settings_hevc_enabled: persisted.hevc_enabled,
             settings_vdd_match: persisted.vdd_match_resolution,
+            settings_vdd_orientation: persisted.vdd_orientation,
             settings_dirty_at: None,
             settings_encoder_choice: encoder_choice,
             settings_capture_display,
@@ -596,6 +598,7 @@ impl AnalyzerApp {
             hevc_enabled: self.settings_hevc_enabled,
             stream_audio: self.control.shared.audio_enabled.load(Ordering::SeqCst),
             vdd_match_resolution: self.settings_vdd_match,
+            vdd_orientation: self.settings_vdd_orientation,
             start_on_boot: self.settings_start_on_boot,
             require_pairing: pairing.required,
             auth_token_hex: crate::pairing::token_hex(&pairing.token()),
@@ -741,6 +744,25 @@ impl AnalyzerApp {
             "VDD resolution match changed — applies next time the extended display starts"
         );
         self.persist_settings();
+    }
+
+    /// Landscape or Portrait for the second screen. A second screen on now,
+    /// with modes written for its iPad, is turned off and on in the new
+    /// shape through a stream restart (`capture::reuse_vdd` finds its modes
+    /// lack the new size); otherwise the next start uses it.
+    fn set_vdd_orientation(&mut self, orientation: crate::vdd_settings::Orientation) {
+        self.settings_vdd_orientation = orientation;
+        *self.control.shared.vdd_orientation.lock() = orientation;
+        let live = self.settings_vdd_match && self.control.shared.vdd_output.lock().is_some();
+        info!(
+            ?orientation,
+            restart = live,
+            "Second screen orientation changed"
+        );
+        self.persist_settings();
+        if live {
+            self.restart_stream();
+        }
     }
 
     fn set_hevc(&mut self, enabled: bool) {

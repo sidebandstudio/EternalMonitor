@@ -49,6 +49,10 @@ pub struct SettingsFile {
     /// resolution/refresh (writes vdd_settings.xml before enabling it).
     #[serde(default = "default_true")]
     pub vdd_match_resolution: bool,
+    /// Which way up the second screen stands while it matches the iPad:
+    /// Landscape, or Portrait for a tall screen.
+    #[serde(default)]
+    pub vdd_orientation: crate::vdd_settings::Orientation,
     pub start_on_boot: bool,
     /// Streaming sessions of five minutes or more, counted up to the
     /// one-time "How's EternalMonitor working for you?" card.
@@ -159,6 +163,7 @@ impl Default for SettingsFile {
             auth_token_hex: String::new(),
             listen_on: Default::default(),
             vdd_match_resolution: true,
+            vdd_orientation: Default::default(),
             start_on_boot: false,
             feedback_sessions: 0,
             feedback_ask_done: false,
@@ -340,6 +345,28 @@ mod tests {
                 .max_dgram,
             1200
         );
+    }
+
+    /// The second screen's orientation: Landscape in a file from before it
+    /// existed, Portrait kept once picked. Older versions ignore the field.
+    #[test]
+    fn the_second_screen_orientation_round_trips_and_defaults_to_landscape() {
+        use crate::vdd_settings::Orientation;
+        let old = r#"{"bitrate_mbps":15,"target_fps":60,"start_on_boot":false}"#;
+        let parsed: SettingsFile = serde_json::from_str(old).unwrap();
+        assert_eq!(parsed.vdd_orientation, Orientation::Landscape);
+        assert_eq!(
+            SettingsFile::default().vdd_orientation,
+            Orientation::Landscape
+        );
+        let settings = SettingsFile {
+            vdd_orientation: Orientation::Portrait,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        assert!(json.contains(r#""vdd_orientation":"portrait""#), "{json}");
+        let parsed: SettingsFile = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.vdd_orientation, Orientation::Portrait);
     }
 
     /// A settings file from before Automatic keeps the input it names, so

@@ -235,6 +235,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     shared
         .audio_enabled
         .store(persisted.stream_audio, std::sync::atomic::Ordering::SeqCst);
+    *shared.vdd_orientation.lock() = persisted.vdd_orientation;
 
     if persisted.listen_on != eternal_host::network::ListenOn::All {
         info!(
