@@ -1759,10 +1759,10 @@ mod tests {
         let height = a_size.1.min(b_size.1) as usize;
         let same: usize = (0..height)
             .map(|y| {
-                let ours = &a[y * a_size.0 as usize * 4..][..width * 4];
-                let theirs = &b[y * b_size.0 as usize * 4..][..width * 4];
-                ours.chunks_exact(4)
-                    .zip(theirs.chunks_exact(4))
+                let (ours, _) = a[y * a_size.0 as usize * 4..][..width * 4].as_chunks::<4>();
+                let (theirs, _) = b[y * b_size.0 as usize * 4..][..width * 4].as_chunks::<4>();
+                ours.iter()
+                    .zip(theirs)
                     .filter(|(p, q)| p[..3] == q[..3])
                     .count()
             })
