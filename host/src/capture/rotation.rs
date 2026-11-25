@@ -53,7 +53,9 @@ impl Rotation {
     }
 
     /// The size of the image Desktop Duplication gives for an `upright`
-    /// desktop: the sides swap for a quarter turn.
+    /// desktop, as measured: the sides swap for a quarter turn. Capture
+    /// starts its staging texture at this size and takes the acquired
+    /// image's own if that differs.
     pub fn duplicated(self, upright: (u32, u32)) -> (u32, u32) {
         self.upright(upright)
     }
@@ -72,14 +74,15 @@ impl Rotation {
     }
 }
 
-/// Copies a duplicated BGRA image, `size` pixels with rows `source_pitch`
-/// bytes apart in `source`, into `target` upright ([`Rotation::upright`]),
-/// with rows `target_row_bytes` apart. Upright, each row is one copy, as
-/// before rotation was handled.
-pub fn copy_upright(
+/// Copies a duplicated BGRA image of `size` pixels into `target` upright
+/// ([`Rotation::upright`]), with rows `target_row_bytes` apart.
+/// `source_row(y)` is the duplicated image's row `y`, at least `size.0`
+/// pixels: rows are read one at a time, never across the padding a mapped
+/// texture's pitch may leave between them. Upright, each row is one copy,
+/// as before rotation was handled.
+pub fn copy_upright<'a>(
     rotation: Rotation,
-    source: &[u8],
-    source_pitch: usize,
+    source_row: impl Fn(usize) -> &'a [u8],
     size: (u32, u32),
     target: &mut [u8],
     target_row_bytes: usize,
@@ -92,7 +95,6 @@ pub fn copy_upright(
         let (w, h) = rotation.upright(size);
         (w as usize, h as usize)
     };
-    assert!(source_pitch >= width * 4 && source.len() >= source_pitch * (height - 1) + width * 4);
     assert!(
         target_row_bytes >= out_width * 4
             && target.len() >= target_row_bytes * (out_height - 1) + out_width * 4
@@ -100,7 +102,7 @@ pub fn copy_upright(
     if rotation == Rotation::Identity {
         for row in 0..height {
             target[row * target_row_bytes..][..width * 4]
-                .copy_from_slice(&source[row * source_pitch..][..width * 4]);
+                .copy_from_slice(&source_row(row)[..width * 4]);
         }
         return;
     }
@@ -110,8 +112,7 @@ pub fn copy_upright(
                 let row = &mut target[y * target_row_bytes..][..out_width * 4];
                 for x in tile_x..(tile_x + TILE).min(out_width) {
                     let (sx, sy) = rotation.source_of((x, y), (width, height));
-                    let at = sy * source_pitch + sx * 4;
-                    row[x * 4..x * 4 + 4].copy_from_slice(&source[at..at + 4]);
+                    row[x * 4..x * 4 + 4].copy_from_slice(&source_row(sy)[sx * 4..sx * 4 + 4]);
                 }
             }
         }
@@ -190,8 +191,7 @@ mod tests {
             let mut target = vec![0xAB; row_bytes * out_h as usize];
             copy_upright(
                 rotation,
-                &source,
-                pitch,
+                |y| &source[y * pitch..][..width * 4],
                 (width as u32, height as u32),
                 &mut target,
                 row_bytes,
@@ -235,15 +235,21 @@ mod tests {
             let mut once = vec![0; w as usize * 4 * h as usize];
             copy_upright(
                 first,
-                &source,
-                width * 4,
+                |y| &source[y * width * 4..][..width * 4],
                 (width as u32, height as u32),
                 &mut once,
                 w as usize * 4,
             );
             // Turning the upright image by the inverse of a turn of its own.
             let mut back = vec![0; width * 4 * height];
-            copy_upright(second, &once, w as usize * 4, (w, h), &mut back, width * 4);
+            let turned_row = w as usize * 4;
+            copy_upright(
+                second,
+                |y| &once[y * turned_row..][..turned_row],
+                (w, h),
+                &mut back,
+                width * 4,
+            );
             assert_eq!(back, source, "{first:?} then {second:?}");
         }
     }
