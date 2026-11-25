@@ -761,7 +761,10 @@ impl AnalyzerApp {
         );
         self.persist_settings();
         if live {
-            self.restart_stream();
+            // Not `restart_stream`, which forgets the encoders that failed
+            // this launch: a turn says nothing about their drivers.
+            self.restart_pending = false;
+            self.control.request_restart();
         }
     }
 
