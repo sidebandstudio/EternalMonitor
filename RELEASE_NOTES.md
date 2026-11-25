@@ -1,12 +1,15 @@
 ## EternalMonitor v0.3.6
 
-Released [date set at release].
+Released November 25, 2026.
 Windows and iPad versions listed on the download page work together.
 Each 0.3.6 app works with the other app on 0.3.5, 0.3.4 and 0.3.3.
 
 ### Second screen
 
-- [Portrait second screen: one line, wording to come.]
+- Portrait for the second screen: Settings > Display > Orientation makes
+  it a tall screen, for a chat or a long page with the iPad held upright.
+  Mirroring a screen turned to Portrait in Windows now shows a picture
+  instead of none.
 
 ### Diagnostics
 
