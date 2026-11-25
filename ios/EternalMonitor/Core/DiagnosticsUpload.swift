@@ -47,6 +47,7 @@ final class DiagnosticsUpload: NSObject, URLSessionTaskDelegate, @unchecked Send
     private var inFlight = false
     private var sequence = 0
     private var pending: [Event] = []
+    private var stagedBatch: (url: URL, batch: Batch)?
     private var nextAttempt = Date.distantPast
     private var backoff = 5.0
     private var statusText = "Automatic upload is not configured"
@@ -57,7 +58,7 @@ final class DiagnosticsUpload: NSObject, URLSessionTaskDelegate, @unchecked Send
     private let lossLock = NSLock()
     static let enabledKey = "automaticallyShareDiagnostics"
 
-    init(directory: URL? = nil, configuration: Configuration? = Configuration.load(), defaults: UserDefaults = .standard, sessionConfiguration: URLSessionConfiguration? = nil) {
+    init(directory: URL? = nil, configuration: Configuration? = Configuration.load(), defaults: UserDefaults = .standard, sessionConfiguration: URLSessionConfiguration? = nil, automaticallyFlush: Bool = true) {
         self.directory = directory ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("DiagnosticsOutbox", isDirectory: true)
         self.configuration = configuration
         self.defaults = defaults
@@ -80,6 +81,7 @@ final class DiagnosticsUpload: NSObject, URLSessionTaskDelegate, @unchecked Send
                 var values = URLResourceValues(); values.isExcludedFromBackup = true
                 try? url.setResourceValues(values)
             } catch { self.statusText = "Automatic upload outbox unavailable: \(error.localizedDescription)" }
+            guard automaticallyFlush else { return }
             let timer = DispatchSource.makeTimerSource(queue: self.queue)
             timer.schedule(deadline: .now() + 1, repeating: 5)
             timer.setEventHandler { [weak self] in self?.flush() }
@@ -95,6 +97,7 @@ final class DiagnosticsUpload: NSObject, URLSessionTaskDelegate, @unchecked Send
         queue.async {
             if !enabled {
                 self.pending.removeAll()
+                self.stagedBatch = nil
                 self.session.getAllTasks { $0.forEach { $0.cancel() } }
                 for url in self.files() { try? FileManager.default.removeItem(at: url) }
                 self.statusText = "Automatic upload disabled"
@@ -103,13 +106,15 @@ final class DiagnosticsUpload: NSObject, URLSessionTaskDelegate, @unchecked Send
     }
     func record(level: String, category: String, message: String, timestamp: Date) {
         guard configured, enabled else { return }
+        let level = level == "warn" ? "warning" : level
+        guard category == "summary" || category == "exits" || level == "warning" || level == "error" else { return }
         guard capacity.wait(timeout: .now()) == .success else { lossLock.lock(); dropped += 1; lossLock.unlock(); return }
         let message = SupportDiagnostics.redactForUpload(String(decoding: message.utf8.prefix(8192), as: UTF8.self), category: category)
         queue.async {
             defer { self.capacity.signal() }
             guard self.enabled else { return }
             self.sequence += 1
-            self.pending.append(Event(sequence: self.sequence, at_ms: Int64(timestamp.timeIntervalSince1970 * 1000), level: level == "warn" ? "warning" : level, category: String(category.prefix(64)), message: message))
+            self.pending.append(Event(sequence: self.sequence, at_ms: Int64(timestamp.timeIntervalSince1970 * 1000), level: level, category: String(category.prefix(64)), message: message))
             // Persist promptly so a disconnect or process termination does not erase pending events.
             self.persistPending()
         }
@@ -122,12 +127,16 @@ final class DiagnosticsUpload: NSObject, URLSessionTaskDelegate, @unchecked Send
         while !pending.isEmpty {
             let info = Bundle.main.infoDictionary ?? [:]
             // Four maximally escaped 8 KiB messages fit within the API's 256 KiB limit.
-            let batch = Batch(batch_id: UUID().uuidString, installation_id: installationID, launch_id: launchID, platform: "ipad", app_version: info["CFBundleShortVersionString"] as? String ?? "unknown", build: info["CFBundleVersion"] as? String ?? "unknown", events: Array(pending.prefix(4)))
+            let staged = stagedBatch
+            let existing = staged?.batch.events ?? []
+            let next = Array(pending.prefix(4 - existing.count))
+            let batch = Batch(batch_id: staged?.batch.batch_id ?? UUID().uuidString, installation_id: installationID, launch_id: launchID, platform: "ipad", app_version: info["CFBundleShortVersionString"] as? String ?? "unknown", build: info["CFBundleVersion"] as? String ?? "unknown", events: existing + next)
             do {
                 let data = try JSONEncoder().encode(batch)
-                let url = directory.appendingPathComponent("\(batch.events[0].at_ms)-\(batch.batch_id).json")
+                let url = staged?.url ?? directory.appendingPathComponent("\(batch.events[0].at_ms)-\(batch.batch_id).json")
                 try data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
-                pending.removeFirst(batch.events.count)
+                pending.removeFirst(next.count)
+                stagedBatch = batch.events.count < 4 ? (url, batch) : nil
                 let files = self.files()
                 var total = files.reduce(0) { $0 + ((try? $1.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0) }
                 var count = files.count
@@ -135,6 +144,7 @@ final class DiagnosticsUpload: NSObject, URLSessionTaskDelegate, @unchecked Send
                     if inFlight && url == self.activeFile { continue }
                     let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
                     try FileManager.default.removeItem(at: url); total -= size; count -= 1
+                    if url == stagedBatch?.url { stagedBatch = nil }
                     lossLock.lock(); dropped += 1; lossLock.unlock()
                 }
             } catch {
@@ -150,6 +160,8 @@ final class DiagnosticsUpload: NSObject, URLSessionTaskDelegate, @unchecked Send
         guard enabled, !inFlight, let configuration, Date() >= nextAttempt else { return }
         persistPending()
         guard let url = files().first else { statusText = "Automatic upload connected; outbox empty"; return }
+        // Once a request has attempted a batch, both its ID and its payload stay fixed.
+        if url == stagedBatch?.url { stagedBatch = nil }
         guard let data = try? Data(contentsOf: url), let batch = try? JSONDecoder().decode(Batch.self, from: data) else {
             // Remove a damaged entry so it cannot permanently block later diagnostics.
             try? FileManager.default.removeItem(at: url)
@@ -169,9 +181,8 @@ final class DiagnosticsUpload: NSObject, URLSessionTaskDelegate, @unchecked Send
                 let ack = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
                 if error == nil, status == 200, ack?["accepted_batch"] as? String == batch.batch_id {
                     try? FileManager.default.removeItem(at: url)
-                    self.backoff = 5; self.nextAttempt = .distantPast
+                    self.backoff = 5; self.nextAttempt = Date().addingTimeInterval(15)
                     self.statusText = "Automatic upload connected; last sent \(ISO8601DateFormatter().string(from: Date()))"
-                    self.flush()
                 } else {
                     self.statusText = "Automatic upload waiting to retry; HTTP=\(status) network=\((error as NSError?)?.code ?? 0) pending_batches=\(self.files().count)"
                     self.backoff = min(300, self.backoff * 2); self.nextAttempt = Date().addingTimeInterval(self.backoff)

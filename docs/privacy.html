@@ -133,8 +133,8 @@
         <p>Automatic sharing is on by default in both the Windows app and the iPad app. While the apps run, they send diagnostics to EternalMonitor support. If an upload can't get through, it is kept on the device and sent after reconnecting or the next time the app opens.</p>
         <ul class="post-list">
           <li>Device details, such as app version, iPad model, Windows version and graphics hardware.</li>
-          <li>Errors and other lines from the apps' logs.</li>
-          <li>Stream statistics, such as frame rate and dropped frames.</li>
+          <li>Session and connection attempt summaries, including whether a picture appeared, how long it took, and why a connection ended.</li>
+          <li>Warnings and errors. Routine logs stay on the device in current builds. Older builds may still send them.</li>
           <li>Reports of crashes, hangs and unexpected exits: where in the app it happened, with device details.</li>
           <li>Names and addresses that appear in these logs: the names of graphics cards and displays, and local network addresses. From version 0.3.4, the Windows app removes your PC's name, your Windows user name, your user folder, your iPad's name and the names of your audio devices before sending, and sends only each audio device's kind, such as headphones. The iPad app removes your PC's name. Earlier versions send them.</li>
           <li>A random installation ID each app creates the first time it runs, so we can find your diagnostics. The PC and the iPad each have their own.</li>
@@ -157,7 +157,7 @@
 
       <article class="post" id="where" aria-labelledby="where-title">
         <h2 id="where-title">Where it is stored</h2>
-        <p>Uploads use encrypted HTTPS. They pass through Vercel and are stored in a Supabase database in the US East region.</p>
+        <p>Uploads use encrypted HTTPS. They pass through Cloudflare or Vercel during the transition and are stored in a Supabase database in the US East region.</p>
       </article>
 
       <article class="post" id="how-long" aria-labelledby="how-long-title">
