@@ -113,24 +113,6 @@ pub(super) fn conversion_context(
     .map(Some)
 }
 
-/// [`conversion_context`] for a capture of `source` encoded at the smaller
-/// `size`, the most a hardware encoder took (see `encoder::smaller_sizes`):
-/// swscale scales as it converts, BGRA to BGRA too.
-pub(super) fn resizing_context(
-    format: Pixel,
-    source: (u32, u32),
-    size: (u32, u32),
-    threads: usize,
-) -> Result<Option<Scaler>, ffmpeg_next::Error> {
-    if source == size {
-        return conversion_context(format, size.0, size.1, threads);
-    }
-    with_one_thread_fallback(threads, |threads| {
-        Scaler::open(format, source, size, threads)
-    })
-    .map(Some)
-}
-
 /// Opens a scaler with `open` on `threads` threads, or on one when that
 /// fails: swscale can fail to start its threads, and the single-threaded
 /// conversion, which needs none, must still open wherever it did before.
@@ -158,17 +140,14 @@ fn threads_for(processors: usize) -> usize {
     (processors / 2).clamp(1, 4)
 }
 
-/// swscale converting BGRA to `output`, at one size or scaling down to
-/// another, FAST_BILINEAR, on `threads` threads. FFmpeg 7.1 splits a conversion across threads only in
+/// swscale converting BGRA to `output` at one size, FAST_BILINEAR, on
+/// `threads` threads. FFmpeg 7.1 splits a conversion across threads only in
 /// `sws_scale_frame`; `sws_scale`, which ffmpeg-next's `Context::run` calls,
 /// always runs on one.
 pub(super) struct Scaler {
     context: *mut ffmpeg_next::ffi::SwsContext,
-    /// The BGRA input's size.
     width: u32,
     height: u32,
-    /// The output's size.
-    size: (u32, u32),
     output: Pixel,
     threads: usize,
 }
@@ -178,15 +157,6 @@ impl Scaler {
         output: Pixel,
         width: u32,
         height: u32,
-        threads: usize,
-    ) -> Result<Self, ffmpeg_next::Error> {
-        Self::open(output, (width, height), (width, height), threads)
-    }
-
-    fn open(
-        output: Pixel,
-        (width, height): (u32, u32),
-        size: (u32, u32),
         threads: usize,
     ) -> Result<Self, ffmpeg_next::Error> {
         use ffmpeg_next::ffi::{
@@ -203,7 +173,6 @@ impl Scaler {
             context,
             width,
             height,
-            size,
             output,
             threads,
         };
@@ -211,8 +180,8 @@ impl Scaler {
             (c"srcw", i64::from(width)),
             (c"srch", i64::from(height)),
             (c"src_format", AVPixelFormat::from(Pixel::BGRA) as i64),
-            (c"dstw", i64::from(size.0)),
-            (c"dsth", i64::from(size.1)),
+            (c"dstw", i64::from(width)),
+            (c"dsth", i64::from(height)),
             (c"dst_format", AVPixelFormat::from(output) as i64),
             (c"sws_flags", i64::from(SWS_FAST_BILINEAR)),
             (c"threads", threads as i64),
@@ -235,8 +204,7 @@ impl Scaler {
         self.threads
     }
 
-    /// Converts `input`, a BGRA frame of the scaler's input size, into
-    /// `output`.
+    /// Converts `input`, a BGRA frame of the scaler's size, into `output`.
     pub(super) fn run(
         &mut self,
         input: &ffmpeg_next::frame::Video,
@@ -278,7 +246,10 @@ impl Scaler {
     }
 
     fn check_output(&self, output: &ffmpeg_next::frame::Video) -> Result<(), ffmpeg_next::Error> {
-        if output.format() != self.output || (output.width(), output.height()) != self.size {
+        if output.format() != self.output
+            || output.width() != self.width
+            || output.height() != self.height
+        {
             return Err(ffmpeg_next::Error::OutputChanged);
         }
         Ok(())
@@ -950,52 +921,5 @@ mod tests {
         assert!(conversion_context(Pixel::BGRZ, width, height, 1)
             .unwrap()
             .is_none());
-    }
-
-    /// A portrait capture a hardware encoder refused at its own size is
-    /// scaled to the size it took, into each input an encoder reads, BGRA
-    /// too, straight from capture's buffer. A flat picture keeps its colour,
-    /// within swscale's rounding.
-    /// At the same size nothing changes: BGRA needs no scaler.
-    #[test]
-    fn a_capture_is_scaled_to_the_size_the_encoder_took() {
-        ffmpeg_next::init().unwrap();
-        let (source, size) = ((1640u32, 2360u32), (1600u32, 2304u32));
-        let row_bytes = source.0 as usize * 4;
-        let mut rows = crate::capture::frame_buffer(row_bytes * source.1 as usize);
-        for pixel in rows[..row_bytes * source.1 as usize].as_chunks_mut::<4>().0 {
-            pixel.copy_from_slice(&[40, 120, 200, 255]);
-        }
-        for format in [Pixel::BGRA, Pixel::BGRZ, Pixel::YUV420P, Pixel::NV12] {
-            let mut scaler = resizing_context(format, source, size, scaler_threads())
-                .unwrap()
-                .expect("a scaler for another size");
-            let mut frame = ffmpeg_next::frame::Video::new(format, size.0, size.1);
-            convert_packed_bgra(&mut scaler, &rows, row_bytes, &mut frame).unwrap();
-            assert_eq!((frame.width(), frame.height()), size);
-            let mut wrong = ffmpeg_next::frame::Video::new(format, source.0, source.1);
-            assert!(convert_packed_bgra(&mut scaler, &rows, row_bytes, &mut wrong).is_err());
-            if matches!(format, Pixel::BGRA | Pixel::BGRZ) {
-                for y in [0, size.1 as usize / 2, size.1 as usize - 1] {
-                    for x in [0, size.0 as usize / 2, size.0 as usize - 1] {
-                        let at = y * frame.stride(0) + x * 4;
-                        // FAST_BILINEAR rounds through its own fixed point.
-                        let got = &frame.data(0)[at..at + 3];
-                        assert!(
-                            got.iter()
-                                .zip([40u8, 120, 200])
-                                .all(|(a, b)| a.abs_diff(b) <= 6),
-                            "{format:?} {x},{y}: {got:?}"
-                        );
-                    }
-                }
-            }
-        }
-        assert!(resizing_context(Pixel::BGRA, size, size, 1)
-            .unwrap()
-            .is_none());
-        assert!(resizing_context(Pixel::NV12, size, size, 1)
-            .unwrap()
-            .is_some());
     }
 }

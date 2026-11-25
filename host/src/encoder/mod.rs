@@ -464,10 +464,10 @@ fn run_encode_loop(
             // once it returned, or a new one.
             let reopened = if let Some(result) = background.as_mut().and_then(|behind| {
                 behind.open.poll(&mut input_mode, |args| {
-                    EncoderState::open_sized(
+                    EncoderState::new(
                         &args.encoder_name,
-                        args.source,
-                        Some(args.size),
+                        args.size.0,
+                        args.size.1,
                         args.bitrate_bps,
                         args.target_fps,
                         &mut EncoderInput::Yuv420,
@@ -693,12 +693,6 @@ fn run_encode_loop(
             Ordering::Relaxed,
         );
 
-        // A session at a smaller size than the capture (see `smaller_sizes`)
-        // takes the pointer in its picture: positions sent apart are the
-        // capture's pixels, which the iPad would place on the video's.
-        shared
-            .encode_scaled
-            .store(encoder.scaled(), Ordering::Relaxed);
         let convert_start = Instant::now();
         encoder.convert(&raw_frame.data, (raw_frame.width * 4) as usize)?;
         // The picture is kept only while a session's first keyframe may stay
@@ -905,12 +899,8 @@ struct EncoderState {
     #[cfg(target_os = "macos")]
     native_converter: Option<vimage::Converter>,
     encoder: ffmpeg_next::codec::encoder::video::Encoder,
-    /// BGRA to the encoder's YUV input, reading capture's buffer directly,
-    /// and scaling it when the session is smaller than the capture.
+    /// BGRA to the encoder's YUV input, reading capture's buffer directly.
     scaler: Option<input::Scaler>,
-    /// The capture's size, evened ([`encoded_size`]): the frames it takes.
-    /// `frame`'s size unless the encoder took only a smaller one.
-    source: (u32, u32),
     frame: ffmpeg_next::frame::Video,
     packet: ffmpeg_next::Packet,
     h264: H264BitstreamState,
@@ -1084,9 +1074,6 @@ impl EncoderState {
     /// Opens a session for captures of `capture_width`x`capture_height`,
     /// at their [`encoded_size`].
     #[allow(clippy::too_many_arguments)]
-    /// A session at the capture's own size.
-    #[cfg(test)]
-    #[allow(clippy::too_many_arguments)]
     fn new(
         encoder_name: &str,
         capture_width: u32,
@@ -1097,42 +1084,10 @@ impl EncoderState {
         opening: Opening,
         progress: &mut dyn FnMut(),
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        Self::open_sized(
-            encoder_name,
-            (capture_width, capture_height),
-            None,
-            bitrate_bps,
-            target_fps,
-            input_mode,
-            opening,
-            progress,
-        )
-    }
-
-    /// [`Self::new`] for a capture of `capture`, at the smaller size `at`
-    /// when given: the most the encoder took (see [`smaller_sizes`]).
-    #[allow(clippy::too_many_arguments)]
-    fn open_sized(
-        encoder_name: &str,
-        (capture_width, capture_height): (u32, u32),
-        at: Option<(u32, u32)>,
-        bitrate_bps: u32,
-        target_fps: u32,
-        input_mode: &mut EncoderInput,
-        opening: Opening,
-        progress: &mut dyn FnMut(),
-    ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
-        let source = encoded_size(capture_width, capture_height);
-        let (width, height) = at.unwrap_or(source);
+        let (width, height) = encoded_size(capture_width, capture_height);
         info!(encoder = encoder_name, width, height, bitrate_bps, target_fps,
             input = ?input_mode, "Opening encoder session");
-        if (width, height) != source {
-            info!(
-                capture_size = %format_args!("{capture_width}x{capture_height}"),
-                encoded_size = %format_args!("{width}x{height}"),
-                "Encoding the capture scaled down to a size this encoder takes"
-            );
-        } else if (width, height) != (capture_width, capture_height) {
+        if (width, height) != (capture_width, capture_height) {
             info!(
                 capture_size = %format_args!("{capture_width}x{capture_height}"),
                 encoded_size = %format_args!("{width}x{height}"),
@@ -1157,7 +1112,6 @@ impl EncoderState {
             Self::open_at(
                 codec,
                 encoder_name,
-                source,
                 (width, height),
                 bitrate_bps,
                 target_fps,
@@ -1181,7 +1135,6 @@ impl EncoderState {
     fn open_at(
         codec: ffmpeg_next::Codec,
         encoder_name: &str,
-        source: (u32, u32),
         (width, height): (u32, u32),
         bitrate_bps: u32,
         target_fps: u32,
@@ -1220,7 +1173,6 @@ impl EncoderState {
 
         let args = SessionArgs {
             encoder_name: encoder_name.to_string(),
-            source,
             size: (width, height),
             bitrate_bps,
             target_fps,
@@ -1247,7 +1199,6 @@ impl EncoderState {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let SessionArgs {
             ref encoder_name,
-            source,
             size: (width, height),
             bitrate_bps,
             target_fps,
@@ -1280,21 +1231,20 @@ impl EncoderState {
         h264.refresh_parameter_sets_from_extradata(encoder_extradata(&encoder));
 
         #[cfg(target_os = "macos")]
-        let native_converter =
-            if pixel_format == ffmpeg_next::format::Pixel::YUV420P && source == (width, height) {
-                match vimage::Converter::new() {
-                    Ok(converter) => {
-                        info!("Accelerate BGRA->YUV420P converter ready");
-                        Some(converter)
-                    }
-                    Err(error) => {
-                        warn!(%error, "Using swscale color conversion");
-                        None
-                    }
+        let native_converter = if pixel_format == ffmpeg_next::format::Pixel::YUV420P {
+            match vimage::Converter::new() {
+                Ok(converter) => {
+                    info!("Accelerate BGRA->YUV420P converter ready");
+                    Some(converter)
                 }
-            } else {
-                None
-            };
+                Err(error) => {
+                    warn!(%error, "Using swscale color conversion");
+                    None
+                }
+            }
+        } else {
+            None
+        };
         // Where Accelerate converts, swscale is only its fallback, so it
         // keeps no threads waiting.
         #[cfg(target_os = "macos")]
@@ -1305,7 +1255,7 @@ impl EncoderState {
         };
         #[cfg(not(target_os = "macos"))]
         let threads = input::scaler_threads();
-        let scaler = input::resizing_context(pixel_format, source, (width, height), threads)?;
+        let scaler = input::conversion_context(pixel_format, width, height, threads)?;
         if let Some(scaler) = &scaler {
             info!(
                 output = ?pixel_format,
@@ -1319,7 +1269,6 @@ impl EncoderState {
             native_converter,
             encoder,
             scaler,
-            source,
             frame: ffmpeg_next::frame::Video::new(pixel_format, width, height),
             packet: ffmpeg_next::Packet::empty(),
             h264,
@@ -1403,12 +1352,7 @@ impl EncoderState {
     }
 
     fn accepts_frame(&self, width: u32, height: u32) -> bool {
-        encoded_size(width, height) == self.source
-    }
-
-    /// Whether the session encodes the capture scaled down.
-    fn scaled(&self) -> bool {
-        self.source != (self.frame.width(), self.frame.height())
+        encoded_size(width, height) == (self.frame.width(), self.frame.height())
     }
 
     fn observe_amf_diagnostics(
@@ -1659,9 +1603,6 @@ fn opens_behind(current: &str, wanted: &str) -> bool {
 /// What a session opens with, to finish an open that returns later.
 struct SessionArgs {
     encoder_name: String,
-    /// The capture's size, evened; `size` is smaller when the encoder took
-    /// only a smaller one.
-    source: (u32, u32),
     size: (u32, u32),
     bitrate_bps: u32,
     target_fps: u32,
@@ -1916,26 +1857,14 @@ fn note_nvidia_driver(
 #[derive(Default)]
 pub(crate) struct LaunchFailures {
     opens: Vec<(String, (u32, u32))>,
-    /// Hardware encoders that refused a capture's size and took a smaller
-    /// one ([`smaller_sizes`]). Later opens of that capture on it go
-    /// straight there.
-    fits: Vec<Fit>,
     /// AMD and Intel cards whose encoder failed to open: the fallback
     /// notice asks for their driver update.
     vendors: Vec<GpuVendor>,
 }
 
-/// A capture size an encoder refused, and the smaller size it took.
-struct Fit {
-    encoder: String,
-    refused: (u32, u32),
-    took: (u32, u32),
-}
-
 static LAUNCH_FAILURES: parking_lot::Mutex<LaunchFailures> =
     parking_lot::Mutex::new(LaunchFailures {
         opens: Vec::new(),
-        fits: Vec::new(),
         vendors: Vec::new(),
     });
 
@@ -1951,25 +1880,6 @@ impl LaunchFailures {
                     size.0, size.1
                 )
             })
-    }
-
-    /// The smaller size `encoder` took this launch for a capture of `size`
-    /// it refused, unless that size failed since.
-    fn fitted(&self, encoder: &str, size: (u32, u32)) -> Option<(u32, u32)> {
-        self.fits
-            .iter()
-            .find(|fit| fit.encoder == encoder && fit.refused == size)
-            .map(|fit| fit.took)
-            .filter(|&took| self.earlier(encoder, took).is_none())
-    }
-
-    /// `encoder` did not open at `size`, which it is not asked for again,
-    /// with no driver note: a size it can't take says nothing about its
-    /// driver.
-    fn refused(&mut self, encoder: &str, size: (u32, u32)) {
-        if self.earlier(encoder, size).is_none() {
-            self.opens.push((encoder.to_string(), size));
-        }
     }
 
     /// Whether an encoder named with `suffix` failed this launch.
@@ -2030,47 +1940,9 @@ pub fn forget_launch_failures() {
     }
 }
 
-/// Sizes a hardware encoder may take, largest first. Measured with FFmpeg
-/// 7.1 (`hardware_encoders_open_at`, November 2026): NVENC on an RTX 5080,
-/// and AMF on Ryzen 7000 graphics and on a Radeon 680M + RX 7600S laptop,
-/// encode H.264 at every portrait iPad size and up to 4096x4096, and refuse
-/// 4352x2448 either way up; their HEVC takes 4352 too. The smaller heights are the 2304,
-/// 2176 and 2160 that some vendors' tables and drivers list for older
-/// generations, which could not be measured here (Quick Sync among them).
-/// Each is only tried after a refusal: an open says whether it fits.
-const ENCODER_LIMITS: [(u32, u32); 4] = [(4096, 4096), (4096, 2304), (4096, 2176), (4096, 2160)];
-
-/// The sizes to try, largest first, when a hardware encoder refused `size`:
-/// `size` scaled down, at its shape, to fit each of [`ENCODER_LIMITS`] it
-/// is larger than, with even sides. None for a size every limit takes,
-/// whose refusal is not about its size.
-fn smaller_sizes((width, height): (u32, u32)) -> Vec<(u32, u32)> {
-    let mut sizes: Vec<(u32, u32)> = Vec::new();
-    for (most_wide, most_tall) in ENCODER_LIMITS {
-        if width <= most_wide && height <= most_tall {
-            continue;
-        }
-        let (wide, tall) = (u64::from(width), u64::from(height));
-        // The side that limits it is kept at the limit, the other scaled.
-        let fitted = if wide * u64::from(most_tall) >= tall * u64::from(most_wide) {
-            (most_wide, (tall * u64::from(most_wide) / wide) as u32)
-        } else {
-            ((wide * u64::from(most_tall) / tall) as u32, most_tall)
-        };
-        let fitted = (fitted.0 & !1, fitted.1 & !1);
-        if fitted.0 >= 2 && fitted.1 >= 2 && !sizes.contains(&fitted) {
-            sizes.push(fitted);
-        }
-    }
-    sizes
-}
-
 /// Opens a session as [`EncoderState::new`] does, unless `encoder_name`
 /// failed to open at this size earlier in this launch, and remembers a
-/// hardware encoder's own failure in `failures`. A hardware encoder that
-/// refuses the capture's size is opened at the largest of
-/// [`smaller_sizes`] it takes, with the capture scaled to it, rather than
-/// leaving the stream to the processor; later opens go straight there.
+/// hardware encoder's own failure in `failures`.
 #[allow(clippy::too_many_arguments)]
 fn open_session(
     failures: &parking_lot::Mutex<LaunchFailures>,
@@ -2083,101 +1955,24 @@ fn open_session(
     opening: Opening,
     progress: &mut dyn FnMut(),
 ) -> Result<EncoderState, Box<dyn std::error::Error + Send + Sync>> {
-    open_fitting(
-        failures,
-        encoder_name,
-        encoded_size(capture_width, capture_height),
-        |at| {
-            EncoderState::open_sized(
-                encoder_name,
-                (capture_width, capture_height),
-                at,
-                bitrate_bps,
-                target_fps,
-                input_mode,
-                opening,
-                progress,
-            )
-        },
-    )
-}
-
-/// [`open_session`]'s choice of size, with `open` opening the encoder at
-/// the capture's own (`None`) or a smaller size.
-fn open_fitting<T>(
-    failures: &parking_lot::Mutex<LaunchFailures>,
-    encoder_name: &str,
-    size: (u32, u32),
-    mut open: impl FnMut(Option<(u32, u32)>) -> Result<T, Box<dyn std::error::Error + Send + Sync>>,
-) -> Result<T, Box<dyn std::error::Error + Send + Sync>> {
-    let fitted = failures.lock().fitted(encoder_name, size);
-    if let Some(at) = fitted {
-        let opened = open(Some(at));
-        if let Err(error) = &opened {
-            note_open_failure(failures, encoder_name, at, error.as_ref());
-        }
-        return opened;
-    }
+    let size = encoded_size(capture_width, capture_height);
     if let Some(why) = failures.lock().earlier(encoder_name, size) {
         return Err(why.into());
     }
-    let error = match open(None) {
-        Err(error) if is_hardware_encoder(encoder_name) && !is_open_stall(error.as_ref()) => error,
-        opened => {
-            if let Err(error) = &opened {
-                note_open_failure(failures, encoder_name, size, error.as_ref());
-            }
-            return opened;
-        }
-    };
-    for at in smaller_sizes(size) {
-        if failures.lock().earlier(encoder_name, at).is_some() {
-            continue;
-        }
-        match open(Some(at)) {
-            Ok(state) => {
-                warn!(
-                    encoder = encoder_name,
-                    refused = %format_args!("{}x{}", size.0, size.1),
-                    size = %format_args!("{}x{}", at.0, at.1),
-                    %error,
-                    "The encoder did not take the screen's size; streaming it scaled to the largest size it took"
-                );
-                let mut failures = failures.lock();
-                failures.refused(encoder_name, size);
-                failures.fits.push(Fit {
-                    encoder: encoder_name.to_string(),
-                    refused: size,
-                    took: at,
-                });
-                return Ok(state);
-            }
-            // One that goes on in the background is its size's to judge
-            // (`note_open_failure` when it returns); the next open of this
-            // capture goes there unless it failed.
-            Err(still) if is_open_stall(still.as_ref()) => {
-                let mut failures = failures.lock();
-                failures.refused(encoder_name, size);
-                failures.fits.push(Fit {
-                    encoder: encoder_name.to_string(),
-                    refused: size,
-                    took: at,
-                });
-                return Err(still);
-            }
-            Err(smaller) => {
-                info!(
-                    encoder = encoder_name,
-                    size = %format_args!("{}x{}", at.0, at.1),
-                    error = %smaller,
-                    "The encoder did not take a smaller size either"
-                );
-                failures.lock().refused(encoder_name, at);
-            }
-        }
+    let opened = EncoderState::new(
+        encoder_name,
+        capture_width,
+        capture_height,
+        bitrate_bps,
+        target_fps,
+        input_mode,
+        opening,
+        progress,
+    );
+    if let Err(error) = &opened {
+        note_open_failure(failures, encoder_name, size, error.as_ref());
     }
-    note_open_failure(failures, encoder_name, size, error.as_ref());
-    Err(error)
+    opened
 }
 
 /// Remembers a hardware encoder's own failure to open at `size`, and shows
@@ -3686,362 +3481,6 @@ mod tests {
                 "{width}x{height}"
             );
             assert!(counters.len() >= 5, "{width}x{height}: {counters:?}");
-        }
-    }
-
-    /// A hardware encoder that refused a size is tried at that size scaled
-    /// to each limit it is over, largest first, at its shape with even
-    /// sides; a size every limit takes is not retried smaller.
-    #[test]
-    fn a_refused_size_is_tried_smaller_at_each_encoder_limit_it_is_over() {
-        // iPad Air 11"/iPad (10th gen) and iPad Pro 12.9" upright, and an
-        // iPad mini, which fits 2304 but not 2176 or 2160.
-        assert_eq!(
-            smaller_sizes((1640, 2360)),
-            [(1600, 2304), (1512, 2176), (1500, 2160)]
-        );
-        assert_eq!(
-            smaller_sizes((2048, 2732)),
-            [(1726, 2304), (1630, 2176), (1618, 2160)]
-        );
-        assert_eq!(smaller_sizes((1488, 2266)), [(1428, 2176), (1418, 2160)]);
-        // A 4K screen turned upright, and a 5K one.
-        assert_eq!(
-            smaller_sizes((2160, 3840)),
-            [(1296, 2304), (1224, 2176), (1214, 2160)]
-        );
-        assert_eq!(
-            smaller_sizes((2880, 5120)),
-            [(2304, 4096), (1296, 2304), (1224, 2176), (1214, 2160)]
-        );
-        // A 32:9 screen wider than 4096.
-        assert_eq!(smaller_sizes((5120, 1440)), [(4096, 1152)]);
-        // Landscape iPads and common screens fit every limit.
-        for size in [
-            (2360, 1640),
-            (2732, 2048),
-            (1920, 1080),
-            (3840, 2160),
-            (1080, 1920),
-        ] {
-            assert!(smaller_sizes(size).is_empty(), "{size:?}");
-        }
-        for size in smaller_sizes((2064, 2752)) {
-            assert_eq!((size.0 % 2, size.1 % 2), (0, 0), "{size:?}");
-            assert!(ENCODER_LIMITS
-                .iter()
-                .any(|&(w, h)| size.0 <= w && size.1 <= h));
-        }
-    }
-
-    type BoxError = Box<dyn std::error::Error + Send + Sync>;
-
-    /// An encoder whose largest height is `most_tall`, as some older ones
-    /// list 2304: each size it was asked for, and what it said.
-    fn tall_limited(
-        most_tall: u32,
-        asked: &std::cell::RefCell<Vec<Option<(u32, u32)>>>,
-        full: (u32, u32),
-    ) -> impl FnMut(Option<(u32, u32)>) -> Result<(u32, u32), BoxError> + '_ {
-        move |at| {
-            asked.borrow_mut().push(at);
-            let size = at.unwrap_or(full);
-            if size.1 <= most_tall {
-                Ok(size)
-            } else {
-                Err(format!("h264_amf open failed: {}x{} is too tall", size.0, size.1).into())
-            }
-        }
-    }
-
-    /// A portrait screen on an encoder that refuses its height opens on the
-    /// same encoder at the largest smaller size it takes, without the driver
-    /// note a broken encoder gets, and every later open of that screen
-    /// (a reopen for bitrate, the next pipeline) goes straight there. A
-    /// Restart forgets it.
-    #[test]
-    fn an_encoder_that_refuses_a_tall_screen_opens_at_the_largest_size_it_takes() {
-        let failures = parking_lot::Mutex::new(LaunchFailures::default());
-        let full = (1640, 2360);
-        let asked = std::cell::RefCell::new(Vec::new());
-        let opened = open_fitting(
-            &failures,
-            "h264_amf",
-            full,
-            tall_limited(2176, &asked, full),
-        );
-        assert_eq!(opened.unwrap(), (1512, 2176));
-        assert_eq!(
-            *asked.borrow(),
-            [None, Some((1600, 2304)), Some((1512, 2176))],
-            "its own size, then smaller ones until one opens"
-        );
-        assert!(failures.lock().vendors.is_empty(), "no driver note");
-        assert_eq!(failures.lock().fitted("h264_amf", full), Some((1512, 2176)));
-        asked.borrow_mut().clear();
-        for _ in 0..3 {
-            let again = open_fitting(
-                &failures,
-                "h264_amf",
-                full,
-                tall_limited(2176, &asked, full),
-            );
-            assert_eq!(again.unwrap(), (1512, 2176));
-        }
-        assert_eq!(*asked.borrow(), [Some((1512, 2176)); 3]);
-        // Another encoder, or the same at another size, starts afresh.
-        assert_eq!(failures.lock().fitted("h264_nvenc", full), None);
-        assert_eq!(failures.lock().fitted("h264_amf", (2360, 1640)), None);
-        *failures.lock() = LaunchFailures::default();
-        asked.borrow_mut().clear();
-        let retried = open_fitting(
-            &failures,
-            "h264_amf",
-            full,
-            tall_limited(4096, &asked, full),
-        );
-        assert_eq!(retried.unwrap(), full);
-        assert_eq!(*asked.borrow(), [None]);
-    }
-
-    /// The fallback is for a size: an encoder that fails at a size every
-    /// limit takes, or at every smaller size too, fails as before (once,
-    /// remembered, with its driver note); a stalled open is not tried
-    /// smaller, and libx264 never is.
-    #[test]
-    fn only_a_refused_size_is_tried_smaller() {
-        let failures = parking_lot::Mutex::new(LaunchFailures::default());
-        let asked = std::cell::RefCell::new(Vec::new());
-        let broken =
-            |at: Option<(u32, u32)>| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-                asked.borrow_mut().push(at);
-                Err("h264_amf open failed: no AMF runtime".into())
-            };
-        assert!(open_fitting(&failures, "h264_amf", (1920, 1080), broken).is_err());
-        assert_eq!(*asked.borrow(), [None]);
-        assert!(failures.lock().earlier("h264_amf", (1920, 1080)).is_some());
-        asked.borrow_mut().clear();
-        let error = open_fitting(&failures, "h264_amf", (1640, 2360), broken)
-            .err()
-            .unwrap();
-        assert!(error.to_string().contains("no AMF runtime"), "{error}");
-        assert_eq!(
-            *asked.borrow(),
-            [
-                None,
-                Some((1600, 2304)),
-                Some((1512, 2176)),
-                Some((1500, 2160))
-            ]
-        );
-        assert!(failures.lock().earlier("h264_amf", (1640, 2360)).is_some());
-        assert_eq!(failures.lock().fitted("h264_amf", (1640, 2360)), None);
-        asked.borrow_mut().clear();
-        assert!(open_fitting(&failures, "h264_amf", (1640, 2360), broken).is_err());
-        assert!(asked.borrow().is_empty(), "not opened again this launch");
-        // A stall says nothing about the size.
-        let failures = parking_lot::Mutex::new(LaunchFailures::default());
-        asked.borrow_mut().clear();
-        let stalled = open_fitting(
-            &failures,
-            "h264_nvenc",
-            (1640, 2360),
-            |at| -> Result<(), _> {
-                asked.borrow_mut().push(at);
-                let stall = OpenStalled("h264_nvenc open failed: timed out".into());
-                Err(Box::new(stall) as Box<dyn std::error::Error + Send + Sync>)
-            },
-        );
-        assert!(stalled.is_err());
-        assert_eq!(*asked.borrow(), [None]);
-        asked.borrow_mut().clear();
-        assert!(
-            open_fitting(&failures, "libx264", (1640, 2360), |at| -> Result<(), _> {
-                asked.borrow_mut().push(at);
-                Err("libx264 open failed".into())
-            })
-            .is_err()
-        );
-        assert_eq!(*asked.borrow(), [None]);
-    }
-
-    /// A session at a smaller size than the capture takes the capture's
-    /// frames, scaled, and streams pictures of its own size; another capture
-    /// size still reopens it. The pointer then stays in the video.
-    #[test]
-    fn a_session_smaller_than_the_capture_scales_its_frames() {
-        ffmpeg_next::init().unwrap();
-        let (width, height) = (1640, 2360);
-        let mut state = EncoderState::open_sized(
-            "libx264",
-            (width, height),
-            Some((1600, 2304)),
-            8_000_000,
-            60,
-            &mut EncoderInput::Yuv420,
-            Opening::First,
-            &mut || {},
-        )
-        .unwrap();
-        assert_eq!((state.frame.width(), state.frame.height()), (1600, 2304));
-        assert!(state.scaled());
-        assert!(state.accepts_frame(width, height));
-        assert!(!state.accepts_frame(1600, 2304));
-        assert!(!libx264_at(width, height).scaled());
-        let codec = ffmpeg_next::decoder::find(ffmpeg_next::codec::Id::H264).unwrap();
-        let mut decoder = ffmpeg_next::codec::Context::new_with_codec(codec)
-            .decoder()
-            .video()
-            .unwrap();
-        let mut decoded = ffmpeg_next::frame::Video::empty();
-        let mut pictures = 0;
-        let start = Instant::now();
-        for n in 1..=5u64 {
-            let rows = synthetic_capture(width, height, n);
-            state.convert(&rows, width as usize * 4).unwrap();
-            let captured = start + Duration::from_micros(n * 16_667);
-            let pts = state.next_pts(captured, n);
-            state.frame.set_pts(Some(pts));
-            state.send_frame(pts, captured, n).unwrap();
-            while state.encoder.receive_packet(&mut state.packet).is_ok() {
-                if state.h264.needs_parameter_sets() {
-                    state
-                        .h264
-                        .refresh_parameter_sets_from_extradata(encoder_extradata(&state.encoder));
-                }
-                let (annex_b, _) = normalize_h264_payload_with_info(
-                    state.packet.data().unwrap_or_default(),
-                    state.packet.is_key(),
-                    &mut state.h264,
-                    &state.opened_encoder,
-                );
-                decoder
-                    .send_packet(&ffmpeg_next::Packet::copy(&annex_b))
-                    .unwrap();
-                while decoder.receive_frame(&mut decoded).is_ok() {
-                    assert_eq!((decoded.width(), decoded.height()), (1600, 2304));
-                    pictures += 1;
-                }
-            }
-        }
-        assert!(pictures >= 1, "no picture decoded");
-        let shared = SharedControl::new(0, 8_000_000);
-        shared.encode_scaled.store(true, Ordering::Relaxed);
-        assert!(!shared.client_draws_pointer());
-    }
-
-    /// Native: the sizes each hardware encoder in this FFmpeg build opens at
-    /// on this PC, portrait iPads and the limits of [`ENCODER_LIMITS`]
-    /// among them, and the size a portrait iPad streams at through
-    /// [`open_session`]'s fallback. Prints `LIMIT` and `FALLBACK` lines.
-    /// `cargo test -p eternal-host --lib hardware_encoders_open_at -- --ignored --nocapture`
-    #[test]
-    #[ignore = "native: needs a hardware encoder"]
-    fn hardware_encoders_open_at() {
-        ffmpeg_next::init().unwrap();
-        let sizes = [
-            (1640, 2360),
-            (1668, 2420),
-            (2048, 2732),
-            (2064, 2752),
-            (1488, 2266),
-            (1600, 2304),
-            (1512, 2176),
-            (1500, 2160),
-            (2160, 3840),
-            (2304, 4096),
-            (4096, 2304),
-            (4096, 4096),
-            (4352, 2448),
-            (2448, 4352),
-        ];
-        for name in [
-            "h264_nvenc",
-            "hevc_nvenc",
-            "h264_amf",
-            "hevc_amf",
-            "h264_qsv",
-            "hevc_qsv",
-        ] {
-            if ffmpeg_next::encoder::find_by_name(name).is_none() {
-                continue;
-            }
-            let mut opened_any = false;
-            for size in sizes {
-                let opened = EncoderState::open_sized(
-                    name,
-                    size,
-                    None,
-                    8_000_000,
-                    60,
-                    &mut EncoderInput::Yuv420,
-                    Opening::First,
-                    &mut || {},
-                );
-                opened_any |= opened.is_ok();
-                let result = match opened {
-                    Err(error) => format!("refused ({error})"),
-                    Ok(mut state) => {
-                        // An open alone may not prove the size: encode some.
-                        let start = Instant::now();
-                        let mut packets = 0;
-                        for n in 1..=5u64 {
-                            let rows = synthetic_capture(size.0, size.1, n);
-                            let sent = state.convert(&rows, size.0 as usize * 4).is_ok() && {
-                                let captured = start + Duration::from_micros(n * 16_667);
-                                let pts = state.next_pts(captured, n);
-                                state.frame.set_pts(Some(pts));
-                                state.send_frame(pts, captured, n).is_ok()
-                            };
-                            if !sent {
-                                break;
-                            }
-                            while state.encoder.receive_packet(&mut state.packet).is_ok() {
-                                packets += 1;
-                            }
-                        }
-                        format!("opens, {packets} packets from 5 frames")
-                    }
-                };
-                eprintln!("LIMIT {name} {}x{}: {result}", size.0, size.1);
-            }
-            if !opened_any {
-                eprintln!("LIMIT {name}: opens at no size on this PC");
-                continue;
-            }
-            let failures = parking_lot::Mutex::new(LaunchFailures::default());
-            for ipad in [
-                (1640, 2360),
-                (1668, 2420),
-                (2048, 2732),
-                (2064, 2752),
-                (1488, 2266),
-            ] {
-                let opened = open_session(
-                    &failures,
-                    name,
-                    ipad.0,
-                    ipad.1,
-                    8_000_000,
-                    60,
-                    &mut EncoderInput::Yuv420,
-                    Opening::First,
-                    &mut || {},
-                );
-                eprintln!(
-                    "FALLBACK {name} {}x{}: {}",
-                    ipad.0,
-                    ipad.1,
-                    opened.as_ref().map_or_else(
-                        |e| format!("failed ({e})"),
-                        |state| format!(
-                            "streams at {}x{}",
-                            state.frame.width(),
-                            state.frame.height()
-                        )
-                    )
-                );
-            }
         }
     }
 
@@ -6288,7 +5727,6 @@ mod tests {
         assert!(pending.park().is_none());
         let args = SessionArgs {
             encoder_name: name.to_string(),
-            source: (64, 64),
             size: (64, 64),
             bitrate_bps: 8_000_000,
             target_fps: 60,

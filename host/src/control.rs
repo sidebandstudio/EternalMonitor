@@ -142,10 +142,6 @@ pub struct SharedControl {
     /// The session whose iPad reported it holds the pointer image whole
     /// (see [`SharedControl::client_draws_pointer`]).
     pub(crate) pointer_confirmed: Arc<AtomicU32>,
-    /// The encoder takes the capture scaled down (a hardware encoder that
-    /// refused its size): the pointer stays in the video, whose pixels are
-    /// no longer the capture's.
-    pub(crate) encode_scaled: Arc<AtomicBool>,
 }
 
 /// Runtime state of the managed virtual extended display.
@@ -210,7 +206,6 @@ impl SharedControl {
             listen_on: Arc::new(Mutex::new(Default::default())),
             pointer: Arc::new(Default::default()),
             pointer_confirmed: Arc::new(AtomicU32::new(0)),
-            encode_scaled: Arc::new(AtomicBool::new(false)),
             running: Arc::new(AtomicBool::new(false)),
             bitrate_bps: Arc::new(AtomicU32::new(initial_bitrate_bps)),
             abr_current_bps: Arc::new(AtomicU32::new(initial_bitrate_bps)),
@@ -291,13 +286,8 @@ impl SharedControl {
     /// The connected iPad draws the pointer, so capture leaves it out of
     /// the video. From when its reports say it holds the current pointer
     /// image whole: until then it has nothing to draw, so the pointer stays
-    /// in the video and the positions sent say hidden. Not while the video
-    /// is scaled down from the capture (`encode_scaled`): the iPad places
-    /// the pointer at video pixels.
+    /// in the video and the positions sent say hidden.
     pub fn client_draws_pointer(&self) -> bool {
-        if self.encode_scaled.load(Ordering::Relaxed) {
-            return false;
-        }
         let session = self.session.lock().pointer_session_id();
         session.is_some_and(|id| self.pointer_confirmed.load(Ordering::Relaxed) == id)
     }
