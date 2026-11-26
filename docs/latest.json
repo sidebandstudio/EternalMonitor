@@ -1,10 +1,10 @@
 {
   "schema": 1,
   "windows": {
-    "version": "0.3.5",
-    "installer": "https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.5/EternalMonitor-Setup.exe",
-    "sha256": "6e816f8de624fddd9aed5a8f3aa8228ca410ba4464fcc2619a93364ac6409643",
-    "note": "Fixes Second screen on laptops running on battery and when the virtual display is already on, adds a Resolution choice for each iPad, and opens minimised at sign-in."
+    "version": "0.3.6",
+    "installer": "https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.6/EternalMonitor-Setup.exe",
+    "sha256": "10f24605c41224626626cd5043cf64078468e080a96b4a899f02c8a3a1b40149",
+    "note": "Adds Portrait for the second screen, shows a picture when mirroring a screen turned to Portrait, and sends diagnostics to EternalMonitor's new support address."
   },
   "ipad": {
     "version": "0.3.4",
