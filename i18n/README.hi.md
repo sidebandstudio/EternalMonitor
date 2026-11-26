@@ -32,10 +32,10 @@ EternalMonitor iPad को आपके Windows PC का मॉनिटर ब
 
 ## तुरंत शुरू करें
 
-[![Windows के लिए डाउनलोड करें](https://img.shields.io/badge/Download_for_Windows-v0.3.3-e8ff47?style=for-the-badge&labelColor=111)](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.3/EternalMonitor-Setup.exe)
+[![Windows के लिए डाउनलोड करें](https://img.shields.io/badge/Download_for_Windows-v0.3.4-e8ff47?style=for-the-badge&labelColor=111)](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.4/EternalMonitor-Setup.exe)
 [![TestFlight पर iPad ऐप पाएँ](https://img.shields.io/badge/iPad_app-TestFlight-e8ff47?style=for-the-badge&labelColor=111)](https://testflight.apple.com/join/ppc9QfXc)
 
-1. **Windows ऐप इंस्टॉल करें।** NVIDIA, AMD या Intel ग्राफ़िक्स वाले 64-bit Windows 10 (संस्करण 1809 या नया) या Windows 11 पर [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.3/EternalMonitor-Setup.exe) चलाएँ। Windows SmartScreen पूछे तो **अधिक जानकारी**, फिर **फिर भी चलाएँ** चुनें। फ़ाइल का SHA-256 [रिलीज़ पृष्ठ](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.3) पर है।
+1. **Windows ऐप इंस्टॉल करें।** NVIDIA, AMD या Intel ग्राफ़िक्स वाले 64-bit Windows 10 (संस्करण 1809 या नया) या Windows 11 पर [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.4/EternalMonitor-Setup.exe) चलाएँ। Windows SmartScreen पूछे तो **अधिक जानकारी**, फिर **फिर भी चलाएँ** चुनें। फ़ाइल का SHA-256 [रिलीज़ पृष्ठ](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.4) पर है।
 2. **iPad ऐप इंस्टॉल करें।** iPadOS 17 या नए संस्करण वाले iPad पर App Store से **TestFlight** इंस्टॉल करें। फिर iPad पर [EternalMonitor TestFlight लिंक](https://testflight.apple.com/join/ppc9QfXc) खोलें और **इंस्टॉल करें** पर टैप करें।
 3. **कनेक्ट करें।** दोनों ऐप एक ही नेटवर्क पर खोलें। iPad पर अपना PC टैप करें या PC पर दिखाया QR कोड स्कैन करें। Windows 10 22H2 या Windows 11 पर USB के लिए केबल लगाएँ और Apple का मुफ़्त [Apple Devices](https://apps.microsoft.com/detail/9np83lwlpz9k) ऐप PC पर खुला रखें।
 
@@ -74,9 +74,9 @@ EternalMonitor iPad को आपके Windows PC का मॉनिटर ब
 
 ## स्थिति
 
-मौजूदा रिलीज़ Windows के लिए v0.3.3 और iPad के लिए v0.3.3 (build 364) है। यह Intel और NVIDIA ग्राफ़िक्स वाले अधिक लैपटॉप पर **दूसरी स्क्रीन** (Second screen) लाता है: iPad तुरंत PC की मुख्य स्क्रीन दिखाता है और Windows के दूसरी स्क्रीन जोड़ने पर उस पर बदल जाता है। [RELEASE_NOTES.md](../RELEASE_NOTES.md) हर संस्करण और [ROADMAP.md](../ROADMAP.md) आगे की योजना बताता है।
+मौजूदा रिलीज़ Windows के लिए v0.3.4 और iPad के लिए v0.3.4 (build 698) है। यह 0.3.3 में रिपोर्ट की गई समस्याएँ ठीक करती है: AMD और Intel ग्राफ़िक्स पर शुरू होते समय क्रैश, धीमे PC पर USB के साथ फ़्रीज़ होना और Wi-Fi पर बिगड़े हुए फ़्रेम। दोनों ऐप अब 11 भाषाओं में उपलब्ध हैं। [RELEASE_NOTES.md](../RELEASE_NOTES.md) हर संस्करण और [ROADMAP.md](../ROADMAP.md) आगे की योजना बताता है।
 
-v0.3.3 रिलीज़ जाँच Windows, macOS और iPad सिमुलेटर पर पास हुई। [docs/hardware-verification.md](../docs/hardware-verification.md) में v0.3.0 से वास्तविक PC और iPad पर हुए परीक्षणों के परिणाम हैं।
+v0.3.4 रिलीज़ जाँच Windows, macOS और iPad सिमुलेटर पर पास हुई। [docs/hardware-verification.md](../docs/hardware-verification.md) में v0.3.0 से वास्तविक PC और iPad पर हुए परीक्षणों के परिणाम हैं।
 
 Windows और iPad डायग्नोस्टिक्स में डिवाइस विवरण, ऐप की त्रुटियाँ और स्ट्रीम के आँकड़े होते हैं। रिपोर्ट में ग्राफ़िक्स कार्ड और डिस्प्ले के नाम और नेटवर्क पते होते हैं, लेकिन स्क्रीन की सामग्री, ऑडियो और पेयरिंग क्रेडेंशियल नहीं होते। 0.3.4 से Windows द्वारा भेजे गए डेटा में से PC का नाम, उपयोगकर्ता नाम, उपयोगकर्ता फ़ोल्डर, iPad का नाम और ऑडियो डिवाइस के नाम हटाए जाते हैं और हर ऑडियो डिवाइस का केवल प्रकार रखा जाता है; iPad द्वारा भेजे गए डेटा में से PC का नाम हटाया जाता है। **सेटिंग्स** (Settings) में स्वचालित साझाकरण बंद करें। डायग्नोस्टिक्स 30 दिन तक रखे जाते हैं और पहले भी हटाए जा सकते हैं। हटाए गए या समय सीमा पार कर चुके डायग्नोस्टिक्स दैनिक बैकअप में 7 और दिन तक रह सकते हैं। [स्वचालित डायग्नोस्टिक्स](../SETUP.md#automatic-diagnostics) और [गोपनीयता सूचना](https://eternalmonitor.dev/privacy.html) देखें। iPad पर रिपोर्ट कॉपी या एक्सपोर्ट करने के लिए **सेटिंग्स** (Settings) > **सहायता** (Support) > **डायग्नोस्टिक्स** (Diagnostics) खोलें।
 

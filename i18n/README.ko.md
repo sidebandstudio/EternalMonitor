@@ -32,10 +32,10 @@ EternalMonitor는 iPad를 Windows PC의 모니터로 바꿉니다. 무료이며 
 
 ## 빠른 시작
 
-[![Windows용 다운로드](https://img.shields.io/badge/Download_for_Windows-v0.3.3-e8ff47?style=for-the-badge&labelColor=111)](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.3/EternalMonitor-Setup.exe)
+[![Windows용 다운로드](https://img.shields.io/badge/Download_for_Windows-v0.3.4-e8ff47?style=for-the-badge&labelColor=111)](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.4/EternalMonitor-Setup.exe)
 [![TestFlight에서 iPad 앱 받기](https://img.shields.io/badge/iPad_app-TestFlight-e8ff47?style=for-the-badge&labelColor=111)](https://testflight.apple.com/join/ppc9QfXc)
 
-1. **Windows 앱 설치.** NVIDIA, AMD 또는 Intel 그래픽이 있는 64비트 Windows 10(버전 1809 이상) 또는 Windows 11에서 [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.3/EternalMonitor-Setup.exe)를 실행하세요. Windows SmartScreen이 묻는다면 **추가 정보**를 선택한 다음 **실행**을 선택하세요. 파일의 SHA-256은 [릴리스 페이지](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.3)에 있습니다.
+1. **Windows 앱 설치.** NVIDIA, AMD 또는 Intel 그래픽이 있는 64비트 Windows 10(버전 1809 이상) 또는 Windows 11에서 [EternalMonitor-Setup.exe](https://github.com/sidebandstudio/EternalMonitor/releases/download/v0.3.4/EternalMonitor-Setup.exe)를 실행하세요. Windows SmartScreen이 묻는다면 **추가 정보**를 선택한 다음 **실행**을 선택하세요. 파일의 SHA-256은 [릴리스 페이지](https://github.com/sidebandstudio/EternalMonitor/releases/tag/v0.3.4)에 있습니다.
 2. **iPad 앱 설치.** iPadOS 17 이상을 사용하는 iPad에서 App Store의 **TestFlight**를 설치하세요. iPad에서 [EternalMonitor TestFlight 링크](https://testflight.apple.com/join/ppc9QfXc)를 열고 **설치**를 탭하세요.
 3. **연결.** 두 앱을 같은 네트워크에서 열고 iPad에서 PC를 탭하거나 PC에 표시된 QR 코드를 스캔하세요. Windows 10 22H2 또는 Windows 11에서 USB를 사용하려면 케이블을 연결하고 Apple의 무료 [Apple Devices](https://apps.microsoft.com/detail/9np83lwlpz9k) 앱을 PC에서 열어 두세요.
 
@@ -74,9 +74,9 @@ EternalMonitor가 유용하다면 별을 눌러 다른 사람들이 찾을 수 �
 
 ## 상태
 
-현재 릴리스는 Windows용 v0.3.3과 iPad용 v0.3.3 (build 364)입니다. Intel과 NVIDIA 그래픽이 있는 더 많은 노트북에서 **두 번째 화면** (Second screen)을 사용할 수 있습니다. iPad에 PC의 기본 화면이 바로 표시되며 Windows가 두 번째 화면을 추가하면 전환됩니다. [RELEASE_NOTES.md](../RELEASE_NOTES.md)는 각 버전을, [ROADMAP.md](../ROADMAP.md)는 앞으로의 계획을 설명합니다.
+현재 릴리스는 Windows용 v0.3.4와 iPad용 v0.3.4 (build 698)입니다. 0.3.3에서 보고된 AMD 및 Intel 그래픽의 시작 시 충돌, 느린 PC에서 USB 사용 중 멈춤, Wi-Fi에서 프레임이 깨지는 문제를 수정합니다. 두 앱은 이제 11개 언어를 지원합니다. [RELEASE_NOTES.md](../RELEASE_NOTES.md)는 각 버전을, [ROADMAP.md](../ROADMAP.md)는 앞으로의 계획을 설명합니다.
 
-v0.3.3 릴리스 검사는 Windows, macOS 및 iPad 시뮬레이터에서 통과했습니다. [docs/hardware-verification.md](../docs/hardware-verification.md)에는 v0.3.0부터 실제 PC와 iPad에서 수행한 검증 결과가 기록되어 있습니다.
+v0.3.4 릴리스 검사는 Windows, macOS 및 iPad 시뮬레이터에서 통과했습니다. [docs/hardware-verification.md](../docs/hardware-verification.md)에는 v0.3.0부터 실제 PC와 iPad에서 수행한 검증 결과가 기록되어 있습니다.
 
 Windows와 iPad 진단에는 기기 정보, 앱 오류와 스트림 통계가 포함됩니다. 보고서에는 그래픽 카드와 디스플레이 이름 및 네트워크 주소가 포함되지만 화면 내용, 오디오와 페어링 자격 증명은 제외됩니다. 0.3.4부터 Windows가 전송하는 데이터에서는 PC 이름, 사용자 이름, 사용자 폴더, iPad 이름과 오디오 기기 이름이 제거되고 각 오디오 기기의 종류만 남습니다. iPad가 전송하는 데이터에서는 PC 이름이 제거됩니다. 설정에서 자동 공유를 끌 수 있습니다. 진단 정보는 최대 30일 동안 보관되며 더 일찍 삭제될 수 있습니다. 삭제되거나 만료된 진단 정보는 일일 백업에 최대 7일 더 남을 수 있습니다. [자동 진단](../SETUP.md#automatic-diagnostics)과 [개인정보 처리방침](https://eternalmonitor.dev/privacy.html)을 참조하세요. iPad에서 **설정** (Settings) > **지원** (Support) > **진단** (Diagnostics)을 열어 보고서를 복사하거나 내보내세요.
 
